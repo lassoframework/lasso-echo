@@ -996,7 +996,7 @@ def _recaption_drive_draft(account, draft, voice, account_key, day_key, slot_i, 
         draft.hashtags = tags or []
         if getattr(source, "category", ""):
             draft.category = source.category
-        log(f"[gym-drive] {account_key} {day_key} slot {slot_i}: caption failed A+, "
+        log(f"[gym-drive] {account_key} {day_key} slot {slot_i}: "
             "retried once with a fresh caption on the same asset")
         return True
     except Exception as exc:  # noqa: BLE001 - a retry failure is just "no retry"
@@ -1006,9 +1006,14 @@ def _recaption_drive_draft(account, draft, voice, account_key, day_key, slot_i, 
 
 # One ordinary recaption plus at most seven distinct approved-source retries.
 _DRIVE_HISTORY_RETRY_LIMIT = 7
+# With SB7 disabled, copy is deterministic: scanning approved baselines does not
+# call an LLM or claim another photo. Do not spend the seven retries on facts
+# whose exact source+CTA copy is already known to repeat history.
+_DRIVE_HISTORY_BASELINE_SCAN_LIMIT = 64
 
 
-def _drive_history_sources(account_key, day_key, slot_i):
+def _drive_history_sources(account_key, day_key, slot_i,
+                           limit=_DRIVE_HISTORY_RETRY_LIMIT):
     """Walk distinct approved facts, interleaved across deterministic pillars.
 
     The old slot offset changes only the category. The within-category day index
@@ -1044,7 +1049,7 @@ def _drive_history_sources(account_key, day_key, slot_i):
                 continue
             seen.add(fact)
             out.append(source)
-    return out[:_DRIVE_HISTORY_RETRY_LIMIT]
+    return out[:limit]
 
 
 def _retry_drive_caption_history(account, draft, voice, base_key, account_key,
@@ -1052,35 +1057,85 @@ def _retry_drive_caption_history(account, draft, voice, base_key, account_key,
     """Bounded genuine copy regeneration on the already selected photo."""
     from . import post_quality, caption_ledger
     from .drafter import angle_for_index
+    sb7 = config.sb7_enabled()
     try:
-        sources = _drive_history_sources(account_key, day_key, slot_i)
+        sources = _drive_history_sources(
+            account_key, day_key, slot_i,
+            _DRIVE_HISTORY_RETRY_LIMIT if sb7 else _DRIVE_HISTORY_BASELINE_SCAN_LIMIT)
     except Exception as exc:
         log(f"[gym-drive] {base_key} {day_key}: approved-source walk unavailable "
             f"({type(exc).__name__})")
         return False
     day_hashes = {caption_ledger.verbatim_hash(c) for c in day_captions}
-    for attempt, source in enumerate(sources, 1):
+
+    def rejections(candidate):
+        """Classification only: never log caption text or confidential banned words."""
+        caption = getattr(candidate, "caption", "") or ""
+        reasons = []
+        try:
+            quality_ok = (post_quality.is_a_plus(candidate, tuple(banned_words or ()),
+                                                 require_media=True)
+                          if sb7 else not _has_banned_word(caption, tuple(banned_words or ())))
+            if not quality_ok:
+                reasons.append("a_plus" if sb7 else "banned_word")
+        except Exception:
+            reasons.append("quality_gate_error")
+        if not caption.strip():
+            reasons.append("empty_caption")
+        if _caption_repeats_history(base_key, caption, day_key):
+            reasons.append("history_180d")
+        if caption_ledger.verbatim_hash(caption) in day_hashes:
+            reasons.append("same_day")
+        return reasons
+
+    if not sb7:
+        from copy import copy
+        candidates = []
+        rejected = {}
+        scanned = 0
+        for source in sources[:_DRIVE_HISTORY_BASELINE_SCAN_LIMIT]:
+            scanned += 1
+            # EXACT same creative key as _recaption_drive_draft: the approved CTA
+            # is photo-keyed, so testing an arbitrary key could admit the wrong copy.
+            candidate = copy(draft)
+            try:
+                candidate.caption, _ = client_content.compose_caption(
+                    account, source, voice, getattr(draft, "creative_path", "") or "")
+                reasons = rejections(candidate)
+            except Exception:
+                reasons = ["baseline_error"]
+            if reasons:
+                for reason in reasons:
+                    rejected[reason] = rejected.get(reason, 0) + 1
+                continue
+            candidates.append(source)
+            if len(candidates) >= _DRIVE_HISTORY_RETRY_LIMIT:
+                break
+        log(f"[gym-drive] {base_key} {day_key}: SB7 disabled; approved baseline "
+            f"scan checked {scanned} facts, found {len(candidates)} candidates; "
+            f"rejections={rejected}")
+        sources = candidates
+
+    for attempt, source in enumerate(sources[:_DRIVE_HISTORY_RETRY_LIMIT], 1):
         # Different facts and entry angles produce real copy, never a suffix.
         if not _recaption_drive_draft(
                 account, draft, voice, account_key, day_key, slot_i, log,
                 source=source, angle=angle_for_index(attempt + int(slot_i or 0))):
+            reasons = rejections(draft)
+            log(f"[gym-drive] {base_key} {day_key}: approved-source attempt "
+                f"{attempt} produced no changed copy "
+                f"({', '.join(reasons) or 'generation_unavailable'}); same photo retained")
             continue
-        caption = getattr(draft, "caption", "") or ""
-        try:
-            quality_ok = (post_quality.is_a_plus(draft, tuple(banned_words or ()),
-                                                 require_media=True)
-                          if config.sb7_enabled()
-                          else not _has_banned_word(caption, tuple(banned_words or ())))
-        except Exception:  # a quality checker failure cannot admit a candidate
-            quality_ok = False
-        if (quality_ok and caption.strip()
-                and not _caption_repeats_history(base_key, caption, day_key)
-                and caption_ledger.verbatim_hash(caption) not in day_hashes):
+        reasons = rejections(draft)
+        if not reasons:
             log(f"[gym-drive] {base_key} {day_key}: approved-source walk admitted "
                 f"caption on attempt {attempt}; same photo retained")
             return True
+        log(f"[gym-drive] {base_key} {day_key}: approved-source attempt "
+            f"{attempt} rejected ({', '.join(reasons)}); same photo retained")
     log(f"[gym-drive] {base_key} {day_key}: approved-source walk exhausted "
-        f"{len(sources)} distinct facts; photo remains unplaced")
+        f"{min(len(sources), _DRIVE_HISTORY_RETRY_LIMIT)} candidate facts; "
+        "photo remains unplaced")
     return False
 
 

@@ -191,16 +191,20 @@ def test_history_walk_advances_within_categories_and_is_bounded(monkeypatch):
 @pytest.mark.parametrize('fresh_on', [3, None])
 def test_distinct_source_walk_preserves_same_photo_and_checks_each_caption(
         monkeypatch, fresh_on):
+    monkeypatch.setattr(cmr.config, 'sb7_enabled', lambda: True)
+    old = 'Previously used copy about real coaching and guidance for members during their gym training.'
+    fresh = 'Fresh approved copy about how coaches guide members through real gym training sessions each day.'
     sources = [SimpleNamespace(text=f'Approved fact {i}', category='service') for i in range(7)]
     monkeypatch.setattr(cmr, '_drive_history_sources', lambda *a: sources)
-    caption_ledger.record_staged('swift', 'Previously used copy', '2026-10-10')
-    feed = draft('Previously used copy')
+    caption_ledger.record_staged('swift', old, '2026-10-10')
+    feed = draft(old)
+    feed.creative_public_url = 'https://cdn.example/photo.jpg'
     feed.source_media_asset_id = 'photo-1'
     feed.caption_grounding = {'creative_name': 'lifting photo', 'verified': {'ok': True}}
     calls = []
     def make(account, source, voice, creative_path, **kw):
         calls.append((source.text, creative_path, kw))
-        return ('Fresh approved copy' if len(calls) == fresh_on else 'Previously used copy', [])
+        return (fresh if len(calls) == fresh_on else old, [])
     monkeypatch.setattr(cmr.client_content, 'make_caption', make)
     ok = cmr._retry_drive_caption_history(
         SimpleNamespace(key='swift_ig'), feed, object(), 'swift', 'swift_ig',
@@ -213,40 +217,56 @@ def test_distinct_source_walk_preserves_same_photo_and_checks_each_caption(
 
 
 def test_history_walk_rejects_unique_caption_with_banned_words(monkeypatch):
+    monkeypatch.setattr(cmr.config, 'sb7_enabled', lambda: True)
+    from agent import post_quality
+    caption = 'Forbidden copy about real coaching and guidance for members during their regular gym training sessions.'
+    feed = draft('Old copy')
+    feed.creative_public_url = 'https://cdn.example/photo.jpg'
+    assert post_quality.caption_issues(caption) == []
     source = SimpleNamespace(text='Approved fact', category='service')
     monkeypatch.setattr(cmr, '_drive_history_sources', lambda *a: [source])
-    monkeypatch.setattr(cmr.client_content, 'make_caption', lambda *a, **kw: ('Forbidden copy', []))
+    monkeypatch.setattr(cmr.client_content, 'make_caption', lambda *a, **kw: (caption, []))
     assert not cmr._retry_drive_caption_history(
-        SimpleNamespace(key='swift_ig'), draft('Old copy'), object(), 'swift', 'swift_ig',
+        SimpleNamespace(key='swift_ig'), feed, object(), 'swift', 'swift_ig',
         '2026-10-15', 0, ('forbidden',), [], lambda msg: None)
 
 
 def test_history_walk_rejects_normalized_same_day_caption(monkeypatch):
+    monkeypatch.setattr(cmr.config, 'sb7_enabled', lambda: True)
+    from agent import post_quality
+    caption = 'Fresh approved copy about how coaches guide members through real gym training sessions each day.'
+    feed = draft('Old copy')
+    feed.creative_public_url = 'https://cdn.example/photo.jpg'
+    assert post_quality.caption_issues(caption) == []
     source = SimpleNamespace(text='Approved fact', category='service')
     monkeypatch.setattr(cmr, '_drive_history_sources', lambda *a: [source])
-    monkeypatch.setattr(cmr.client_content, 'make_caption', lambda *a, **kw: ('FRESH copy', []))
+    monkeypatch.setattr(cmr.client_content, 'make_caption', lambda *a, **kw: (caption, []))
     assert not cmr._retry_drive_caption_history(
-        SimpleNamespace(key='swift_ig'), draft('Old copy'), object(), 'swift', 'swift_ig',
-        '2026-10-15', 0, (), [' fresh  COPY '], lambda msg: None)
+        SimpleNamespace(key='swift_ig'), feed, object(), 'swift', 'swift_ig',
+        '2026-10-15', 0, (), ['  ' + caption.upper() + '  '], lambda msg: None)
 
 
 @pytest.mark.parametrize('day', ['2026-10-10', '2026-10-15', '2026-10-16', '2026-10-20'])
 @pytest.mark.parametrize('fresh_on', [4, None])
 def test_drive_stage_history_exhaustion_rolls_back_once_and_success_keeps_photo(
         monkeypatch, fresh_on, day):
+    monkeypatch.setattr(cmr.config, 'sb7_enabled', lambda: True)
+    old = 'Old copy about real coaching and guidance for members during their regular gym training sessions.'
+    fresh = 'Fresh approved copy about how coaches guide members through real gym training sessions each day.'
     source = SimpleNamespace(text='First approved fact', category='service')
     sources = [SimpleNamespace(text=f'Other approved fact {i}', category='about') for i in range(7)]
     monkeypatch.setattr(cmr, '_gym_drive_source_for', lambda *a: source)
     monkeypatch.setattr(cmr, '_drive_history_sources', lambda *a: sources)
-    caption_ledger.record_staged('swift', 'Old copy', '2026-10-07')
-    feed = draft('Old copy')
+    caption_ledger.record_staged('swift', old, '2026-10-07')
+    feed = draft(old)
+    feed.creative_public_url = 'https://cdn.example/photo.jpg'
     feed.source_media_asset_id = 'photo-1'
     generated, rollback = [], []
     def make(account, source, voice, creative_path, **kw):
         generated.append(source.text)
         assert not rollback, 'photo must stay claimed while searching approved copy'
         return ('Forbidden copy' if len(generated) == 1 and fresh_on is not None
-                else 'Fresh approved copy' if len(generated) == fresh_on else 'Old copy', [])
+                else fresh if len(generated) == fresh_on else old, [])
     monkeypatch.setattr(cmr.client_content, 'make_caption', make)
     monkeypatch.setattr(cmr, '_rollback_drive_asset', lambda *a: rollback.append(a))
     monkeypatch.setattr(cmr, '_finish_feed_with_story', lambda account, d, *a, **kw: [d])
