@@ -84,16 +84,43 @@ class OwnerPhotoTests(unittest.TestCase):
         with self.assertRaisesRegex(PhotoCertificateHold,'dedicated_prepared_owner_photo_required'):
             stage_prepared_photo(object(),object())
 
+    def test_stage_signed_sibling_preserves_original_anchor_and_rejects_source_change(self):
+        snap,drive,data,recipe,packet,auditor,rpc=self.setup_candidate()
+        with patch.object(auditor,'_rpc',side_effect=rpc):
+            prepared=prepare_remote_photo(snap,drive_reader=drive,hosted_reader=Hosted(data),
+                recipe=recipe,auditor=auditor,audit_id=packet['payload']['audit_id'])
+        canonical_original={**prepared.source.original.row(),'registry_evidence_ref':'SYNTHETIC first original receipt'}
+        clearance={**canonical_original,'decision':'cleared_unused','history_evidence_ref':'SYNTHETIC first clearance'}
+        class ClearanceCursor(Cursor):
+            def fetchone(self):return (clearance,)
+        class ClearanceConnection(Connection):
+            def cursor(self):return ClearanceCursor()
+        persistence=ForwardMediaOwnerPersistence(ClearanceConnection(),'offline_owner',Hosted(data))
+        with patch.object(persistence,'_assert_owner_identity'), \
+             patch.object(ForwardMediaOwnerPersistence,'persist_in_transaction') as persist:
+            stage_prepared_photo(persistence,prepared)
+            self.assertEqual(persist.call_args.args[0].row(),canonical_original)
+            self.assertEqual(persist.call_args.args[1].row(),clearance)
+            self.assertEqual(persist.call_args.args[2],prepared.manifest)
+            clearance['source_url']='https://media.example.test/other-original.png'
+            with self.assertRaisesRegex(PhotoCertificateHold,'original_anchor_mismatch'):
+                stage_prepared_photo(persistence,prepared)
+            self.assertEqual(persist.call_count,1)
+
     def test_existing_grant_reconciliation_checks_real_signature_and_outcome(self):
         snap,drive,data,recipe,packet,auditor,rpc=self.setup_candidate()
         with patch.object(auditor,'_rpc',side_effect=rpc):
             prepared=prepare_remote_photo(snap,drive_reader=drive,hosted_reader=Hosted(data),
                 recipe=recipe,auditor=auditor,audit_id=packet['payload']['audit_id'])
         key=rpc('certificate',())['approved_key']
+        anchor_packet,anchor_key,_,_=fixtures(candidate=packet['payload']['candidate'])
+        from agent.forward_media_photo_certificate import canonical
+        anchor_ref='photo-audit:sha256:'+hashlib.sha256((canonical(anchor_packet['payload'])+'\n'+anchor_packet['signature_hex']).encode()).hexdigest()
         result={'registry':prepared.source.original.row(),'manifest':prepared.manifest.row(),
-            'clearance':{'history_evidence_ref':'owner-photo-reservation:'+prepared.certificate.receipt_ref},
+            'clearance':{'history_evidence_ref':'owner-photo-reservation:'+anchor_ref},
             'replayed':True,'progress':{'state':'final','outcome':{'status':'persisted'}},
-            'certificate':{'packet':packet,'approved_key':key}}
+            'certificate':{'packet':packet,'approved_key':key},
+            'clearance_certificate':{'packet':anchor_packet,'approved_key':anchor_key}}
         class ExistingCursor(Cursor):
             def fetchone(self):return (result,)
         class ExistingConnection(Connection):
@@ -102,6 +129,11 @@ class OwnerPhotoTests(unittest.TestCase):
         with patch.object(persistence,'_assert_owner_identity'):
             readback=reconcile_owner_photo(persistence,packet['payload']['audit_id'])
             self.assertEqual(readback['progress']['state'],'final')
+            anchor_signature=anchor_packet['signature_hex']
+            anchor_packet['signature_hex']='00'*64
+            with self.assertRaisesRegex(PhotoCertificateHold,'existing_photo_signature_or_identity_invalid'):
+                reconcile_owner_photo(persistence,packet['payload']['audit_id'])
+            anchor_packet['signature_hex']=anchor_signature
             packet['signature_hex']='00'*64
             with self.assertRaisesRegex(PhotoCertificateHold,'existing_photo_signature_or_identity_invalid'):
                 reconcile_owner_photo(persistence,packet['payload']['audit_id'])

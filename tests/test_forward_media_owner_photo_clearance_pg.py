@@ -56,9 +56,9 @@ def main():
        'create table media_source(id text primary key,gym_id text,kind text,folder_id text,active boolean);'
        'create table media_asset(id text primary key,source_id text,gym_id text,content_hash text,rendition_url text);')
    sql("alter table media_asset add column eligible boolean default true,add column excluded_by_coach boolean default false,add column review_status text default 'approved',add column moderation_status text default 'clean',add column review_content_hash text,add column reviewed_by text default 'SYNTHETIC reviewer',add column reviewed_at timestamptz default now(),add column moderation_json jsonb,add column people_detected boolean default false,add column used_count integer default 0")
-   def approved_asset(asset_id,data_bytes):
+   def approved_asset(asset_id,data_bytes,tenant='gym'):
     md5=hashlib.md5(data_bytes).hexdigest()
-    proof={'verdict':'clean','provider':'SYNTHETIC scanner','content_hash':md5,'asset_id':asset_id,'gym_id':'gym','people_detected':False,'observed_at':'2026-10-07T00:00:00Z','sha256':hashlib.sha256(data_bytes).hexdigest()}
+    proof={'verdict':'clean','provider':'SYNTHETIC scanner','content_hash':md5,'asset_id':asset_id,'gym_id':tenant,'people_detected':False,'observed_at':'2026-10-07T00:00:00Z','sha256':hashlib.sha256(data_bytes).hexdigest()}
     sql('update media_asset set content_hash=%s,review_content_hash=%s,moderation_json=%s::jsonb where id=%s',(md5,md5,json.dumps(proof),asset_id))
    for name in ('DRAFT_fixer_forward_media_claim_20261006.sql','DRAFT_fixer_forward_media_observation_bridge_20261007.sql','DRAFT_fixer_forward_media_source_history_20261007.sql','DRAFT_fixer_forward_media_photo_certificate_20261007.sql','DRAFT_fixer_owner_photo_clearance_20261007.sql'):
     sql((ROOT/'migrations'/name).read_text())
@@ -489,14 +489,104 @@ def main():
    denied(lambda:claim(first),'unknown historical')
    sql("update content_calendar set status='publishing',image_url=%s where id=%s",(URL,second[0]))
    assert claim(first) is True
+   # Real independently signed feed/story crops of ONE approved original
+   # share the immutable source clearance only for this exact gym/date/group.
+   # Exercise preparation AFTER the original's real claim receipts exist too.
+   rendered_objects={URL:source_bytes}
+   class RenditionHosted(Hosted):
+    def read(self,url):return rendered_objects[url]
+   rendition_hosted=RenditionHosted()
+   def signed_rendition(name,tag,day='2026-10-10',group='group',tenant='gym'):
+    recipe_now=attester.make_still_recipe(name,caption='SYNTHETIC distinct story',gym_name='SYNTHETIC gym')
+    image_bytes=attester.replay_still_recipe(source_bytes,recipe_now)['image_bytes']
+    image_url='https://media.example.test/signed-'+tag+'.png'
+    rendered_objects[image_url]=image_bytes
+    row_id=new_row(day=day,fmt='story' if name=='story_photo' else 'feed')
+    asset_id,source_url,drive_now=FILE,URL,drive
+    if tenant!='gym':
+     asset_id=FILE+'OtherTenant';source_url=URL+'&tenant=other';rendered_objects[source_url]=source_bytes
+     sql('insert into media_source values(%s,%s,%s,%s,true)',('other-source',tenant,'gym_drive',FOLDER))
+     sql('insert into media_asset(id,source_id,gym_id) values(%s,%s,%s)',(asset_id,'other-source',tenant))
+     approved_asset(asset_id,source_bytes,tenant)
+     class TenantDrive(Drive):
+      def original_bytes(self,file_id):assert file_id==asset_id;return source_bytes
+     drive_now=TenantDrive();drive_now.data=source_bytes
+     drive_now.meta.update(id=asset_id,size=str(len(source_bytes)),md5Checksum=hashlib.md5(source_bytes).hexdigest())
+    sql('update content_calendar set gym_id=%s,visual_group_key=%s,source_media_asset_id=%s,source_media_url=%s,image_url=%s where id=%s',
+        (tenant,group,asset_id,source_url,image_url,row_id))
+    revision_now=sql('select md5(to_jsonb(r)::text) from content_calendar r where id=%s',(row_id,))[0][0]
+    current_now=store.snapshot(row_id,revision_now)
+    source_now=verify_source(current_now,drive_now,rendition_hosted)
+    store.stage_source(source_now);conn.commit()
+    candidate_now={**candidate,'calendar_row_id':row_id,'tenant_id':tenant,'group_key':group,'post_date':day,
+     'source_asset_id':asset_id,'source_url':source_url,'source_receipt_ref':source_now.receipt_ref,
+     'image_url':image_url,'image_fingerprint':'md5:'+hashlib.md5(image_bytes).hexdigest(),
+     'image_sha256':'sha256:'+hashlib.sha256(image_bytes).hexdigest(),'image_length':len(image_bytes),
+     'render_recipe_digest':digest(recipe_now),
+     'content_digest':sql("select 'sha256:'||encode(sha256(convert_to(fixer_forward_media_photo_content_20261007(%s)::text,'UTF8')),'hex')",(row_id,))[0][0]}
+    cert_now,_,_,_=fixtures(candidate=candidate_now,snapshot=sql('select fixer_forward_media_photo_snapshot_20261007()')[0][0],private=private)
+    IndependentPhotoAuditor(auditor_conn,'photo_auditor').submit(cert_now);auditor_conn.commit()
+    prepared_now=prepare_remote_photo(current_now,drive_reader=drive_now,hosted_reader=rendition_hosted,
+       recipe=recipe_now,auditor=owner_auditor,audit_id=cert_now['payload']['audit_id']);conn.rollback()
+    return row_id,prepared_now,cert_now
+   def rendition_claim(row_id):
+    with lane('service_role') as service:assert service.execute('select fixer_bind_forward_media_manifest_20261006(%s)',(row_id,)).fetchone()[0]
+    token=str(uuid.uuid4())
+    sql("update content_calendar set status='publishing',publish_claim_token=%s,publish_reservation_day='2026-10-10' where id=%s",(token,row_id))
+    rev=sql('select fixer_forward_media_attestation_request_20261006(%s)',(row_id,))[0][0]['revision']
+    with lane(guard.ROLE) as verifier:
+     original_check,renderer=attester.production_callbacks(verifier,row_id,expected_revision=rev)
+    guard.attest(row_id,rev,connection_factory=lambda:lane(guard.ROLE),read_bytes=rendition_hosted.read,
+       original_verifier=original_check,controlled_renderer=renderer)
+    eid=sql('select evidence_id from fixer_forward_media_lineage_20261006 where calendar_row_id=%s',(row_id,))[0][0]
+    return row_id,token,eid,rev
+   signed_crops=[]
+   for name in ('feed_autofit_4x5','story_photo'):
+    row_id,prepared_now,cert_now=signed_rendition(name,name)
+    counts=sql('select (select count(*) from fixer_owner_photo_reservation_20261007),(select count(*) from fixer_forward_media_render_manifest_20261006)')[0]
+    staged=stage_prepared_photo(p,prepared_now)
+    assert staged['registry']==verified_source.original.row(),staged
+    assert staged['clearance']==result['clearance'],staged
+    assert sql('select count(*) from fixer_owner_photo_reservation_20261007')[0][0]==counts[0]
+    conn.commit()
+    assert sql('select count(*) from fixer_owner_photo_reservation_20261007')[0][0]==counts[0]+1
+    assert sql('select count(*) from fixer_forward_media_render_manifest_20261006')[0][0]==counts[1]+1
+    assert sql("select count(*) from fixer_forward_media_original_registry_20261006 where tenant_id='gym' and source_asset_id=%s",(FILE,))[0][0]==1
+    assert stage_prepared_photo(p,prepared_now)['replayed'] is True;conn.commit()
+    assert reconcile_owner_photo(p,cert_now['payload']['audit_id'])['manifest']==prepared_now.manifest.row();conn.rollback()
+    binding_now=rendition_claim(row_id)
+    assert claim(binding_now) is True and claim(binding_now) is True
+    signed_crops.append((prepared_now,cert_now,binding_now))
+   assert signed_crops[0][0].manifest.image_fingerprint!=signed_crops[1][0].manifest.image_fingerprint
+   assert signed_crops[0][0].manifest.manifest_digest!=signed_crops[1][0].manifest.manifest_digest
+   for tag,day,group,tenant in (
+       ('wrong-day','2026-10-11','group','gym'),
+       ('wrong-group','2026-10-10','other-group','gym'),
+       ('wrong-tenant','2026-10-10','group','other-gym'),
+       ('duplicate-render','2026-10-10','group','gym')):
+    row_id,prepared_now,cert_now=signed_rendition('story_photo',tag,day,group,tenant)
+    before=sql('select (select count(*) from fixer_owner_photo_reservation_20261007),(select count(*) from fixer_forward_media_render_manifest_20261006)')[0]
+    denied(lambda:stage_prepared_photo(p,prepared_now),'already used cleared or reserved');conn.rollback()
+    assert sql('select (select count(*) from fixer_owner_photo_reservation_20261007),(select count(*) from fixer_forward_media_render_manifest_20261006)')[0]==before
+   unknown_crop=str(uuid.uuid4())
+   sql("insert into content_calendar(id,gym_id,status,image_url) values(%s,'other','published','https://media.example.test/unknown-crop-history.png')",(unknown_crop,))
+   denied(lambda:claim(signed_crops[0][2]),'unknown historical')
+   denied(lambda:reconcile_owner_photo(p,signed_crops[0][1]['payload']['audit_id']),'complete known current history');conn.rollback()
+   sql('delete from content_calendar where id=%s',(unknown_crop,))
+   # Rendition revocation blocks only that exact signed rendition. The original
+   # anchor's revocation, tested below, still blocks the entire shared source.
+   sql('insert into fixer_owner_photo_revocation_20261007 values(%s,%s)',(signed_crops[1][1]['payload']['audit_id'],'SYNTHETIC story revoke'))
+   denied(lambda:claim(signed_crops[1][2]),'revoked')
+   assert claim(signed_crops[0][2]) is True and claim(first) is True
    # Explicit monotonic epoch invalidation holds both fresh sends and replay.
    sql('update fixer_forward_media_photo_state_20261007 set generation=1')
    denied(lambda:claim(first),'retired epoch')
    denied(lambda:sql('update fixer_forward_media_photo_state_20261007 set generation=0'),'cannot regress')
    sql('insert into fixer_owner_photo_revocation_20261007 values(%s,%s)',(packet['payload']['audit_id'],'SYNTHETIC revoke'))
    denied(lambda:claim(first),'revoked')
+   denied(lambda:claim(signed_crops[0][2]),'revoked')
    conn.close();auditor_conn.close();admin.close()
-   print('PASS PG17 signed owner grant; OFF/moderation/byte-binding/safety-hold/direct bypass holds; atomic reservation+authority; concurrent stale corpus hold; signed date/group before first claim; post-binder replay + stored-signature reconciliation; IG/FB/Story siblings; census INSERT/UPDATE/DELETE held through claim COMMIT for admin+service; prelocked writer fail-fast; own provider receipt and concurrent siblings allowed; actual production_callbacks IDLE remote reads permit claim/write; binding/history/moderation drift denied at fresh final authority; both-order concurrency without graph upgrade; different Story rendition hold; production owner-worker factory with acknowledged outcome; initial/final lost COMMIT and remote crash quarantine/no-retry; unknown history/epoch/revocation holds')
+   print('PASS PG17 signed owner grant; OFF/moderation/byte-binding/safety-hold/direct bypass holds; atomic reservation+authority; concurrent stale corpus hold; signed date/group before first claim; post-binder replay + stored-signature reconciliation; IG/FB/Story siblings; census INSERT/UPDATE/DELETE held through claim COMMIT for admin+service; prelocked writer fail-fast; own provider receipt and concurrent siblings allowed; actual production_callbacks IDLE remote reads permit claim/write; binding/history/moderation drift denied at fresh final authority; both-order concurrency without graph upgrade; unsigned Story rendition hold; independently signed distinct feed/story crops share original+clearance after claims; wrong date/group/tenant/duplicate-render atomic denial; separate rendition revocation; production owner-worker factory with acknowledged outcome; initial/final lost COMMIT and remote crash quarantine/no-retry; unknown history/epoch/revocation holds')
   finally:
    subprocess.run([str(pg/'pg_ctl'),'-D',str(data),'-m','immediate','-w','stop'],check=True,capture_output=True,timeout=60)
 
