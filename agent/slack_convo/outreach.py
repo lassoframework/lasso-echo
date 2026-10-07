@@ -35,7 +35,10 @@ REFUSAL PATHS (Blake's own words, restated as hard gates -- both have tests):
      slack_user_id does not match the ticket's own `reporter`/`slack_user_id` refuses too.
 """
 from dataclasses import dataclass
+from datetime import datetime, timezone
+import uuid
 
+from .. import config
 from . import identity_gate as _ig
 from .adapter import _slack_escape, KIND_OUTREACH_REQUEST
 
@@ -82,6 +85,8 @@ class OutreachResult:
     completion_posted: bool = False
     posted_ts: str = ""
     ticket_stamped: bool = False
+    notice_id: str = ""
+    attempt_token: str = ""
 
 
 def _base_eligible(ticket, who):
@@ -208,7 +213,8 @@ def first_message_text(ticket, ident):
 
 def initiate(ticket, who, ident, *, open_group_dm, post_first_message, record_outbound,
             stamp_ticket=None, message_text=None, mark_message=None, claim_message=None,
-            completion=False, ticket_lookup=None, reconcile_uncertain=None, log=print):
+            completion=False, ticket_lookup=None, reconcile_uncertain=None,
+            current_notice_bus=None, readback=None, member_check=None, log=print):
     """The one outbound-first call this whole adapter makes.
 
     `open_group_dm(user_ids: list[str]) -> {"ok": bool, "channel_id": str}` and
@@ -265,13 +271,16 @@ def initiate(ticket, who, ident, *, open_group_dm, post_first_message, record_ou
                 stamp_ticket=stamp_ticket, message_text=message_text,
                 mark_message=mark_message, claim_message=claim_message,
                 completion=completion, ticket_lookup=ticket_lookup,
-                reconcile_uncertain=reconcile_uncertain, log=log)
+                reconcile_uncertain=reconcile_uncertain,
+                current_notice_bus=current_notice_bus, readback=readback,
+                member_check=member_check, log=log)
 
 
 def _send(ticket, who, ident, *, open_group_dm, post_first_message, record_outbound,
          stamp_ticket=None, message_text=None, message_text_already_escaped=False,
          mark_message=None, claim_message=None, completion=False,
-         ticket_lookup=None, reconcile_uncertain=None, log=print):
+         ticket_lookup=None, reconcile_uncertain=None, current_notice_bus=None,
+         readback=None, member_check=None, log=print):
     """The actual Slack side of outreach, with NO eligibility check of its own -- every
     caller (`initiate()` after the autonomous `eligible()` gate, `release_approved_outreach()`
     after a human tap) has already decided this send is authorized, by a different route.
@@ -296,11 +305,51 @@ def _send(ticket, who, ident, *, open_group_dm, post_first_message, record_outbo
         text = (_slack_escape(message_text) if message_text is not None
                else first_message_text(ticket, ident))
 
+    current_notice = bool(completion and current_notice_bus is not None
+                          and ticket.get("product") == "echo"
+                          and ticket.get("source") == "website_tab")
+    if current_notice and not config.slack_convo_echo_current_notice_enabled():
+        return OutreachResult(opened=False, reason="current_notice_disabled")
+
     opened = open_group_dm([BLAKE_SLACK_USER_ID, who.slack_user_id])
     if not opened or not opened.get("ok") or not opened.get("channel_id"):
         log(f"[outreach] conversations.open failed ticket={(ticket or {}).get('id')}")
         return OutreachResult(opened=False, reason="open_failed")
     channel_id = opened["channel_id"]
+
+    notice_id = ""
+    attempt_token = ""
+    if current_notice:
+        if (current_notice_bus is None or not callable(readback)
+                or not callable(member_check) or not ident.bot_user_id()
+                or not callable(claim_message)):
+            return OutreachResult(opened=True, channel_id=channel_id,
+                                  reason="current_notice_preflight_unavailable")
+        try:
+            blake_is_member = member_check(channel_id, BLAKE_SLACK_USER_ID)
+        except Exception as exc:  # noqa: BLE001 - no outbound row or Slack POST exists
+            log(f"[outreach] current notice membership check failed "
+                f"ticket={ticket.get('id')}: {type(exc).__name__}")
+            return OutreachResult(opened=True, channel_id=channel_id,
+                                  reason="current_notice_preflight_failed")
+        if not blake_is_member:
+            return OutreachResult(opened=True, channel_id=channel_id,
+                                  reason="blake_membership_unverified")
+        notice_id = str(uuid.uuid4())
+        try:
+            attempt_token = current_notice_bus.begin_current_notice(
+                ticket, notice_id, unrouted=True)
+        except Exception as exc:  # noqa: BLE001 - reservation alone cannot send
+            log(f"[outreach] current notice reservation failed "
+                f"ticket={ticket.get('id')}: {type(exc).__name__}")
+            # Even a committed reservation with a lost response has no outbound
+            # row or posting intent. Return no notice ID so intake can CAS this
+            # request into its hold queue rather than await nonexistent readback.
+            return OutreachResult(opened=True, channel_id=channel_id,
+                                  reason="current_notice_reservation_failed")
+        if not attempt_token:
+            return OutreachResult(opened=True, channel_id=channel_id,
+                                  reason="current_notice_reservation_refused")
 
     # Row-first even on this exceptional outbound-first path. A completion uses
     # kind='status' because migration 0381 recognises only posted status notices;
@@ -313,6 +362,17 @@ def _send(ticket, who, ident, *, open_group_dm, post_first_message, record_outbo
         "meta": {"identity": getattr(ident, "name", ""), "outreach": True,
                  "recipient_kind": who.kind},
     }
+    if current_notice:
+        outbound_args["message_id"] = notice_id
+        outbound_args["meta"].update({
+            "fixer": True, "resolve_notice": True,
+            "fixer_current_attempt_token": attempt_token,
+            "fixer_route_pending": True,
+            "surface": "portal_ticket_bridge",
+            "request_version": ticket["request_version"],
+            "delivery_expected_slack_channel_id": None,
+            "delivery_expected_slack_thread_ts": None,
+        })
     version = (ticket or {}).get("request_version")
     if type(version) is int and version >= 0:
         outbound_args["expected_request_version"] = version
@@ -328,6 +388,21 @@ def _send(ticket, who, ident, *, open_group_dm, post_first_message, record_outbo
     row = record_outbound(**outbound_args)
     row_id = (row or {}).get("id")
 
+    def cancel_current_notice(reason, *, claimed=False):
+        if not current_notice or not row_id:
+            return
+        try:
+            suppress = (current_notice_bus.suppress_unattempted_current_notice
+                        if claimed else current_notice_bus.suppress_unclaimed_current_notice)
+            canceled = suppress(row_id, reason)
+            if not canceled or canceled.get("delivery_status") != "suppressed":
+                return  # a competing claimant may own the posting row
+            current_notice_bus.ensure_suppressed_current_notice_alert(
+                row_id, getattr(ident, "name", ""))
+        except Exception as exc:  # noqa: BLE001 - no customer POST occurred
+            log(f"[outreach] current notice cancellation/alert failed "
+                f"row={row_id}: {type(exc).__name__}")
+
     # D44 (MINOR, Frame 2 closing-audit finding): the row sat in 'ready' for the whole
     # duration of the post call, the exact window an identity's own armed outbox loop
     # could also see it and race this function (its first-contact gate always passes
@@ -342,9 +417,11 @@ def _send(ticket, who, ident, *, open_group_dm, post_first_message, record_outbo
             claimed = claim_message(row_id)
         except Exception as e:  # noqa: BLE001 - a claim failure refuses, never guesses
             log(f"[outreach] claim_message failed row={row_id}: {type(e).__name__}")
+            cancel_current_notice("FIXER first-contact claim failed before Slack")
             return OutreachResult(opened=True, channel_id=channel_id, reason="claim_failed")
         if not claimed:
             log(f"[outreach] row={row_id} already claimed by another consumer, backing off")
+            cancel_current_notice("FIXER first-contact claim was not acquired")
             return OutreachResult(opened=True, channel_id=channel_id, reason="lost_claim")
 
     if ticket_lookup is not None:
@@ -358,8 +435,13 @@ def _send(ticket, who, ident, *, open_group_dm, post_first_message, record_outbo
                 or any(fresh.get(field) != ticket.get(field) for field in fields)
                 or fresh.get("bot_identity") != getattr(ident, "name", "")
                 or fresh.get("slack_user_id") != who.slack_user_id
+                or current_notice and (fresh.get("slack_channel_id") is not None
+                                       or fresh.get("slack_thread_ts") is not None)
                 or fresh.get("escalated") is True or fresh.get("hold_tier") is not None):
-            if mark_message is not None and row_id is not None:
+            if current_notice:
+                cancel_current_notice("FIXER delivery identity changed before Slack",
+                                      claimed=True)
+            elif mark_message is not None and row_id is not None:
                 try:
                     mark_message(row_id, "suppressed",
                                  meta_update={"suppressed_why": "delivery identity changed"})
@@ -367,6 +449,99 @@ def _send(ticket, who, ident, *, open_group_dm, post_first_message, record_outbo
                     pass
             return OutreachResult(opened=True, channel_id=channel_id,
                                   reason="delivery_identity_changed")
+
+    if current_notice:
+        # The same designated row carries the first and only customer message.
+        # Persist intent before Slack, read back the returned exact timestamp,
+        # then let 0384 bind the route while the row is still posting.
+        from . import outbox as _ob
+
+        def uncertain(reason):
+            log(f"[outreach] current notice uncertain row={row_id}: {reason}")
+            try:
+                current_notice_bus.hold_uncertain_fixer_delivery(row_id, reason)
+            except Exception:  # noqa: BLE001 - never retry an uncertain Slack post
+                pass
+            return OutreachResult(opened=True, channel_id=channel_id,
+                                  reason="current_notice_uncertain",
+                                  notice_id=notice_id, attempt_token=attempt_token)
+
+        intent = {
+            "channel": channel_id, "thread_ts": None, "body": text,
+            "sender": ident.bot_user_id(),
+            "claimed_at": datetime.now(timezone.utc).isoformat(),
+            "request_key": None, "request_version": ticket["request_version"],
+        }
+        try:
+            claimed_row = current_notice_bus.message(row_id)
+            prepared = current_notice_bus.prepare_fixer_delivery(
+                row_id, intent,
+                expected_attachments=dict((claimed_row or {}).get("attachments") or {}))
+            if not prepared or prepared.get("delivery_status") != "posting":
+                return uncertain("delivery intent was not persisted")
+            intent["not_before"] = datetime.now(timezone.utc).isoformat()
+            prepared = current_notice_bus.prepare_fixer_delivery(
+                row_id, intent,
+                expected_attachments=dict(prepared.get("attachments") or {}))
+            if (not prepared or prepared.get("delivery_status") != "posting"
+                    or (prepared.get("attachments") or {}).get(
+                        "fixer_slack_delivery_intent") != intent):
+                return uncertain("readback boundary was not persisted")
+            fresh = ticket_lookup(ticket["id"])
+            if (not isinstance(fresh, dict) or any(
+                    fresh.get(field) != ticket.get(field) for field in
+                    ("request_version", "status", "classification", "product",
+                     "client_id", "bot_identity", "slack_user_id"))
+                    or fresh.get("slack_channel_id") is not None
+                    or fresh.get("slack_thread_ts") is not None
+                    or fresh.get("escalated") or fresh.get("hold_tier") is not None
+                    or not member_check(channel_id, BLAKE_SLACK_USER_ID)):
+                return uncertain("request or destination changed before Slack")
+            posted = post_first_message(channel_id, text)
+            ts = posted.get("ts") if isinstance(posted, dict) and posted.get("ok") else None
+            if not isinstance(ts, str) or not ts:
+                return uncertain("Slack post returned no confirmed timestamp")
+            stamped = current_notice_bus.record_fixer_delivery_timestamp(row_id, intent, ts)
+            if not stamped:
+                # A stale sweep may have moved posting to held while Slack was
+                # answering. Keep the returned exact timestamp on that same
+                # reserved row so readback can reconcile without another POST.
+                held = current_notice_bus.hold_uncertain_fixer_delivery(
+                    row_id, "Slack returned a timestamp after claim ownership changed")
+                if held and held.get("delivery_status") == "held":
+                    stamped = current_notice_bus.record_fixer_delivery_timestamp(
+                        row_id, intent, ts)
+            if not stamped or stamped.get("slack_ts") != ts:
+                return uncertain("Slack timestamp was not persisted")
+            proof, reason = _ob._readback_fixer_message(readback, intent, ts=ts)
+            if not proof:
+                return uncertain(reason)
+            verified = current_notice_bus.transition_fixer_delivery(
+                row_id, "posting", slack_ts=ts, meta_update=proof,
+                expected_intent=intent, expected_ts=ts)
+            if not verified:
+                held = current_notice_bus.message(row_id)
+                if (held or {}).get("delivery_status") == "held":
+                    verified = current_notice_bus.record_held_current_notice_readback(
+                        row_id, proof, expected_intent=intent, expected_ts=ts)
+            if not verified or (verified.get("attachments") or {}).get(
+                    "delivery_readback_verified") is not True:
+                return uncertain("exact Slack readback could not be persisted")
+            if not current_notice_bus.bind_current_notice_route(
+                    ticket["id"], ticket["request_version"], notice_id,
+                    attempt_token, channel_id, ts):
+                return uncertain("posted route could not be bound")
+            finished = current_notice_bus.transition_fixer_delivery(
+                row_id, "posted", slack_ts=ts,
+                expected_intent=intent, expected_ts=ts)
+            if not finished or finished.get("delivery_status") != "posted":
+                return uncertain("verified notice could not be marked posted")
+            return OutreachResult(
+                opened=True, channel_id=channel_id, reason="ok", delivered=True,
+                completion_posted=True, posted_ts=ts, ticket_stamped=True,
+                notice_id=notice_id, attempt_token=attempt_token)
+        except Exception as exc:  # noqa: BLE001 - a timeout may follow Slack success
+            return uncertain(f"{type(exc).__name__}: {exc}")
 
     posted = post_first_message(channel_id, text)
     if not posted or not posted.get("ok"):

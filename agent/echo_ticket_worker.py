@@ -63,6 +63,11 @@ _INTAKE_MAX_SWEEP_SECONDS = 24 * 60 * 60
 _intake_now = time.time
 
 
+def _current_notice_bus(bus):
+    """Use the same current-notice capability check in both poll passes."""
+    return bus if callable(getattr(bus, "begin_current_notice", None)) else None
+
+
 # ---------------------------------------------------------------------------
 # Intake keyset cursor (2026-09-23 starvation fix)
 #
@@ -256,10 +261,15 @@ def _delivery_snapshot(bus, original, *, status, classification, identity_name, 
 
 def _resolve_delivered(bus, snapshot, result, *, log):
     """Close only a confirmed posted completion for the original request cycle."""
-    resolver = getattr(bus, "resolve_current_delivery", None)
+    current_notice = bool(getattr(result, "notice_id", "") and
+                          getattr(result, "attempt_token", ""))
+    resolver = getattr(bus, ("resolve_current_notice" if current_notice else
+                             "resolve_current_delivery"), None)
     if (not snapshot or not result.completion_posted or not result.ticket_stamped
             or not callable(resolver)
             or not result.channel_id or not result.posted_ts):
+        return False
+    if current_notice and (not result.notice_id or not result.attempt_token):
         return False
     try:
         fresh = bus.ticket(snapshot["id"])
@@ -273,16 +283,20 @@ def _resolve_delivered(bus, snapshot, result, *, log):
                 or fresh.get("slack_thread_ts") != result.posted_ts):
             return False
         expected = {field: fresh.get(field) for field in _DELIVERY_IDENTITY}
-        resolved = resolver(
-            snapshot["id"], snapshot["request_version"], snapshot["status"],
-            snapshot["classification"], expected["product"], expected["client_id"],
-            expected["bot_identity"], expected["slack_user_id"],
-            result.channel_id, result.posted_ts)
+        if current_notice:
+            resolved = resolver(fresh, result.notice_id, result.attempt_token,
+                                snapshot["status"])
+        else:
+            resolved = resolver(
+                snapshot["id"], snapshot["request_version"], snapshot["status"],
+                snapshot["classification"], expected["product"], expected["client_id"],
+                expected["bot_identity"], expected["slack_user_id"],
+                result.channel_id, result.posted_ts)
     except Exception as e:  # noqa: BLE001 - a failed CAS leaves the request open
         log(f"[echo-ticket-worker] delivery resolution refused ticket={snapshot['id']}: "
             f"{type(e).__name__}")
         return False
-    return (isinstance(resolved, dict) and resolved.get("id") == snapshot["id"]
+    accepted = (isinstance(resolved, dict) and resolved.get("id") == snapshot["id"]
             and resolved.get("request_version") == snapshot["request_version"]
             and resolved.get("status") == "resolved"
             and resolved.get("classification") == snapshot["classification"]
@@ -292,6 +306,14 @@ def _resolve_delivered(bus, snapshot, result, *, log):
                     for field in _DELIVERY_IDENTITY)
             and resolved.get("slack_channel_id") == result.channel_id
             and resolved.get("slack_thread_ts") == result.posted_ts)
+    if accepted and current_notice:
+        try:
+            bus.finalize_fixer_delivery(result.notice_id,
+                                        "resolved_after_verified_slack")
+        except Exception as exc:  # noqa: BLE001 - posted receipt remains retryable
+            log(f"[echo-ticket-worker] current notice finalization pending "
+                f"row={result.notice_id}: {type(exc).__name__}")
+    return accepted
 
 
 def _escalate_unresolved(bus, ticket, *, reason, identity_name="echo", log=print,
@@ -333,7 +355,7 @@ def intake_pass(bus, *, slack_lookup_email, slack_user_info, portal_lookup, open
                post_first_message, write_hold_notice, product=PRODUCT, source=SOURCE,
                identity_name="echo", operator_ids=(), fetch_state=None, llm=None,
                classify_llm=None, mark_message=None, claim_message=None, stamp_ticket=None,
-               cursor_path=None, log=print):
+               readback=None, member_check=None, cursor_path=None, log=print):
     """First pass: NEW, unclassified tickets for (product, source), dispatched under
     identity_name. Never runs if the config flag is off. Defaults preserve the
     original Echo-only behavior; D47 generalized this for a second (product,
@@ -387,7 +409,8 @@ def intake_pass(bus, *, slack_lookup_email, slack_user_info, portal_lookup, open
                         identity_name=identity_name, fetch_state=fetch_state, llm=llm,
                         classify_llm=classify_llm,
                         mark_message=mark_message, claim_message=claim_message,
-                        stamp_ticket=stamp_ticket, log=log)
+                        stamp_ticket=stamp_ticket, readback=readback,
+                        member_check=member_check, log=log)
             processed += 1
         except Exception as e:  # noqa: BLE001 -- one bad ticket must never starve the rest
             log(f"[echo-ticket-worker] intake failed ticket={tid}: "
@@ -418,8 +441,7 @@ def intake_pass(bus, *, slack_lookup_email, slack_user_info, portal_lookup, open
 def _intake_one(bus, ticket, *, slack_lookup_email, slack_user_info, portal_lookup,
                 operator_ids, open_group_dm, post_first_message, write_hold_notice,
                 ident, identity_name, fetch_state, llm, classify_llm, mark_message,
-                claim_message,
-                stamp_ticket, log):
+                claim_message, stamp_ticket, readback, member_check, log):
     tid = ticket["id"]
     # The portal ticket already stores the client's original words in raw_text.
     # Mirroring them as an inbound client message increments request_version under
@@ -547,14 +569,28 @@ def _intake_one(bus, ticket, *, slack_lookup_email, slack_user_info, portal_look
                 log(f"[echo-ticket-worker] current delivery identity unavailable "
                     f"ticket={tid}; answer not sent")
                 return
+            current_attempt_notice = None
+
+            def record_attempt_outbound(**kwargs):
+                nonlocal current_attempt_notice
+                row = bus.record_outbound(**kwargs)
+                meta = kwargs.get("meta") or {}
+                if (meta.get("fixer_current_attempt_token")
+                        and (row or {}).get("id") == kwargs.get("message_id")):
+                    current_attempt_notice = row["id"]
+                return row
+
             result = _out.initiate(
                 _verified_ticket_dict(snapshot), who, ident,
                 open_group_dm=open_group_dm, post_first_message=post_first_message,
-                record_outbound=bus.record_outbound, stamp_ticket=stamp_ticket,
+                record_outbound=record_attempt_outbound, stamp_ticket=stamp_ticket,
                 message_text=answer["body"], mark_message=mark_message,
                 claim_message=claim_message, completion=resolves_on_delivery,
                 ticket_lookup=bus.ticket,
-                reconcile_uncertain=bus.hold_uncertain_outreach, log=log)
+                reconcile_uncertain=bus.hold_uncertain_outreach,
+                current_notice_bus=_current_notice_bus(bus),
+                readback=readback,
+                member_check=member_check, log=log)
             if getattr(result, "delivered", False):
                 if not resolves_on_delivery:
                     _a.route_follow_up_promise(bus, bus.ticket(tid) or {"id": tid},
@@ -581,6 +617,30 @@ def _intake_one(bus, ticket, *, slack_lookup_email, slack_user_info, portal_look
                 # no receipt may claim it was told. It escalates to a person instead.
                 log(f"[echo-ticket-worker] outreach did not deliver ticket={tid} "
                     f"reason={result.reason}")
+                if (resolves_on_delivery and current_attempt_notice
+                        and result.reason in {"claim_failed", "lost_claim",
+                                              "delivery_identity_changed"}):
+                    # Outreach already tries to suppress this exact attempt and
+                    # queue its stable staff alert. Read/repair that alert before
+                    # falling back, so one refusal does not produce two cards.
+                    try:
+                        alert = bus.ensure_suppressed_current_notice_alert(
+                            current_attempt_notice, identity_name)
+                        if alert:
+                            return
+                    except Exception as exc:  # noqa: BLE001 - retain fallback escalation
+                        log(f"[echo-ticket-worker] suppressed notice alert unconfirmed "
+                            f"ticket={tid}: {type(exc).__name__}")
+                if (resolves_on_delivery and result.reason.startswith(
+                        "current_notice_")):
+                    # The reserved attempt may have reached Slack. Changing the
+                    # ticket to hold would make the exact late bind ineligible.
+                    # Keep this request open for readback reconciliation.
+                    if result.notice_id:
+                        return  # outbox reports the held row by exact notice ID
+                    # No reserved notice means no send attempt exists to reconcile.
+                    # Escalate through the current-ticket CAS below so the FIXER
+                    # polls this request instead of stranding it in verification.
                 _escalate_unresolved(bus, ticket, reason=f"answer_undelivered_{result.reason}",
                                      identity_name=identity_name, log=log, who=who,
                                      outreach=None)
@@ -974,7 +1034,7 @@ def _outbound_escalations_today(bus, tid):
 
 def fixed_pass(bus, *, open_group_dm, post_first_message, product=PRODUCT,
               identity_name="echo", mark_message=None, claim_message=None,
-              stamp_ticket=None, log=print):
+              stamp_ticket=None, readback=None, member_check=None, log=print):
     """Second pass: code_fix tickets already dispatched, whose verification has landed.
     A ticket the fixer worker has not finished yet is left exactly as-is -- polled
     again next cycle. Never runs if the config flag is off.
@@ -1093,7 +1153,10 @@ def fixed_pass(bus, *, open_group_dm, post_first_message, product=PRODUCT,
             message_text=summary, mark_message=mark_message,
             claim_message=claim_message, completion=True,
             ticket_lookup=bus.ticket,
-            reconcile_uncertain=bus.hold_uncertain_outreach, log=log)
+            reconcile_uncertain=bus.hold_uncertain_outreach,
+            current_notice_bus=_current_notice_bus(bus),
+            readback=readback,
+            member_check=member_check, log=log)
         if getattr(result, "delivered", False):
             if _resolve_delivered(bus, snapshot, result, log=log):
                 notified += 1
