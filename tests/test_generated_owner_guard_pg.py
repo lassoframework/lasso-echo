@@ -65,9 +65,46 @@ def main():
    snap=trusted(guard.generated_snapshot(p,rid));conn.rollback()
    c=candidate(snap,pixels)
    with patch('agent.visual_writer_prepare._own_media_url',lambda u: isinstance(u,str) and u.startswith('https://owned.example/')):
-    def reserve(rid,candidate_=c,visuals=None,original=pixels):
+    deleted_pixels=pixels
+    def reserve(rid,candidate_=None,visuals=None,original=None):
+     candidate_=candidate_ or c
+     original=original or pixels
      fresh=trusted(guard.generated_snapshot(p,rid));conn.rollback()
-     out=guard.reserve_generated(p,rid,candidate_,fresh,history_visuals=visuals or [],read_bytes=lambda u:original if u==candidate_['original_url'] else pixels);conn.commit();return out
+     out=guard.reserve_generated(p,rid,candidate_,fresh,history_visuals=visuals or [],read_bytes=lambda u:original if u==candidate_['original_url'] else deleted_pixels if u=='https://owned.example/deleted-old.png' else pixels);conn.commit();return out
+    def sealed(rows,complete=True,excluded=None):
+     bid=str(uuid.uuid4());excluded=excluded or []
+     sql("insert into fixer_forward_media_photo_baseline_20261007(baseline_id,policy_id,scope_complete,rows_json,historical_manifest_ref,declared_full_fleet_row_count,excluded_rows_json) values(%s,'SYNTHETIC policy',%s,%s::jsonb,'SYNTHETIC sealed manifest',%s,%s::jsonb)",(bid,complete,json.dumps(rows),len(rows)+len(excluded),json.dumps(excluded)))
+     sql('update fixer_forward_media_photo_state_20261007 set baseline_id=%s where singleton',(bid,))
+     return bid
+    deleted={'history_key':'calendar:deleted-2026-10-01','resolved':True,'media_kind':'still_photo',
+      'visual_sha256':'sha256:'+hashlib.sha256(pixels).hexdigest(),
+      'published_binding_ref':'SEALED old other gym published receipt','visual_url':'https://owned.example/deleted-old.png'}
+    sealed([deleted]);fresh=trusted(guard.generated_snapshot(p,rid));conn.rollback()
+    assert fresh['history']['rows'][0]['history_key'].startswith('sealed:')
+    denied(lambda:reserve(rid,candidate(fresh,pixels)), 'repeated historical');conn.rollback()
+    # Reencoding produces different exact bytes but same pHash as deleted art.
+    import io
+    from PIL import Image
+    out=io.BytesIO();Image.open(io.BytesIO(pixels)).save(out,format='PNG',compress_level=0)
+    reencoded=out.getvalue();near=candidate(fresh,reencoded);near['original_url']='https://owned.example/reencoded.png'
+    assert near['original_phash']==c['original_phash'] and near['original_sha256']!=c['original_sha256']
+    denied(lambda:reserve(rid,near,original=reencoded), 'repeated historical');conn.rollback()
+    for rows,complete,excluded in [([{**deleted,'resolved':False}],True,[]),([deleted],False,[]),
+      ([],True,[{'media_kind':'reviewed_video_scope_exclusion','published_binding_ref':'excluded'}]),
+      ([deleted,deleted],True,[])]:
+     sealed(rows,complete,excluded)
+     assert not guard.generated_snapshot(p,rid)['history_complete'];conn.rollback()
+     denied(lambda:reserve(rid),'fresh verified');conn.rollback()
+    sql('update fixer_forward_media_photo_state_20261007 set baseline_id=null')
+    assert not guard.generated_snapshot(p,rid)['history_complete'];conn.rollback()
+    denied(lambda:reserve(rid),'fresh verified');conn.rollback()
+    sql('update fixer_forward_media_photo_state_20261007 set baseline_id=%s',(baseline,))
+    # Previously approved sealed visuals survive baseline replacement too.
+    fresh=trusted(guard.generated_snapshot(p,rid));conn.rollback()
+    denied(lambda:reserve(rid,candidate(fresh,deleted_pixels)), 'repeated historical');conn.rollback()
+    rng=random.Random(30);im=Image.frombytes('RGB',(128,128),rng.randbytes(128*128*3))
+    buf=io.BytesIO();im.save(buf,format='PNG');pixels=buf.getvalue()
+    c=candidate(trusted(guard.generated_snapshot(p,rid)),pixels);conn.rollback()
     result=reserve(rid);assert not result['replayed']
     assert reserve(rid)['replayed']
     assert sql('select count(*) from fixer_generated_reservation_20261007')[0][0]==1
@@ -85,22 +122,23 @@ def main():
     sql("insert into media_asset values('photo','source','gym',%s,null,'photo',true,false,'approved','clean',%s,'SYNTHETIC scanner',now(),%s::jsonb,false,999)",(fp,fp,json.dumps(proof)))
     assert guard.generated_snapshot(p,rid)['eligible_photo_count']==1;conn.rollback()
     denied(lambda:reserve(rid),'fresh verified');conn.rollback()
+    sql("update media_asset set moderation_json=moderation_json-'sha256' where id='photo'")
+    assert not guard.generated_snapshot(p,rid)['photo_inventory_complete'];conn.rollback()
+    denied(lambda:reserve(rid),'fresh verified');conn.rollback()
     sql("delete from media_asset where id='photo';delete from media_source where id='source'")
     # Original bytes reserve permanently even after the anchor calendar is gone.
     later=row(day='2026-10-12');fresh=trusted(guard.generated_snapshot(p,later));conn.rollback()
     other=candidate(fresh,pixels)
     history=guard.generated_snapshot(p,later)['history']['rows'];conn.rollback()
-    history=[{**h,'visual_sha256':'sha256:'+hashlib.sha256(pixels).hexdigest()} for h in history]
+    history=[{**h,'visual_sha256':h.get('visual_sha256') or 'sha256:'+hashlib.sha256(pixels).hexdigest()} for h in history]
     denied(lambda:reserve(later,other,history),'repeated historical');conn.rollback()
     # Different original bytes encoding the same visual also fail across gyms.
-    import io
-    from PIL import Image
     out=io.BytesIO();Image.open(io.BytesIO(pixels)).save(out,format='PNG',compress_level=0)
     reencoded=out.getvalue();assert reencoded!=pixels
     other_row=row(gym='other');fresh=trusted(guard.generated_snapshot(p,other_row));conn.rollback()
     near=candidate(fresh,reencoded);near['original_url']='https://owned.example/reencoded.png'
     history=guard.generated_snapshot(p,other_row)['history']['rows'];conn.rollback()
-    history=[{**h,'visual_sha256':'sha256:'+hashlib.sha256(pixels).hexdigest()} for h in history]
+    history=[{**h,'visual_sha256':h.get('visual_sha256') or 'sha256:'+hashlib.sha256(pixels).hexdigest()} for h in history]
     assert near['original_phash']==c['original_phash'] and near['original_md5']!=c['original_md5']
     denied(lambda:reserve(other_row,near,history,reencoded),'repeated historical');conn.rollback()
     # A published unknown row invalidates all current generated provenance.
@@ -123,6 +161,13 @@ def main():
     assert service.execute('select fixer_claim_forward_media_20261006(%s,%s,%s,%s)',(rid,token,receipt['evidence_id'],revision)).fetchone()[0] is True
     service.commit();service.close()
     assert reserve(sibling)['replayed']
+    # Unknown approved photo bytes hold at the actual service claim too.
+    sql("insert into media_source values('source','gym','gym_drive','folder',true,'ready',now())")
+    sql("insert into media_asset values('unknown-sha-photo','source','gym',%s,null,'photo',true,false,'approved','clean',%s,'SYNTHETIC scanner',now(),%s::jsonb,false,0)",(fp,fp,json.dumps({**proof,'asset_id':'unknown-sha-photo','sha256':None})))
+    service=lane('service_role')
+    denied(lambda:service.execute('select fixer_claim_forward_media_20261006(%s,%s,%s,%s)',(rid,token,receipt['evidence_id'],revision)),'binding changed')
+    service.rollback();service.close()
+    sql("delete from media_asset where id='unknown-sha-photo';delete from media_source where id='source'")
     # Stale contenders cannot write inventory while graph proof is uncommitted.
     lock=lane('generated_owner');lock.execute('select pg_advisory_xact_lock(hashtextextended(%s,0))',('fixer_forward_graph_20261006',))
     denied(lambda:sql("insert into media_source values('racing','gym','gym_drive','folder',true,'ready',now())"),'authority busy')
@@ -152,12 +197,50 @@ def main():
     history=guard.generated_snapshot(p,future)['history']['rows'];conn.rollback()
     def read_historical(url):
      return fresh_bytes if url==fresh_candidate['original_url'] else old_bytes if url=='https://owned.example/unknown' else pixels
-    visuals=[{**h,'visual_sha256':'sha256:'+hashlib.sha256(read_historical(h['visual_url'])).hexdigest()} for h in history]
-    assert guard.reserve_generated(p,future,fresh_candidate,fresh,history_visuals=visuals,read_bytes=read_historical)['reserved']
+    def exact_history_reader(url):
+     return deleted_pixels if url=='https://owned.example/deleted-old.png' else read_historical(url)
+    visuals=[{**h,'visual_sha256':'sha256:'+hashlib.sha256(exact_history_reader(h['visual_url'])).hexdigest()} for h in history]
+    assert guard.reserve_generated(p,future,fresh_candidate,fresh,history_visuals=visuals,read_bytes=exact_history_reader)['reserved']
     conn.commit()
     assert sql('select source_media_asset_id is null and source_media_url is null from content_calendar where id=%s',(unknown,))[0][0]
+    # Persisted exact historical proofs remain authority after a remote old
+    # object disappears. Only new history gaps are fetched, deduped by URL.
+    next_row=row(day='2026-10-16',gym='other');next_bytes=noise(3)
+    fresh=trusted(guard.generated_snapshot(p,next_row));conn.rollback()
+    next_candidate=candidate(fresh,next_bytes);next_candidate['original_url']='https://owned.example/next.png'
+    reads=[]
+    def with_missing_old_object(url):
+     reads.append(url)
+     if url=='https://owned.example/unknown':raise RuntimeError('old object disappeared')
+     if url==next_candidate['original_url']:return next_bytes
+     if url==fresh_candidate['original_url']:return fresh_bytes
+     return pixels
+    assert guard.reserve_generated(p,next_row,next_candidate,fresh,history_visuals=[],read_bytes=with_missing_old_object)['reserved']
+    conn.commit()
+    assert 'https://owned.example/unknown' not in reads
+    assert reads.count(fresh_candidate['original_url'])==1
+    sql('delete from content_calendar where id=%s',(unknown,))
+    deleted_live=row(day='2026-10-17',gym='other')
+    fresh=trusted(guard.generated_snapshot(p,deleted_live));conn.rollback()
+    assert any(h['history_key'].startswith('retained:calendar-image:'+unknown) for h in fresh['history']['rows'])
+    repeated=candidate(fresh,old_bytes);repeated['original_url']='https://owned.example/repeated-deleted-live.png'
+    def vanished_old_reader(url):
+     if url==repeated['original_url']:return old_bytes
+     if url=='https://owned.example/unknown':raise RuntimeError('deleted history object')
+     if url==next_candidate['original_url']:return next_bytes
+     if url==fresh_candidate['original_url']:return fresh_bytes
+     return deleted_pixels if url=='https://owned.example/deleted-old.png' else pixels
+    denied(lambda:guard.reserve_generated(p,deleted_live,repeated,fresh,history_visuals=[],read_bytes=vanished_old_reader), 'repeated historical')
+    conn.rollback()
+    # A newer sealed baseline matching old original or its reencoded visual
+    # retires the prior epoch and blocks final claim AND receipt replay.
+    for historical_bytes in (pixels,reencoded):
+     sealed([{**deleted,'visual_sha256':'sha256:'+hashlib.sha256(historical_bytes).hexdigest()}])
+     service=lane('service_role')
+     denied(lambda:service.execute('select fixer_claim_forward_media_20261006(%s,%s,%s,%s)',(rid,token,receipt['evidence_id'],revision)),'binding changed')
+     service.rollback();service.close()
    conn.close();admin.close()
-   print('PASS: PG17 generated owner atomic reservation, replay, siblings, different day/gym/copy, original+pHash collision, used_count ambiguity, current photo-first, unread history hold, final attestation/claim/replay, inventory serialization, role denial and fresh generation against source-null delivered history')
+   print('PASS: PG17 generated atomic authority, deleted sealed exact/pHash reserve denial, baseline unresolved/missing/scope/exclusion holds, epoch final-claim/replay denial, missing photo SHA reserve/send hold, byte/pHash repeats, source-null delivered history, sibling/claim/replay/serialization and role denial')
   finally:
    subprocess.run([str(pg/'pg_ctl'),'-D',str(data),'-m','immediate','-w','stop'],check=True,capture_output=True,timeout=60)
 

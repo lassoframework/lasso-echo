@@ -9,7 +9,7 @@ begin;
 create table public.fixer_generated_reservation_20261007 (
  job_id uuid primary key, calendar_row_id uuid not null, group_key text not null,
  candidate_json jsonb not null, manifest_json jsonb not null,
- receipt_ref text unique not null,
+ receipt_ref text unique not null, history_epoch jsonb not null,
  reserved_at timestamptz not null default clock_timestamp()
 );
 -- Exact historical byte reads by the existing trusted owner, bound to the
@@ -93,7 +93,12 @@ begin
     and a->>'review_status'='pending_review' and a->>'moderation_status'='pending')
   and not exists(select 1 from jsonb_array_elements(assets) a
     where a->>'kind'='photo' and a->'eligible'='true'::jsonb
-      and not exists(select 1 from jsonb_array_elements(sources) s where s->>'id'=a->>'source_id'));
+      and not exists(select 1 from jsonb_array_elements(sources) s where s->>'id'=a->>'source_id'))
+  and not exists(select 1 from public.media_asset a where a.gym_id=r.gym_id
+   and to_jsonb(a)->>'kind'='photo' and to_jsonb(a)->'eligible'='true'::jsonb
+   and coalesce(to_jsonb(a)->>'excluded_by_coach','false')='false'
+   and to_jsonb(a)->>'review_status'='approved'
+   and not public.fixer_owner_photo_source_ready_20261007(a.id,'sha256:'||(to_jsonb(a)#>>'{moderation_json,sha256}')));
  -- Conservative photo-first count: an approved usable photo with no proven
  -- permanent use blocks fallback. used_count alone never proves consumption.
  select count(*) into available from public.media_asset a
@@ -107,6 +112,7 @@ begin
  h:=public.fixer_generated_history_snapshot_20261007();
  copy:=jsonb_build_object('gym_id',r.gym_id,'local_date',r.post_date,'logical_post_id',to_jsonb(r)->>'logical_post_id','group_key',r.visual_group_key,'caption',r.caption);
  return jsonb_build_object('gym_id',r.gym_id,'local_date',r.post_date,'logical_post_id',to_jsonb(r)->>'logical_post_id','group_key',r.visual_group_key,
+  'account',r.account,'format',r.format,
   'copy',copy,'copy_revision','sha256:'||encode(sha256(convert_to(copy::text,'UTF8')),'hex'),
   'inventory_revision','sha256:'||encode(sha256(convert_to(jsonb_build_object('sources',sources,'assets',assets)::text,'UTF8')),'hex'),
   'photo_inventory_complete',complete,'eligible_photo_count',available,
@@ -122,40 +128,89 @@ end; $$;
 -- source originals of old photos. This never grants old-photo clearance.
 create function public.fixer_generated_history_snapshot_20261007()
 returns jsonb language plpgsql security definer set search_path=pg_catalog,public as $$
-declare rows jsonb; spine text;
+declare rows jsonb; spine text; epoch jsonb; authority_complete boolean;
+ state public.fixer_forward_media_photo_state_20261007%rowtype;
+ baseline public.fixer_forward_media_photo_baseline_20261007%rowtype;
+ policy public.fixer_forward_media_photo_policy_20261007%rowtype;
 begin
+ select * into state from public.fixer_forward_media_photo_state_20261007 where singleton;
+ select * into baseline from public.fixer_forward_media_photo_baseline_20261007 where baseline_id=state.baseline_id;
+ select * into policy from public.fixer_forward_media_photo_policy_20261007 where policy_id=baseline.policy_id;
+ epoch:=jsonb_build_object('baseline_id',state.baseline_id,'generation',state.generation,'policy_id',baseline.policy_id);
+ -- Sealed visuals survive calendar deletion/redating and can never silently
+ -- disappear from a generated candidate's comparison set. An unknown sealed
+ -- visual, partial corpus or excluded scope cannot certify non-repetition.
+ authority_complete:=state.enabled and nullif(btrim(state.routes_reconciled_ref),'') is not null
+  and policy.approved and baseline.scope_complete
+  and baseline.declared_full_fleet_row_count=jsonb_array_length(baseline.rows_json)
+  and jsonb_array_length(baseline.excluded_rows_json)=0
+  and not exists(select 1 from jsonb_array_elements(baseline.rows_json) h
+    where h->'resolved' is distinct from 'true'::jsonb or h->>'media_kind' is distinct from 'still_photo'
+      or (h->>'visual_sha256' ~ '^sha256:[0-9a-f]{64}$') is distinct from true
+      or nullif(btrim(h->>'history_key'),'') is null or nullif(btrim(h->>'published_binding_ref'),'') is null)
+  and (select count(*)=count(distinct value->>'history_key') from jsonb_array_elements(baseline.rows_json));
  with raw as (
   select 'calendar-image:'||r.id::text key,r.gym_id tenant,r.post_date content_day,r.visual_group_key grp,
-   r.image_url url,md5(jsonb_build_array(r.gym_id,r.post_date,r.visual_group_key,r.image_url,r.thumbnail_url)::text) binding
+   r.image_url url,md5(jsonb_build_array(r.gym_id,r.post_date,r.visual_group_key,r.image_url,r.thumbnail_url)::text) binding,
+   null::text sealed_sha
   from public.content_calendar r where r.status='published' or r.published_at is not null or r.late_post_id is not null
   union all
   select 'calendar-thumbnail:'||r.id::text,r.gym_id,r.post_date,r.visual_group_key,r.thumbnail_url,
-   md5(jsonb_build_array(r.gym_id,r.post_date,r.visual_group_key,r.image_url,r.thumbnail_url)::text)
+   md5(jsonb_build_array(r.gym_id,r.post_date,r.visual_group_key,r.image_url,r.thumbnail_url)::text),null
   from public.content_calendar r where (r.status='published' or r.published_at is not null or r.late_post_id is not null) and r.thumbnail_url is not null
   union all
   select 'claim-'||object.kind||':'||claim.claim_token::text,claim.tenant_id,claim.post_date,claim.group_key,object.url,
-   md5(to_jsonb(claim)::text) from public.fixer_forward_media_claim_receipt_20261006 claim
+   md5(to_jsonb(claim)::text),null from public.fixer_forward_media_claim_receipt_20261006 claim
   cross join lateral (values('source',claim.source_url),('image',claim.image_url),('thumbnail',claim.thumbnail_url)) object(kind,url) where object.url is not null
   union all
   select 'photo-reserved-'||object.kind||':'||r.audit_id::text,r.candidate_json->>'tenant_id',
-   (r.candidate_json->>'post_date')::date,r.candidate_json->>'group_key',object.url,r.receipt_ref
+   (r.candidate_json->>'post_date')::date,r.candidate_json->>'group_key',object.url,r.receipt_ref,null
   from public.fixer_owner_photo_reservation_20261007 r cross join lateral
    (values('source',r.candidate_json->>'source_url'),('image',r.candidate_json->>'image_url'),('thumbnail',r.candidate_json->>'thumbnail_url')) object(kind,url) where object.url is not null
   union all
   select 'generated-reserved:'||r.job_id::text,r.candidate_json->>'gym_id',(r.candidate_json->>'local_date')::date,
-   r.group_key,r.candidate_json->>'original_url',r.receipt_ref from public.fixer_generated_reservation_20261007 r
+   r.group_key,r.candidate_json->>'original_url',r.receipt_ref,null from public.fixer_generated_reservation_20261007 r
+  union all
+  select 'sealed:'||sealed.baseline_id::text||':'||(h->>'history_key'),h->>'tenant_id',
+   case when h->>'local_date' ~ '^\d{4}-\d{2}-\d{2}$' then (h->>'local_date')::date else null end,
+   h->>'group_key',h->>'visual_url',h->>'published_binding_ref',h->>'visual_sha256'
+  from public.fixer_forward_media_photo_baseline_20261007 sealed
+  join public.fixer_forward_media_photo_policy_20261007 approved_policy on approved_policy.policy_id=sealed.policy_id
+  cross join lateral jsonb_array_elements(sealed.rows_json) h
+  where approved_policy.approved and sealed.scope_complete and jsonb_array_length(sealed.excluded_rows_json)=0
+    and sealed.declared_full_fleet_row_count=jsonb_array_length(sealed.rows_json)
+    and (select count(*)=count(distinct j->>'history_key') from jsonb_array_elements(sealed.rows_json) j)
+    and not exists(select 1 from jsonb_array_elements(sealed.rows_json) j
+      where j->'resolved' is distinct from 'true'::jsonb or j->>'media_kind' is distinct from 'still_photo'
+       or (j->>'visual_sha256' ~ '^sha256:[0-9a-f]{64}$') is distinct from true
+       or nullif(btrim(j->>'history_key'),'') is null or nullif(btrim(j->>'published_binding_ref'),'') is null)
  ), bound as (
   select jsonb_build_object('history_key',key,'tenant_id',tenant,'local_date',content_day,'group_key',grp,
-   'published_binding_ref',binding,'visual_url',url,'visual_sha256',v.visual_sha256) item
+   'published_binding_ref',binding,'visual_url',url,'visual_sha256',coalesce(raw.sealed_sha,v.visual_sha256),
+   'phash',v.phash,'history_proof_ref',case when v.history_key is not null then
+    'generated-history:sha256:'||encode(sha256(convert_to(to_jsonb(v)::text,'UTF8')),'hex') else null end) item
   from raw left join public.fixer_generated_history_visual_20261007 v
     on v.history_key=raw.key and v.published_binding_ref=raw.binding and v.visual_url=raw.url
+     and (raw.sealed_sha is null or raw.sealed_sha=v.visual_sha256)
+  union all
+  -- Observed live deltas remain permanent evidence after a later row deletion
+  -- or binding edit. Reuse the original immutable proof, without recursively
+  -- creating another receipt for this retained view.
+  select jsonb_build_object('history_key','retained:'||v.history_key||':'||v.visual_sha256,
+    'tenant_id',null,'local_date',null,'group_key',null,'published_binding_ref',v.published_binding_ref,
+    'visual_url',v.visual_url,'visual_sha256',v.visual_sha256,'phash',v.phash,
+    'history_proof_ref','generated-history:sha256:'||encode(sha256(convert_to(to_jsonb(v)::text,'UTF8')),'hex'))
+  from public.fixer_generated_history_visual_20261007 v
+  where not exists(select 1 from raw where raw.key=v.history_key and raw.binding=v.published_binding_ref
+     and raw.url=v.visual_url and (raw.sealed_sha is null or raw.sealed_sha=v.visual_sha256))
  ) select coalesce(jsonb_agg(item order by item->>'history_key'),'[]'::jsonb) into rows from bound;
  -- Remove observed byte SHA from the spine: recording exact current visuals
  -- cannot invalidate the stable calendar/claim/reservation tuple revision.
- select 'sha256:'||encode(sha256(convert_to(coalesce(jsonb_agg(value-'visual_sha256' order by value->>'history_key'),'[]'::jsonb)::text,'UTF8')),'hex')
+ select 'sha256:'||encode(sha256(convert_to(jsonb_build_object('epoch',epoch,'sealed_rows',baseline.rows_json,
+  'rows',coalesce(jsonb_agg(value-'visual_sha256'-'phash'-'history_proof_ref' order by value->>'history_key'),'[]'::jsonb))::text,'UTF8')),'hex')
  into spine from jsonb_array_elements(rows);
- return jsonb_build_object('rows',rows,'spine_digest',spine,
-  'scope_complete',jsonb_array_length(rows)<=10000 and not exists(select 1 from jsonb_array_elements(rows) h
+ return jsonb_build_object('rows',rows,'spine_digest',spine,'epoch',epoch,
+  'scope_complete',coalesce(authority_complete,false) and jsonb_array_length(rows)<=10000 and not exists(select 1 from jsonb_array_elements(rows) h
     where (h->>'visual_url' ~ '^https://[^[:space:]]+$') is distinct from true));
 end; $$;
 
@@ -255,12 +310,16 @@ begin
      and g.candidate_json->>'original_url'=c->>'original_url') then
     raise exception 'unresolved or repeated historical generated visual' using errcode='23514'; end if;
   end if;
+  if h->>'history_key' not like 'retained:%' then
   insert into public.fixer_generated_history_visual_20261007 values(h->>'history_key',proof->>'visual_sha256',h->>'published_binding_ref',proof->>'phash',proof->>'visual_url') on conflict do nothing;
   if not exists(select 1 from public.fixer_generated_history_visual_20261007 v
     where v.history_key=h->>'history_key' and v.visual_sha256=proof->>'visual_sha256'
      and v.published_binding_ref=h->>'published_binding_ref' and v.phash=proof->>'phash'
      and v.visual_url=proof->>'visual_url') then
    raise exception 'historical perceptual receipt identity conflict' using errcode='23514'; end if;
+  elsif proof->>'phash' is distinct from h->>'phash' then
+   raise exception 'retained perceptual receipt identity conflict' using errcode='23514';
+  end if;
  end loop;
  if exists(select 1 from public.fixer_generated_reservation_20261007 g
   where (g.candidate_json->>'original_sha256'=c->>'original_sha256'
@@ -281,8 +340,8 @@ begin
   'thumbnail_url',null,'thumbnail_fingerprint',null,'thumbnail_length',null,'operation','same_object','render_recipe',null,'render_evidence_ref',asset)
   or m->>'manifest_digest' is distinct from 'sha256:'||encode(sha256(convert_to(public.fixer_owner_photo_canonical_20261007(m-'manifest_digest'),'UTF8')),'hex') then
   raise exception 'generated original requires exact same-object manifest' using errcode='23514'; end if;
- insert into public.fixer_generated_reservation_20261007(job_id,calendar_row_id,group_key,candidate_json,manifest_json,receipt_ref)
- values((c->>'job_id')::uuid,p_id,r.visual_group_key,c,m,receipt);
+ insert into public.fixer_generated_reservation_20261007(job_id,calendar_row_id,group_key,candidate_json,manifest_json,receipt_ref,history_epoch)
+ values((c->>'job_id')::uuid,p_id,r.visual_group_key,c,m,receipt,snap#>'{history,epoch}');
  insert into public.fixer_forward_media_original_registry_20261006(tenant_id,source_asset_id,source_url,source_fingerprint,source_length,registry_evidence_ref)
  values(c->>'gym_id',asset,c->>'original_url',fp,(c->>'original_length')::bigint,'astra-job:'||(c->>'job_id'));
  insert into public.fixer_forward_media_history_clearance_20261006(tenant_id,source_asset_id,source_url,source_fingerprint,source_length,registry_evidence_ref,decision,history_evidence_ref)
@@ -327,6 +386,7 @@ begin
   or snap->'photo_inventory_complete' is distinct from 'true'::jsonb
   or snap->'eligible_photo_count' is distinct from '0'::jsonb
   or snap->'history_complete' is distinct from 'true'::jsonb
+  or g.history_epoch is distinct from snap#>'{history,epoch}'
   or g.candidate_json->>'original_url' is distinct from r.source_media_url
   or r.source_media_url is distinct from r.image_url or r.thumbnail_url is not null
   or g.manifest_json->>'manifest_digest' is distinct from r.render_manifest_digest then
@@ -353,11 +413,13 @@ begin
         and live.gym_id=sibling.candidate_json->>'gym_id' and live.post_date::text=sibling.candidate_json->>'local_date'
         and live.visual_group_key=sibling.group_key and live.source_media_asset_id='generated-astra:'||sibling.job_id::text
         and live.image_url=sibling.candidate_json->>'original_url' and live.thumbnail_url is null))) then continue; end if;
+  if h->>'history_key' like 'retained:%' then ph:=h->>'phash'; else
   select phash into ph from public.fixer_generated_history_visual_20261007 v where v.history_key=h->>'history_key'
    and v.visual_sha256=h->>'visual_sha256' and v.published_binding_ref=h->>'published_binding_ref';
   if not found then
    select candidate_json->>'original_phash' into ph from public.fixer_generated_reservation_20261007 sibling
     where h->>'history_key'='generated-reserved:'||sibling.job_id::text;
+  end if;
   end if;
   if ph is null or public.fixer_generated_hamming_20261007(ph,g.candidate_json->>'original_phash')<=6
    or h->>'visual_sha256'='sha256:'||(g.candidate_json->>'original_sha256') then

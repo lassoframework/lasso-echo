@@ -272,6 +272,18 @@ def reserve_generated(persistence, calendar_row_id, candidate, trusted_snapshot,
         if not isinstance(candidate.get(key), str) or not candidate[key].strip():
             raise ForwardMediaVerificationHold('generated provenance unavailable: ' + key)
     _uuid(candidate.get('job_id'))
+    # Only this authenticated DB lookup can issue reusable historical proof.
+    # Producer/scheduler flags in a supplied history list cannot skip byte reads.
+    current = generated_snapshot(persistence, calendar_row_id)
+    for key in ('gym_id', 'local_date', 'logical_post_id', 'copy_revision', 'inventory_revision'):
+        if current.get(key) != trusted_snapshot.get(key):
+            raise ForwardMediaVerificationHold('generated database snapshot changed: ' + key)
+    for key in ('account', 'format'):
+        if key in trusted_snapshot and current.get(key) != trusted_snapshot[key]:
+            raise ForwardMediaVerificationHold('generated database snapshot changed: ' + key)
+    if (current.get('photo_inventory_complete') is not True
+            or current.get('eligible_photo_count') != 0 or current.get('history_complete') is not True):
+        raise ForwardMediaVerificationHold('generated database depletion/history unverified')
     # End read-only identity/snapshot work BEFORE bounded remote object reads.
     persistence._conn.rollback()
     data = _read(candidate.get('original_url'), read_bytes)
@@ -290,18 +302,50 @@ def reserve_generated(persistence, calendar_row_id, candidate, trusted_snapshot,
             raise ForwardMediaVerificationHold('generated original dimensions changed')
         im.verify()
     checked_visuals = []
+    byte_cache = {candidate['original_url']: data}
+    visual_cache = {candidate['original_url']:
+                    ('sha256:' + candidate['original_sha256'], candidate['original_phash'])}
     if not isinstance(history_visuals, list):
         raise ForwardMediaVerificationHold('complete historical visual bytes required')
+    supplied = {}
     for item in history_visuals:
         if not isinstance(item, dict):
             raise ForwardMediaVerificationHold('historical visual evidence malformed')
-        prior = _read(item.get('visual_url'), read_bytes)
-        if item.get('visual_sha256') != 'sha256:' + hashlib.sha256(prior).hexdigest():
+        key = (item.get('history_key'), item.get('published_binding_ref'), item.get('visual_url'))
+        if key in supplied:
+            raise ForwardMediaVerificationHold('historical visual evidence ambiguous')
+        supplied[key] = item
+    rows = current.get('history', {}).get('rows')
+    if not isinstance(rows, list):
+        raise ForwardMediaVerificationHold('complete database historical inventory required')
+    for item in rows:
+        key = (item.get('history_key'), item.get('published_binding_ref'), item.get('visual_url'))
+        asserted = supplied.pop(key, None)
+        if (item.get('history_proof_ref') and item.get('visual_sha256')
+                and visual_scene.normalize_scene(item.get('phash'))):
+            # Immutable SQL-issued proof is tied to the exact current history
+            # identity, published binding, URL, SHA and pHash. Deleted/missing
+            # remote objects do not erase the already observed historical visual.
+            if asserted and asserted.get('visual_sha256') != item['visual_sha256']:
+                raise ForwardMediaVerificationHold('historical visual bytes changed')
+            checked_visuals.append(dict(item))
+            continue
+        url = item.get('visual_url')
+        if url not in byte_cache:
+            byte_cache[url] = _read(url, read_bytes)
+        prior = byte_cache[url]
+        if url not in visual_cache:
+            visual_cache[url] = ('sha256:' + hashlib.sha256(prior).hexdigest(),
+                                 visual_scene.scene_fingerprint(prior))
+        sha, phash = visual_cache[url]
+        if ((item.get('visual_sha256') is not None and item['visual_sha256'] != sha)
+                or (asserted and asserted.get('visual_sha256') != sha)):
             raise ForwardMediaVerificationHold('historical visual bytes changed')
-        phash = visual_scene.scene_fingerprint(prior)
         if phash is None:
             raise ForwardMediaVerificationHold('historical perceptual evidence unavailable')
-        checked_visuals.append({**item, 'phash': phash})
+        checked_visuals.append({**item, 'visual_sha256': sha, 'phash': phash})
+    if supplied:
+        raise ForwardMediaVerificationHold('historical visual evidence outside database inventory')
     if _read(candidate['original_url'], read_bytes) != data:
         raise ForwardMediaVerificationHold('generated original changed during observation')
     original = prepare.register_original(
