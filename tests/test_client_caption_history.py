@@ -48,9 +48,9 @@ def rows(day, caption):
                                  ('instagram', 'story')]]
 
 
-@pytest.mark.parametrize('day', ['2026-10-15', '2026-10-16'])
+@pytest.mark.parametrize('day', ['2026-10-10', '2026-10-15', '2026-10-16', '2026-10-20'])
 def test_one_day_verbatim_block_fails_before_delete(day):
-    caption_ledger.record_staged('swift', 'Real approved caption', '2026-10-10')
+    caption_ledger.record_staged('swift', 'Real approved caption', '2026-10-07')
     store = AdmissionStore()
     result = cmr._apply('swift', rows(day, 'Real approved caption'),
                         date.fromisoformat(day), 1, store, lambda msg: None)
@@ -230,14 +230,15 @@ def test_history_walk_rejects_normalized_same_day_caption(monkeypatch):
         '2026-10-15', 0, (), [' fresh  COPY '], lambda msg: None)
 
 
+@pytest.mark.parametrize('day', ['2026-10-10', '2026-10-15', '2026-10-16', '2026-10-20'])
 @pytest.mark.parametrize('fresh_on', [4, None])
 def test_drive_stage_history_exhaustion_rolls_back_once_and_success_keeps_photo(
-        monkeypatch, fresh_on):
+        monkeypatch, fresh_on, day):
     source = SimpleNamespace(text='First approved fact', category='service')
     sources = [SimpleNamespace(text=f'Other approved fact {i}', category='about') for i in range(7)]
     monkeypatch.setattr(cmr, '_gym_drive_source_for', lambda *a: source)
     monkeypatch.setattr(cmr, '_drive_history_sources', lambda *a: sources)
-    caption_ledger.record_staged('swift', 'Old copy', '2026-10-10')
+    caption_ledger.record_staged('swift', 'Old copy', '2026-10-07')
     feed = draft('Old copy')
     feed.source_media_asset_id = 'photo-1'
     generated, rollback = [], []
@@ -252,7 +253,7 @@ def test_drive_stage_history_exhaustion_rolls_back_once_and_success_keeps_photo(
     failed, extra, covered = set(), [], set()
     ok = cmr._stage_drive_draft(
         SimpleNamespace(key='swift_ig'), 'swift', 'swift_ig', 'instagram', feed,
-        '2026-10-15', 0, 1, object(), ('forbidden',), [], 'library', lambda msg: None,
+        day, 0, 1, object(), ('forbidden',), [], 'library', lambda msg: None,
         failed, extra, covered, 'service', False)
     assert ok is (fresh_on is not None)
     assert len(generated) == (fresh_on or 8)
