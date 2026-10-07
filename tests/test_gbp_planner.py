@@ -706,6 +706,13 @@ def test_legacy_initial_status_cannot_create_new_coach_review_rows():
     assert all(r["status"] == "pending" for r in store.rows)
 
 
+def test_gbp_row_normalizes_legacy_coach_review_status():
+    row = gp._row(
+        "lasso", "lasso_ig", "2026-09-01", "caption", "https://example.test/photo.jpg",
+        topic_type="STANDARD", pillar="community", status="coach_review")
+    assert row["status"] == "pending"
+
+
 def test_no_offer_skips_offer_slot():
     _seed()
     store = _Store()
