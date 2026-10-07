@@ -25,6 +25,10 @@ alter table public.content_calendar add column if not exists render_manifest_dig
 -- No login, password, membership or provider activation is provisioned here.
 create role fixer_forward_media_attester_20261006 nologin;
 grant usage on schema public to fixer_forward_media_attester_20261006;
+-- A separately provisioned LOGIN may inherit this narrow owner role. The
+-- service/attester roles cannot prepare originals, clear history or bind renders.
+create role fixer_forward_media_owner_20261006 nologin;
+grant usage on schema public to fixer_forward_media_owner_20261006;
 
 create function public.fixer_forward_media_immutable_20261006()
 returns trigger language plpgsql set search_path=pg_catalog,public as $$
@@ -32,6 +36,7 @@ begin
   raise exception 'forward media authority is immutable' using errcode='23514';
 end;
 $$;
+
 revoke all on function public.fixer_forward_media_immutable_20261006() from public,anon,authenticated,service_role;
 
 create table public.fixer_forward_media_tenant_alias_20261006 (
@@ -207,6 +212,22 @@ begin
       execute format('grant select on public.%I to service_role',t);
       execute format('create policy service_read on public.%I for select to service_role using(true)',t);
     end if;
+  end loop;
+end;
+$$;
+
+-- RLS is enabled above. Table grants alone cannot admit the dedicated owner:
+-- require both role membership and these insert/read policies. No update,
+-- delete or truncate privilege is granted; immutable triggers remain in force.
+do $$
+declare t text;
+begin
+  foreach t in array array['fixer_forward_media_original_registry_20261006',
+    'fixer_forward_media_history_clearance_20261006',
+    'fixer_forward_media_render_manifest_20261006'] loop
+    execute format('grant select,insert on public.%I to fixer_forward_media_owner_20261006',t);
+    execute format('create policy owner_read on public.%I for select to fixer_forward_media_owner_20261006 using(true)',t);
+    execute format('create policy owner_insert on public.%I for insert to fixer_forward_media_owner_20261006 with check(true)',t);
   end loop;
 end;
 $$;
