@@ -476,6 +476,57 @@ class SupabaseCalendarStore:
             raise PortalStoreError(r.status_code, _scrub((r.text or "")[:200]))
         return r.json() or []
 
+    def list_month_strict(self, account_key, month):
+        """Complete counted active month snapshot for the final ownership barrier.
+
+        Unlike best-effort planner reads, a missing/changing count, short page,
+        repeated ID or malformed/foreign row cannot certify an available slot.
+        """
+        year, number = map(int, month.split("-"))
+        first = f"{month}-01"
+        last = f"{month}-{_calendar.monthrange(year, number)[1]:02d}"
+        fields = {"id", "gym_id", "post_date", "account", "format",
+                  "status", "slot_index", "variant_status"}
+        rows, seen, expected_total = [], set(), None
+        while True:
+            response = self._client().get(
+                self._rest(_TABLE),
+                params={"gym_id": f"eq.{account_key}",
+                        "post_date": [f"gte.{first}", f"lte.{last}"],
+                        "variant_status": "eq.active", "order": "id",
+                        "select": ",".join(sorted(fields)),
+                        "limit": "500", "offset": str(len(rows))},
+                headers=self._headers({"Prefer": "count=exact"}), timeout=30)
+            if response.status_code >= 400:
+                raise PortalStoreError(response.status_code, "live cadence read unavailable")
+            page = response.json()
+            total = (getattr(response, "headers", {}) or {}).get(
+                "Content-Range", "").rsplit("/", 1)[-1]
+            if not isinstance(page, list) or not total.isdigit():
+                raise PortalStoreError(502, "live cadence read count unavailable")
+            total = int(total)
+            if expected_total is None:
+                expected_total = total
+            if total != expected_total or len(page) != min(500, total - len(rows)):
+                raise PortalStoreError(502, "live cadence read incomplete or changed")
+            for row in page:
+                if (not isinstance(row, dict) or not fields.issubset(row)
+                        or not isinstance(row["id"], str) or not row["id"]
+                        or row["id"] in seen or row["gym_id"] != account_key
+                        or not isinstance(row["post_date"], str)
+                        or not first <= row["post_date"] <= last
+                        or row["variant_status"] != "active"
+                        or not isinstance(row["account"], str)
+                        or not isinstance(row["format"], str)
+                        or (row["status"] is not None and not isinstance(row["status"], str))
+                        or (row["slot_index"] is not None
+                            and (type(row["slot_index"]) is not int or row["slot_index"] < 0))):
+                    raise PortalStoreError(502, "live cadence read scope invalid")
+                seen.add(row["id"])
+            rows.extend(page)
+            if len(rows) == total:
+                return rows
+
     def list_media_publish_history(self, account_key, since):
         """Complete cross-platform send history for a strict reuse decision.
 
@@ -5301,17 +5352,51 @@ def preserve_and_prune(store, account_key, months, rows):
 
 
 def _preserve_and_prune_strict(store, account_key, months, rows):
-    """Fail-closed variant for the final prevalidated cadence write barrier."""
-    locked_slots = getattr(store, "locked_slots", None)
-    if not callable(locked_slots):
-        raise RuntimeError("locked slot reader unavailable")
+    """Live, fail-closed ownership check at the final prevalidated write barrier.
+
+    At one post/day any owned cell retains the legacy whole-cell lock. At
+    multi-slot cadence only the exact ordinal is occupied; a legacy null owns
+    ordinal zero. No content, caption or time bucket can bypass ownership.
+    """
+    reader = getattr(store, "list_month_strict", None)
+    if not callable(reader):
+        raise RuntimeError("authoritative cadence reader unavailable")
+    from .cadence import resolve_posts_per_day
     locked = set()
+    capacities = {}
+
+    def capacity(day):
+        if day not in capacities:
+            value = int(resolve_posts_per_day(account_key, store, day=day) or 1)
+            if value < 1:
+                raise RuntimeError("invalid cadence capacity")
+            capacities[day] = value
+        return capacities[day]
+
     for month in months:
-        result = locked_slots(account_key, month)
-        if not isinstance(result, set):
-            raise RuntimeError("locked slot read was not authoritative")
-        locked |= result
-    kept = [row for row in rows if _slot_key(row) not in locked]
+        retained = reader(account_key, month)
+        if not isinstance(retained, list):
+            raise RuntimeError("live cadence read was not authoritative")
+        for row in retained:
+            status = str(row.get("status") or "").lower()
+            if not status or status in _WIPEABLE_STATUSES:
+                continue
+            key = _slot_key(row)
+            slots = capacity(key[0])
+            ordinal = row.get("slot_index")
+            if slots > 1 and ordinal is not None and ordinal >= slots:
+                raise RuntimeError("owned cadence ordinal invalid")
+            locked.add((key, (ordinal or 0) if slots > 1 else None))
+    kept = []
+    for row in rows:
+        key = _slot_key(row)
+        slots = capacity(key[0])
+        ordinal = row.get("slot_index")
+        if slots > 1 and ordinal is not None and (
+                type(ordinal) is not int or ordinal not in range(slots)):
+            raise RuntimeError("proposed cadence ordinal invalid")
+        if (key, (ordinal or 0) if slots > 1 else None) not in locked:
+            kept.append(row)
     return kept, len(locked)
 
 
