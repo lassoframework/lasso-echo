@@ -53,22 +53,30 @@ def reconcile_owner_photo(persistence, audit_id):
         cursor.execute('select public.fixer_reconcile_owner_photo_20261007(%s)', (audit_id,))
         result = cursor.fetchone()[0]
     try:
-        packet, key = result['certificate']['packet'], result['certificate']['approved_key']
-        payload = packet['payload']
-        if (key.get('approved') is not True or payload['audit_id'] != audit_id
-                or payload['key_id'] != key['key_id'] or payload['auditor_id'] != key['auditor_id']
-                or payload['policy_id'] != key['policy_id']):
-            raise ValueError()
         from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
         from .forward_media_photo_certificate import canonical
-        payload_json = canonical(payload)
-        Ed25519PublicKey.from_public_bytes(bytes.fromhex(key['public_key_hex'])).verify(
-            bytes.fromhex(packet['signature_hex']), payload_json.encode())
-        ref = 'photo-audit:sha256:' + hashlib.sha256(
-            (payload_json+'\n'+packet['signature_hex']).encode()).hexdigest()
-        if (result['manifest']['render_evidence_ref'] != ref
-                or result['clearance']['history_evidence_ref'] != 'owner-photo-reservation:'+ref
-                or result['replayed'] is not True):
+        if not result['clearance']['history_evidence_ref'].startswith('owner-photo-reservation:'):
+            raise ValueError()
+        # The original has one immutable clearance. Each same-day rendition has
+        # its own certificate; independently verify both stored signatures.
+        for name, expected_ref in (
+                ('certificate', result['manifest']['render_evidence_ref']),
+                ('clearance_certificate', result['clearance']['history_evidence_ref'].removeprefix('owner-photo-reservation:'))):
+            packet, key = result[name]['packet'], result[name]['approved_key']
+            payload = packet['payload']
+            if (key.get('approved') is not True
+                    or (name == 'certificate' and payload['audit_id'] != audit_id)
+                    or payload['key_id'] != key['key_id'] or payload['auditor_id'] != key['auditor_id']
+                    or payload['policy_id'] != key['policy_id']):
+                raise ValueError()
+            payload_json = canonical(payload)
+            Ed25519PublicKey.from_public_bytes(bytes.fromhex(key['public_key_hex'])).verify(
+                bytes.fromhex(packet['signature_hex']), payload_json.encode())
+            ref = 'photo-audit:sha256:' + hashlib.sha256(
+                (payload_json+'\n'+packet['signature_hex']).encode()).hexdigest()
+            if expected_ref != ref:
+                raise ValueError()
+        if result['replayed'] is not True:
             raise ValueError()
     except Exception:
         raise PhotoCertificateHold('existing_photo_signature_or_identity_invalid') from None
@@ -140,6 +148,11 @@ def stage_prepared_photo(persistence, prepared):
              json.dumps(prepared.manifest.row(), ensure_ascii=False)))
         clearance_row = cursor.fetchone()[0]
     clearance = prepare.HistoryClearance(**clearance_row)
+    canonical_original = {k: clearance_row[k] for k in original.row()}
+    if any(canonical_original[k] != v for k, v in original.row().items()
+           if k != 'registry_evidence_ref'):
+        raise PhotoCertificateHold('certified_owner_original_anchor_mismatch')
+    original = prepare.OriginalRegistration(**canonical_original)
     frozen = ForwardMediaOwnerPersistence(persistence._conn, persistence._expected_owner,
         _FrozenBytes(prepared.source, prepared.manifest.image_url, prepared.image_bytes))
     return frozen.persist_in_transaction(original, clearance, prepared.manifest)
