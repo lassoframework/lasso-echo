@@ -892,8 +892,7 @@ def test_drive_only_empty_rebuild_is_not_reported_as_generated(monkeypatch):
 
     assert out["generated"] == 0
     assert out["results"] == [{"base": "gritx", "status": "not_built",
-                               "reason": "noop_empty", "synced": 0,
-                               "upserted": 0}]
+                               "reason": "no admissible photo posts", "synced": 0}]
 
 
 def test_drive_only_gym_without_gym_drive_flags_still_awaits(monkeypatch):
