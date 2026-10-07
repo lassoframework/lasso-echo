@@ -8,6 +8,7 @@ import json
 import time
 
 import pytest
+import requests
 
 from agent import echo_ticket_worker as worker
 from agent.slack_convo import outbox, outreach
@@ -859,6 +860,151 @@ def test_released_non_fixer_answer_cannot_resolve_unverified_website_ticket():
                               att=row["attachments"], body="Your account is connected.")
     assert bus.current["status"] == "verification"
     assert summary["resolved"] == 0
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_real_bus_released_answer_uses_actual_notice_flag(monkeypatch, enabled):
+    if enabled:
+        monkeypatch.setenv("SLACK_CONVO_ECHO_CURRENT_NOTICE_ENABLED", "true")
+    else:
+        monkeypatch.delenv("SLACK_CONVO_ECHO_CURRENT_NOTICE_ENABLED")
+    bus = Bus(url="https://example.test", service_key="test")
+    ticket = NoticeBus().current
+    row = {"id": "70164909-16b5-43df-b6a3-8d7499d51485", "ticket_id": TICKET_ID,
+           "body": "Your account is connected.", "delivery_status": "held",
+           "attachments": {"identity": "echo", "kind": "answer"}}
+    monkeypatch.setattr(bus, "ticket", lambda _tid: deepcopy(ticket))
+    monkeypatch.setattr(bus, "message", lambda _mid: deepcopy(row))
+    monkeypatch.setattr(bus, "set_ticket", lambda _tid, **fields: ticket.update(fields))
+    monkeypatch.setattr(bus, "mark_message", lambda _mid, status, meta_update:
+                        (row.update(delivery_status=status),
+                         row["attachments"].update(meta_update)))
+    monkeypatch.setattr(bus, "_client", lambda: pytest.fail("unexpected current-notice RPC"))
+    # These real Bus methods exist in both flag states. Their presence is not arming.
+    assert callable(bus.resolve_current_notice) and callable(bus.begin_current_notice)
+    identity = SimpleNamespace(name="echo")
+    assert outbox.release_held(bus, row["id"], approved_by="U_BLAKE", identity=identity)
+    assert ticket["status"] == "verification" and row["delivery_status"] == "ready"
+    row["delivery_status"] = "posted"  # simulate the confirmed successful client send
+    summary = {"resolved": 0}
+    outbox._after_answer_posted(bus, ticket, row, "answer", summary,
+                               row["attachments"], identity)
+    assert ticket["status"] == ("verification" if enabled else "resolved")
+    assert summary["resolved"] == (0 if enabled else 1)
+
+
+@pytest.mark.parametrize("enabled,token", [(False, None), (True, None),
+                                           (True, NOTICE_TOKEN), (False, NOTICE_TOKEN)])
+def test_real_bus_fixer_answer_selects_armed_close_contract(monkeypatch, enabled, token):
+    monkeypatch.setenv("SLACK_CONVO_ECHO_CURRENT_NOTICE_ENABLED", str(enabled))
+    bus = Bus(url="https://example.test", service_key="test")
+    ticket = NoticeBus().current
+    ticket.update(slack_channel_id="G_CLIENT", slack_thread_ts="1.2")
+    monkeypatch.setattr(bus, "ticket", lambda _tid: deepcopy(ticket))
+    monkeypatch.setattr(outbox, "_current_fixer_request_key", lambda *_a: "current-request")
+    monkeypatch.setattr(bus, "set_ticket", lambda *_a, **_kw:
+                        pytest.fail("FIXER answer bypassed atomic close"))
+    calls = []
+
+    def post(url, *, data, **_kw):
+        payload = json.loads(data)
+        calls.append((url, payload))
+        assert payload["p_ticket_id"] == TICKET_ID
+        assert payload["p_expected_request_version"] == 3
+        assert payload["p_expected_slack_channel_id"] == "G_CLIENT"
+        assert payload["p_expected_slack_thread_ts"] == "1.2"
+        ticket["status"] = "resolved"
+        return SimpleNamespace(status_code=200, json=lambda: [deepcopy(ticket)])
+
+    monkeypatch.setattr(bus, "_client", lambda: SimpleNamespace(post=post))
+    meta = {"fixer": True, "kind": "answer", "released_by": "U_BLAKE",
+            "request_key": "current-request", "request_version": 3,
+            "delivery_expected_status": "verification"}
+    if token:
+        meta["fixer_current_attempt_token"] = token
+    row = {"id": "70164909-16b5-43df-b6a3-8d7499d51485", "ticket_id": TICKET_ID,
+           "delivery_status": "posted", "attachments": meta}
+    summary = {"resolved": 0}
+    outbox._resolve_on_answer(bus, deepcopy(ticket), row, "answer", summary,
+                              att=meta, body="Your account is connected.")
+    closes = enabled == bool(token)
+    assert summary["resolved"] == int(closes)
+    assert ticket["status"] == ("resolved" if closes else "verification")
+    assert len(calls) == int(closes)
+    if closes:
+        rpc = "fixer_resolve_current_notice" if enabled else "fixer_resolve_current_delivery"
+        assert calls[0][0].endswith("/" + rpc)
+        if enabled:
+            assert calls[0][1]["p_attempt_token"] == NOTICE_TOKEN
+            assert calls[0][1]["p_notice_message_id"] == row["id"]
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize("recipient,escalated,hold_tier", [("staff", True, "human"),
+                                                        ("client", False, None)])
+def test_real_bus_generic_resolve_tap_uses_actual_notice_flag(
+        monkeypatch, enabled, recipient, escalated, hold_tier):
+    monkeypatch.setenv("SLACK_CONVO_ECHO_CURRENT_NOTICE_ENABLED", str(enabled))
+    bus = Bus(url="https://example.test", service_key="test")
+    ticket = NoticeBus().current
+    ticket.update(status="hold", slack_channel_id="G_CLIENT", identity_kind=recipient,
+                  escalated=escalated, hold_tier=hold_tier)
+    # Staff escalation has no customer fix proof exemption. It retains the
+    # existing generic notice path when the current-notice capability is OFF.
+    monkeypatch.setattr(bus, "ticket", lambda _tid: deepcopy(ticket))
+    written = []
+    monkeypatch.setattr(bus, "recent_messages", lambda *_a, **_kw: deepcopy(written))
+    monkeypatch.setattr(bus, "_insert", lambda _table, row:
+                        (written.append(deepcopy(row)) or deepcopy(row), False))
+    monkeypatch.setattr(bus, "set_ticket", lambda _tid, **fields: ticket.update(fields))
+    monkeypatch.setattr(bus, "_client", lambda: pytest.fail("generic tap used notice RPC"))
+    monkeypatch.setattr(outbox, "_recipient_armed", lambda *_a: True)
+    identity = SimpleNamespace(name="echo")
+    accepted = outbox.resolve_and_notify(bus, TICKET_ID, approved_by="U_BLAKE",
+                                         identity=identity, log=lambda _msg: None)
+    assert accepted is (not enabled)
+    assert ticket["status"] == "hold"  # queueing a notice never closes the ticket
+    assert len(written) == int(not enabled)
+    if not enabled:
+        assert written[0]["attachments"]["resolve_notice"] is True
+        assert ticket["approved_by"] == "U_BLAKE"
+        assert not outbox.resolve_and_notify(bus, TICKET_ID, approved_by="U_BLAKE",
+                                             identity=identity, log=lambda _msg: None)
+        row = {**written[0], "delivery_status": "posted"}
+        summary = {"resolved": 0}
+        outbox._resolve_on_answer(bus, ticket, row, "status", summary,
+                                  att=row["attachments"], body=row["body"])
+        assert ticket["status"] == "resolved" and summary["resolved"] == 1
+
+
+def test_real_bus_resolve_tap_contains_reservation_transport_failure(monkeypatch):
+    bus = Bus(url="https://example.test", service_key="test")
+    ticket = NoticeBus().current
+    ticket.update(status="merged", classification="code_fix", slack_channel_id="G_CLIENT",
+                  fix_pr_url="https://github.com/example/echo/pull/317",
+                  verification_after={"fixer": {"request_key": "current-request"}})
+    before = deepcopy(ticket)
+    monkeypatch.setattr(bus, "ticket", lambda _tid: deepcopy(ticket))
+    monkeypatch.setattr(bus, "recent_messages", lambda *_a, **_kw: [])
+    monkeypatch.setattr(bus, "_insert", lambda *_a: pytest.fail("failed reservation inserted notice"))
+    monkeypatch.setattr(bus, "set_ticket", lambda *_a, **_kw:
+                        pytest.fail("uncertain reservation stamped approval"))
+    monkeypatch.setattr(outbox, "_recipient_armed", lambda *_a: True)
+    monkeypatch.setattr(outbox, "_verified_fix_notice", lambda *_a, **_kw: True)
+    monkeypatch.setattr(outbox, "_current_fixer_request_key", lambda *_a: "current-request")
+    attempts = []
+
+    def post(url, **_kw):
+        attempts.append(url)
+        raise requests.exceptions.Timeout("lost reservation response")
+
+    monkeypatch.setattr(bus, "_client", lambda: SimpleNamespace(post=post))
+    logs = []
+    assert not outbox.resolve_and_notify(bus, TICKET_ID, approved_by="U_BLAKE",
+                                         identity=SimpleNamespace(name="echo"), log=logs.append)
+    assert len(attempts) == 2  # the existing idempotent RPC retry, no new tap retry
+    assert ticket == before
+    assert any("failed: Timeout" in entry for entry in logs)
 
 
 def _alert_store(monkeypatch, *, initial=None, fail_alert_inserts=0,

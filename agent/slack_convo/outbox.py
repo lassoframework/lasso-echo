@@ -2687,6 +2687,11 @@ def _resolve_on_answer(bus, ticket, row, kind, summary, att=None, body=""):
     delivery, so a failed post left a ticket claiming to be resolved over a failed row)."""
     meta = att or {}
     fixer = bool(meta.get("fixer"))
+    current_notice_enabled = config.slack_convo_echo_current_notice_enabled()
+    if meta.get("fixer_current_attempt_token") and not current_notice_enabled:
+        # Disabling new notices cannot downgrade an existing reservation to
+        # the legacy close path, even after a successful client delivery.
+        return
     should_resolve = (
         kind == _a.KIND_ANSWER and ticket.get("status") == "verification"
         or kind == _a.KIND_STATUS and meta.get("resolve_notice") is True
@@ -2701,7 +2706,7 @@ def _resolve_on_answer(bus, ticket, row, kind, summary, att=None, body=""):
             bus, ticket, meta, body=body, require_direct_answer=grounded)
         current_notice = (ticket.get("product") == "echo"
                           and ticket.get("source") == "website_tab"
-                          and callable(getattr(bus, "resolve_current_notice", None)))
+                          and current_notice_enabled)
         token = meta.get("fixer_current_attempt_token")
         resolver = getattr(bus, ("resolve_current_notice" if current_notice
                                  else "resolve_current_delivery"), None)
@@ -2751,7 +2756,7 @@ def _resolve_on_answer(bus, ticket, row, kind, summary, att=None, body=""):
         return
     if (ticket.get("product") == "echo"
             and ticket.get("source") == "website_tab"
-            and callable(getattr(bus, "resolve_current_notice", None))):
+            and current_notice_enabled):
         # 0384 protects every Echo website-tab resolution, including ordinary
         # answers and human taps. Unreserved legacy rows remain open.
         return
@@ -2822,11 +2827,10 @@ def resolve_and_notify(bus, ticket_id, *, approved_by, identity, log=print):
     if ticket.get("status") == "resolved":
         return False
     customer_fix = _customer_fix_reply(ticket, {})
-    if (callable(getattr(bus, "begin_current_notice", None))
+    if (config.slack_convo_echo_current_notice_enabled()
             and ticket.get("product") == "echo"
             and ticket.get("source") == "website_tab"
-            and (not config.slack_convo_echo_current_notice_enabled()
-                 or not customer_fix or ticket.get("escalated") is True
+            and (not customer_fix or ticket.get("escalated") is True
                  or ticket.get("hold_tier") is not None)):
         # 0384 reserves only current unheld verification/merged notices. A
         # generic or held tap cannot borrow that reservation; 0383 owns the
@@ -2916,9 +2920,10 @@ def resolve_and_notify(bus, ticket_id, *, approved_by, identity, log=print):
                   **({"fixer": True, "request_key": current_key,
                       "request_version": request_version,
                       "pr_url": ticket.get("fix_pr_url")} if customer_fix else {})})
-    except BusError as exc:
+    except Exception as exc:  # noqa: BLE001 - an uncertain write never stamps approval
         # The flag or request can change after the precheck; a rejected
-        # reservation must not propagate through the Slack action or stamp approval.
+        # reservation or lost transport response must not stamp approval.
+        # Preserve any committed row for normal readback; do not retry the tap here.
         log(f"[slack-convo/outbox] resolve refused: notice write for ticket "
             f"{ticket_id} failed: {type(exc).__name__}")
         return False
