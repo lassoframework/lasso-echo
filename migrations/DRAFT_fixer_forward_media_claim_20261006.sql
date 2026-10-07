@@ -143,6 +143,8 @@ begin
     where a.alias_key=btrim(r.gym_id);
   tenant:=coalesce(tenant,btrim(r.gym_id));
   snapshot:=jsonb_build_object('calendar_row_id',r.id,'tenant_id',tenant,
+    'gym_id',r.gym_id,'account',r.account,'format',r.format,
+    'gbp_location_id',r.gbp_location_id,
     'post_date',r.post_date,'group_key',r.visual_group_key,
     'source_url',r.source_media_url,'image_url',r.image_url,'thumbnail_url',r.thumbnail_url);
   return snapshot||jsonb_build_object('revision',md5(snapshot::text));
@@ -231,7 +233,7 @@ grant execute on function public.fixer_attest_forward_media_20261006(uuid,text,u
   to fixer_forward_media_attester_20261006;
 
 create function public.fixer_claim_forward_media_20261006(
-  p_calendar_row_id uuid,p_claim_token uuid,p_evidence_id uuid
+  p_calendar_row_id uuid,p_claim_token uuid,p_evidence_id uuid,p_expected_revision text
 ) returns boolean language plpgsql security definer
 set search_path=pg_catalog,public as $$
 declare
@@ -243,7 +245,8 @@ declare
   receipt public.fixer_forward_media_claim_receipt_20261006%rowtype;
   occupied public.fixer_forward_media_use_20261006%rowtype;
 begin
-  if p_calendar_row_id is null or p_claim_token is null or p_evidence_id is null then
+  if p_calendar_row_id is null or p_claim_token is null or p_evidence_id is null
+      or nullif(btrim(p_expected_revision),'') is null then
     raise exception 'existing owned calendar claim required' using errcode='22023';
   end if;
   -- Shared graph authority persists through occupancy/receipt commit. Claims
@@ -257,10 +260,22 @@ begin
   if not found or r.publish_claim_token is distinct from p_claim_token
       or r.status is null or r.status not in ('publishing','published')
       or r.variant_status is distinct from 'active'
-      or r.post_date is null or r.publish_reservation_day is null
+      or r.post_date is null
       or r.media_not_ready_reason is not null
       or nullif(btrim(r.visual_group_key),'') is null then
     raise exception 'calendar claim ownership or ready media invalid' using errcode='23514';
+  end if;
+  -- Bind exactly the caller's outgoing media snapshot under the row lock.
+  -- A concurrent edit/re-attestation cannot authorize different outbound bytes.
+  if public.fixer_forward_media_attestation_request_20261006(r.id)->>'revision'
+      is distinct from p_expected_revision then
+    raise exception 'outgoing media revision changed' using errcode='23514';
+  end if;
+  -- The publisher must bind its gym-local attempt day under the owned token
+  -- before this RPC. Never infer it from UTC or the content date: catch-up may
+  -- send on a different local day.
+  if r.publish_reservation_day is null then
+    raise exception 'owned publishing reservation day unavailable' using errcode='23514';
   end if;
   select a.tenant_id into tenant from public.fixer_forward_media_tenant_alias_20261006 a
     where a.alias_key=btrim(r.gym_id);
@@ -358,6 +373,6 @@ begin
   return true;
 end;
 $$;
-revoke all on function public.fixer_claim_forward_media_20261006(uuid,uuid,uuid) from public,anon,authenticated,service_role;
-grant execute on function public.fixer_claim_forward_media_20261006(uuid,uuid,uuid) to service_role;
+revoke all on function public.fixer_claim_forward_media_20261006(uuid,uuid,uuid,text) from public,anon,authenticated,service_role;
+grant execute on function public.fixer_claim_forward_media_20261006(uuid,uuid,uuid,text) to service_role;
 commit;

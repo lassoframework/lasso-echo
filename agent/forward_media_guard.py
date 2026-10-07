@@ -154,7 +154,7 @@ def attest(calendar_row_id, expected_revision, *, original_verifier=None, contro
             pass
 
 
-def claim(store, calendar_row_id, claim_token, evidence_id):
+def claim(store, calendar_row_id, claim_token, evidence_id, expected_revision):
     """Final provider boundary: success requires literal true from atomic RPC.
 
     Missing evidence, HTTP errors, bad responses and DB exceptions are
@@ -163,6 +163,9 @@ def claim(store, calendar_row_id, claim_token, evidence_id):
     """
     arguments = dict(zip(('p_calendar_row_id', 'p_claim_token', 'p_evidence_id'),
                          map(_uuid, (calendar_row_id, claim_token, evidence_id))))
+    if not isinstance(expected_revision, str) or not expected_revision:
+        raise ForwardMediaVerificationHold('expected outgoing media revision required')
+    arguments['p_expected_revision'] = expected_revision
     try:
         response = store._client().post(
             store._rest('rpc/fixer_claim_forward_media_20261006'),

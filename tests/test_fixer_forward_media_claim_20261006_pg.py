@@ -38,10 +38,12 @@ def main():
                 assert result.returncode != 0, 'unexpected SQL success'
             return result.stdout.strip() if ok else result.stderr
 
-        def claim(pair, ok=True):
+        def claim(pair, ok=True, expected_revision=None):
             rid, token, evidence = pair
+            expected_revision = expected_revision or sql(
+                f"select fixer_forward_media_attestation_request_20261006('{rid}')->>'revision';")
             return sql("set role service_role; select public.fixer_claim_forward_media_20261006"
-                       f"('{rid}','{token}','{evidence}');", ok)
+                       f"('{rid}','{token}','{evidence}','{expected_revision}');", ok)
 
         def row(tenant, group, url, day='2026-10-10', reservation='2026-10-10', image=None, thumbnail=None):
             rid, token = str(uuid.uuid4()), str(uuid.uuid4())
@@ -75,14 +77,16 @@ def main():
 
         def race(pair):
             rid,token,evidence = pair
+            expected_revision = sql(f"select fixer_forward_media_attestation_request_20261006('{rid}')->>'revision';")
             return subprocess.run(base, input="begin; set role service_role; select "
-                f"fixer_claim_forward_media_20261006('{rid}','{token}','{evidence}');"
+                f"fixer_claim_forward_media_20261006('{rid}','{token}','{evidence}','{expected_revision}');"
                 "select pg_sleep(0.5); commit;", text=True,capture_output=True,timeout=15)
 
         try:
             sql("create role anon; create role authenticated; create role service_role;"
                 "create table content_calendar(id uuid primary key,gym_id text,post_date date,"
-                "status text,variant_status text,published_at timestamptz,publish_claim_token uuid,"
+                "account text,format text,gbp_location_id text,status text,variant_status text,"
+                "published_at timestamptz,publish_claim_token uuid,"
                 "publish_reservation_day date,late_post_id text,image_url text,thumbnail_url text,"
                 "media_not_ready_reason text);")
             # Apply only this self-contained draft. NO #306/#307 dependency.
@@ -116,7 +120,7 @@ def main():
             assert 'permission denied' in sql("set role service_role; insert into fixer_forward_media_object_read_20261006"
                 f" values('{uuid.uuid4()}','{tenant}','https://scratch.example/forged','{fp}',10,'forged','forged',now());",ok=False)
             assert 'permission denied' in sql("set role authenticated; select fixer_claim_forward_media_20261006"
-                f"('{first[0]}','{first[1]}','{first[2]}');",ok=False)
+                f"('{first[0]}','{first[1]}','{first[2]}','revision');",ok=False)
             assert 'permission denied' in sql("set role service_role; update fixer_forward_media_claim_gate_20261006 set enabled=true;",ok=False)
             assert 'permission denied' in sql("set role fixer_forward_media_attester_20261006; delete from fixer_forward_media_use_20261006;",ok=False)
             missing = (*row(tenant,group,url),str(uuid.uuid4()))
@@ -201,7 +205,25 @@ def main():
             assert sql(f"select count(*) from fixer_forward_media_use_20261006 where fingerprint='{tfp}';")=='0'
             # Fixed transaction snapshots cannot bypass post-lock graph refresh.
             assert 'read committed isolation' in sql("begin isolation level repeatable read; set role service_role; "
-                f"select fixer_claim_forward_media_20261006('{target[0]}','{target[1]}','{target[2]}'); commit;",ok=False)
+                f"select fixer_claim_forward_media_20261006('{target[0]}','{target[1]}','{target[2]}','revision'); commit;",ok=False)
+            # Outgoing revision is locked even if a concurrent writer re-attests.
+            stale, _tenant, _group, _url, stale_fp = seed()
+            old_revision = sql(f"select fixer_forward_media_attestation_request_20261006('{stale[0]}')->>'revision';")
+            sql(f"update content_calendar set image_url='https://scratch.example/revised' where id='{stale[0]}';")
+            new_evidence = attest(stale[:2], stale_fp, image_fp='md5:'+uuid.uuid4().hex, operation='render')
+            assert 'outgoing media revision changed' in claim(new_evidence, ok=False, expected_revision=old_revision)
+            assert sql(f"select count(*) from fixer_forward_media_claim_receipt_20261006 where calendar_row_id='{stale[0]}';") == '0'
+            # GBP publisher binds its gym-local attempt day under its token;
+            # the authority never substitutes UTC or the old content date.
+            gbp_pair, _, _, _, gbp_fp = seed(day='2026-09-01')
+            sql(f"update content_calendar set account='googlebusiness',publish_reservation_day=null where id='{gbp_pair[0]}';")
+            gbp_pair = attest(gbp_pair[:2], gbp_fp)
+            assert 'reservation day unavailable' in claim(gbp_pair, ok=False)
+            sql(f"update content_calendar set publish_reservation_day='2026-08-31' "
+                f"where id='{gbp_pair[0]}' and publish_claim_token='{gbp_pair[1]}';")
+            assert claim(gbp_pair) == 't'
+            assert sql(f"select reservation_day from fixer_forward_media_claim_receipt_20261006 where calendar_row_id='{gbp_pair[0]}';") == '2026-08-31'
+            assert sql(f"select post_date from fixer_forward_media_claim_receipt_20261006 where calendar_row_id='{gbp_pair[0]}';") == '2026-09-01'
             # Deleting content never frees consumed bytes or receipts.
             sql(f"delete from content_calendar where id='{first[0]}';")
             assert sql(f"select count(*) from fixer_forward_media_use_20261006 where fingerprint='{fp}';")=='1'

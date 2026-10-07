@@ -138,7 +138,7 @@ def test_claim_only_literal_true_and_distinct_duplicate(status, payload, error):
     response=SimpleNamespace(status_code=status,json=lambda:payload)
     store=SimpleNamespace(_client=lambda:SimpleNamespace(post=lambda *args,**kwargs:response),
                           _rest=lambda url:url, _headers=lambda headers:headers)
-    args=(store,*[str(uuid.uuid4()) for _ in range(3)])
+    args=(store,*[str(uuid.uuid4()) for _ in range(3)], 'outgoing-revision')
     if error:
         with pytest.raises(error): guard.claim(*args)
     else:

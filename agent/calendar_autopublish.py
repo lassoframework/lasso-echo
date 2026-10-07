@@ -1452,6 +1452,7 @@ def publish_due(run_date, *, gym_id="lasso", store=None, publisher=None,
     skipped = []
     failed = []
     waiting = []            # slot not arrived yet: left pending for a later run
+    forward_media_holds = {}
     recovery_required = []  # pre-network block claimed a row, but rollback was unconfirmed
     published_accounts = set()
 
@@ -2078,6 +2079,31 @@ def publish_due(run_date, *, gym_id="lasso", store=None, publisher=None,
             failed.append(row_id)
             continue
 
+        # Default-OFF byte authority: a failed check is a proven pre-network
+        # hold. Only release a lease whose persisted token this run owns.
+        from . import forward_media_guard as _fmg
+        from .forward_media_publish import authorize as _authorize_media
+        if _fmg.enabled():
+            try:
+                if draft.creative_public_url != row.get("image_url"):
+                    raise _fmg.ForwardMediaVerificationHold("outgoing draft media differs from row")
+                _authorize_media(store, row, claim_token)
+            except _fmg.ForwardMediaVerificationHold as exc:
+                reason = ("forward_media_duplicate" if isinstance(
+                    exc, _fmg.ForwardMediaDuplicateHold) else "forward_media_verification")
+                forward_media_holds[row_id] = reason
+                reverted = False
+                if claim_token:
+                    reverted = _revert_to_pending(
+                        store, row_id, reject_reason=reason, gym_id=gym_id,
+                        expected_claim_token=claim_token,
+                        revert_status="approved" if approved_only else "pending")
+                if not reverted:
+                    recovery_required.append(row_id)
+                _alert_publish_blocked(gym_id, row_id, reason, reverted=reverted)
+                failed.append(row_id)
+                continue
+
         # CAPTION TRACE (pure logging, WIRING.md 2026-08-27): stage-by-stage
         # visible-length for the outbound caption, so a caption that goes
         # missing between the row and the API call is grep-able as
@@ -2244,7 +2270,8 @@ def publish_due(run_date, *, gym_id="lasso", store=None, publisher=None,
 
     return {"ok": True, "published": published, "skipped": skipped,
             "failed": failed, "waiting": waiting,
-            "held": bool(recovery_required),
+            "held": bool(recovery_required or forward_media_holds),
+            "forward_media_holds": forward_media_holds,
             "recovery_required": recovery_required, "date": run_date}
 
 
