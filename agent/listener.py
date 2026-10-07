@@ -16,11 +16,12 @@ approver's taps do anything. Everyone else is denied.
 Run:  python -m agent listen
 """
 
+import hashlib
 import json
 import os
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from . import config, ops_alerts, schedule
 from .approvals import handle_action
@@ -590,6 +591,99 @@ def _start_shared_media_runway_refresh():
 # Independent from run_daily: a long draw must not starve pending media evidence.
 _MEDIA_MODERATION_DAILY_LIMIT = 50  # existing asset budget, including videos
 _MEDIA_MODERATION_POLL_SECONDS = 3600  # at most 24 inventory/gate checks per day
+_MEDIA_MODERATION_RETRY_KEY = "gym_media_moderation_retry_v1"
+_MEDIA_MODERATION_RETRY_MAX_ASSETS = 20000
+_MEDIA_MODERATION_RETRY_MAX_BYTES = 8 * 1024 * 1024
+_MEDIA_MODERATION_RETRY_RETENTION_DAYS = 180
+
+
+def _moderation_retry_ref(gym_id, asset_id):
+    """Opaque stable ref for auxiliary retry state; never suitable for logs."""
+    return hashlib.sha256(f"{gym_id}\0{asset_id}".encode()).hexdigest()
+
+
+def _moderation_retry_binding(asset):
+    """Bind retry state to the source and exact indexed content version."""
+    raw = f"{asset.get('source_id') or ''}\0{asset.get('content_hash') or ''}"
+    return hashlib.sha256(raw.encode()).hexdigest()
+
+
+def _moderation_retry_state(db, now):
+    raw = db.kv_get(_MEDIA_MODERATION_RETRY_KEY, "")
+    if not raw:
+        return {}
+    if len(raw) > _MEDIA_MODERATION_RETRY_MAX_BYTES:
+        raise ValueError("durable moderation retry state exceeds size bound")
+    state = json.loads(raw)
+    if (not isinstance(state, dict) or set(state) != {"version", "assets"}
+            or state.get("version") != 1 or not isinstance(state.get("assets"), dict)
+            or len(state["assets"]) > _MEDIA_MODERATION_RETRY_MAX_ASSETS):
+        raise ValueError("invalid durable moderation retry state")
+    cutoff = now.timestamp() - _MEDIA_MODERATION_RETRY_RETENTION_DAYS * 86400
+    clean = {}
+    for ref, item in state["assets"].items():
+        if (not isinstance(ref, str) or len(ref) != 64
+                or any(c not in "0123456789abcdef" for c in ref)
+                or not isinstance(item, dict)
+                or set(item) != {"binding", "category", "failures", "retry_after", "updated_at"}
+                or not isinstance(item.get("binding"), str) or len(item["binding"]) != 64
+                or any(c not in "0123456789abcdef" for c in item["binding"])
+                or item.get("category") not in {"drive_http_403", "drive_http_404",
+                    "drive_http_429", "drive_http_5xx", "drive_transport"}
+                or type(item.get("failures")) is not int or item["failures"] < 1
+                or not isinstance(item.get("retry_after"), str)
+                or len(item["retry_after"]) > 64
+                or not isinstance(item.get("updated_at"), str)
+                or len(item["updated_at"]) > 64):
+            raise ValueError("invalid durable moderation retry entry")
+        updated = datetime.fromisoformat(item["updated_at"])
+        retry_after = datetime.fromisoformat(item["retry_after"])
+        if updated.tzinfo is None or retry_after.tzinfo is None:
+            raise ValueError("naive moderation retry timestamp")
+        if updated > now + timedelta(minutes=5):
+            raise ValueError("future moderation retry timestamp")
+        expected_delay = timedelta(days=_moderation_retry_delay_days(
+            item["category"], item["failures"]))
+        if abs((retry_after - updated - expected_delay).total_seconds()) > 1:
+            raise ValueError("misaligned moderation retry deadline")
+        if updated.timestamp() >= cutoff:
+            clean[ref] = item
+    return clean
+
+
+def _moderation_retry_delay_days(category, failures):
+    # A once-daily lane gains nothing from a sub-day retry. Repeated unavailable
+    # Drive references back off but remain scheduled for eventual automatic retry.
+    cap = 30 if category in ("drive_http_403", "drive_http_404") else 7
+    base = 7 if category == "drive_http_404" else 1
+    return min(base * (2 ** min(max(failures - 1, 0), 5)), cap)
+
+
+def _record_moderation_retry(state, asset, gym_id, asset_id, retry, now):
+    ref = _moderation_retry_ref(gym_id, asset_id)
+    binding = _moderation_retry_binding(asset)
+    previous = state.get(ref)
+    category = retry.get("category")
+    failures = (previous["failures"] + 1
+                if previous and previous["binding"] == binding
+                and previous["category"] == category else 1)
+    delay = _moderation_retry_delay_days(category, failures)
+    state[ref] = {
+        "binding": binding,
+        "category": category,
+        "failures": failures,
+        "retry_after": (now + timedelta(days=delay)).isoformat(),
+        "updated_at": now.isoformat(),
+    }
+
+
+def _save_moderation_retry_state(db, state):
+    if len(state) > _MEDIA_MODERATION_RETRY_MAX_ASSETS:
+        raise ValueError("moderation retry state capacity exceeded")
+    raw = json.dumps({"version": 1, "assets": state}, sort_keys=True)
+    if len(raw) > _MEDIA_MODERATION_RETRY_MAX_BYTES:
+        raise ValueError("moderation retry state exceeds size bound")
+    db.kv_set(_MEDIA_MODERATION_RETRY_KEY, raw)
 
 
 def _run_media_moderation_day(now=None, *, store=None, drive=None, vision=None):
@@ -647,9 +741,11 @@ def _run_media_moderation_day_locked(now=None, *, store=None, drive=None, vision
     vision = vision if vision is not None else moderation.default_vision()
     if vision is None:
         return {"ok": False, "reason": "vision provider unarmed"}
+    retry_state = _moderation_retry_state(db, now)
     sources = store.list_sources()
     verified = account_key_resolve.resolve_known_source_keys(s.get("gym_id") for s in sources)
     candidates = {}
+    cooldown_deferred = 0
     for source in sources:
         gym = verified.get(source.get("gym_id"))
         if (not gym or source.get("active") is not True
@@ -663,6 +759,14 @@ def _run_media_moderation_day_locked(now=None, *, store=None, drive=None, vision
                     and asset.get("review_status") == "pending_review"
                     and asset.get("moderation_status") == "pending"
                     and asset.get("content_hash") and asset.get("id")):
+                retry_ref = _moderation_retry_ref(gym, asset["id"])
+                retry = retry_state.get(retry_ref)
+                if retry and retry["binding"] != _moderation_retry_binding(asset):
+                    retry_state.pop(retry_ref, None)
+                    retry = None
+                if retry and datetime.fromisoformat(retry["retry_after"]) > now:
+                    cooldown_deferred += 1
+                    continue
                 candidates[(gym, asset["id"])] = asset
     # A crashed previous-day request may have spent at the provider without
     # storing evidence. Give its selected assets one day off, then re-eligible
@@ -680,7 +784,10 @@ def _run_media_moderation_day_locked(now=None, *, store=None, drive=None, vision
     # one large gym cannot monopolize the whole batch.
     gyms = sorted({gym for gym, _ in candidates})
     if not gyms:
-        return {"ok": True, "reason": "no pending eligible assets", "attempted": 0}
+        reason = ("retry cooldown active" if cooldown_deferred
+                  else "no pending eligible assets")
+        return {"ok": True, "reason": reason, "attempted": 0,
+                "cooldown_deferred": cooldown_deferred}
     ordinal = now.date().toordinal()
     offset = ordinal % len(gyms)
     gyms = gyms[offset:] + gyms[:offset]
@@ -714,10 +821,27 @@ def _run_media_moderation_day_locked(now=None, *, store=None, drive=None, vision
             try:
                 result = moderation.moderate_asset(gym, asset_id, store=store,
                     drive=drive, vision=vision, now_iso=now.isoformat())
+                asset = candidates[(gym, asset_id)]
+                retry = result.get("retry")
+                retry_categories = {"drive_http_403", "drive_http_404",
+                    "drive_http_429", "drive_http_5xx", "drive_transport"}
+                if result.get("ok") is True:
+                    retry_state.pop(_moderation_retry_ref(gym, asset_id), None)
+                elif isinstance(retry, dict) and retry.get("category") in retry_categories:
+                    _record_moderation_retry(retry_state, asset, gym, asset_id,
+                                             retry, now)
+                else:
+                    # The Drive bytes were available or the failure was outside
+                    # the retryable access/transport classes; forget stale cooldown.
+                    retry_state.pop(_moderation_retry_ref(gym, asset_id), None)
                 results.append({"ok": result.get("ok") is True,
                                 "reason": result.get("reason")})
             except Exception as exc:
                 results.append({"ok": False, "reason": type(exc).__name__})
+            # Persist each known outcome before starting the next asset. A crash
+            # later in the reserved batch must not erase retry cooldowns already
+            # learned from Drive.
+            _save_moderation_retry_state(db, retry_state)
     finally:
         # Partial execution stays consumed. Completion write failure leaves the
         # initial reservation intact, preventing duplicate spend.
@@ -733,6 +857,7 @@ def _run_media_moderation_day_locked(now=None, *, store=None, drive=None, vision
             conn.close()
     return {"ok": all(r["ok"] for r in results), "attempted": len(results),
             "recorded": receipt["recorded"], "reserved": len(selected),
+            "cooldown_deferred": cooldown_deferred,
             "failures": receipt["failures"]}
 
 
