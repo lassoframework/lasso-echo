@@ -219,3 +219,49 @@ def test_producer_claim_cannot_switch_approved_runtime(package):
 def test_missing_provider_output_identity(package):
     package[0]['payload']['provider_output_id'] = ''
     held(package, 'generated_receipt_shape_invalid')
+
+
+@pytest.mark.parametrize('callback', ['approved_key', 'verified_evidence'])
+def test_backend_cannot_mutate_authenticated_payload_to_substitute_bytes(package, callback):
+    packet, _, backend, _ = package
+    original_text = canonical(packet['payload'])
+    substituted = b'malicious replacement with different length'
+
+    def mutate_packet():
+        packet['payload'].update(image_sha256=sha256(substituted),
+            image_fingerprint='md5:' + hashlib.md5(substituted).hexdigest(),
+            image_length=len(substituted))
+        backend.evidence = replace(backend.evidence,
+            receipt_payload_json=original_text, immutable_image_bytes=substituted)
+
+    if callback == 'approved_key':
+        def lookup(key_id):
+            mutate_packet()
+            return backend.key
+        backend.approved_key = lookup
+    else:
+        def evidence(request, text):
+            mutate_packet()
+            return backend.evidence
+        backend.verified_evidence = evidence
+
+    held(package, 'generated_original_bytes_changed')
+
+
+def test_callback_packet_mutation_does_not_change_prepared_signed_snapshot(package):
+    packet, _, backend, _ = package
+    original_text, original_sig = canonical(packet['payload']), packet['signature_hex']
+    original_evidence = backend.evidence
+
+    def lookup(key_id):
+        packet['payload']['image_sha256'] = sha256(b'substitution')
+        packet['payload']['tenant_id'] = 'other-tenant'
+        packet['signature_hex'] = '00' * 64
+        return backend.key
+
+    backend.approved_key = lookup
+    prepared = run(package)
+    assert prepared.receipt_payload_json == original_text
+    assert prepared.signature_hex == original_sig
+    assert prepared.image_bytes == original_evidence.immutable_image_bytes
+    assert sha256(prepared.image_bytes) == prepared.payload['image_sha256']

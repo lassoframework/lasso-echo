@@ -35,6 +35,7 @@ import hashlib
 import json
 import re
 from typing import Protocol
+from types import MappingProxyType
 from urllib.parse import urlsplit
 import uuid
 
@@ -192,7 +193,15 @@ def prepare_generated_original(packet, request, backend=None, *, enabled=False,
         if (not isinstance(packet, dict) or set(packet) != {'payload', 'signature_hex'}
                 or not isinstance(packet['payload'], dict) or set(packet['payload']) != _FIELDS):
             _hold('generated_receipt_shape_invalid')
-        p = packet['payload']
+        # Capture payload and signature before invoking any external callback.
+        # Canonical JSON detaches nested producer containers; every accepted
+        # field is scalar, so the read-only mapping is the immutable snapshot
+        # used for signature, binding and byte verification throughout.
+        text = canonical(packet['payload'])
+        if len(text.encode()) > MAX_RECEIPT_BYTES:
+            _hold('generated_receipt_shape_invalid')
+        p = MappingProxyType(json.loads(text))
+        signature_hex = packet['signature_hex']
         if type(p['schema_version']) is not int or p['schema_version'] != 1:
             _hold('generated_receipt_version_unsupported')
         for name in _FIELDS - {'schema_version', 'image_length'}:
@@ -221,17 +230,14 @@ def prepare_generated_original(packet, request, backend=None, *, enabled=False,
                 or not requested <= created <= now
                 or (now - requested).total_seconds() > max_age_seconds):
             _hold('generated_receipt_stale_or_future')
-        text = canonical(p)
-        if len(text.encode()) > MAX_RECEIPT_BYTES:
-            _hold('generated_receipt_shape_invalid')
         key = backend.approved_key(p['key_id'])
         if (type(key) is not ApprovedGenerationKey or key.approved is not True
                 or key.role != 'independent_generation_verifier' or key.key_id != p['key_id']
                 or any(getattr(key, n) != p[n] for n in ('provider', 'model', 'runtime_id'))):
             _hold('generated_signer_unapproved')
-        sig = bytes.fromhex(packet['signature_hex'])
+        sig = bytes.fromhex(signature_hex)
         pub = bytes.fromhex(key.public_key_hex)
-        if len(sig) != 64 or len(pub) != 32 or sig.hex() != packet['signature_hex']:
+        if len(sig) != 64 or len(pub) != 32 or sig.hex() != signature_hex:
             _hold('generated_signature_invalid')
         from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
         from cryptography.exceptions import InvalidSignature
