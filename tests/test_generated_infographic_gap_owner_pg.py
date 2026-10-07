@@ -1,0 +1,171 @@
+"""Run as a script: disposable PG17 gap dispatch/bind/reserve/claim proof.
+
+No production credentials, remote providers, or persistent databases are used.
+"""
+import concurrent.futures
+from datetime import timedelta
+import hashlib
+import json
+from pathlib import Path
+import random
+import shutil
+import subprocess
+import sys
+import tempfile
+import uuid
+from unittest.mock import patch
+
+ROOT=Path(__file__).resolve().parents[1]
+sys.path.insert(0,str(ROOT))
+from agent import forward_media_guard as guard, forward_media_owner as owner
+from agent import generated_infographic_gap_owner as gap, generated_infographic_preparation as prep
+from tests.test_generated_owner_guard import candidate, trusted, image_bytes
+
+
+def main():
+ import psycopg
+ pg=Path('/opt/homebrew/opt/postgresql@17/bin')
+ assert shutil.disk_usage('/tmp').free>5*1024**3
+ with tempfile.TemporaryDirectory(prefix='generated_gap_pg_',dir='/tmp') as tmp:
+  root=Path(tmp);sock=root/'sock';sock.mkdir();data=root/'data';port=random.randint(41000,59000)
+  subprocess.run([str(pg/'initdb'),'-D',str(data),'-U','postgres','--no-sync'],check=True,capture_output=True,timeout=60)
+  subprocess.run([str(pg/'pg_ctl'),'-D',str(data),'-l',str(root/'pg.log'),'-o',f"-k {sock} -p {port} -c listen_addresses=''",'-w','start'],check=True,capture_output=True,timeout=60)
+  try:
+   def dsn(role='postgres'):return f'host={sock} port={port} dbname=postgres user={role}'
+   admin=psycopg.connect(dsn(),autocommit=True)
+   admin.execute("set statement_timeout='5s'")
+   def sql(q,args=None):
+    c=admin.execute(q,args);return c.fetchall() if c.description else None
+   def lane(role):
+    c=psycopg.connect(dsn(role));c.execute("set statement_timeout='5s'");c.commit();return c
+   def denied(fn,reason=None):
+    try:fn()
+    except psycopg.Error as e:
+     if reason:assert reason in str(e),str(e)
+    else:raise AssertionError('unsafe gap mutation unexpectedly accepted')
+   sql('create role anon;create role authenticated;create role service_role login;'
+       'create table content_calendar(id uuid primary key,gym_id text,logical_post_id uuid,post_date date,account text,format text,gbp_location_id text,status text,variant_status text,published_at timestamptz,publish_claim_token uuid,publish_reservation_day date,late_post_id text,image_url text,thumbnail_url text,media_not_ready_reason text,caption text);'
+       'create table media_source(id text primary key,gym_id text,kind text,folder_id text,active boolean,sync_status text,sync_finished_at timestamptz);'
+       'create table media_asset(id text primary key,source_id text,gym_id text,content_hash text,rendition_url text,kind text,eligible boolean,excluded_by_coach boolean,review_status text,moderation_status text,review_content_hash text,reviewed_by text,reviewed_at timestamptz,moderation_json jsonb,people_detected boolean,used_count integer);')
+   for name in ('DRAFT_fixer_forward_media_claim_20261006.sql','DRAFT_fixer_forward_media_observation_bridge_20261007.sql','DRAFT_fixer_forward_media_source_history_20261007.sql','DRAFT_fixer_forward_media_photo_certificate_20261007.sql','DRAFT_fixer_owner_photo_clearance_20261007.sql','DRAFT_fixer_generated_owner_20261007.sql','DRAFT_fixer_generated_gap_dispatch_20261007.sql'):
+    sql((ROOT/'migrations'/name).read_text())
+   sql('create role generated_owner login;grant fixer_forward_media_owner_20261006 to generated_owner;'
+       'create role mixed_owner login;grant fixer_forward_media_owner_20261006,service_role to mixed_owner;'
+       'alter role fixer_forward_media_attester_20261006 login;'
+       'grant select,insert,update,delete on content_calendar to service_role;')
+   baseline=str(uuid.uuid4())
+   sql("insert into fixer_forward_media_photo_policy_20261007 values('SYNTHETIC policy',true,'complete_fleet_still_photo_history',null,'SYNTHETIC reconciliation','SYNTHETIC admin')")
+   sql("insert into fixer_forward_media_photo_baseline_20261007(baseline_id,policy_id,scope_complete,rows_json,historical_manifest_ref,declared_full_fleet_row_count) values(%s,'SYNTHETIC policy',true,'[]','SYNTHETIC empty full fleet',0)",(baseline,))
+   sql("update fixer_forward_media_photo_state_20261007 set baseline_id=%s,generation=1,enabled=true,routes_reconciled_ref='SYNTHETIC routes'",(baseline,))
+   sql("insert into fixer_forward_media_claim_gate_20261006 values('gym',true),('other',true)")
+   today=sql('select current_date')[0][0];day=today+timedelta(days=1)
+   service=lane('service_role');conn=lane('generated_owner')
+   def dispatch(gym='gym',date_=day,account='instagram',request=None):
+    request=request or str(uuid.uuid4())
+    result=service.execute('select fixer_generated_gap_dispatch_20261007(%s,%s,%s,%s,%s)',
+                           (request,gym,date_,account,'feed')).fetchone()[0]
+    service.commit();return result
+   refs=('SYNTHETIC approved words','client-source:sha256:'+'a'*64,'sha256:'+'b'*64,'b'*64,'brand-colors:sha256:'+'c'*64)
+   logical=str(uuid.uuid4());group='vg_generated_'+uuid.UUID(logical).hex
+   def args(q,row=None):return (q['request_id'],row or str(uuid.uuid4()),logical,group,*refs)
+   def bind(c,a,commit=True):
+    result=c.execute('select fixer_generated_gap_bind_20261007('+','.join(['%s']*9)+')',a).fetchone()[0]
+    if commit:c.commit()
+    return result
+   q=dispatch();a=args(q)
+   assert sql('select count(*) from content_calendar')[0][0]==0
+   assert dispatch(request=q['request_id'])==q
+   denied(lambda:dispatch(request=str(uuid.uuid4())),'identity conflict');service.rollback()
+   denied(lambda:dispatch(date_=today+timedelta(days=10)),'bounded exact');service.rollback()
+   denied(lambda:service.execute('select fixer_generated_gap_pending_20261007(%s,10)',(['gym'],)),'permission denied');service.rollback()
+   denied(lambda:service.execute('insert into fixer_generated_gap_request_20261007(request_id,gym_id,local_date,account,format) values(%s,%s,%s,%s,%s)',(str(uuid.uuid4()),'other',day,'instagram','feed')),'permission denied');service.rollback()
+   denied(lambda:bind(service,a),'permission denied');service.rollback()
+   mixed=lane('mixed_owner');denied(lambda:bind(mixed,a),'isolated existing owner');mixed.rollback();mixed.close()
+   assert conn.execute('select fixer_generated_gap_pending_20261007(%s,10)',(['other'],)).fetchone()[0]==[];conn.rollback()
+   assert len(conn.execute('select fixer_generated_gap_pending_20261007(%s,10)',(['gym'],)).fetchone()[0])==1;conn.rollback()
+   out=bind(conn,a);assert out['bound'] and not out['replayed']
+   assert bind(conn,a)['replayed']
+   assert sql('select count(*) from content_calendar')[0][0]==1
+   r=sql('select status,variant_status,image_url,thumbnail_url,source_media_asset_id,caption,media_not_ready_reason from content_calendar where id=%s',(a[1],))[0]
+   assert r==('pending','active',None,None,None,refs[0],None)
+   denied(lambda:bind(conn,(*a[:4],'Changed words',*a[5:])),'immutable identity');conn.rollback()
+   denied(lambda:service.execute("insert into content_calendar(id,gym_id,post_date,account,format,status,variant_status) values(%s,'gym',%s,'instagram','feed','pending','active')",(str(uuid.uuid4()),day)),'already bound');service.rollback()
+   denied(lambda:service.execute("insert into content_calendar(id,gym_id,post_date,account,format,status,variant_status) values(%s,'gym',%s,'ig','feed','pending','active')",(str(uuid.uuid4()),day)),'already bound');service.rollback()
+   # Human approval remains required and existing holds are neither cleared nor
+   # overwritten. A changed caption/denied slot is held on owner replay.
+   sql("update content_calendar set status='approved',media_not_ready_reason='existing hold' where id=%s",(a[1],))
+   assert bind(conn,a)['replayed']
+   assert sql('select media_not_ready_reason from content_calendar where id=%s',(a[1],))[0][0]=='existing hold'
+   sql('update content_calendar set media_not_ready_reason=null where id=%s',(a[1],))
+   denied(lambda:conn.execute('select fixer_generated_gap_record_20261007(%s,%s,true,null)',(q['request_id'],a[1])),'committed generated reservation');conn.rollback()
+   assert conn.execute('select fixer_generated_gap_record_20261007(%s,%s,false,%s)',(q['request_id'],a[1],'generated_photo_available')).fetchone()[0];conn.commit()
+   assert sql('select state,last_hold from fixer_generated_gap_request_20261007')[0]==('bound','generated_photo_available')
+   # Atomic replay under two independent owner transactions creates one row.
+   q2=dispatch(date_=today+timedelta(days=2));a2=args(q2)
+   def concurrent_bind():
+    c=lane('generated_owner')
+    try:return bind(c,a2)
+    finally:c.close()
+   with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+    results=list(pool.map(lambda _:concurrent_bind(),range(2)))
+   assert sorted(x['replayed'] for x in results)==[False,True]
+   assert sql('select count(*) from content_calendar where id=%s',(a2[1],))[0][0]==1
+   # Occupied legacy alias dates and arbitrary active holds cannot be replaced.
+   occupied=dispatch(gym='other')
+   sql("insert into content_calendar(id,gym_id,post_date,account,format,status,variant_status) values(%s,'other',%s,'ig','feed','pending','active')",(str(uuid.uuid4()),day))
+   denied(lambda:bind(conn,args(occupied)),'already occupied');conn.rollback()
+   assert sql("select calendar_row_id from fixer_generated_gap_request_20261007 where gym_id='other'")[0][0] is None
+   # Late eligible photo prevents ANY placeholder commit, irrespective of
+   # stale scheduler depletion. Unknown readiness SHA fails closed too.
+   photoq=dispatch(gym='photo-gym');photoa=args(photoq)
+   sql("insert into media_source values('source','photo-gym','gym_drive','folder',true,'ready',now())")
+   pixels=image_bytes();fp=hashlib.md5(pixels).hexdigest()
+   proof=dict(verdict='clean',provider='SYNTHETIC scanner',content_hash=fp,asset_id='photo',gym_id='photo-gym',people_detected=False,observed_at='2026-10-07T00:00:00Z',sha256=hashlib.sha256(pixels).hexdigest())
+   sql("insert into media_asset values('photo','source','photo-gym',%s,null,'photo',true,false,'approved','clean',%s,'SYNTHETIC scanner',now(),%s::jsonb,false,999)",(fp,fp,json.dumps(proof)))
+   denied(lambda:bind(conn,photoa),'depletion or sealed');conn.rollback()
+   assert sql('select count(*) from content_calendar where id=%s',(photoa[1],))[0][0]==0
+   sql("update media_asset set moderation_json=moderation_json-'sha256' where id='photo'")
+   denied(lambda:bind(conn,photoa),'depletion or sealed');conn.rollback()
+   sql("delete from media_asset where id='photo';delete from media_source where id='source'")
+   sql('update fixer_forward_media_photo_state_20261007 set baseline_id=null')
+   denied(lambda:bind(conn,photoa),'depletion or sealed');conn.rollback()
+   sql('update fixer_forward_media_photo_state_20261007 set baseline_id=%s',(baseline,))
+   # SQL bind -> B verified original reserve -> queue completion -> normal
+   # attester -> owned publisher claim, using synthetic original bytes only.
+   persistence=owner.ForwardMediaOwnerPersistence(conn,'generated_owner',None)
+   snap=trusted(guard.generated_snapshot(persistence,a[1]));conn.rollback();original=candidate(snap,pixels)
+   with patch('agent.visual_writer_prepare._own_media_url',lambda u:isinstance(u,str) and u.startswith('https://owned.example/')):
+    reserved=guard.reserve_generated(persistence,a[1],original,snap,history_visuals=[],read_bytes=lambda u:pixels);conn.commit()
+    assert reserved['reserved']
+    assert conn.execute('select fixer_generated_gap_record_20261007(%s,%s,true,null)',(q['request_id'],a[1])).fetchone()[0];conn.commit()
+    assert sql('select state,last_hold from fixer_generated_gap_request_20261007 where request_id=%s',(q['request_id'],))[0]==('complete',None)
+    assert sql('select status from content_calendar where id=%s',(a[1],))[0][0]=='approved'
+    revision=sql('select fixer_forward_media_attestation_request_20261006(%s)',(a[1],))[0][0]['revision']
+    receipt=guard.attest(a[1],revision,connection_factory=lambda:lane(guard.ROLE),original_verifier=lambda s,b:b==pixels,read_bytes=lambda u:pixels)
+    token=str(uuid.uuid4())
+    sql("update content_calendar set status='publishing',publish_claim_token=%s,publish_reservation_day=post_date where id=%s",(token,a[1]))
+    assert service.execute('select fixer_claim_forward_media_20261006(%s,%s,%s,%s)',(a[1],token,receipt['evidence_id'],revision)).fetchone()[0] is True;service.commit()
+    # Sibling shares exact logical identity/original; no queue-generated authority.
+    fbq=dispatch(account='facebook');fba=args(fbq);fbrow=bind(conn,fba)
+    fresh=trusted(guard.generated_snapshot(persistence,fba[1]));conn.rollback()
+    assert guard.reserve_generated(persistence,fba[1],original,fresh,history_visuals=[{**h,'visual_sha256':h.get('visual_sha256') or 'sha256:'+hashlib.sha256(pixels).hexdigest()} for h in fresh['history']['rows']],read_bytes=lambda u:pixels)['replayed'];conn.commit()
+    assert fbrow['logical_post_id']==out['logical_post_id']
+   # Exercise the actual idle-transaction owner RPC adapter and durable phase,
+   # without any provider execution or publisher credential fallback.
+   adapter=gap.GapOwnerTransport(persistence,prep.SQLiteGenerationJobs(root/'jobs.sqlite'))
+   discovered=adapter.pending(('photo-gym',),10)
+   assert len(discovered)==1 and discovered[0]['request_id']==photoq['request_id']
+   palette=dict(evidence_ref=refs[-1])
+   bound=adapter.bind(discovered[0],caption=refs[0],source_revision=refs[1],palette=palette,palette_revision=refs[2])
+   assert bound['bound'] and adapter.phase(photoq['request_id'])=='bound'
+   assert adapter.bind(discovered[0],caption=refs[0],source_revision=refs[1],palette=palette,palette_revision=refs[2])['replayed']
+   adapter.record(discovered[0],bound['calendar_row_id'],dict(ok=False,reason='generated_astra_unavailable'))
+   # Competing calendar writer cannot bypass an in-flight graph/slot bind.
+   lock=lane('generated_owner');lock.execute('select pg_advisory_xact_lock(hashtextextended(%s,0))',('fixer_forward_graph_20261006',))
+   denied(lambda:service.execute("insert into content_calendar(id,gym_id,post_date,account,format,status) values(%s,'free',%s,'instagram','feed','pending')",(str(uuid.uuid4()),day)),'authority busy');service.rollback();lock.rollback();lock.close()
+   service.close();conn.close();admin.close()
+   print('PASS: PG17 queue-only dispatch, role isolation, bounded discovery, atomic/idempotent row bind, concurrency, exact refs, occupied/held slots, late-photo and sealed-history rollback, no coach marker, client approval, B reservation/completion and normal attester/publisher claim')
+  finally:
+   subprocess.run([str(pg/'pg_ctl'),'-D',str(data),'-m','immediate','-w','stop'],check=True,capture_output=True,timeout=60)
+
+if __name__=='__main__':main()

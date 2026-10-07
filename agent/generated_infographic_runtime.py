@@ -1,7 +1,7 @@
 """Default-OFF runtime bridge for fresh gym Astra originals.
 
 The scheduler is a publisher process and cannot open the dedicated owner DSN.
-Its dispatch seam intentionally holds until an existing owner transport can bind
+Its queue-only dispatch requests dates; the isolated owner atomically binds
 empty dates to persisted calendar rows. The row runner uses the existing owner,
 Astra, reviewer and R2 adapters; it never approves or clears calendar holds.
 """
@@ -232,6 +232,38 @@ def _runtime_record(jobs, row_id, *, binding=None, source_revision=None, state=N
                     job_state=job[1] if job else 'unstarted', candidate=candidate, source_revision=row[3])
 
 
+
+def _same_post_job(jobs, row_id, frozen, source_revision):
+    """Pin logical IG/FB siblings to one existing execution across spine drift.
+
+    No journal fact authorizes reservation. Current owner facts, strict original
+    validation and B's sealed history epoch checks still run for each row.
+    """
+    with sqlite3.connect(jobs.path, timeout=10) as con:
+        rows = con.execute('SELECT row_id,binding,source_revision FROM generated_runtime_rows WHERE row_id<>?',
+                           (row_id,)).fetchall()
+    matches = []
+    keys = tuple(k for k in frozen if k != 'history_revision')
+    for other_id, raw, revision in rows:
+        if raw is None:
+            continue
+        binding = json.loads(raw)
+        if not all(binding.get(k) == frozen.get(k) for k in ('gym_id','local_date','logical_post_id')):
+            continue
+        if revision != source_revision or any(binding.get(k) != frozen.get(k) for k in keys):
+            raise RuntimeHold('generated_logical_binding_changed')
+        matches.append(_runtime_record(jobs, other_id))
+    if not matches:
+        return None
+    if len({r['job_id'] for r in matches}) != 1:
+        raise RuntimeHold('generated_logical_job_ambiguous')
+    if any(r['state'] == 'committing' for r in matches):
+        raise RuntimeHold('generated_owner_commit_uncertain')
+    if any(r['job_state'] == 'generating' for r in matches):
+        raise RuntimeHold('generated_execution_pending_reconciliation')
+    return _runtime_record(jobs, row_id, binding=matches[0]['binding'], source_revision=source_revision)
+
+
 def run_calendar_row(base, account, row_id, *, persistence, loader=None, jobs=None,
                      provider=None, reviewer=None, storage=None):
     """Generate one exact persisted feed row and acknowledge owner reservation.
@@ -266,6 +298,8 @@ def run_calendar_row(base, account, row_id, *, persistence, loader=None, jobs=No
         before, visuals = loader.load(row_id, base, account)
         request = {k: before[k] for k in prep.BINDING_FIELDS}
         expected_job, frozen = _generation_binding(request, before)
+        if not existing:
+            existing = _same_post_job(jobs, row_id, frozen, before['approved_source_revision'])
         if existing and existing['source_revision'] != before['approved_source_revision']:
             raise RuntimeHold('generated_approved_source_changed')
         if existing and existing['candidate'] is None and existing['binding'] != frozen:
@@ -323,23 +357,53 @@ def run_calendar_row(base, account, row_id, *, persistence, loader=None, jobs=No
         return dict(ok=False, held=True, reason=reason)
 
 
-def run_scheduled(base, account, store, *, logger=None):
-    """Scheduler handoff remains held until the dedicated row-dispatch seam exists.
-
-    The missing operation must atomically bind an empty date to a persisted
-    unsent row and dispatch its ID to the isolated owner using approved copy.
-    The normal publisher store cannot impersonate the owner or carry its DSN.
-    """
+def run_scheduled(base, account, store, *, logger=None, now=None, days_ahead=2):
+    """Dispatch empty photo-depleted dates, never calendar writes or owner DSN."""
     if not enabled():
         return dict(ok=False, held=True, filled=0, reason='generated_runtime_disabled')
     try:
         _account_binding(base, account)
-    except RuntimeHold as exc:
-        return dict(ok=False, held=True, filled=0, reason=str(exc))
-    result = dict(ok=False, held=True, filled=0, reason='generated_gap_owner_transport_missing')
-    if logger:
-        logger(f'{base}: fresh infographic held ({result["reason"]})')
-    return result
+        from . import client_infographic_fill as fill, config
+        state, detail = fill.real_media_status(base, now=now)
+        if state == fill.MEDIA_AVAILABLE:
+            return dict(ok=True, dispatched=0, filled=0, reason='generated_photo_available')
+        if state != fill.MEDIA_DEPLETED:
+            raise RuntimeHold('generated_photo_inventory_uncertain')
+        if store is None or not all(callable(getattr(store, name, None))
+                                    for name in ('_client','_rest','_headers','list_month')):
+            raise RuntimeHold('generated_gap_owner_transport_missing')
+        gaps = fill._empty_upcoming_days(store, base, config.posting_timezone_for(base),
+                                         min(max(int(days_ahead),1),2), now=now)
+        dispatched = []
+        from .accounts import get_account
+        for day in gaps:
+            # A same-gym connected FB mirror gets its own row request with the
+            # exact same logical-post identity derived by the owner.
+            platforms = ['instagram']
+            facebook = get_account(base+'_fb')
+            if facebook is not None:
+                _account_binding(base, facebook)
+                platforms.append('facebook')
+            for platform in platforms:
+                request_id = str(uuid.uuid5(uuid.NAMESPACE_URL,
+                    'echo-generated-gap-request:'+base+':'+day+':'+platform+':feed'))
+                payload = dict(p_request_id=request_id,p_gym=base,p_local_date=day,
+                               p_account=platform,p_format='feed')
+                response = store._client().post(store._rest('rpc/fixer_generated_gap_dispatch_20261007'),
+                    headers=store._headers({'Content-Type':'application/json'}),json=payload,timeout=30)
+                result = response.json()
+                if (not 200<=response.status_code<300 or not isinstance(result,dict)
+                        or result.get('dispatched') is not True or result.get('request_id') != request_id
+                        or any(result.get(k)!=v for k,v in dict(gym_id=base,local_date=day,
+                                                              account=platform,format='feed').items())):
+                    raise RuntimeHold('generated_gap_dispatch_unavailable')
+                dispatched.append(request_id)
+        return dict(ok=True, dispatched=len(dispatched), request_ids=dispatched, filled=0)
+    except Exception as exc:
+        reason = str(exc) if isinstance(exc,RuntimeHold) else 'generated_gap_dispatch_unavailable'
+        if logger:
+            logger(f'{base}: fresh infographic held ({reason})')
+        return dict(ok=False, held=True, filled=0, reason=reason)
 
 
 def validate_publish_palette(row, *, jobs_path=None, palette_loader=None, sources=None):
@@ -397,9 +461,10 @@ def validate_publish_palette(row, *, jobs_path=None, palette_loader=None, source
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument('--gym', required=True)
-    parser.add_argument('--account', required=True)
-    parser.add_argument('--row', required=True)
+    parser.add_argument('--scan', action='store_true')
+    parser.add_argument('--gym')
+    parser.add_argument('--account')
+    parser.add_argument('--row')
     args = parser.parse_args(argv)
     if not enabled():
         report = dict(ok=False, held=True, reason='generated_runtime_disabled')
@@ -409,8 +474,14 @@ def main(argv=None):
             from .accounts import get_account
             from .forward_media_owner import ForwardMediaOwnerPersistence
             persistence = ForwardMediaOwnerPersistence.connect_from_environment()
-            report = run_calendar_row(args.gym, get_account(args.account), args.row,
-                                      persistence=persistence)
+            if args.scan:
+                from .generated_infographic_gap_owner import run_pending
+                report = run_pending(persistence=persistence)
+            elif all((args.gym,args.account,args.row)):
+                report = run_calendar_row(args.gym, get_account(args.account), args.row,
+                                          persistence=persistence)
+            else:
+                report = dict(ok=False,held=True,reason='generated_gap_request_invalid')
         except Exception:
             report = dict(ok=False, held=True, reason='generated_owner_environment_unavailable')
         finally:

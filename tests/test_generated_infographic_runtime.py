@@ -224,6 +224,7 @@ def test_legacy_fill_not_called_when_fresh_lane_is_enabled(monkeypatch):
     monkeypatch.setenv(runtime.FLAG, 'true')
     def forbidden(*a, **k): raise AssertionError('Legacy fallback must not run')
     monkeypatch.setattr(client_infographic_fill, 'fill_gaps', forbidden)
+    monkeypatch.setattr(client_infographic_fill, 'real_media_status', lambda *a,**k: (client_infographic_fill.MEDIA_DEPLETED, {}))
     result = client_media_sync._maybe_infographic_fill('same-gym',
         SimpleNamespace(key='same-gym_ig',platform='instagram'), object(), lambda text: None)
     assert result['reason'] == 'generated_gap_owner_transport_missing'
@@ -369,9 +370,10 @@ def test_invalid_cached_proof_holds(system):
 
 
 def test_no_sources_legacy_seed_suppressed_under_new_on_flag(monkeypatch):
-    from agent import client_media_sync, no_media_astra_seed
+    from agent import client_media_sync, no_media_astra_seed, client_infographic_fill
     monkeypatch.setenv(runtime.FLAG,'true')
     monkeypatch.setattr(no_media_astra_seed,'enabled',lambda: True)
+    monkeypatch.setattr(client_infographic_fill, 'real_media_status', lambda *a,**k: (client_infographic_fill.MEDIA_DEPLETED, {}))
     monkeypatch.setattr(no_media_astra_seed,'seed_gaps',lambda *a,**k: pytest.fail('legacy seed ran'))
     result = client_media_sync._maybe_seed_no_media_astra('same-gym',
         SimpleNamespace(key='same-gym_ig',platform='instagram'), object(), lambda text: None)
@@ -390,3 +392,44 @@ def test_approved_source_revocation_or_metadata_change_blocks_send(system):
     with pytest.raises(runtime.RuntimeHold, match='generated_approved_source_changed'):
         runtime.validate_publish_palette(row, jobs_path=str(system.case.jobs.path),
             palette_loader=lambda base,key:(system.palette,'palette-v1'), sources=lambda key:[system.source])
+
+
+def test_same_day_facebook_sibling_reuses_original_after_history_drift(system, monkeypatch):
+    assert run(system)['ok']
+    old_job = system.reserved[0]['job_id']
+    sibling = str(uuid.uuid4())
+    system.snap['account'] = 'facebook'
+    system.snap['history_revision'] = 'history-after-instagram-reservation'
+    system.snap['history']['spine_digest'] = system.snap['history_revision']
+    reserved = []
+    monkeypatch.setattr(guard, 'reserve_generated', lambda p,rid,candidate,current,**kw:
+                        reserved.append(candidate) or dict(receipt_ref='sibling'))
+    result = runtime.run_calendar_row('same-gym', SimpleNamespace(key='same-gym_fb',platform='facebook_page'),
+        sibling, persistence=system.persistence, loader=system.loader, jobs=system.case.jobs,
+        provider=system.case.provider,reviewer=system.case.reviewer,storage=system.case.storage)
+    assert result['ok'] and reserved[0]['job_id'] == old_job
+    assert system.case.provider.calls == system.case.reviewer.calls == 1
+
+
+def test_sibling_ambiguous_provider_never_mints_second_job(system):
+    calls = []
+    system.case.provider.create = lambda brief,job: calls.append(job) or (_ for _ in ()).throw(TimeoutError())
+    assert run(system)['reason'] == 'generated_preparation_unavailable'
+    system.snap['account'] = 'facebook'
+    system.snap['history_revision'] = 'new-history'
+    system.snap['history']['spine_digest'] = 'new-history'
+    result = runtime.run_calendar_row('same-gym', SimpleNamespace(key='same-gym_fb',platform='facebook_page'),
+        str(uuid.uuid4()),persistence=system.persistence,loader=system.loader,jobs=system.case.jobs,
+        provider=system.case.provider,reviewer=system.case.reviewer,storage=system.case.storage)
+    assert result['reason'] == 'generated_execution_pending_reconciliation' and len(calls)==1
+
+
+def test_same_logical_sibling_with_new_copy_receipt_holds_old_job(system):
+    assert run(system)['ok']
+    system.source.citation='changed approved metadata'
+    system.snap['account']='facebook'
+    result=runtime.run_calendar_row('same-gym',SimpleNamespace(key='same-gym_fb',platform='facebook_page'),
+        str(uuid.uuid4()),persistence=system.persistence,loader=system.loader,jobs=system.case.jobs,
+        provider=system.case.provider,reviewer=system.case.reviewer,storage=system.case.storage)
+    assert result['reason']=='generated_logical_binding_changed'
+    assert system.case.provider.calls==1
