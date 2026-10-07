@@ -445,7 +445,12 @@ def _humanize_stem(stem):
             continue
         low = tok.lower()
         if low in ("img", "image", "photo", "video", "vid", "final", "original",
-                   "edit", "copy"):
+                   "edit", "copy", "feedfit", "storyfit", "src", "rendition"):
+            continue
+        # Camera default prefixes (DSC_4412, DSCN0042, PXL_2026..., GOPR0123) name
+        # the camera, not the scene. "DSC" handed to SB7 as a scene hint is what made
+        # it ask what the photo shows (Bolton Club, 2026-10-07).
+        if re.fullmatch(r"(?:dsc[nf]?|pxl|mvimg|gopr|gp|dji|dcim|sam|wp|pict|imgp)\d*", low):
             continue
         if tok.isdigit():                       # bare counter like 1946
             continue
@@ -581,7 +586,12 @@ def make_caption(account, source, voice, creative_key, creative=None,
                 # personalizes a child onto an ungrounded photo, is a fabrication and
                 # falls back to compose_caption (the deterministic, source-verbatim,
                 # always-safe baseline) instead of shipping.
-                if rotation.caption_output_gate_clean(
+                if _copy_gate.is_meta_reply(cleaned):
+                    # The generator's own retry did not catch it (or a stub returned it):
+                    # a clarification request is never staged. Fall to the baseline.
+                    print(f"[client-caption] SB7 output for {account.key} was a "
+                          "clarification or meta reply, not a caption; using the baseline")
+                elif rotation.caption_output_gate_clean(
                         cleaned, getattr(source, "text", ""), verified=verified,
                         photo_hint=hint):
                     return cleaned, (tags or fallback_hashtags(account))
@@ -607,6 +617,13 @@ def compose_caption(account, source, voice, creative_key):
             caption = (body + "\n\n" + cta).strip()
     hashtags = variant_hashtags(account.platform,
                                 _select_hashtags(voice, _CtaKey(creative_key)))
+    if _copy_gate.is_meta_reply(caption):
+        # Never stage a meta reply, even on the template path (its source text could
+        # itself be a stored model reply). An empty caption is the existing "do not
+        # stage this slot" signal every caller already honors.
+        print(f"[client-caption] baseline caption for {getattr(account, 'key', '')} is a "
+              "clarification or meta reply; slot not captioned")
+        return "", (hashtags or fallback_hashtags(account))
     return caption, (hashtags or fallback_hashtags(account))
 
 

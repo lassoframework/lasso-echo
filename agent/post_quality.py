@@ -176,6 +176,9 @@ def caption_issues(caption, banned_words=()):
     if _HINT_LEAK_RE.search(cap):
         issues.append("caption carries an internal prompt hint block "
                       "(scene/grounding scaffolding), not client copy")
+    if _copy_gate.is_meta_reply(cap):
+        issues.append("caption is a clarification request or model meta reply "
+                      "(it talks to us instead of the audience), not client copy")
     if _EDIT_META_RE.search(cap):
         issues.append("caption carries an internal edit-rationale block "
                       "(a bracketed meta-label like [why]), not client copy")
