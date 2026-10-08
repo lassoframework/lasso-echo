@@ -1,10 +1,12 @@
-"""Default-OFF canonical generated publisher lease, never an intake bridge.
+"""Default-OFF delegated generated publisher lease.
 
 REST RPC transactions commit before provider I/O. Lost begin/outcome responses
 retain a durable fence; no lease expires and no runtime reconciliation is offered.
 Legacy reservations without owner-pinned canonical authority remain blocked.
 """
 import uuid
+
+from . import generated_infographic_preparation as preparation
 
 from .generated_infographic_runtime import PREFIX, RuntimeHold, enabled
 
@@ -23,14 +25,10 @@ def rpc(store, name, payload):
 
 
 def pins(value, tenant):
-    expected = {'tenant_id', 'epoch', 'source_id', 'source_revision', 'palette_key', 'palette_revision'}
-    if (not isinstance(value, dict) or set(value) != expected or value['tenant_id'] != tenant
-            or any(type(value[k]) is not int or value[k] < 1 for k in
-                   ('epoch', 'source_revision', 'palette_revision'))
-            or any(not isinstance(value[k], str) or not value[k].strip() for k in
-                   ('source_id', 'palette_key'))):
-        raise RuntimeHold('generated_canonical_pins_required')
-    return value
+    from .generated_infographic_runtime import validate_authority_pins
+    # A calendar tenant is an Echo account key. The canonical UUID is carried
+    # separately and re-resolved against both SQL registries by the bridge.
+    return validate_authority_pins(value, tenant)
 
 
 class GeneratedSendLease:
@@ -49,8 +47,19 @@ class GeneratedSendLease:
     def acquire(self):
         from .generated_infographic_runtime import _sql_publish_readback
         binding = _sql_publish_readback(self.store, self.row['id'])
+        if not isinstance(binding, dict) or type(binding.get('schema_version')) is not int or binding['schema_version'] != 2:
+            raise RuntimeHold('generated_bundle_reservation_required')
         canonical = pins(binding.get('authority_pins') if isinstance(binding, dict) else None,
                          self.row['gym_id'])
+        receipt = binding.get('copy_derivation_receipt')
+        try:
+            preparation.authority_binding(dict(authority_pins=canonical,
+                copy_derivation_receipt=receipt, copy_digest=binding.get('copy_digest')),
+                self.row['gym_id'])
+        except preparation.PreparationHold:
+            raise RuntimeHold('generated_bundle_derivation_invalid') from None
+        if receipt.get('caption') != self.row.get('caption'):
+            raise RuntimeHold('generated_bundle_caption_unsupported')
         if self.row.get('generated_authority_pins') != canonical:
             raise RuntimeHold('generated_approval_pins_changed')
         value = rpc(self.store, 'generated_send_acquire', dict(p_attempt=self.attempt,
@@ -67,6 +76,12 @@ class GeneratedSendLease:
             # forward context still binds each mutation to the same row/target.
             if provider != self.provider:
                 raise RuntimeHold('generated_provider_changed')
+            # Meta performs multiple mutations. Recheck the durable lease and
+            # current delegated authority before each subsequent mutation.
+            value = rpc(self.store, 'generated_send_validate', {'p_attempt': self.attempt})
+            if (value.get('attempt_token') != self.attempt
+                    or value.get('state') != 'inflight' or value.get('authorize_send') is not True):
+                raise RuntimeHold('generated_send_requires_reconciliation')
             return
         self.begin_uncertain = True
         value = rpc(self.store, 'generated_send_begin', {'p_attempt': self.attempt})

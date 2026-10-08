@@ -1,13 +1,13 @@
 """Synthetic lower publishers and fake RPC acknowledgements; no real sends.
 
 The disposable PG companion separately exercises the actual lease SQL. The
-owner canonical generation route remains unwired and cannot mint these fixtures.
+fixtures use the delegated v2 contract and do not establish live authorization.
 """
 from types import SimpleNamespace
 import uuid
 
 import pytest
-from agent import generated_infographic_runtime as runtime
+from agent import generated_infographic_runtime as runtime, generated_infographic_preparation as prep
 from agent import forward_media_publish as bridge, forward_media_send_context as scope
 from test_forward_media_lower_publishers import lane
 
@@ -19,25 +19,32 @@ def generated(lane, monkeypatch):
     def factory(provider='zernio', platform='instagram'):
         row, token, authority, draft, account, vendor, publish, requests = lane(provider, platform)
         row['source_media_asset_id'] = runtime.PREFIX + str(uuid.uuid4())
-        row['generated_authority_pins'] = dict(tenant_id=row['gym_id'],epoch=1,source_id='src',
-            source_revision=1,palette_key='brand',palette_revision=1)
+        graphic_copy=dict(headline=row['caption'],facts=[row['caption']],cta='',footer='')
+        derivation=dict(policy='verbatim_selected_fact_v1',caption=row['caption'],copy_digest=prep.digest(graphic_copy),
+            fact_witness=dict(key='SYNTHETIC fact',capture_id=str(uuid.uuid4()),bytes_sha256='a'*64,
+                source_locator='https://synthetic.test/',byte_offset=0,byte_length=len(row['caption'].encode()),text=row['caption']))
+        row['generated_authority_pins'] = dict(mode='delegated_policy',gym_id=str(uuid.uuid4()),
+            echo_account_key=row['gym_id'],bundle_id=str(uuid.uuid4()),bundle_version=1,
+            configuration_sha256='b'*64,configuration_receipt_sha256='c'*64,observation_id=1,
+            observation_sha256='d'*64,validator_revision='SYNTHETIC validator',derivation_sha256=prep.digest(derivation))
         authority.row.update(row)
         events=[]
-        control={'begin':'ok','acquire':'ok','outcome':'ok'}
+        control={'begin':'ok','acquire':'ok','validate':'ok','outcome':'ok'}
         original=authority.post
         def post(path, **kwargs):
             args=kwargs['json']
             if path.endswith('fixer_generated_publish_readback_20261007'):
-                result={'authority_pins':row['generated_authority_pins']}
+                result={'schema_version':2,'authority_pins':row['generated_authority_pins'],
+                    'copy_derivation_receipt':derivation,'copy_digest':prep.digest(graphic_copy)}
             elif 'generated_send_' in path:
                 events.append((path,args))
                 kind = path.split('generated_send_')[1].split('_')[0]
                 if control[kind]=='lost':
                     raise TimeoutError('synthetic response loss')
-                result={'attempt_token':args['p_attempt'],'authorize_send':kind=='begin'}
+                result={'attempt_token':args['p_attempt'],'authorize_send':kind in ('begin','validate')}
                 if kind=='acquire':
                     result.update(state='reserved',replayed=control[kind]=='replay')
-                elif kind=='begin': result.update(state='inflight')
+                elif kind in ('begin','validate'): result.update(state='inflight')
                 else: result.update(state=args['p_outcome'])
             else: return original(path, **kwargs)
             return SimpleNamespace(status_code=200,json=lambda:result)
@@ -54,7 +61,9 @@ def test_generated_lower_send_one_begin_then_settlement(generated,provider,platf
     with bridge.authorized_send(s.authority,s.row,s.token):
         assert s.publish().ok
     assert s.requests
-    assert [e[0].split('generated_send_')[1].split('_')[0] for e in s.events]==['acquire','begin','outcome']
+    kinds=[e[0].split('generated_send_')[1].split('_')[0] for e in s.events]
+    assert [kind for kind in kinds if kind!='validate']==['acquire','begin','outcome']
+    assert kinds.count('validate')==len(s.requests)-1
     assert s.events[-1][1]['p_outcome']=='sent'
     assert ':post:' in s.events[-1][1]['p_evidence']['receipt_ref']
 
