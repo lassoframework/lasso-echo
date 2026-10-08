@@ -10,6 +10,9 @@ The separate default-OFF photo-clearance mode admits independently stored signed
 certificates, with durable quarantine before reads and atomic authority/outcome;
 with the staged lane flag it uses only the staged-specific grant RPC
 (fixer_prepare_owner_staged_photo_20261008), never the active-only grant.
+The explicit prospective-still-v2 mode prepares staged authority, then admits
+permanent occupancy only after independently persisted attester evidence. Both
+phases quarantine before reads; service scheduling/claim retain their own gates.
 The generic adapter also supports offline fixtures; those are not live proof.
 """
 from __future__ import annotations
@@ -30,6 +33,7 @@ WORKER_ENV = 'AGENT_FORWARD_MEDIA_OWNER_WORKER'
 TENANTS_ENV = 'AGENT_FORWARD_MEDIA_OWNER_TENANTS'
 PHOTO_CLEARANCE_ENV = 'AGENT_FORWARD_MEDIA_OWNER_PHOTO_CLEARANCE'
 STAGED_ENV = 'AGENT_FORWARD_MEDIA_OWNER_STAGED_WORKER'
+PROSPECTIVE_V2_ENV = 'AGENT_FORWARD_MEDIA_OWNER_PROSPECTIVE_STILL_V2'
 _TENANT = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,127}\Z')
 _FORBIDDEN = ('AGENT_SOCIALAPI_KEY', 'AGENT_SOCIALAPI_ENC_KEY', 'ZERNIO_API_KEY',
               'AGENT_GBP_ACCESS_TOKEN', 'AGENT_FORWARD_MEDIA_ATTESTER_DSN',
@@ -58,6 +62,9 @@ _REASONS = frozenset({
     'historical_original_bytes_unknown', 'preexisting_original_has_no_fresh_production_proof',
     'historical_scan_bound_exceeded', 'trusted_original_bytes_previously_used',
     'staged_preparation_not_eligible', 'staged_candidate_batch_invalid',
+    'prospective_v2_configuration_invalid', 'prospective_v2_candidate_invalid',
+    'prospective_v2_verification_failed', 'prospective_v2_source_binding_changed',
+    'prospective_v2_outcome_unverified',
 })
 
 
@@ -104,6 +111,15 @@ def staged_enabled():
     return os.getenv(STAGED_ENV, '').lower() in ('1', 'true', 'yes', 'on')
 
 
+def prospective_v2_enabled():
+    value = os.getenv(PROSPECTIVE_V2_ENV, '').strip().lower()
+    if value in ('1', 'true', 'yes', 'on'):
+        return True
+    if value in ('', '0', 'false', 'no', 'off'):
+        return False
+    raise OwnerWorkerHold('prospective_v2_configuration_invalid')
+
+
 def settings_from_environment():
     try:
         owner.check_environment()
@@ -123,6 +139,10 @@ def settings_from_environment():
         raise OwnerWorkerHold('worker_bounds_invalid') from None
     if not 1 <= batch <= 100:
         raise OwnerWorkerHold('worker_bounds_invalid')
+    if prospective_v2_enabled():
+        from .forward_media_prospective_photo_prepare import enabled
+        if not staged_enabled() or enabled() is not True:
+            raise OwnerWorkerHold('prospective_v2_configuration_invalid')
     return tenants, batch
 
 
@@ -469,6 +489,177 @@ def run_staged_pass(*, transport, persistence, reader, drive_reader=None):
             'rows': rows}
 
 
+class _ProspectiveV2Transport:
+    """Fixed owner-only RPC surface; writes never inherit a caller transaction."""
+
+    def __init__(self, persistence):
+        from psycopg.pq import TransactionStatus
+        if (type(persistence) is not owner.ForwardMediaOwnerPersistence
+                or persistence._conn.autocommit is not False
+                or persistence._conn.info.transaction_status != TransactionStatus.IDLE):
+            raise OwnerWorkerHold('owner_transaction_contract_required')
+        self.persistence, self.conn = persistence, persistence._conn
+
+    def call(self, operation, args):
+        if operation not in ('pending', 'reserve', 'snapshot', 'locked', 'finish', 'status'):
+            raise OwnerWorkerHold('owner_transaction_contract_required')
+        owner.check_environment()
+        self.persistence._assert_owner_identity()
+        with self.conn.cursor() as cursor:
+            cursor.execute('select public.fixer_still_v2_owner_' + operation + '_20261008('
+                           + ','.join(['%s'] * len(args)) + ')', args)
+            result = cursor.fetchone()
+        if not result:
+            raise OwnerWorkerHold('owner_transport_unavailable')
+        return result[0]
+
+    def commit(self):
+        try:
+            self.conn.commit()
+        except Exception:
+            raise owner.UncertainCommitError('prospective owner commit uncertain') from None
+
+    def read(self, operation, args):
+        try:
+            return self.call(operation, args)
+        finally:
+            self.conn.rollback()
+
+
+def _v2_identity(candidate, tenants):
+    try:
+        if (not isinstance(candidate, dict) or candidate['phase'] not in ('prepare', 'admit')
+                or candidate['tenant_id'] not in tenants
+                or not re.fullmatch(r'[0-9a-f]{32}', candidate['revision'])
+                or not re.fullmatch(r'[0-9a-f]{32}', candidate['binding_revision'])):
+            raise ValueError()
+        for field in ('audit_id', 'calendar_row_id', 'batch_id', 'logical_post_id'):
+            if str(uuid.UUID(candidate[field])) != candidate[field]:
+                raise ValueError()
+        if candidate['phase'] == 'admit':
+            ids = candidate['attestation_ids']
+            if (not isinstance(ids, list) or len(ids) != 3 or len(set(ids)) != 3
+                    or not isinstance(candidate['expected_revision'], str)
+                    or not candidate['expected_revision']):
+                raise ValueError()
+            for value in ids:
+                if str(uuid.UUID(value)) != value:
+                    raise ValueError()
+        return candidate['audit_id'], candidate['phase']
+    except (KeyError, TypeError, ValueError, AttributeError):
+        raise OwnerWorkerHold('prospective_v2_candidate_invalid') from None
+
+
+def _v2_snapshot_matches(snapshot, candidate):
+    return (isinstance(snapshot, dict) and not snapshot.get('hold_reason')
+            and all(snapshot.get(field) == candidate[field] for field in
+                    ('revision', 'binding_revision', 'tenant_id', 'batch_id'))
+            and snapshot.get('calendar', {}).get('id') == candidate['calendar_row_id']
+            and snapshot['calendar'].get('logical_post_id') == candidate['logical_post_id'])
+
+
+def run_prospective_v2_pass(*, persistence, reader, drive_reader, tenants, limit):
+    """Two bounded staged passes through independently recorded v2 evidence.
+
+    Prepare creates only owner authority. The existing service binder/isolated
+    attester supply the exact durable evidence before an admit candidate is
+    discoverable. Admission and its durable outcome commit atomically; service
+    scheduling and final claiming still recheck permanent occupancy themselves.
+    Every attempt quarantines before remote reads, with no retry/expiry path.
+    """
+    from .forward_media_prospective_photo_prepare import (
+        prepare_prospective_photo, stage_prepared_still_v2, admit_prepared_photo,
+        admission_receipt, reconcile_admission, enabled,
+    )
+    from .forward_media_still_certificate_v2 import IndependentStillPhotoAuditorV2
+    if not worker_enabled() or not prospective_v2_enabled():
+        return {'status': 'disabled', 'rows': []}
+    reports = []
+    transport = None
+    try:
+        if not staged_enabled() or enabled() is not True:
+            raise OwnerWorkerHold('prospective_v2_configuration_invalid')
+        if (not tenants or len(tenants) > 32 or type(limit) is not int
+                or not 1 <= limit <= 100):
+            raise OwnerWorkerHold('worker_bounds_invalid')
+        transport = _ProspectiveV2Transport(persistence)
+        candidates = transport.read('pending', (list(tenants), limit))
+        if not isinstance(candidates, list) or len(candidates) > limit:
+            raise OwnerWorkerHold('candidate_batch_invalid')
+        seen = set()
+        for candidate in candidates:
+            key = _v2_identity(candidate, tenants)
+            if key in seen:
+                continue
+            seen.add(key)
+            token = str(uuid.uuid4())
+            args = (*key, token)
+            reserved = transport.call('reserve', args)
+            transport.commit()  # Quarantine must be acknowledged before reads.
+            if reserved is not True:
+                continue
+            snapshot = transport.read('snapshot', args)
+            prepared, reason = None, None
+            try:
+                if not _v2_snapshot_matches(snapshot, candidate):
+                    raise OwnerWorkerHold('prospective_v2_source_binding_changed')
+                prepared = prepare_prospective_photo(snapshot, asset=snapshot['asset'],
+                    drive_reader=drive_reader, hosted_reader=reader, recipe=candidate['recipe'],
+                    auditor=IndependentStillPhotoAuditorV2(transport.conn, persistence._expected_owner),
+                    audit_id=key[0])
+            except Exception:
+                reason = 'prospective_v2_verification_failed'
+            finally:
+                transport.conn.rollback()  # End all read transactions before locks.
+            # SQL failures from the final phase abort and retain quarantine.
+            # Never catch poisoned authority transactions as successful holds.
+            final = transport.call('locked', args)
+            if not _v2_snapshot_matches(final, candidate):
+                raise OwnerWorkerHold('prospective_v2_source_binding_changed')
+            admitted = None
+            if reason:
+                outcome = {'status': 'hold', 'reason': reason}
+            elif key[1] == 'prepare':
+                staged = stage_prepared_still_v2(persistence, prepared)
+                outcome = {'status': 'persisted', 'decision': 'cleared_unused',
+                           'manifest_digest': staged['manifest']['manifest_digest']}
+            else:
+                admitted = admit_prepared_photo(persistence, prepared,
+                    logical_post_id=candidate['logical_post_id'],
+                    expected_revision=candidate['expected_revision'],
+                    attestation_ids=candidate['attestation_ids'])
+                outcome = {'status': 'persisted', 'occupancy_id': admitted['occupancy_id']}
+            if transport.call('finish', (*args, json.dumps(outcome))) is not True:
+                raise OwnerWorkerHold('prospective_v2_outcome_unverified')
+            try:
+                transport.commit()
+            except owner.UncertainCommitError:
+                # Read-only exact receipt reconciliation, never a second write.
+                # Occupancy alone cannot prove that its worker outcome committed.
+                transport.conn.rollback()
+                if admitted is None:
+                    raise
+                proof = reconcile_admission(persistence, admission_receipt(prepared),
+                    logical_post_id=candidate['logical_post_id'], occupancy_id=admitted['occupancy_id'])
+                progress = transport.read('status', args)
+                if (proof.get('status') != 'admitted' or not isinstance(progress, dict)
+                        or progress.get('state') != 'final' or progress.get('outcome') != outcome):
+                    raise owner.UncertainCommitError('prospective owner outcome uncertain') from None
+                outcome = dict(outcome, reconciled_committed=True)
+            reports.append({'audit_id': key[0], 'calendar_row_id': candidate['calendar_row_id'],
+                            'phase': key[1], **outcome})
+    except owner.UncertainCommitError:
+        return {'status': 'hold', 'reason': 'uncertain_authority_commit', 'rows': reports}
+    except OwnerWorkerHold as exc:
+        return {'status': 'hold', 'reason': str(exc), 'rows': reports}
+    except Exception:
+        if transport is not None:
+            transport.conn.rollback()
+        return {'status': 'hold', 'reason': 'owner_transport_unavailable', 'rows': reports}
+    return {'status': 'partial_hold' if any(r['status'] == 'hold' for r in reports) else 'complete',
+            'rows': reports}
+
+
 def run_once():
     """One isolated owner pass, default OFF; signed clearance separately gated.
 
@@ -489,7 +680,10 @@ def run_once():
         from .forward_media_owner_transport import DedicatedOwnerTransport
         reader = owner.HostedObjectReader()
         persistence = owner.ForwardMediaOwnerPersistence.connect_from_environment(reader=reader)
-        if os.getenv(PHOTO_CLEARANCE_ENV, '').lower() in ('1', 'true', 'yes', 'on'):
+        if prospective_v2_enabled():
+            report = run_prospective_v2_pass(persistence=persistence, reader=reader,
+                drive_reader=OriginalDriveReader(), tenants=tenants, limit=limit)
+        elif os.getenv(PHOTO_CLEARANCE_ENV, '').lower() in ('1', 'true', 'yes', 'on'):
             from .forward_media_owner_photo_prepare import run_photo_pass, run_staged_photo_pass
             drive = OriginalDriveReader()
             if staged_enabled():

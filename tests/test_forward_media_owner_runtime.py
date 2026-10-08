@@ -13,6 +13,7 @@ from agent import forward_media_source_verifier as source_module
 @pytest.fixture
 def runtime(monkeypatch):
     monkeypatch.delenv(worker.PHOTO_CLEARANCE_ENV, raising=False)
+    monkeypatch.delenv(worker.PROSPECTIVE_V2_ENV, raising=False)
     for key in owner.forbidden_credential_names(os.environ):
         monkeypatch.delenv(key)
     class ProcessEnvironment:
@@ -93,6 +94,42 @@ def test_explicit_photo_gate_routes_existing_factory_to_signed_pass(runtime, mon
 def test_photo_gate_alone_cannot_enable_owner_worker(runtime, monkeypatch):
     monkeypatch.delenv(worker.WORKER_ENV)
     monkeypatch.setenv(worker.PHOTO_CLEARANCE_ENV, 'true')
+    assert worker.run_once() == {'status': 'disabled', 'rows': []}
+    assert runtime.events == []
+
+
+def test_prospective_v2_routes_real_entrypoint_to_its_staged_pass(runtime, monkeypatch):
+    monkeypatch.setenv(worker.PROSPECTIVE_V2_ENV, 'true')
+    monkeypatch.setenv(worker.STAGED_ENV, 'true')
+    monkeypatch.setenv('AGENT_FORWARD_PROSPECTIVE_PHOTO_PREPARE', 'true')
+    report = {'status': 'complete', 'rows': [{'phase': 'prepare', 'status': 'persisted'}]}
+    def v2_pass(**kwargs):
+        runtime.events.append('v2_pass')
+        assert kwargs['persistence']._conn is runtime.conn
+        assert kwargs['tenants'] == ('gym',) and kwargs['limit'] == 25
+        return report
+    monkeypatch.setattr(worker, 'run_prospective_v2_pass', v2_pass)
+    assert worker.run_once() is report
+    assert runtime.events == ['hosted', 'connect', 'drive', 'v2_pass', 'close']
+
+
+@pytest.mark.parametrize('staged,prepare,v2', [
+    ('false', 'true', 'true'), ('true', 'false', 'true'),
+    ('true', 'maybe', 'true'), ('true', 'true', 'maybe'),
+])
+def test_prospective_v2_requires_unambiguous_explicit_gates_before_connection(
+        runtime, monkeypatch, staged, prepare, v2):
+    monkeypatch.setenv(worker.PROSPECTIVE_V2_ENV, v2)
+    monkeypatch.setenv(worker.STAGED_ENV, staged)
+    monkeypatch.setenv('AGENT_FORWARD_PROSPECTIVE_PHOTO_PREPARE', prepare)
+    assert worker.run_once() == {'status': 'hold',
+        'reason': 'prospective_v2_configuration_invalid', 'rows': []}
+    assert runtime.events == []
+
+
+def test_prospective_v2_flag_cannot_enable_worker(runtime, monkeypatch):
+    monkeypatch.delenv(worker.WORKER_ENV)
+    monkeypatch.setenv(worker.PROSPECTIVE_V2_ENV, 'true')
     assert worker.run_once() == {'status': 'disabled', 'rows': []}
     assert runtime.events == []
 

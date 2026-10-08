@@ -48,6 +48,10 @@ class OwnerPhotoTests(unittest.TestCase):
         auditor=IndependentPhotoAuditor(Connection(),'offline-dedicated-owner')
         def rpc(name,values):
             return {'packet':packet,'approved_key':key} if name=='certificate' else corpus
+        # Keep certificate verification fully offline: this fake connection's
+        # cursor is for unrelated persistence assertions and cannot provide the
+        # reviewed corpus snapshot expected by IndependentPhotoAuditor.
+        auditor._snapshot = lambda: corpus
         return snapshot,drive,data,recipe,packet,auditor,rpc
 
     def test_exact_source_hosted_recipe_and_real_ed25519_prepare(self):
@@ -78,7 +82,9 @@ class OwnerPhotoTests(unittest.TestCase):
                     self.urls.append(url_now)
                     return thumb if url_now==url else data
             reader=Reader()
-            with patch.object(auditor,'_rpc',side_effect=rpc),patch('agent.visual_writer_prepare._own_media_url',return_value=True):
+            with patch.object(auditor,'_rpc',side_effect=rpc), \
+                    patch.object(auditor,'_snapshot',return_value=corpus), \
+                    patch('agent.visual_writer_prepare._own_media_url',return_value=True):
                 prepared=prepare_remote_photo(snap,drive_reader=drive,hosted_reader=reader,recipe=recipe,
                     auditor=auditor,audit_id=packet['payload']['audit_id'])
             self.assertEqual(prepared.thumbnail_bytes,thumb)
