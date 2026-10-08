@@ -21,7 +21,7 @@ from agent import generated_infographic_preparation as prep, generated_infograph
 from tests.test_generated_owner_guard import candidate, trusted, image_bytes
 
 PG=Path('/opt/homebrew/opt/postgresql@17/bin')
-PORTAL=ROOT.parent/'portal-brand-source-bundle-20261008/supabase/migrations/DRAFT_echo_source_brand_bundle.sql'
+PORTAL=ROOT.parent/'portal-brand-source-bundle-20261008/supabase/migrations/0611_echo_source_brand_bundle.sql'
 
 
 def main(source_mode=None):
@@ -310,7 +310,8 @@ def main(source_mode=None):
    revision=rpc(admin,'fixer_forward_media_attestation_request_20261006',rid)['revision']
    # Actual independent attester API reads exact synthetic PNG bytes twice;
    # real claim RPC commits the required immutable lineage receipt.
-   with patch('agent.visual_writer_prepare._own_media_url',lambda url: url.startswith('https://owned.example/')):
+   with patch.dict('os.environ', {'AGENT_S3_PUBLIC_BASE_URL':'https://owned.example'}), \
+        patch('agent.visual_writer_prepare._own_media_url',lambda url: url.startswith('https://owned.example/')):
     receipt=guard.attest(str(rid),revision,connection_factory=lambda:connect(guard.ROLE),
      original_verifier=lambda snapshot,source:source==pixels,read_bytes=lambda url:pixels)
    row,job,claim=rid,uuid.UUID(cc['job_id']),uuid.uuid4()
