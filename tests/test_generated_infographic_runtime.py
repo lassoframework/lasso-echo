@@ -71,8 +71,14 @@ def system(case, active, monkeypatch):
         reserved.append(candidate)
         return dict(reserved=True, receipt_ref='offline_owner_receipt')
     monkeypatch.setattr(guard, 'reserve_generated', reserve)
+    # Default trusted census: newest current-epoch row at the exact inventory
+    # revision is complete, zero-supply and fresh (legitimate exhausted case).
+    census = dict(enabled=True, receipt_id=str(uuid.uuid4()), local_complete=True,
+                  local_available=0, observed_at=datetime.now(timezone.utc))
+    monkeypatch.setattr(runtime, '_latest_local_census', lambda *args, **kwargs: dict(census))
     return SimpleNamespace(case=case, conn=conn, persistence=persistence, row_id=row_id,
-        snap=snap, source=source, account=account, palette=palette, loader=loader, reserved=reserved, active=active)
+        snap=snap, source=source, account=account, palette=palette, loader=loader, reserved=reserved, active=active,
+        census=census)
 
 
 def run(s):
@@ -137,6 +143,57 @@ def test_owner_facts_block_before_paid_generation(system, field, value, reason):
     system.snap[field] = value
     result = run(system)
     assert result['held'] and result['reason'] == reason
+    assert system.case.provider.calls == 0 and not system.reserved
+
+
+@pytest.mark.parametrize('change,reason', [
+    (dict(local_available=1), 'generated_local_photo_available'),
+    (dict(local_complete=False), 'generated_local_census_incomplete'),
+    (dict(receipt_id=None), 'generated_local_census_unavailable'),
+    (dict(enabled=False), 'generated_local_census_unavailable'),
+    (dict(observed_at=datetime.now(timezone.utc) - timedelta(minutes=11)),
+     'generated_local_census_stale'),
+    (dict(observed_at=datetime.now(timezone.utc) + timedelta(minutes=1)),
+     'generated_local_census_stale'),
+    (dict(observed_at='not-a-timestamp'), 'generated_local_census_stale'),
+])
+def test_latest_local_census_governs_before_paid_generation(system, change, reason):
+    """A positive/incomplete/stale/missing newest census holds pre-generation."""
+    system.census.update(change)
+    result = run(system)
+    assert result['held'] and result['reason'] == reason
+    assert system.case.provider.calls == 0 and not system.reserved
+
+
+def test_late_local_arrival_after_first_preflight_still_blocks_rerun(system):
+    """Zero-then-positive at the same revision: a later run sees only the newest
+    census and never reaches provider I/O or owner reservation."""
+    first = run(system)
+    assert first['ok'] and first['reserved']
+    system.census.update(local_available=2)
+    second = run(system)
+    assert second['held'] and second['reason'] == 'generated_local_photo_available'
+    assert system.case.provider.calls == 1 and len(system.reserved) == 1
+
+
+def test_newest_zero_census_after_positive_restores_exhausted_fallback(system):
+    """A newer complete zero census again governs: legitimate photo-exhausted
+    generated fallback proceeds through reservation."""
+    system.census.update(local_available=1)
+    assert run(system)['reason'] == 'generated_local_photo_available'
+    system.census.update(local_available=0,
+                         observed_at=datetime.now(timezone.utc))
+    result = run(system)
+    assert result['ok'] and result['reserved']
+    assert system.case.provider.calls == 1
+
+
+def test_census_rpc_failure_fails_closed_before_provider(system, monkeypatch):
+    def unavailable(*args, **kwargs):
+        raise runtime.RuntimeHold('generated_local_census_unavailable')
+    monkeypatch.setattr(runtime, '_latest_local_census', unavailable)
+    result = run(system)
+    assert result['held'] and result['reason'] == 'generated_local_census_unavailable'
     assert system.case.provider.calls == 0 and not system.reserved
 
 

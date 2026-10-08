@@ -14,7 +14,7 @@ import os
 import re
 import sqlite3
 import uuid
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 
 from . import generated_infographic_preparation as prep
 
@@ -546,6 +546,78 @@ class OwnerSnapshotLoader:
         return snap, visuals
 
 
+
+CENSUS_MAX_AGE = timedelta(minutes=10)
+
+
+def _latest_local_census(persistence, gym_id, inventory_revision):
+    """Newest trusted current-epoch census at the exact inventory revision.
+
+    SQL resolves one latest-authority row by deterministic observed_at/receipt
+    ordering; an older zero census never overrides a newer positive or
+    incomplete one. Dedicated owner role wrapper only; the read transaction
+    always ends here and never spans provider or storage work.
+    """
+    from .forward_media_owner import ForwardMediaOwnerPersistence
+    if type(persistence) is not ForwardMediaOwnerPersistence:
+        raise RuntimeHold('generated_owner_required')
+    try:
+        persistence._assert_owner_identity()
+        with persistence._conn.cursor() as cur:
+            cur.execute('select public.fixer_generated_local_census_authority_20261008(%s,%s)',
+                        (gym_id, inventory_revision))
+            row = cur.fetchone()
+        return row[0] if row else None
+    except RuntimeHold:
+        raise
+    except Exception:
+        raise RuntimeHold('generated_local_census_unavailable') from None
+    finally:
+        persistence._conn.rollback()
+
+
+def _census_observed_at(value):
+    if isinstance(value, datetime):
+        parsed = value
+    elif isinstance(value, str):
+        try:
+            parsed = datetime.fromisoformat(value.replace('Z', '+00:00'))
+        except ValueError:
+            return None
+    else:
+        return None
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
+
+
+def _require_latest_local_depletion(persistence, gym_id, inventory_revision, *, now=None):
+    """Fail-closed local-photo gate before any paid provider I/O.
+
+    Only the single newest trusted current-epoch/current-gym census at the
+    exact inventory revision governs: it must be complete, fresh (within ten
+    minutes, not future-dated) and zero-supply. Missing, stale, noncomplete or
+    nonzero latest rows hold; SQL repeats this same latest-authority rule under
+    reservation locks and again at final send.
+    """
+    if (not isinstance(gym_id, str) or not gym_id.strip()
+            or not isinstance(inventory_revision, str) or not inventory_revision.strip()):
+        raise RuntimeHold('generated_local_census_unavailable')
+    census = _latest_local_census(persistence, gym_id, inventory_revision)
+    receipt = census.get('receipt_id') if isinstance(census, dict) else None
+    try:
+        uuid.UUID(str(receipt))
+    except (TypeError, ValueError, AttributeError):
+        receipt = None
+    if not isinstance(census, dict) or census.get('enabled') is not True or receipt is None:
+        raise RuntimeHold('generated_local_census_unavailable')
+    if census.get('local_complete') is not True:
+        raise RuntimeHold('generated_local_census_incomplete')
+    if type(census.get('local_available')) is not int or census['local_available'] != 0:
+        raise RuntimeHold('generated_local_photo_available')
+    observed = _census_observed_at(census.get('observed_at'))
+    now = now or datetime.now(timezone.utc)
+    if observed is None or not now - CENSUS_MAX_AGE <= observed <= now:
+        raise RuntimeHold('generated_local_census_stale')
+
 def _generation_binding(request, snapshot):
     binding = {**request, 'copy_digest': prep.digest(snapshot['copy']),
                'palette_digest': prep.digest(snapshot['palette']), 'review_policy_id': prep.POLICY,
@@ -658,6 +730,12 @@ def run_calendar_row(base, account, row_id, *, persistence, loader=None, jobs=No
         if existing and existing['job_state'] == 'generating':
             raise RuntimeHold('generated_execution_pending_reconciliation')
         before, visuals = loader.load(row_id, base, account)
+        # Late local-photo authority before any paid provider I/O: only the
+        # newest trusted current-epoch census at this exact inventory revision
+        # governs. An older zero census never overrides a newer positive or
+        # incomplete one; SQL repeats this under reservation locks and at send.
+        _require_latest_local_depletion(persistence, before.get('gym_id'),
+                                        before.get('inventory_revision'))
         request = {k: before[k] for k in prep.BINDING_FIELDS}
         expected_job, frozen = _generation_binding(request, before)
         if not existing:

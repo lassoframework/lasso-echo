@@ -168,13 +168,43 @@ begin
  return active;
 end $$;
 
+-- Latest-authority local census. Exactly one newest trusted current-epoch,
+-- current-gym census governs pre-generation,
+-- reservation and final send, resolved by deterministic observed_at/receipt
+-- ordering. An older zero row can never override a newer positive or
+-- incomplete census, including after an inventory revision changes and returns.
+-- Select newest first, then require its exact current revision. Missing rows
+-- return a null receipt and every consumer holds.
+create function public.fixer_generated_local_census_authority_20261008(p_gym text,p_revision text)
+returns jsonb language plpgsql security definer set search_path=pg_catalog,public as $$
+declare s public.fixer_still_cutover_20261007%rowtype;
+ i public.fixer_still_inventory_20261007%rowtype;
+ caller text:=coalesce(nullif(current_setting('role',true),'none'),session_user);
+begin
+ if not pg_has_role(caller,'fixer_forward_media_owner_20261006','member')
+  or pg_has_role(caller,'service_role','member') or pg_has_role(caller,'fixer_forward_media_attester_20261006','member') then
+  raise exception 'isolated existing owner required' using errcode='42501'; end if;
+ if nullif(btrim(p_gym),'') is null or nullif(btrim(p_revision),'') is null then
+  raise exception 'exact current inventory revision required' using errcode='23514'; end if;
+ select * into s from public.fixer_still_cutover_20261007 where singleton;
+ if not coalesce(s.enabled,false) or s.epoch_id is null then
+  return jsonb_build_object('enabled',false,'receipt_id',null); end if;
+ select * into i from public.fixer_still_inventory_20261007 c
+  where c.epoch_id=s.epoch_id and c.gym_id=p_gym
+  order by c.observed_at desc,c.receipt_id desc limit 1;
+ if not found or i.inventory_revision is distinct from p_revision then
+  return jsonb_build_object('enabled',true,'receipt_id',null); end if;
+ return jsonb_build_object('enabled',true,'receipt_id',i.receipt_id,'epoch_id',s.epoch_id,
+  'local_complete',i.local_complete,'local_available',i.local_available,'observed_at',i.observed_at);
+end $$;
+
 -- Final send applies the same exact URL duplicate fence as reservation.
 -- Existing verified same-date/logical sibling exception remains above the
 -- comparison; unrelated historical rows never inherit that exception.
 create or replace function public.fixer_generated_runtime_check_20261007(p_id uuid)
 returns boolean language plpgsql security definer set search_path=pg_catalog,public as $$
 declare r public.content_calendar%rowtype; g public.fixer_generated_reservation_20261007%rowtype;
- s record; snap jsonb; h jsonb; ph text;
+ s record; snap jsonb; h jsonb; ph text; i public.fixer_still_inventory_20261007%rowtype;
 begin
  select * into r from public.content_calendar where id=p_id;
  select * into g from public.fixer_generated_reservation_20261007
@@ -207,12 +237,22 @@ begin
   or g.manifest_json->>'manifest_digest' is distinct from r.render_manifest_digest then
   raise exception 'generated current content/depletion/history binding changed' using errcode='23514'; end if;
  -- Final send re-observes local depletion: reserve-time revisions were
- -- identity, not freshness. Without a current-revision, complete, zero-supply
- -- owner observation inside ten minutes the send holds, exactly as for stills.
+ -- identity, not freshness. The single NEWEST trusted current-epoch census at
+ -- newest row must match the live inventory revision, be complete, zero-supply and fresh
+ -- inside ten minutes. An older zero row never overrides a newer positive or
+ -- incomplete census; a missing, stale, noncomplete or nonzero latest row
+ -- holds the send, exactly as for stills.
  select * into s from public.fixer_still_cutover_20261007 where singleton;
- if not coalesce(s.enabled,false) or s.epoch_id is null or not exists(select 1 from public.fixer_still_inventory_20261007 i
-   where i.epoch_id=s.epoch_id and i.gym_id=r.gym_id and i.inventory_revision=snap->>'inventory_revision'
-    and i.local_complete and i.local_available=0 and i.observed_at>=clock_timestamp()-interval '10 minutes') then
+ if coalesce(s.enabled,false) and s.epoch_id is not null then
+  select * into i from public.fixer_still_inventory_20261007 c
+   where c.epoch_id=s.epoch_id and c.gym_id=r.gym_id
+   order by c.observed_at desc,c.receipt_id desc limit 1;
+ end if;
+ if not coalesce(s.enabled,false) or s.epoch_id is null or i.receipt_id is null
+  or i.inventory_revision is distinct from snap->>'inventory_revision'
+  or not i.local_complete or i.local_available<>0
+  or i.observed_at<clock_timestamp()-interval '10 minutes'
+  or i.observed_at>clock_timestamp() then
   raise exception 'generated final send requires fresh local depletion authority' using errcode='23514'; end if;
  for h in select value from jsonb_array_elements(snap#>'{history,rows}') loop
   -- Known same logical generated siblings, including their committed claim.
@@ -267,6 +307,7 @@ create function public.fixer_reserve_generated_bundle_20261007(p_id uuid,c jsonb
 returns jsonb language plpgsql security definer set search_path=pg_catalog,public as $$
 declare snap jsonb; h jsonb; proof jsonb; prior public.fixer_generated_reservation_20261007%rowtype;
  r public.content_calendar%rowtype; receipt text; original jsonb; clearance jsonb; fp text; asset text;
+ s public.fixer_still_cutover_20261007%rowtype; i public.fixer_still_inventory_20261007%rowtype;
  caller text:=coalesce(nullif(current_setting('role',true),'none'),session_user);
 begin
  if not pg_has_role(caller,'fixer_forward_media_owner_20261006','member')
@@ -348,6 +389,23 @@ begin
   or c->>'history_revision' is distinct from snap->>'history_revision'
   or jsonb_typeof(visuals) is distinct from 'array' or jsonb_array_length(visuals)<>jsonb_array_length(snap#>'{history,rows}') then
   raise exception 'generated candidate stale or unsent depletion unavailable' using errcode='23514'; end if;
+ -- A first generated reservation also requires the newest trusted
+ -- current-epoch/current-gym census, observed under the
+ -- census advisory lock already held above: exact current revision, complete, zero-supply and fresh.
+ -- A late local photo arrival between preflight and reserve leaves a newer
+ -- positive/incomplete census that an older zero row can never override.
+ select * into s from public.fixer_still_cutover_20261007 where singleton;
+ if coalesce(s.enabled,false) and s.epoch_id is not null then
+  select * into i from public.fixer_still_inventory_20261007 ci
+   where ci.epoch_id=s.epoch_id and ci.gym_id=c->>'gym_id'
+   order by ci.observed_at desc,ci.receipt_id desc limit 1;
+ end if;
+ if not coalesce(s.enabled,false) or s.epoch_id is null or i.receipt_id is null
+  or i.inventory_revision is distinct from snap->>'inventory_revision'
+  or not i.local_complete or i.local_available<>0
+  or i.observed_at<clock_timestamp()-interval '10 minutes'
+  or i.observed_at>clock_timestamp() then
+  raise exception 'generated reservation requires fresh local depletion authority' using errcode='23514'; end if;
  for h in select value from jsonb_array_elements(snap#>'{history,rows}') loop
   select value into proof from jsonb_array_elements(visuals) v(value)
    where value->>'history_key'=h->>'history_key'
@@ -715,6 +773,7 @@ revoke all on function public.fixer_reserve_generated_20261007(uuid,jsonb,jsonb,
  from public,anon,authenticated,service_role,fixer_forward_media_owner_20261006;
 do $$ declare f text; begin
  foreach f in array array['fixer_generated_bundle_digest_20261007(jsonb)','fixer_generated_bundle_job_20261007(jsonb)',
+  'fixer_generated_local_census_authority_20261008(text,text)',
   'fixer_generated_source_brand_active_20261007(text)','fixer_generated_bundle_validate_20261007(text,jsonb,jsonb,text,text,text,text)',
   'fixer_reserve_generated_bundle_20261007(uuid,jsonb,jsonb,jsonb,text)',
   'fixer_generated_gap_bind_bundle_20261007(uuid,uuid,uuid,text,text,text,text,text,text,text,text)',
@@ -725,7 +784,8 @@ do $$ declare f text; begin
 end $$;
 grant execute on function public.fixer_generated_source_brand_active_20261007(text),
  public.fixer_reserve_generated_bundle_20261007(uuid,jsonb,jsonb,jsonb,text),
- public.fixer_generated_gap_bind_bundle_20261007(uuid,uuid,uuid,text,text,text,text,text,text,text,text)
+ public.fixer_generated_gap_bind_bundle_20261007(uuid,uuid,uuid,text,text,text,text,text,text,text,text),
+ public.fixer_generated_local_census_authority_20261008(text,text)
  to fixer_forward_media_owner_20261006;
 grant execute on function public.fixer_generated_source_brand_active_20261007(text),
  public.fixer_generated_publish_readback_20261007(uuid),public.generated_send_validate_20261007(uuid) to service_role;

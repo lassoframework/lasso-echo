@@ -179,6 +179,14 @@ def main(source_mode=None):
    historical_row=uuid.uuid4()
    sql("insert into content_calendar(id,gym_id,post_date,account,format,status,variant_status,caption,image_url) values(%s,'other-gym',current_date-1,'instagram','feed','published','active','SYNTHETIC prior','https://owned.example/generated.png')",(historical_row,))
    snap=rpc(owner,'fixer_generated_snapshot_20261007',rid)
+   # Census authority is owner-only; a missing census holds pre-generation and
+   # reservation. Record the trusted complete zero census for this revision.
+   denied(lambda:rpc(service,'fixer_generated_local_census_authority_20261008','gym',snap['inventory_revision']),'permission denied')
+   census0=rpc(owner,'fixer_generated_local_census_authority_20261008','gym',snap['inventory_revision'])
+   assert census0['enabled'] and census0['receipt_id'] is None
+   rpc(owner,'fixer_still_inventory_record_20261007',uuid.uuid4(),rid,snap['inventory_revision'],True,0,'SYNTHETIC zero local inventory')
+   census0=rpc(owner,'fixer_generated_local_census_authority_20261008','gym',snap['inventory_revision'])
+   assert census0['receipt_id'] and census0['local_complete'] and census0['local_available']==0
    import io
    from PIL import Image
    first=Image.open(io.BytesIO(image_bytes())).resize((1024,1280))
@@ -210,6 +218,42 @@ def main(source_mode=None):
    m['manifest_digest']='sha256:'+prep.digest({k:v for k,v in m.items() if k!='manifest_digest'})
    denied(lambda:reserve({**c,'schema_version':1}),'generated original authority')
    denied(lambda:reserve({**c,'job_id':str(uuid.uuid4())}),'job identity')
+   # A -> B -> A must not revive the old A/zero receipt. Record B's
+   # positive census against an actual changed snapshot, then restore A.
+   def revision_toggle_positive(row):
+    revision_a=rpc(owner,'fixer_generated_snapshot_20261007',row)['inventory_revision']
+    sql("insert into media_source values('SYNTHETIC toggle source','gym','gym_drive','toggle',false,'ready',clock_timestamp())")
+    revision_b=rpc(owner,'fixer_generated_snapshot_20261007',row)['inventory_revision']
+    assert revision_b!=revision_a
+    rpc(owner,'fixer_still_inventory_record_20261007',uuid.uuid4(),row,revision_b,True,1,'SYNTHETIC B local photo arrival')
+    sql("delete from media_source where id='SYNTHETIC toggle source'")
+    assert rpc(owner,'fixer_generated_snapshot_20261007',row)['inventory_revision']==revision_a
+    assert rpc(owner,'fixer_generated_local_census_authority_20261008','gym',revision_a)['receipt_id'] is None
+   revision_toggle_positive(rid)
+   denied(lambda:reserve(),'reservation requires fresh local depletion')
+   assert sql('select count(*) from fixer_generated_reservation_20261007')[0][0]==0
+   # Late local photo arrival between preflight and reserve: the newer positive
+   # census at the SAME inventory revision overrides the older zero; no
+   # reservation, generated image or pending card staging is possible.
+   rpc(owner,'fixer_still_inventory_record_20261007',uuid.uuid4(),rid,snap['inventory_revision'],True,1,'SYNTHETIC late local photo arrival')
+   assert rpc(owner,'fixer_generated_local_census_authority_20261008','gym',snap['inventory_revision'])['local_available']==1
+   denied(lambda:reserve(),'reservation requires fresh local depletion')
+   rpc(owner,'fixer_still_inventory_record_20261007',uuid.uuid4(),rid,snap['inventory_revision'],False,0,'SYNTHETIC incomplete local census')
+   denied(lambda:reserve(),'reservation requires fresh local depletion')
+   epoch=sql('select epoch_id from fixer_still_cutover_20261007')[0][0]
+   # Isolate age: a temporary synthetic epoch contains only a complete zero
+   # row. A newer incomplete row in the original epoch cannot mask this check.
+   stale_epoch=uuid.uuid4()
+   sql('update fixer_still_cutover_20261007 set epoch_id=%s where singleton',(stale_epoch,))
+   sql("insert into fixer_still_inventory_20261007 values(%s,%s,'gym',%s,true,0,'SYNTHETIC aged newest census',clock_timestamp()-interval '20 minutes')",(uuid.uuid4(),stale_epoch,snap['inventory_revision']))
+   aged=rpc(owner,'fixer_generated_local_census_authority_20261008','gym',snap['inventory_revision'])
+   assert aged['local_complete'] and aged['local_available']==0
+   assert aged['epoch_id']==str(stale_epoch)
+   denied(lambda:reserve(),'reservation requires fresh local depletion')
+   sql('update fixer_still_cutover_20261007 set epoch_id=%s where singleton',(epoch,))
+   assert sql('select count(*) from fixer_generated_reservation_20261007')[0][0]==0
+   # Legitimate photo-exhausted fallback: a newest complete fresh zero census.
+   rpc(owner,'fixer_still_inventory_record_20261007',uuid.uuid4(),rid,snap['inventory_revision'],True,0,'SYNTHETIC confirmed zero local inventory')
    assert reserve()['reserved']
    if source_mode:
     for change in (dict(lookup_status='unavailable',authenticated=False),
@@ -273,6 +317,14 @@ def main(source_mode=None):
    sql("update content_calendar set status='publishing',publish_claim_token=%s,publish_reservation_day=post_date where id=%s",(claim,row))
    assert rpc(service,'fixer_claim_forward_media_20261006',row,claim,receipt['evidence_id'],revision) is True
    attempt=uuid.uuid4()
+   send_snap=rpc(owner,'fixer_generated_snapshot_20261007',rid)
+   revision_toggle_positive(rid)
+   denied(lambda:rpc(service,'generated_send_acquire_20261007',attempt,'gym',row,claim,job,json.dumps(p)),'fresh local depletion')
+   assert sql('select count(*) from generated_send_lease_20261007')[0][0]==0
+   rpc(owner,'fixer_still_inventory_record_20261007',uuid.uuid4(),rid,send_snap['inventory_revision'],True,1,'SYNTHETIC late local photo before send')
+   denied(lambda:rpc(service,'generated_send_acquire_20261007',attempt,'gym',row,claim,job,json.dumps(p)),'fresh local depletion')
+   assert sql('select count(*) from generated_send_lease_20261007')[0][0]==0
+   rpc(owner,'fixer_still_inventory_record_20261007',uuid.uuid4(),rid,send_snap['inventory_revision'],True,0,'SYNTHETIC confirmed zero local before send')
    assert rpc(service,'generated_send_acquire_20261007',attempt,'gym',row,claim,job,json.dumps(p))['state']=='reserved'
    denied(lambda:observe(),'freezes portal')
    if source_mode:
@@ -298,7 +350,7 @@ def main(source_mode=None):
    denied(lambda:sql('delete from '+mapping+' where gym_id=%s',(gym,)),'freezes portal')
    denied(lambda:sql('truncate '+mapping),'freezes portal')
    assert not rpc(service,'generated_send_validate_20261007',attempt)['authorize_send']
-   print('PASS '+str(source_mode or 'legacy_v1')+' assembled portal + B/gap + delegated approval/acquire/begin/validate + empty/missing/cross-tenant mapping holds + exact approved UUID bijection + mapping/ACL/concurrency fences + failed/changed v2 provider holds + stale evidence + durable unknown fences; synthetic local only')
+   print('PASS '+str(source_mode or 'legacy_v1')+' latest-authority local census (revision A->B->A and zero->positive/incomplete/isolated stale holds pre-reserve and final send, newest zero restores exhausted fallback) + assembled portal + B/gap + delegated approval/acquire/begin/validate + empty/missing/cross-tenant mapping holds + exact approved UUID bijection + mapping/ACL/concurrency fences + failed/changed v2 provider holds + stale evidence + durable unknown fences; synthetic local only')
   finally:
    for c in connections:c.close()
    subprocess.run([str(PG/'pg_ctl'),'-D',str(root/'data'),'-m','immediate','-w','stop'],check=True,capture_output=True,timeout=60)
