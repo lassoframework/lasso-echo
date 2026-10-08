@@ -44,10 +44,10 @@ def test_counts_only_current_nonterminal_held_rows_with_client_safe_reasons():
     assert fact["window"]["from"] == "2026-10-08"
     assert fact["window"]["through"] == "2026-11-30"
     by = {r["reason"]: r for r in fact["reasons"]}
-    assert by[al._HOLD_REVIEW_TEXT]["count"] == 2
-    assert by[al._HOLD_REVIEW_TEXT]["post_dates"] == ["2026-10-08", "2026-10-09"]
+    assert al._HOLD_REVIEW_TEXT not in by
+    assert by[al._HOLD_REPEAT_TEXT]["count"] == 3
+    assert by[al._HOLD_REPEAT_TEXT]["post_dates"] == ["2026-10-08", "2026-10-09", "2026-10-10"]
     assert by[al._HOLD_NOT_READY_TEXT]["post_dates"] == ["2026-11-02"]
-    assert by[al._HOLD_REPEAT_TEXT]["post_dates"] == ["2026-10-10"]
     dumped = json.dumps(fact)
     for internal in ("cross_gym", "astra", "Cross-day", "cross_date_media_repeat"):
         assert internal not in dumped
@@ -67,14 +67,19 @@ def test_unknown_reasons_get_cause_neutral_text_not_an_invented_review():
         _row("2026-10-12", reason="caption_changed_needs_new_visual"),
         _row("2026-10-13", reason="global_cross_date_media_repeat"),
         _row("2026-10-14", reason="Cross-day image repeat review 2026-10-05"),
+        _row("2026-10-15", reason="Incident approval provenance review 2026-10-05"),
+        _row("2026-10-16", reason="caption_internal_clarification_needs_review"),
+        _row("2026-10-17", reason="scene_review_hold"),
     ]})
     fact = al.posts_on_hold_fact(store, "k", today=TODAY)
     by = {r["reason"]: r["post_dates"] for r in fact["reasons"]}
     assert by[al._HOLD_PAIRED_STORY_TEXT] == ["2026-10-09"]
-    assert by[al._HOLD_NOT_READY_TEXT] == ["2026-10-10", "2026-10-11"]
+    assert by[al._HOLD_NOT_READY_TEXT] == ["2026-10-10", "2026-10-11", "2026-10-15",
+                                           "2026-10-16"]
     assert by[al._HOLD_CAPTION_CHANGED_TEXT] == ["2026-10-12"]
-    assert by[al._HOLD_REPEAT_TEXT] == ["2026-10-13"]
-    assert by[al._HOLD_REVIEW_TEXT] == ["2026-10-14"]
+    assert by[al._HOLD_REPEAT_TEXT] == ["2026-10-13", "2026-10-14"]
+    # Only a real manual-review queue says LASSO is reviewing.
+    assert by[al._HOLD_REVIEW_TEXT] == ["2026-10-17"]
     dumped = json.dumps(fact)
     for internal in ("paired_feed", "purpose_built", "astra", "global_cross", "Cross-day"):
         assert internal not in dumped
@@ -141,7 +146,7 @@ def test_answer_with_only_hold_fact_is_grounded():
                   "posts_on_hold": {"count": 2, "window": {"from": "2026-10-08",
                                                                 "through": "2026-11-30"},
                                     "scope": al._HOLD_SCOPE_TEXT,
-                                    "reasons": [{"reason": al._HOLD_REVIEW_TEXT, "count": 2,
+                                    "reasons": [{"reason": al._HOLD_REPEAT_TEXT, "count": 2,
                                                  "post_dates": ["2026-10-08", "2026-10-09"]}]}}
     ident = types.SimpleNamespace(name="echo", product="echo")
     who = types.SimpleNamespace(kind="client", account_key="k")
@@ -149,10 +154,28 @@ def test_answer_with_only_hold_fact_is_grounded():
 
     def llm(system, user):
         seen["user"] = user
-        return "Two of your upcoming posts are on hold while we review their photos."
+        return "Two of your upcoming posts are on hold until they get a different photo."
 
     out = al.answer({"raw_text": "Why is account on hold?"}, who, [],
                     "Why is account on hold?", identity=ident,
                     fetch_state=lambda t, w: store_fact, llm=llm)
     assert out and out["grounding"]["facts"]["posts_on_hold"]["count"] == 2
     assert "posts_on_hold" in seen["user"]
+
+
+def test_tough_temple_live_reasons_say_different_photo_not_review():
+    """Verifier finding on #353: both live Tough Temple reasons contain 'review' but no one
+    is reviewing them; they clear when the visual is swapped."""
+    for reason in ("cross_gym_media_source_mismatch_review_required",
+                   "Cross-day exact image URL repeat review 2026-10-05"):
+        assert al._hold_text(reason) == al._HOLD_REPEAT_TEXT, reason
+    store = _Store({"2026-10": [
+        _row("2026-10-11", reason="cross_gym_media_source_mismatch_review_required"),
+        _row("2026-10-14", status="approved",
+             reason="Cross-day exact image URL repeat review 2026-10-05"),
+    ]})
+    fact = al.posts_on_hold_fact(store, "toughtemple52040e", today=TODAY)
+    assert fact["count"] == 2
+    assert [r["reason"] for r in fact["reasons"]] == [al._HOLD_REPEAT_TEXT]
+    assert "review" not in json.dumps(fact["reasons"]).lower()
+
