@@ -9,6 +9,15 @@ The owner checks the contract at packet apply, connection construction and
 transaction entry. The attester checks it at worker settings and direct database
 connection. The shared publisher and its S3 reader are unchanged.
 
+The owner original reader uses only `FORWARD_MEDIA_OWNER_DRIVE_SA_JSON`, an
+inline JSON key for a dedicated Google service account with Viewer access to
+the approved gym source folders. It requests only `drive.readonly`, uses the
+fixed Google OAuth token endpoint and a 30-second HTTP timeout, and performs
+original downloads without retries. Credential file paths, ADC, delegated user
+subjects, shared Drive aliases and publisher credentials remain forbidden.
+This name is owner-only and rejected by the attester. Missing or invalid keys
+leave original verification held; they never fall back to shared Echo secrets.
+
 Use `agent.forward_media_lane_launcher.launch_isolated(lane, arguments,
 environment=dedicated_mapping)` from an operator supervisor. Its required mapping
 is passed explicitly as the complete child environment, never inherited. The
