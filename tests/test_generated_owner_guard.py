@@ -65,6 +65,7 @@ class Cursor:
 
 @pytest.fixture
 def lane(monkeypatch):
+    monkeypatch.setenv('AGENT_S3_PUBLIC_BASE_URL', 'https://owned.example')
     monkeypatch.setattr('agent.visual_writer_prepare._own_media_url',lambda u: isinstance(u,str) and u.startswith('https://owned.example/'))
     conn=Conn(); p=owner.ForwardMediaOwnerPersistence(conn,'owner',None)
     data=image_bytes(); snap=trusted(); c=candidate(snap,data)
