@@ -116,6 +116,8 @@ class FakeConnection:
 
     def _run(self, query, params):
         q = ' '.join(query.lower().split())
+        if q.startswith('set local '):
+            return []
         if q.startswith('select current_user'):
             return [{'current_user': self.current_user}]
         table = self._table(q)
@@ -184,6 +186,8 @@ def test_persists_all_three_rows_in_one_transaction(prepared):
     original, clearance, manifest, reader = prepared
     svc, conn = adapter(reader=reader)
     result = svc.persist(original, clearance, manifest)
+    assert [q for q, _ in conn.executed[:3]] == [
+        "set local lock_timeout = '5s'", "set local statement_timeout = '20s'", CURRENT_USER]
     assert conn.commits == 1 and conn.rollbacks == 0
     assert len(conn.tables['registry']) == len(conn.tables['clearance']) == 1
     assert len(conn.tables['manifest']) == 1
@@ -192,6 +196,21 @@ def test_persists_all_three_rows_in_one_transaction(prepared):
     assert order == ['fixer_forward_media_original_registry_20261006',
                      'fixer_forward_media_history_clearance_20261006',
                      'fixer_forward_media_render_manifest_20261006']
+
+
+def test_owner_startup_deadlines_precede_all_commands(monkeypatch):
+    import sys
+    from types import SimpleNamespace
+    calls = []
+    conn = FakeConnection()
+    def connect(dsn, **kwargs):
+        calls.append((dsn, kwargs))
+        return conn
+    monkeypatch.setitem(sys.modules, 'psycopg', SimpleNamespace(connect=connect))
+    ForwardMediaOwnerPersistence.connect_from_environment(reader=FakeReader(STORE))
+    assert calls[0][1] == {'autocommit': False,
+                           'options': '-c lock_timeout=5000 -c statement_timeout=20000'}
+    assert conn.executed == []
 
 
 def test_idempotent_exact_replay(prepared):

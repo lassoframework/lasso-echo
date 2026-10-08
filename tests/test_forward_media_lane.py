@@ -220,7 +220,8 @@ def test_direct_attester_clean_connection_keeps_exact_role_check(monkeypatch):
     driver = Mock(connect=Mock(return_value=conn))
     monkeypatch.setitem(sys.modules, 'psycopg', driver)
     assert guard._connect() is conn
-    driver.connect.assert_called_once_with(ATTESTER['AGENT_FORWARD_MEDIA_ATTESTER_DSN'])
+    driver.connect.assert_called_once_with(ATTESTER['AGENT_FORWARD_MEDIA_ATTESTER_DSN'],
+                                           options=guard.DB_DEADLINE_OPTIONS)
     cursor.execute.assert_called_once_with('select current_user')
     cursor.fetchone.return_value = ('service_role',)
     with pytest.raises(guard.ForwardMediaVerificationHold, match='role mismatch'):

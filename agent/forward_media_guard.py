@@ -15,6 +15,14 @@ from .forward_media_lane import unknown_environment_names, approved_url, read_pu
 
 ROLE = 'fixer_forward_media_attester_20261006'
 MAX_BYTES = 128 * 1024 * 1024
+DB_DEADLINE_OPTIONS = '-c lock_timeout=5000 -c statement_timeout=20000'
+
+
+def _transaction_deadlines(cur):
+    # Configure before the invoking SELECT: function-local statement_timeout
+    # cannot reliably time out that command. Reapply after the snapshot rollback.
+    cur.execute("set local lock_timeout = '5s'")
+    cur.execute("set local statement_timeout = '20s'")
 
 
 class ForwardMediaVerificationHold(RuntimeError):
@@ -46,7 +54,7 @@ def _connect():
     conn = None
     try:
         import psycopg
-        conn = psycopg.connect(dsn)
+        conn = psycopg.connect(dsn, options=DB_DEADLINE_OPTIONS)
         with conn.cursor() as cur:
             cur.execute('select current_user')
             if cur.fetchone() != (ROLE,):
@@ -97,6 +105,7 @@ def attest(calendar_row_id, expected_revision, *, original_verifier=None, contro
     conn = connection_factory() if connection_factory else _connect()
     try:
         with conn.cursor() as cur:
+            _transaction_deadlines(cur)
             cur.execute('select current_user')
             if cur.fetchone() != (ROLE,):
                 raise ForwardMediaVerificationHold('trusted attester role mismatch')
@@ -156,6 +165,7 @@ def attest(calendar_row_id, expected_revision, *, original_verifier=None, contro
                            if data is not None else (None, None)))
         evidence_id = str(uuid.uuid4())
         with conn.cursor() as cur:
+            _transaction_deadlines(cur)
             cur.execute('select public.fixer_attest_forward_media_20261006('
                         '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)',
                         (row_id, expected_revision, evidence_id, *values, operation,

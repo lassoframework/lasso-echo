@@ -13,7 +13,8 @@ class Cursor:
     def __exit__(self, *args): pass
     def execute(self, sql, args=None):
         self.conn.calls.append((sql, args))
-        self.result = ((self.conn.role,) if 'current_user' in sql else
+        self.result = (None if sql.startswith('set local ') else
+                       (self.conn.role,) if 'current_user' in sql else
                        (self.conn.snapshot,) if 'attestation_request' in sql else
                        (args[2],))
     def fetchone(self): return self.result
@@ -53,11 +54,30 @@ def test_same_object_computes_hash_and_uses_narrow_rpc(lane):
     assert result['fingerprints'] == ['md5:50c68002746cabbaf1bec7acc3b0dd6c']
     conn = lane[1]
     assert conn.committed and conn.closed
+    deadlines = [("set local lock_timeout = '5s'", None),
+                 ("set local statement_timeout = '20s'", None)]
+    assert conn.calls[:2] == deadlines
+    assert conn.calls[-3:-1] == deadlines  # Fresh final transaction after rollback.
     sql, args = conn.calls[-1]
     assert 'fixer_attest_forward_media_20261006' in sql
     assert args[-2] == 'same_object'
     assert args[3:7] == ('md5:50c68002746cabbaf1bec7acc3b0dd6c', 15,
                         'md5:50c68002746cabbaf1bec7acc3b0dd6c', 15)
+
+
+def test_attester_startup_deadlines_precede_role_query(monkeypatch):
+    import sys
+    conn = Connection({})
+    calls = []
+    def connect(dsn, **kwargs):
+        calls.append((dsn, kwargs))
+        return conn
+    monkeypatch.setitem(sys.modules, 'psycopg', SimpleNamespace(connect=connect))
+    monkeypatch.setenv('AGENT_FORWARD_MEDIA_GUARD', 'true')
+    monkeypatch.setenv('AGENT_FORWARD_MEDIA_ATTESTER_DSN', 'isolated-test-dsn')
+    monkeypatch.setenv('AGENT_FORWARD_MEDIA_ATTESTER_ROLE', guard.ROLE)
+    assert guard._connect() is conn
+    assert calls == [('isolated-test-dsn', {'options': '-c lock_timeout=5000 -c statement_timeout=20000'})]
 
 
 @pytest.mark.parametrize('role', ['postgres', 'service_role', 'authenticated'])
@@ -144,7 +164,7 @@ def test_connection_closed_when_role_query_fails(monkeypatch, failure):
             raise RuntimeError('cursor unavailable')
         return FailingCursor(conn)
     conn.cursor = cursor
-    monkeypatch.setitem(sys.modules, 'psycopg', SimpleNamespace(connect=lambda _: conn))
+    monkeypatch.setitem(sys.modules, 'psycopg', SimpleNamespace(connect=lambda _, **kwargs: conn))
     monkeypatch.setenv('AGENT_FORWARD_MEDIA_GUARD', 'true')
     monkeypatch.setenv('AGENT_FORWARD_MEDIA_ATTESTER_DSN', 'isolated-test-dsn')
     monkeypatch.setenv('AGENT_FORWARD_MEDIA_ATTESTER_ROLE', guard.ROLE)

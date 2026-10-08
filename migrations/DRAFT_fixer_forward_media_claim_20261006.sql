@@ -13,6 +13,11 @@
 -- siblings may reuse bytes; another gym or content date may never reuse them.
 -- No historical import, no bypass of legacy/global/pHash or other publish holds.
 -- Rollback before use: remove new objects. After use preserve occupancy/receipts.
+-- Authority lock waits fail closed after 5s per acquisition, including RPC
+-- callers without a connection deadline. Dedicated owner/attester connections
+-- also set lock/statement deadlines BEFORE commands: a trigger's SET is restored
+-- on return and cannot bound a later wait in the outer INSERT. Setting
+-- statement_timeout inside a function does not bound its invoking statement.
 begin;
 
 -- Standalone additive provenance fields. Existing rows stay NULL/held until
@@ -88,7 +93,8 @@ create index fixer_forward_history_fingerprint_20261006
 -- Historical authority appends serialize with attestations/claims under the
 -- existing graph lock, so a waiting claim observes committed quarantine data.
 create function public.fixer_forward_history_lock_20261006()
-returns trigger language plpgsql set search_path=pg_catalog,public as $$
+returns trigger language plpgsql set search_path=pg_catalog,public
+set lock_timeout='5s' as $$
 begin
   if current_setting('transaction_isolation')<>'read committed' then
     raise exception 'forward media authority requires read committed isolation' using errcode='25000';
@@ -359,7 +365,8 @@ create function public.fixer_attest_forward_media_20261006(
   p_calendar_row_id uuid,p_expected_revision text,p_evidence_id uuid,
   p_source_fingerprint text,p_source_length bigint,p_image_fingerprint text,p_image_length bigint,
   p_thumbnail_fingerprint text,p_thumbnail_length bigint,p_operation text,p_evidence_ref text
-) returns uuid language plpgsql security definer set search_path=pg_catalog,public as $$
+) returns uuid language plpgsql security definer set search_path=pg_catalog,public
+set lock_timeout='5s' as $$
 declare
   snapshot jsonb; provenance jsonb; tenant text; urls text[]; hashes text[]; lengths bigint[];
   ids uuid[]:=array[]::uuid[]; rid uuid; i integer; old public.fixer_forward_media_object_read_20261006%rowtype;
@@ -445,7 +452,7 @@ grant execute on function public.fixer_attest_forward_media_20261006(uuid,text,u
 create function public.fixer_claim_forward_media_20261006(
   p_calendar_row_id uuid,p_claim_token uuid,p_evidence_id uuid,p_expected_revision text
 ) returns boolean language plpgsql security definer
-set search_path=pg_catalog,public as $$
+set search_path=pg_catalog,public set lock_timeout='5s' as $$
 declare
   r public.content_calendar%rowtype;
   tenant text;
@@ -625,7 +632,8 @@ grant execute on function public.fixer_claim_forward_media_20261006(uuid,uuid,uu
 -- never writes owner authority, never sends, and never touches approval or
 -- status. Fail closed on missing or ambiguous persisted binding.
 create function public.fixer_bind_forward_media_manifest_20261006(p_calendar_row_id uuid)
-returns boolean language plpgsql security definer set search_path=pg_catalog,public as $$
+returns boolean language plpgsql security definer set search_path=pg_catalog,public
+set lock_timeout='5s' as $$
 declare
   r public.content_calendar%rowtype; tenant text; digest text; matches integer;
   original public.fixer_forward_media_original_registry_20261006%rowtype;

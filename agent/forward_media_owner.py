@@ -47,6 +47,7 @@ from agent.forward_media_prepare import (
 )
 
 MAX_OBJECT_LENGTH = 134217728
+DB_DEADLINE_OPTIONS = '-c lock_timeout=5000 -c statement_timeout=20000'
 
 # Tables created by the DRAFT migration. Owner-only: no grant exists for
 # anon/authenticated/service_role/attester on these three tables.
@@ -267,7 +268,8 @@ class ForwardMediaOwnerPersistence:
             raise EnvironmentGuardError('dedicated owner role missing or forbidden')
         try:
             import psycopg
-            conn = psycopg.connect(os.environ[OWNER_DSN_ENV], autocommit=False)
+            conn = psycopg.connect(os.environ[OWNER_DSN_ENV], autocommit=False,
+                                   options=DB_DEADLINE_OPTIONS)
         except Exception as exc:
             raise OwnerPersistenceError('dedicated owner database unavailable') from exc
         return cls(conn, expected, reader or HostedObjectReader())
@@ -331,6 +333,12 @@ class ForwardMediaOwnerPersistence:
         _verify_reader_bytes(self._reader, original, manifest)
         if getattr(self._conn, 'autocommit', None) is not False:
             raise OwnerPersistenceError('owner connection must use one transaction')
+        # Bound every outer INSERT too: its graph-lock trigger restores its
+        # local settings before a unique/FK wait in the INSERT can occur.
+        # Caller-owned connections receive the same pre-command protection.
+        with self._conn.cursor() as cur:
+            cur.execute("set local lock_timeout = '5s'")
+            cur.execute("set local statement_timeout = '20s'")
         self._assert_owner_identity()
         registry, clear_row, man_row = original.row(), clearance.row(), manifest.row()
         man_row['render_recipe'] = json.dumps(manifest.render_recipe, sort_keys=True)
