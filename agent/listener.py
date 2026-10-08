@@ -908,6 +908,34 @@ def _start_media_repeat_sweep_scheduler():
     return True
 
 
+_lasso_cadence_recovery_started = False
+_lasso_cadence_recovery_lock = threading.Lock()
+
+
+def _start_lasso_cadence_recovery():
+    """Start the LASSO-only cadence recovery lane: two per-account prep daemons
+    plus one publisher daemon, exactly once per process. Default OFF
+    (AGENT_LASSO_CADENCE_RECOVERY); the lane never runs run_daily and never
+    touches a client gym. Same boot pattern as the media/repeat schedulers,
+    before the synchronous daily draw."""
+    global _lasso_cadence_recovery_started
+    from .jobs import lasso_cadence_recovery as _lcr
+    if not _lcr.enabled():
+        return False
+    with _lasso_cadence_recovery_lock:
+        if _lasso_cadence_recovery_started:
+            return False
+        for account_key, _paired in _lcr.ACCOUNTS:
+            threading.Thread(target=_lcr.prep_worker, args=(account_key,),
+                             name=f"lasso-cadence-prep-{account_key}",
+                             daemon=True).start()
+        threading.Thread(target=_lcr.publish_worker,
+                         name="lasso-cadence-publish", daemon=True).start()
+        _lasso_cadence_recovery_started = True
+    print("LASSO cadence recovery lane started (2 prep workers + 1 publisher).")
+    return True
+
+
 def _daily_scheduler(store):
     """
     Minimal in-process daily trigger. Fires run_daily once per day at the target
@@ -1601,6 +1629,7 @@ def run_listener():
     _start_shared_media_runway_refresh()
     _start_media_moderation_scheduler()
     _start_media_repeat_sweep_scheduler()
+    _start_lasso_cadence_recovery()
 
     if str(os.environ.get("AGENT_SCHEDULER_ENABLED", "true")).lower() in {"1", "true", "yes", "on"}:
         threading.Thread(target=_daily_scheduler, args=(store,), daemon=True).start()
