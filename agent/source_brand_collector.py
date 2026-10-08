@@ -603,6 +603,123 @@ class AuthenticatedZernioIdentityReader:
             profile_id=profile, provider_mapping_revision=revision,
             source='zernio_authenticated_accounts', **identity)
 
+
+def read_zernio_identity_readonly(gym_id, echo_account_key, *, read_rows,
+                                  environ=None, http=None, now=None):
+    """Read exact stored-profile Instagram identity without writing receipts.
+
+    This operator diagnostic deliberately does not use
+    ``AuthenticatedZernioIdentityReader``: that runtime reader persists a portal
+    attestation. This function only performs gym-scoped portal GETs and one fixed
+    profile-scoped Zernio GET, and returns a minimal identity receipt.
+    """
+    _canonical_gym(gym_id)
+    if (not isinstance(echo_account_key, str)
+            or not re.fullmatch(r'[A-Za-z0-9_-]{1,128}', echo_account_key)
+            or not callable(read_rows)):
+        _fail('exact_tenant_mapping_required')
+    env = os.environ if environ is None else environ
+    clock = now or (lambda: datetime.now(timezone.utc))
+    tokens = read_rows('echo_intake_tokens', {
+        'gym_id': 'eq.' + gym_id, 'select': 'gym_id,echo_account_key'})
+    if tokens != [{'gym_id': gym_id, 'echo_account_key': echo_account_key}]:
+        _fail('current_tenant_mapping_mismatch')
+    settings = read_rows('echo_gym_settings', {
+        'gym_id': 'eq.' + gym_id, 'select': 'gym_id,zernio_profile_id'})
+    if (not isinstance(settings, list) or len(settings) != 1
+            or not isinstance(settings[0], dict)
+            or settings[0].get('gym_id') != gym_id
+            or not isinstance(settings[0].get('zernio_profile_id'), str)
+            or not re.fullmatch(r'[A-Za-z0-9_-]{1,128}', settings[0]['zernio_profile_id'])):
+        _fail('exact_zernio_profile_mapping_required')
+    profile = settings[0]['zernio_profile_id']
+    key = env.get('ZERNIO_API_KEY', '')
+    if not isinstance(key, str) or not key or any(c.isspace() for c in key):
+        _fail('zernio_account_credential_required')
+    client = http
+    if client is None:
+        import requests
+        client = requests
+    try:
+        response = client.get('https://api.zernio.com/v1/accounts',
+            params={'profileId': profile}, headers={'Authorization': 'Bearer ' + key},
+            timeout=30, allow_redirects=False)
+        observed_at = clock().astimezone(timezone.utc).isoformat()
+        raw = response.content
+        if response.status_code != 200 or type(raw) is not bytes or not 1 <= len(raw) <= 2_000_000:
+            _fail('authenticated_social_status_unavailable')
+        def unique(pairs):
+            result = {}
+            for name, value in pairs:
+                if name in result:
+                    raise ValueError()
+                result[name] = value
+            return result
+        data = json.loads(raw, object_pairs_hook=unique,
+            parse_constant=lambda _: (_ for _ in ()).throw(ValueError()))
+        accounts = data.get('accounts') if isinstance(data, dict) else None
+        if (not isinstance(accounts, list) or any(not isinstance(row, dict) for row in accounts)
+                or any(name in data for name in ('pagination', 'nextCursor', 'hasMore', 'next'))):
+            _fail('authenticated_social_status_incomplete')
+        from .zernio import account_state
+        if any(not isinstance(row.get('platform'), str)
+                or not re.fullmatch(r'[a-z][a-z0-9_]*', row['platform'])
+                or not isinstance(row.get('_id'), str) or not row['_id']
+                or row.get('profileId') != profile for row in accounts):
+            _fail('authenticated_social_profile_mismatch')
+        connected = [row for row in accounts if row.get('platform') == 'instagram'
+                     and account_state(row, now=clock()) == 'connected']
+        if len(connected) != 1:
+            _fail('authenticated_social_identity_ambiguous_or_missing')
+        row = connected[0]
+        metadata = row.get('metadata', {})
+        if not isinstance(metadata, dict):
+            _fail('independent_social_id_evidence_missing')
+        profile_data = metadata.get('profileData', {})
+        if not isinstance(profile_data, dict):
+            _fail('independent_social_id_evidence_missing')
+        ids = [value for value in (row.get('platformUserId'), metadata.get('platformUserId'))
+               if value is not None]
+        handles = [value for value in (row.get('username'), profile_data.get('username'))
+                   if value is not None]
+        if (not ids or any(type(value) is not str or not re.fullmatch(r'[0-9]+', value) for value in ids)
+                or len(set(ids)) != 1 or row['_id'] == ids[0]
+                or not handles or any(type(value) is not str
+                                      or not re.fullmatch(r'[a-z0-9._]{1,30}', value) for value in handles)
+                or len(set(handles)) != 1):
+            _fail('independent_social_id_evidence_missing')
+        return {'profile_id': profile, 'platform_user_id': ids[0], 'handle': handles[0],
+                'observed_at': observed_at, 'response_sha256': hashlib.sha256(raw).hexdigest()}
+    except CaptureIngestError:
+        raise
+    except Exception:
+        _fail('authenticated_social_status_unavailable_or_incomplete')
+
+
+def _readonly_identity_cli(argv=None):
+    import argparse
+    parser = argparse.ArgumentParser(description='Read exact-profile Zernio Instagram identity (no writes).')
+    parser.add_argument('--gym', required=True)
+    parser.add_argument('--account-key', required=True)
+    args = parser.parse_args(argv)
+    try:
+        env = os.environ
+        reader = CollectorPortalReader(environ=env)
+        result = read_zernio_identity_readonly(args.gym, args.account_key,
+                                               read_rows=reader, environ=env)
+        print(_json(result))
+        return 0
+    except CaptureIngestError as error:
+        print(_json({'error': str(error)}))
+        return 2
+    except Exception:
+        print(_json({'error': 'identity_lookup_failed'}))
+        return 2
+
+
+if __name__ == '__main__':
+    raise SystemExit(_readonly_identity_cli())
+
 def build_collector(*, approved_mappings=(), environ=None, http=None,
                     receipt_journal=None, apify_journal=None, apify_client=None,
                     identity_http=None):
