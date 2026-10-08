@@ -598,9 +598,8 @@ def test_prevalidated_insert_rechecks_human_owned_slot_before_post(monkeypatch):
         media_not_ready_reason=None,
         caption='Replacement with different content')
     monkeypatch.setattr(
-        store, 'locked_slots',
-        lambda _key, _month: {
-            (proposal['post_date'], proposal['account'], proposal['format'])})
+        store, 'list_month_strict',
+        lambda _key, _month: [dict(proposal, status='approved')])
 
     with pytest.raises(pcs.CadencePreconditionError):
         store.insert_rows(
@@ -614,7 +613,7 @@ def test_prevalidated_insert_fails_closed_when_live_lock_read_fails(monkeypatch)
     store, http = _state_store(monkeypatch, [])
     proposal = _persisted(media_not_ready_reason=None)
     monkeypatch.setattr(
-        store, 'locked_slots',
+        store, 'list_month_strict',
         lambda *_args: (_ for _ in ()).throw(RuntimeError('read failed')))
 
     with pytest.raises(pcs.CalendarInsertNotStartedError):
@@ -734,3 +733,234 @@ def test_cadence_insert_counts_recovered_story_without_reinserting_it(monkeypatc
     assert len(posted) == 1
     assert {(row['account'], row['format']) for row in posted[0]} == {
         ('instagram', 'feed'), ('facebook', 'feed')}
+
+
+@pytest.mark.parametrize('owned_ordinal', [0, None, 1])
+@pytest.mark.parametrize('span_days', [1, 2])
+@pytest.mark.parametrize('replace_gbp', [False, True])
+def test_partial_locked_day_rebuild_replaces_open_slot_idempotently(monkeypatch, tmp_path, owned_ordinal, span_days, replace_gbp):
+    """An approved feed retains its pending siblings, not the other cadence slot."""
+    from copy import deepcopy
+    from datetime import date
+    import re
+    from agent import cadence, client_month_run as cmr
+    monkeypatch.setenv('AGENT_DB_PATH', str(tmp_path / 'echo.db'))
+    monkeypatch.setenv('AGENT_MEDIA_CROSS_DAY_GUARD', 'false')
+    monkeypatch.setattr(cadence, 'resolve_posts_per_day', lambda *a, **k: 2)
+    retained_slot = owned_ordinal or 0
+    open_slot = 1 - retained_slot
+    day = '2026-10-15'
+
+    def row(identity, slot, account='instagram', fmt='feed', status='pending'):
+        return dict(id=identity, gym_id='eng', post_date=day, account=account,
+                    format=fmt, status=status, slot_index=slot,
+                    variant_status='active', media_not_ready_reason=None,
+                    image_url=f'https://cdn/{identity}.jpg',
+                    created_at='2026-10-01T12:00:00+00:00',
+                    caption=f'Members build strength together {identity.replace("-", " ")}.')
+
+    owned = [row('approved', owned_ordinal, status='approved'),
+             row('owned-fb', owned_ordinal, 'facebook'),
+             row('owned-story', owned_ordinal, fmt='story')]
+    stale = [row('old-ig', open_slot), row('old-fb', open_slot, 'facebook'),
+             row('old-story', open_slot, fmt='story')]
+    outside = dict(row('outside', open_slot), post_date='2026-10-16')
+    foreign = dict(row('foreign', open_slot), gym_id='other-gym')
+    candidate = dict(row('candidate', open_slot), variant_status='candidate')
+
+    gbp = [row('gbp-update', None, 'googlebusiness', 'update'),
+           row('gbp-photo', None, 'googlebusiness', 'photo')]
+
+    class HTTP(_StateHTTP):
+        def delete(self, url, params=None, **kw):
+            # Exercise the real store's generated predicate. Model its nested slot
+            # guard independently of the caller's preservation set.
+            protected = set()
+            for pd, ordinal in re.findall(r'and\(post_date.eq.(\d{4}-\d{2}-\d{2}),'
+                                         r'(?:or\()?slot_index.eq.(\d+)', params.get('and', '')):
+                protected.add((pd, int(ordinal)))
+            gbp_guards = {}
+            for pd, replaced in re.findall(
+                    r'and\(post_date.eq.(\d{4}-\d{2}-\d{2}),account.eq.googlebusiness'
+                    r'(?:,or\(format.is.null,format.not.in.\(([^)]*)\)\))?\)', params.get('and', '')):
+                gbp_guards[pd] = set(replaced.split(',')) if replaced else set()
+            saved = [r for r in self.rows if
+                     (r['account'] != 'googlebusiness'
+                      and (r['post_date'], r.get('slot_index') or 0) in protected)
+                     or (r['account'] == 'googlebusiness'
+                         and r['post_date'] in gbp_guards
+                         and r['format'] not in gbp_guards[r['post_date']])]
+            self.rows = [r for r in self.rows if r not in saved]
+            response = super().delete(url, params=params, **kw)
+            self.rows.extend(saved)
+            return response
+
+    http = HTTP(owned + stale + [outside, foreign, candidate] + gbp)
+    monkeypatch.setattr(pcs.SupabaseCalendarStore, '_client', lambda self: http)
+
+    class Store(pcs.SupabaseCalendarStore):
+        def list_month(self, account_key, month):
+            return deepcopy([r for r in http.rows if r['gym_id'] == account_key
+                             and r['post_date'].startswith(month) and r['variant_status'] == 'active'])
+
+        def rows_in_range(self, account_key, first, last):
+            return [r for r in self.list_month(account_key, first[:7]) if first <= r['post_date'] <= last]
+
+        def preflight_cadence_rows(self, account_key, rows, *, replace_dates=()):
+            assert day in replace_dates
+            return rows
+
+        def insert_rows(self, account_key, rows, **kw):
+            inserted = [dict(r, id=f'new-{len(http.rows)}-{i}', variant_status='active',
+                             media_not_ready_reason=None) for i, r in enumerate(rows)]
+            http.rows.extend(inserted)
+            return inserted
+
+    incoming = [row('new-ig', open_slot), row('new-fb', open_slot, 'facebook'),
+                row('new-story', open_slot, fmt='story')]
+    if replace_gbp:
+        incoming.append(row('new-gbp', None, 'googlebusiness', 'update'))
+    for _ in range(2):
+        result = cmr._apply('eng', incoming, date(2026, 10, 15), span_days, Store(), lambda m: None,
+                            locked_days={day})
+        assert result['ok'], result
+        if span_days == 2:
+            # The open slot is being replaced, so it cannot also count as retained
+            # capacity. Three existing feeds would otherwise shrink to two.
+            assert result['noop_shrink']
+            assert result['deleted'] == result['inserted'] == 0
+            assert all(r in http.rows for r in owned + stale + [outside, foreign, candidate])
+            assert not any(method == 'delete' for method, _ in http.calls)
+            continue
+        assert result['deleted'] == result['deleted_total'] == (4 if replace_gbp else 3)
+        assert result['inserted'] == (4 if replace_gbp else 3)
+        assert all(r in http.rows for r in owned + [outside, foreign, candidate])
+        active = [r for r in http.rows if r['gym_id'] == 'eng' and r['post_date'] == day
+                  and r['variant_status'] == 'active']
+        assert len(active) == 8
+        assert gbp[1] in http.rows
+        assert len([r for r in active if r['account'] == 'googlebusiness']) == 2
+        if replace_gbp:
+            assert gbp[0] not in http.rows
+        else:
+            assert gbp[0] in http.rows
+        assert len([r for r in active if r['format'] == 'feed' and r['account'] == 'instagram']) == 2
+        assert not any(r['id'].startswith('old-') for r in http.rows)
+        params = next(params for method, params in reversed(http.calls) if method == 'delete')
+        assert f'post_date.eq.{day}' in params['and']
+        assert 'not.or(' in params['and']
+        assert params['media_not_ready_reason'] == 'is.null'
+        assert params['variant_status'] == 'eq.active'
+        if retained_slot == 0:
+            assert 'or(slot_index.eq.0,slot_index.is.null)' in params['and']
+
+
+@pytest.mark.parametrize('owned_slot, incoming_slot', [(0, 1), (1, 0), (None, 1)])
+def test_strict_prevalidated_insert_accepts_distinct_approved_cadence_sibling(
+        monkeypatch, owned_slot, incoming_slot):
+    from agent import cadence
+    monkeypatch.setattr(cadence, 'resolve_posts_per_day', lambda *a, **kw: 2)
+    approved = _persisted(status='approved', slot_index=owned_slot,
+                          media_not_ready_reason=None)
+    store, http = _state_store(monkeypatch, [approved])
+    proposal = _persisted(id='proposed', slot_index=incoming_slot,
+                          media_not_ready_reason=None, caption='Different approved source copy',
+                          image_url='https://cdn/different.jpg')
+    result = store.insert_rows('eng', [proposal], prevalidated_cadence=True,
+                               required_feed_slots={(proposal['post_date'], incoming_slot)})
+    assert len(result) == 1 and result[0]['slot_index'] == incoming_slot
+    assert approved in http.rows
+    assert len([call for call in http.calls if call[0] == 'post']) == 1
+
+
+@pytest.mark.parametrize('capacity, owned_slot, incoming_slot', [(2, 1, 1), (2, None, 0), (1, 0, 1)])
+def test_strict_prevalidated_insert_refuses_owned_slot_or_legacy_one_post_cell(
+        monkeypatch, capacity, owned_slot, incoming_slot):
+    from agent import cadence
+    monkeypatch.setattr(cadence, 'resolve_posts_per_day', lambda *a, **kw: capacity)
+    approved = _persisted(status='approved', slot_index=owned_slot,
+                          media_not_ready_reason=None)
+    store, http = _state_store(monkeypatch, [approved])
+    proposal = _persisted(id='proposed', slot_index=incoming_slot,
+                          media_not_ready_reason=None, caption='Changed content cannot bypass approval')
+    with pytest.raises(pcs.CadencePreconditionError):
+        store.insert_rows('eng', [proposal], prevalidated_cadence=True,
+                          required_feed_slots={(proposal['post_date'], incoming_slot)})
+    assert http.rows == [approved]
+    assert not any(method == 'post' for method, _ in http.calls)
+
+
+@pytest.mark.parametrize('failure', ['http', 'missing_count', 'short_page', 'changing_count', 'duplicate_page', 'foreign'])
+def test_strict_cadence_month_read_refuses_partial_or_unconfirmed_snapshot(monkeypatch, failure):
+    store, http = _state_store(monkeypatch, [])
+    proposal = _persisted(media_not_ready_reason=None)
+    original_get = http.get
+    calls = []
+    def get(url, params=None, **kwargs):
+        if params.get('select') and 'status' in params['select'].split(','):
+            calls.append(params)
+            page = [dict(proposal, id=f'owned-{i}', status='pending') for i in range(500)]
+            if failure == 'http':
+                return _Resp(503)
+            if failure == 'short_page':
+                page = page[:499]
+            if failure == 'foreign':
+                page[0]['gym_id'] = 'foreign'
+            response = _Resp(200, page)
+            response.headers = {'Content-Range': '0-499/1000'}
+            if failure == 'missing_count':
+                response.headers = {}
+            if failure == 'changing_count' and len(calls) == 2:
+                response.headers = {'Content-Range': '500-999/1001'}
+            return response
+        return original_get(url, params=params, **kwargs)
+    monkeypatch.setattr(http, 'get', get)
+    with pytest.raises(pcs.CalendarInsertNotStartedError):
+        store.insert_rows('eng', [proposal], prevalidated_cadence=True,
+                          required_feed_slots={(proposal['post_date'], proposal['slot_index'])})
+    assert not any(method == 'post' for method, _ in http.calls)
+    assert len(calls) <= 2
+
+
+def test_strict_cadence_month_read_paginates_approval_beyond_first_response(monkeypatch):
+    from agent import cadence
+    monkeypatch.setattr(cadence, 'resolve_posts_per_day', lambda *a, **kw: 2)
+    proposal = _persisted(id='proposed', slot_index=1, media_not_ready_reason=None)
+    existing = [dict(proposal, id=f'row-{i:04d}', status='pending') for i in range(1000)]
+    existing.append(dict(proposal, id='row-1000', status='approved'))
+    store, http = _state_store(monkeypatch, existing)
+    original_get = http.get
+    offsets = []
+    def get(url, params=None, **kwargs):
+        if params.get('select') and 'status' in params['select'].split(','):
+            offset = int(params['offset'])
+            offsets.append(offset)
+            page = existing[offset:offset + 500]
+            response = _Resp(200, page)
+            response.headers = {'Content-Range': f'{offset}-{offset + len(page) - 1}/1001'}
+            assert kwargs['headers']['Prefer'] == 'count=exact'
+            return response
+        return original_get(url, params=params, **kwargs)
+    monkeypatch.setattr(http, 'get', get)
+    with pytest.raises(pcs.CadencePreconditionError):
+        store.insert_rows('eng', [proposal], prevalidated_cadence=True,
+                          required_feed_slots={(proposal['post_date'], 1)})
+    assert offsets == [0, 500, 1000]
+    assert not any(method == 'post' for method, _ in http.calls)
+
+
+def test_strict_barrier_sees_exact_slot_approved_after_preflight(monkeypatch):
+    from agent import cadence
+    monkeypatch.setattr(cadence, 'resolve_posts_per_day', lambda *a, **kw: 2)
+    store, http = _state_store(monkeypatch, [])
+    proposal = _persisted(id='proposed', slot_index=1, media_not_ready_reason=None)
+    admitted = store.preflight_cadence_rows('eng', [proposal],
+                                            replace_dates={proposal['post_date']})
+    assert len(admitted) == 1
+    approved = dict(proposal, id='concurrent-approval', status='approved')
+    http.rows.append(approved)
+    with pytest.raises(pcs.CadencePreconditionError):
+        store.insert_rows('eng', admitted, prevalidated_cadence=True,
+                          required_feed_slots={(proposal['post_date'], 1)})
+    assert http.rows == [approved]
+    assert not any(method == 'post' for method, _ in http.calls)

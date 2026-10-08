@@ -15,13 +15,10 @@ import re
 import threading
 
 from . import forward_media_guard as guard
+from .forward_media_lane import unknown_environment_names
 
 TENANTS_ENV = 'AGENT_FORWARD_MEDIA_ATTESTER_TENANTS'
 WORKER_ENV = 'AGENT_FORWARD_MEDIA_ATTESTER_WORKER'
-_FORBIDDEN_CREDENTIALS = (
-    'SUPABASE_SERVICE_ROLE_KEY', 'AGENT_SOCIALAPI_KEY', 'AGENT_SOCIALAPI_ENC_KEY',
-    'ZERNIO_API_KEY', 'AGENT_GBP_ACCESS_TOKEN',
-)
 _TENANT = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,127}\Z')
 _REVISION = re.compile(r'[0-9a-f]{32}\Z')
 _ELIGIBLE_RPC = 'select public.forward_schedule_preparation_eligible_20261008(%s)'
@@ -59,7 +56,7 @@ def _integer(env, name, default, minimum, maximum):
 
 def settings_from_environment(env=None):
     env = os.environ if env is None else env
-    if any(env.get(name) for name in _FORBIDDEN_CREDENTIALS):
+    if unknown_environment_names(env, 'attester'):
         raise WorkerConfigurationHold('publisher_or_service_credentials_present')
     if (not env.get('AGENT_FORWARD_MEDIA_ATTESTER_DSN')
             or env.get('AGENT_FORWARD_MEDIA_ATTESTER_ROLE') != guard.ROLE):

@@ -451,3 +451,47 @@ def test_build_finally_prewrite_failure_still_rolls_back(monkeypatch):
     assert len(calls["rollback"]) == 1
     assert len(calls["released"]) == 1
     assert calls["restored"] == 1
+
+
+@pytest.mark.parametrize("gbp_formats", [(), ("update",)])
+@pytest.mark.parametrize("retained_ordinal", [None, 0, 1])
+def test_atomic_old_manifest_matches_partial_day_slot_and_gbp_preservation(
+        gbp_formats, retained_ordinal):
+    store = _AtomicApplyStore()
+    original = store.old[0]
+    retained_slot = retained_ordinal or 0
+    open_slot = 1 - retained_slot
+    replaceable = [dict(original, id=str(uuid.uuid4()), account=account, format=fmt,
+                        slot_index=open_slot)
+                   for account, fmt in (("instagram", "feed"), ("facebook", "feed"))]
+    protected = [dict(row, id=str(uuid.uuid4()), slot_index=retained_ordinal)
+                 for row in replaceable]
+    gbp = [dict(original, id=str(uuid.uuid4()), account="googlebusiness", format=fmt,
+                slot_index=None) for fmt in ("update", "photo")]
+    whole_locked = dict(original, id=str(uuid.uuid4()), post_date="2026-10-21")
+    store.old = replaceable + protected + gbp + [whole_locked]
+    rows = cmr._forward_replacement_rows(
+        store, "gritx", ["2026-10"], DAY, "2026-10-21", {"2026-10-21"},
+        preserve_slots={(DAY, retained_slot)}, preserve_gbp={DAY: gbp_formats})
+    assert rows == replaceable + [row for row in gbp if row["format"] in gbp_formats]
+
+
+def test_armed_apply_freezes_open_partial_day_slot_without_deleting(monkeypatch):
+    from agent import cadence
+    monkeypatch.setenv(pcs.FORWARD_RESERVATION_FLAG_ENV, "1")
+    monkeypatch.setattr(cadence, 'resolve_posts_per_day', lambda *a, **k: 2)
+    store = _AtomicApplyStore()
+    stale = dict(store.old[0], slot_index=1)
+    retained = dict(stale, id=str(uuid.uuid4()), slot_index=0)
+    store.old = [stale, retained]
+    store.before = deepcopy(store.old)
+    def delete_month(*args, preserve_slots=(), preserve_gbp=None, **kwargs):
+        pytest.fail("armed staging must not delete")
+    store.delete_month = delete_month
+    incoming = [dict(row, slot_index=1) for row in _apply_rows(with_proofs=True)]
+    result = cmr._apply("gritx", incoming, date(2026, 10, 20), 1, store,
+                        lambda msg: None, locked_days={DAY})
+    assert result["ok"] is True and result["state"] == "preparing"
+    assert store.expected_old_rows == [stale]
+    assert store.old == store.before
+    assert store.deleted == []

@@ -196,11 +196,11 @@ def main():
             sql('update forward_media_visual_gate_20261008 set enabled=true;')
             sql('update forward_schedule_reservation_gate_20261008 set enabled=true;')
 
-            for name in list(os.environ):
-                if owner._FORBIDDEN_ENV_NAME.search(name):
-                    os.environ.pop(name)
+            for name in owner.forbidden_credential_names(os.environ):
+                os.environ.pop(name)
             os.environ['FORWARD_MEDIA_OWNER_DSN'] = dsn('staged_owner')
             os.environ['FORWARD_MEDIA_OWNER_ROLE'] = 'staged_owner'
+            os.environ['AGENT_S3_PUBLIC_BASE_URL'] = 'https://media.example.test'
             os.environ[worker.WORKER_ENV] = 'true'
             os.environ[worker.STAGED_ENV] = 'true'
 
@@ -533,6 +533,7 @@ def main():
             from agent import media_host
             with patch.object(media_host.config, 'S3_PUBLIC_BASE_URL', 'https://media.example.test'), \
                  patch.object(guard, '_connect', side_effect=trusted_lane), \
+                 patch.object(guard, 'read_public_object', side_effect=a_hosted.read), \
                  patch.object(visual_writer_prepare, '_bytes_for_url', side_effect=a_hosted.read):
                 a_rev = sql('select public.fixer_forward_media_attestation_request_20261006(%s)',
                             (a_rid,))[0][0]['revision']
@@ -665,6 +666,7 @@ def main():
                              (rid,))[0][0]['revision']
             with patch.object(media_host.config, 'S3_PUBLIC_BASE_URL', 'https://media.example.test'), \
                  patch.object(guard, '_connect', side_effect=trusted_lane), \
+                 patch.object(guard, 'read_public_object', side_effect=hosted.read), \
                  patch.object(visual_writer_prepare, '_bytes_for_url', side_effect=hosted.read):
                 active_proof = guard.attest(rid, normal_rev)
             assert active_proof['revision'] == normal_rev
@@ -872,6 +874,7 @@ def main():
                        (b_rid,), role='service_role')[0][0] is True
             with patch.object(media_host.config, 'S3_PUBLIC_BASE_URL', 'https://media.example.test'), \
                  patch.object(guard, '_connect', side_effect=trusted_lane), \
+                 patch.object(guard, 'read_public_object', side_effect=a_hosted.read), \
                  patch.object(visual_writer_prepare, '_bytes_for_url', side_effect=a_hosted.read):
                 b_snapshot = sql('select public.fixer_forward_media_attestation_request_20261006(%s)',
                                  (b_rid,))[0][0]

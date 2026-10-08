@@ -16,6 +16,7 @@ from .slack_convo import adapter as _a
 from .slack_convo import answer_lane as _al
 from .slack_convo import identities as _ids
 from .slack_convo import listener_wiring as _lw
+from .slack_convo import outbox as _ob
 from .slack_convo.bus import Bus
 from .slack_surface import SlackPoster
 
@@ -109,6 +110,9 @@ def live_deps(*, product=None, source=None, identity_name="echo", bus=None, log=
     shared = dict(
         open_group_dm=_open_group_dm_factory(poster),
         post_first_message=_post_first_message_factory(poster),
+        readback=lambda channel, **kwargs: poster.read_conversation_messages(
+            channel, **kwargs),
+        member_check=lambda channel, user: _ob._blake_is_member(ident, channel, user),
         mark_message=bus.mark_message,
         claim_message=bus.claim_message,
         stamp_ticket=_stamp_ticket_factory(bus),

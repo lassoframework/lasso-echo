@@ -12,8 +12,18 @@ import json
 import os
 import uuid
 
+from .forward_media_lane import unknown_environment_names, approved_url, read_public_object
+
 ROLE = 'fixer_forward_media_attester_20261006'
 MAX_BYTES = 128 * 1024 * 1024
+DB_DEADLINE_OPTIONS = '-c lock_timeout=5000 -c statement_timeout=20000'
+
+
+def _transaction_deadlines(cur):
+    # Configure before the invoking SELECT: function-local statement_timeout
+    # cannot reliably time out that command. Reapply after the snapshot rollback.
+    cur.execute("set local lock_timeout = '5s'")
+    cur.execute("set local statement_timeout = '20s'")
 
 
 class ForwardMediaVerificationHold(RuntimeError):
@@ -44,13 +54,16 @@ def _uuid(value):
 
 
 def _connect():
+    if unknown_environment_names(os.environ, 'attester'):
+        raise ForwardMediaVerificationHold('unrecognized attester environment')
     dsn = os.getenv('AGENT_FORWARD_MEDIA_ATTESTER_DSN')
     expected = os.getenv('AGENT_FORWARD_MEDIA_ATTESTER_ROLE')
     if not enabled() or not dsn or expected != ROLE:
         raise ForwardMediaVerificationHold('trusted media attester is not configured')
+    conn = None
     try:
         import psycopg
-        conn = psycopg.connect(dsn)
+        conn = psycopg.connect(dsn, options=DB_DEADLINE_OPTIONS)
         with conn.cursor() as cur:
             cur.execute('select current_user')
             if cur.fetchone() != (ROLE,):
@@ -60,15 +73,19 @@ def _connect():
     except ForwardMediaVerificationHold:
         raise
     except Exception as exc:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
         raise ForwardMediaVerificationHold('trusted attester database unavailable') from exc
 
 
 def _read(url, reader):
-    from . import visual_writer_prepare as prepare
-    if not prepare._own_media_url(url):
+    if not approved_url(url):
         raise ForwardMediaVerificationHold('object is outside approved media host')
     try:
-        data = (reader or prepare._bytes_for_url)(url)
+        data = (reader or read_public_object)(url)
     except Exception as exc:
         raise ForwardMediaVerificationHold('exact object read unavailable') from exc
     if not isinstance(data, bytes) or not data or len(data) > MAX_BYTES:
@@ -97,6 +114,7 @@ def attest(calendar_row_id, expected_revision, *, original_verifier=None, contro
     conn = connection_factory() if connection_factory else _connect()
     try:
         with conn.cursor() as cur:
+            _transaction_deadlines(cur)
             cur.execute('select current_user')
             if cur.fetchone() != (ROLE,):
                 raise ForwardMediaVerificationHold('trusted attester role mismatch')
@@ -156,6 +174,7 @@ def attest(calendar_row_id, expected_revision, *, original_verifier=None, contro
                            if data is not None else (None, None)))
         evidence_id = str(uuid.uuid4())
         with conn.cursor() as cur:
+            _transaction_deadlines(cur)
             cur.execute('select public.fixer_attest_forward_media_20261006('
                         '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)',
                         (row_id, expected_revision, evidence_id, *values, operation,

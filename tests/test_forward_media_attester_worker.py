@@ -15,7 +15,11 @@ SECRET = 'postgresql://service_role:never-log-this@private.example/db'
 
 @pytest.fixture(autouse=True)
 def configured(monkeypatch):
-    for name in worker._FORBIDDEN_CREDENTIALS:
+    import os
+    from agent.forward_media_owner import forbidden_credential_names
+    for name in forbidden_credential_names(os.environ):
+        monkeypatch.delenv(name, raising=False)
+    for name in ('SUPABASE_SERVICE_ROLE_KEY', 'ZERNIO_API_KEY'):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv(worker.WORKER_ENV, 'true')
     monkeypatch.setenv('AGENT_FORWARD_MEDIA_GUARD', 'true')
@@ -595,3 +599,43 @@ def test_staged_lane_wrong_role_holds_everything():
     assert result['rows'] == []
     assert result['tenants'][0]['reason'] == 'attester_role_mismatch'
     assert result['status'] == 'partial_hold'
+
+
+@pytest.mark.parametrize('name', [
+    'AGENT_WHATSAPP_TOKEN', 'AGENT_WHATSAPP_APP_SECRET', 'AGENT_META_APP_SECRET',
+    'META_APP_SECRET', 'AGENT_SLACK_APP_TOKEN', 'AGENT_SUPPORT_SLACK_BOT_TOKEN',
+    'AGENT_FUTURE_GYM_IG_TOKEN', 'AGENT_INTAKE_TOKEN_PIERCE',
+    'AGENT_INTAKE_TOKEN_FUTURE_GYM', 'PGPASSWORD', 'MYSQLPASSWORD',
+])
+def test_provider_credentials_rejected_by_shared_guard(name):
+    import os
+    env = dict(os.environ)
+    env[name] = SECRET
+    with pytest.raises(worker.WorkerConfigurationHold) as exc:
+        worker.settings_from_environment(env)
+    assert str(exc.value) == 'publisher_or_service_credentials_present'
+    assert SECRET not in str(exc.value)
+
+
+def test_dedicated_attester_settings_and_runtime_flags_allowed():
+    settings = worker.settings_from_environment({
+        'AGENT_FORWARD_MEDIA_ATTESTER_DSN': 'postgresql://attester/db',
+        'AGENT_FORWARD_MEDIA_ATTESTER_ROLE': worker.guard.ROLE,
+        worker.TENANTS_ENV: 'pierce', worker.WORKER_ENV: 'true',
+        'PATH': '/usr/bin', 'SSL_CERT_FILE': '/etc/ssl/cert.pem',
+
+    })
+    assert settings.tenants == ('pierce',)
+
+
+@pytest.fixture(autouse=True)
+def isolated_process_environment(monkeypatch):
+    # Pytest injects PYTEST_CURRENT_TEST after fixture setup. This test-only
+    # process view excludes that harness marker; production accepts no such name.
+    import os
+    class ProcessEnvironment:
+        @property
+        def environ(self):
+            return {k: v for k, v in os.environ.items() if k != 'PYTEST_CURRENT_TEST'}
+        getenv = staticmethod(os.getenv)
+    monkeypatch.setattr(worker, 'os', ProcessEnvironment())

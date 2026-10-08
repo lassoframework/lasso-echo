@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import sys
 from datetime import date, timedelta
 
@@ -56,6 +57,62 @@ def _log(msg):
 def _lib_dir(base):
     from agent.client_media_sync import _library_dir
     return _library_dir(base)
+
+
+def _client_sweep_bases(registered_bases, client_set):
+    """Add Echo client account keys missing from the account registry.
+
+    The account registry remains the preferred source of operational account
+    keys. The authoritative Echo snapshot supplies a fallback key only for a
+    gym already proven to be a client; intake-token keys alone never establish
+    client membership. Ambiguous or malformed aliases are not used.
+    """
+    from agent import echo_clients
+
+    if not getattr(client_set, "ok", False):
+        return list(dict.fromkeys(registered_bases or []))
+
+    by_gym = {}
+    ungrouped = []
+    for base in registered_bases or []:
+        normalized = echo_clients.normalize_key(base)
+        gym_id = client_set.key_to_gym.get(normalized)
+        if normalized in client_set.ambiguous_keys:
+            # A conflicted alias cannot safely identify a tenant, even when it
+            # appeared in the previously filtered registry roster.
+            continue
+        if gym_id:
+            by_gym.setdefault(gym_id, []).append(base)
+        else:
+            # Preserve existing explicitly configured/hardcoded bases whose
+            # client alias is not represented in this snapshot.
+            ungrouped.append(base)
+
+    result = list(ungrouped)
+    for gym_id in sorted(client_set.gym_ids):
+        result.extend(by_gym.get(gym_id) or [])
+        candidates = sorted(
+            echo_clients.normalize_key(key)
+            for key in client_set.token_keys_by_gym.get(gym_id, ())
+            if re.fullmatch(r"[a-z0-9][a-z0-9_]{0,100}",
+                            echo_clients.normalize_key(key))
+            and echo_clients.normalize_key(key) not in client_set.ambiguous_keys
+            and client_set.key_to_gym.get(echo_clients.normalize_key(key)) == gym_id
+        )
+        result.extend(candidates)
+    return list(dict.fromkeys(result))
+
+
+def _sweep_roster():
+    """Resolve the sweep roster from registered accounts plus Echo's client set."""
+    from agent.calendar_autopublish import client_gym_bases
+    from agent import echo_clients
+
+    registered = client_gym_bases()
+    client_set = echo_clients.snapshot(fresh=True)
+    # A failed Echo read must not admit token-only gyms. Keep the established
+    # registry result (which itself applies the Echo gate) and let LASSO run.
+    return _client_sweep_bases(registered, client_set)
 
 
 def _is_real_image(path):
@@ -980,8 +1037,8 @@ def sweep_gym(base, store, *, apply=False, horizon=62, today=None):
 def run(gyms, *, apply=False, horizon=62):
     store = SupabaseCalendarStore()
     if not gyms:
-        from agent.calendar_autopublish import client_gym_bases
-        gyms = client_gym_bases() + ["lasso"]
+        gyms = _sweep_roster() + ["lasso"]
+    gyms = list(dict.fromkeys(gyms))
     results = []
     today_iso = date.today().isoformat()
     for base in gyms:

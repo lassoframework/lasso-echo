@@ -88,9 +88,7 @@ class Connection:
 @pytest.fixture
 def lane(monkeypatch):
     monkeypatch.setenv('AGENT_FORWARD_MEDIA_GUARD', '1')
-    from agent import visual_writer_prepare
-    monkeypatch.setattr(visual_writer_prepare, '_own_media_url',
-                        lambda url: url.startswith('https://owned.example/'))
+    monkeypatch.setenv('AGENT_S3_PUBLIC_BASE_URL', 'https://owned.example')
     row_id = str(uuid.uuid4())
     snapshot = {'calendar_row_id': row_id, 'revision': REVISION,
                 'tenant_id': 'tenant-1', 'gym_id': 'gym-1',
