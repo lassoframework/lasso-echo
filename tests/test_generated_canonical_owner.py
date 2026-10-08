@@ -265,6 +265,12 @@ def test_full_owner_generation_replay_and_current_publish_binding(active,case,mo
     monkeypatch.setattr(guard,'generated_snapshot',lambda p,r:copy.deepcopy(snap))
     def read(url):return case.storage.get_bytes(url.split('images.example.test/')[1])
     loader=runtime.OwnerSnapshotLoader(p,bundle_reader=lambda base:copy.deepcopy(active),reader=read)
+    # This offline owner fixture represents the SQL function's latest,
+    # complete zero-photo census at the exact inventory revision. Keep the
+    # production SQL authority path in the runtime by faking only this read.
+    census=dict(enabled=True,receipt_id=identity(),local_complete=True,
+        local_available=0,observed_at=datetime.now(timezone.utc))
+    monkeypatch.setattr(runtime,'_latest_local_census',lambda _p,_gym,_revision:copy.deepcopy(census))
     reservations=[]
     def reserve(p,r,c,current,**kw):
         assert current['copy_approved'] is False
@@ -334,6 +340,7 @@ def test_gap_missing_semantic_validation_never_binds(active,case,monkeypatch):
 
 
 def test_real_python_B_seam_uses_canonical_reservation_and_fresh_authority(active,case,monkeypatch):
+    monkeypatch.setenv('AGENT_S3_PUBLIC_BASE_URL','https://images.example.test')
     authority=derive(active)
     case.snapshot.update(copy=authority['copy'],palette=authority['palette'],copy_approved=False,
         copy_verified=True,copy_digest=prep.digest(authority['copy']),authority_pins=authority['authority_pins'],
