@@ -377,11 +377,14 @@ def test_real_barrier_serializes_with_calendar_writer(db):
         assert time.monotonic() < deadline, 'writer never reached sleep with its ROW EXCLUSIVE lock'
         time.sleep(.02)
     started = time.monotonic()
-    proof = activate(key)  # SHARE ROW EXCLUSIVE must wait for the writer to commit
+    with pytest.raises(RuntimeError, match=r'55P03|could not obtain lock'):
+        activate(key)  # NOWAIT must refuse while the calendar writer holds ROW EXCLUSIVE.
     elapsed = time.monotonic() - started
     thread.join(timeout=15)
     assert not thread.is_alive() and errors == []
-    assert elapsed >= 1.5, f'activation did not wait for the in-flight calendar writer ({elapsed:.2f}s)'
+    assert elapsed < 1.5, f'activation waited on the in-flight calendar writer ({elapsed:.2f}s)'
+    assert enforced(tid) == 'false', 'failed activation must not partially arm the tenant'
+    proof = activate(key)
     assert proof['enforced'] is True and proof['calendar_rows'] == 2
 
 

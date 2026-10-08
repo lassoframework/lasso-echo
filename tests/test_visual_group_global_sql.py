@@ -352,7 +352,11 @@ def test_keyed_same_date_reservation_gains_append_only_published_attribution():
     assert member < receipt
     assert "on conflict (tenant_id,group_key,fingerprint,calendar_row_id) do nothing" in claim
     importer = sql.split("create or replace function public.visual_global_import_history()", 1)[1].split("end;\n$$;", 1)[0]
-    assert "public.visual_global_published_attribution" in importer.split("nowait", 1)[0]
+    calendar_lock = importer.index("lock table public.content_calendar in share row exclusive mode nowait")
+    auxiliary_locks = importer.index("lock table public.visual_group_usage_ledger")
+    attribution_lock = importer.index("public.visual_global_published_attribution", auxiliary_locks)
+    assert calendar_lock < auxiliary_locks < attribution_lock
+    assert "in share row exclusive mode nowait" in importer[auxiliary_locks:]
     history = sql.split("create or replace function public.visual_global_history_coverage()", 1)[1].split("$$;", 1)[0]
     assert history.count("public.visual_global_published_attribution pa") == 2
     assert "pa.calendar_row_id=m.calendar_row_id" in history

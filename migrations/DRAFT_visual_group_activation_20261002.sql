@@ -12,15 +12,28 @@
 -- tenant is armed; preserve all global published rows during rollback.
 --
 -- Barrier contract (all in ONE fresh READ COMMITTED transaction):
---   1. LOCK TABLE content_calendar IN SHARE ROW EXCLUSIVE MODE first, before
---      any advisory lock, row lock or calendar read. SHARE ROW EXCLUSIVE
---      conflicts with the ROW EXCLUSIVE of every calendar INSERT/UPDATE/
---      DELETE (including claim-trigger writers). FOR UPDATE readers may
---      remain; their auxiliary tenant/key locks are TRYed below, so we
---      release/refuse instead of waiting for their blocked calendar writes.
---   2. TRY one canonical tenant auxiliary advisory, then TRY per-key
---      backfill advisories in sorted order. Contention raises 55P03; never
---      wait for an advisory owner that might be blocked by our barrier.
+--   1. LOCK TABLE content_calendar IN SHARE ROW EXCLUSIVE MODE NOWAIT first,
+--      before any advisory lock, row lock or calendar read. SHARE ROW
+--      EXCLUSIVE conflicts with the ROW EXCLUSIVE of every calendar
+--      INSERT/UPDATE/DELETE (including claim-trigger writers). NOWAIT turns
+--      an in-flight writer into an immediate 55P03 refusal instead of a
+--      queue: a queued barrier would hold no locks yet, but once granted it
+--      would block writers that already hold the forward graph/census
+--      advisory locks ('G' shared on 'fixer_forward_graph_20261006', 'C'
+--      exclusive on 'fixer_forward_photo_census_20261007') and then need
+--      calendar ROW EXCLUSIVE -- while activation, holding the barrier,
+--      would wait on those same advisories. That cycle is a 40P01 deadlock;
+--      every acquisition here is nonblocking so the cycle cannot form.
+--      FOR UPDATE readers may remain; their auxiliary tenant/key locks are
+--      TRYed below, so we release/refuse instead of waiting for their
+--      blocked calendar writes.
+--   2. Immediately after the barrier, TRY the forward graph advisory 'G' in
+--      SHARED mode, then TRY the census advisory 'C' (exclusive) -- the same
+--      keys and order the calendar/claim entry guards use -- then TRY one
+--      canonical tenant auxiliary advisory, then TRY per-key backfill
+--      advisories in sorted order. Any contention raises 55P03 and rolls
+--      back BEFORE any auxiliary write or backfill; never wait for a lock
+--      owner that might be blocked by our barrier.
 --   3. Real backfill for EVERY covered calendar alias key, then a locked
 --      re-read of all calendar rows (any status/variant: archived, held,
 --      candidate, published, pending), ledger, siblings, events, scene
@@ -189,7 +202,13 @@ begin
 
   -- 1. WRITE BARRIER FIRST: drains and blocks all calendar writers (ROW
   -- EXCLUSIVE conflicts) before any advisory lock, row lock or calendar read.
-  lock table public.content_calendar in share row exclusive mode;
+  -- NOWAIT: an in-flight writer (including one holding the forward G/C entry
+  -- advisories) makes the barrier fail with 55P03 immediately; the caller
+  -- retries in a fresh transaction. Waiting here would let this transaction
+  -- later hold the barrier while queued on G/C -- the exact inversion cycle
+  -- (writer: G/C -> calendar ROW EXCLUSIVE; activation: barrier -> G/C) that
+  -- PG detects as 40P01.
+  lock table public.content_calendar in share row exclusive mode nowait;
   -- Freeze cross-tenant history/identity inputs as well. NOWAIT avoids a
   -- deadlock if an auxiliary writer owns one while waiting for our calendar
   -- barrier; a retry must start a new transaction.
@@ -202,7 +221,23 @@ begin
     public.visual_global_usage, public.visual_global_usage_member
     in share row exclusive mode nowait;
 
-  -- 2. The SAME canonical mutex every auxiliary mutation RPC takes before
+  -- 2. Forward entry locks G then C, nonblocking, BEFORE any auxiliary write
+  -- or backfill. Same system-wide keys and order as the calendar/claim entry
+  -- guards (graph shared 'G' on 'fixer_forward_graph_20261006', census
+  -- exclusive 'C' on 'fixer_forward_photo_census_20261007'). Activation never
+  -- upgrades G; it only needs to prove no exclusive graph owner and no census
+  -- entrant can be waiting on the calendar barrier it now holds. Any miss
+  -- raises 55P03 and rolls the barrier back with the transaction.
+  if not pg_try_advisory_xact_lock_shared(hashtextextended('fixer_forward_graph_20261006',0)) then
+    raise exception 'activation refused: forward graph entry lock busy; retry transaction'
+      using errcode='55P03';
+  end if;
+  if not pg_try_advisory_xact_lock(hashtextextended('fixer_forward_photo_census_20261007',0)) then
+    raise exception 'activation refused: forward census entry lock busy; retry transaction'
+      using errcode='55P03';
+  end if;
+
+  -- 3. The SAME canonical mutex every auxiliary mutation RPC takes before
   -- its other locks. Never wait after the barrier: an auxiliary writer may
   -- own this lock while queued for calendar DML that our barrier blocks.
   if not pg_try_advisory_xact_lock(hashtextextended(
@@ -226,7 +261,7 @@ begin
     end if;
   end loop;
 
-  -- 3a. Register/verify every covered calendar key against this tenant.
+  -- 4a. Register/verify every covered calendar key against this tenant.
   if exists(select 1 from unnest(v_keys) k
     where not exists(select 1 from public.tenant_alias t
       where t.alias_key = k and t.tenant_id = v_tenant)) then
@@ -276,7 +311,7 @@ begin
       using errcode='23514';
   end if;
 
-  -- 3b. ACTUAL backfill for every covered alias key (not just one). Held rows
+  -- 4b. ACTUAL backfill for every covered alias key (not just one). Held rows
   -- become review events; the locked re-read below refuses on any of them, so
   -- a refusal rolls back ALL of these writes with the rest of the transaction.
   for v_key in select unnest(v_keys) order by 1 loop
@@ -284,7 +319,7 @@ begin
     v_backfills := v_backfills || jsonb_build_object('key', v_key, 'report', v_bf);
   end loop;
 
-  -- 3c. Locked re-read of ALL calendar rows for every covered key (any
+  -- 4c. Locked re-read of ALL calendar rows for every covered key (any
   -- status/variant, including archived, held, candidate, published, pending),
   -- plus ledger, siblings, decision events, scene components and holds.
 
@@ -389,7 +424,7 @@ begin
       using errcode='23514';
   end if;
 
-  -- 4. Proof + arming in the SAME transaction. The receipt (current txid)
+  -- 5. Proof + arming in the SAME transaction. The receipt (current txid)
   -- authorizes the settings write through the arm guard; any earlier failure
   -- rolled back every alias, ledger, sibling, event and receipt write.
   select count(*) into v_calendar_rows from public.content_calendar r where r.gym_id = any(v_keys);
@@ -409,7 +444,7 @@ begin
     'global_member_rows', v_global_rows,
     'global_history_imported', true,
     'backfills', v_backfills,
-    'barrier', 'lock table content_calendar share row exclusive; try advisory visual_tenant + sorted visual_backfill keys',
+    'barrier', 'lock table content_calendar share row exclusive nowait; try forward graph G shared + census C; try advisory visual_tenant + sorted visual_backfill keys',
     'armed_at', now());
 
   insert into public.visual_group_activation(gym_id, proof, actor)
