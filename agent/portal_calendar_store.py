@@ -383,6 +383,7 @@ FORWARD_RESERVATION_FLAG_ENV = "AGENT_FORWARD_SCHEDULE_RESERVATION"
 #: write and only consults it for fail-closed pre-insert validation.
 RESERVATION_PROOF = "_reservation_proof"
 
+_FINALIZE_RPC = "finalize_forward_schedule_batch_20261008"
 _RESERVE_RPC = "reserve_forward_slot_20261008"
 _RELEASE_RPC = "release_forward_slot_20261008"
 _REVOKE_RPC = "revoke_source_reservations_20261008"
@@ -408,6 +409,14 @@ def forward_reservation_flag():
 class ReservationStoreError(PortalStoreError):
     """A reservation RPC failed or returned something that fails strict
     parsing. The reservation outcome is UNKNOWN: fail closed."""
+
+
+class ReservationStagingError(ReservationStoreError):
+    """Candidate preparation failed before finalization; old rows are intact.
+
+    Inactive rows/attestation evidence may remain. This never asserts that no
+    insert happened and never authorizes deleting a possibly activated batch.
+    """
 
 
 class ReservationHoldError(ReservationStoreError):
@@ -625,6 +634,9 @@ class SupabaseCalendarStore:
             "gym_id": f"eq.{account_key}",
             "post_date": [f"gte.{first}", f"lte.{last}"],
             "variant_status": "eq.candidate",
+            # Reservation preparation is an internal inactive batch, never
+            # a client-selectable alternate or a staff review candidate.
+            "or": "(media_not_ready_reason.is.null,media_not_ready_reason.neq.forward_reservation_staged)",
             "order": "post_date",
         }
         r = self._client().get(
@@ -635,7 +647,9 @@ class SupabaseCalendarStore:
         )
         if r.status_code >= 400:
             raise PortalStoreError(r.status_code, _scrub((r.text or "")[:200]))
-        return r.json() or []
+        rows = r.json() or []
+        return [row for row in rows
+                if row.get("media_not_ready_reason") != "forward_reservation_staged"]
 
     def has_owner_visible_rows(self, account_key):
         """GATE 2 (coach-screens-first-month): True if the gym has EVER had an owner-visible
@@ -1509,51 +1523,98 @@ class SupabaseCalendarStore:
                 "persisted trusted media evidence unavailable")
         return self._reservation_uuid(rows[0].get("evidence_id"), "evidence_id")
 
-    def _stage_inserted_reservations(self, account_key, inserted):
-        """Stage the durable reservation for every logical-post group of the
-        rows THIS insert call persisted. Runs AFTER the owner observation
-        manifest/lineage persisted (the attestations bind to it).
+    def finalize_forward_schedule_batch(self, account_key, candidates, expected_old_rows):
+        """Activate an attested batch and replace exact old rows in ONE transaction.
 
-        Per sibling row: read the exact persisted media revision, read the
-        lineage evidence, append the three role attestations through the
-        trusted attester lane, then reserve the slot. Sibling rows of one
-        logical post MUST share one post_date and resolve to the SAME
-        reservation id (the RPC's idempotent same-slot retry); same
-        tenant/date under a DIFFERENT logical_post_id is a conflict, never a
-        share. Any failure raises; the caller removes the just-inserted rows
-        and reports a definite pre-insert refusal."""
+        A lost or malformed result is unknown. Never replay or delete candidate
+        rows to infer a successful rollback from mutable calendar readback.
+        """
+        tenant = str(account_key or "").strip()
+        if not tenant or not isinstance(candidates, list) or not candidates:
+            raise ReservationArgumentError(422, "tenant and candidates required")
+        if not isinstance(expected_old_rows, list):
+            raise ReservationArgumentError(422, "exact old row manifest required")
+        row_ids, logical_ids = set(), set()
+        for candidate in candidates:
+            if not isinstance(candidate, dict):
+                raise ReservationArgumentError(422, "candidate must be an object")
+            row_id = self._reservation_uuid(candidate.get("calendar_row_id"), "calendar_row_id")
+            if row_id in row_ids:
+                raise ReservationArgumentError(422, "duplicate candidate row")
+            row_ids.add(row_id)
+            logical_ids.add(self._reservation_uuid(candidate.get("logical_post_id"), "logical_post_id"))
+            ids = candidate.get("attestation_ids")
+            if (not str(candidate.get("expected_revision") or "").strip()
+                    or not isinstance(ids, list) or len(ids) != 3
+                    or len(set(map(str, ids))) != 3):
+                raise ReservationArgumentError(422, "exact candidate proof required")
+            for ident in ids:
+                self._reservation_uuid(ident, "attestation_id")
+        old_ids = set()
+        for old in expected_old_rows:
+            if not isinstance(old, dict) or old.get("gym_id") != account_key:
+                raise ReservationArgumentError(422, "foreign or unreadable old row")
+            ident = self._reservation_uuid(old.get("id"), "old row id")
+            if ident in old_ids or ident in row_ids:
+                raise ReservationArgumentError(422, "duplicate or overlapping old row")
+            old_ids.add(ident)
+        data = self._reservation_rpc(_FINALIZE_RPC, {
+            "p_tenant_id": tenant, "p_candidates": candidates,
+            "p_expected_old_rows": expected_old_rows}, timeout=60)
+        if not isinstance(data, dict):
+            raise ReservationStoreError(502, "batch finalization response malformed; outcome unknown")
+        returned_rows, reservations = data.get("row_ids"), data.get("reservation_ids")
+        if (not isinstance(returned_rows, list) or len(returned_rows) != len(row_ids)
+                or set(map(str, returned_rows)) != row_ids
+                or not isinstance(reservations, list)
+                or len(reservations) != len(row_ids)
+                or any(not _UUID_RE.fullmatch(str(ident)) for ident in reservations)):
+            raise ReservationStoreError(502, "batch finalization proof incomplete; outcome unknown")
+        groups = {}
+        by_row = {candidate["calendar_row_id"]: candidate["logical_post_id"]
+                  for candidate in candidates}
+        for row_id, reservation_id in zip(returned_rows, reservations):
+            group = by_row[str(row_id)]
+            if groups.setdefault(group, reservation_id) != reservation_id:
+                raise ReservationStoreError(502, "sibling batch reservation mismatch; outcome unknown")
+        if len(set(groups.values())) != len(groups):
+            raise ReservationStoreError(502, "different groups share reservation; outcome unknown")
+        return data
+
+    def _stage_inserted_reservations(self, account_key, inserted):
+        """Attest every inactive candidate before the atomic batch finalization.
+
+        This lane never reserves a single row. A partial attestation failure
+        leaves inactive candidates and the prior calendar intact, with no new
+        forward reservation created by this attempt.
+        """
         from . import forward_media_visual_index as visual_index
         if not visual_index.enabled():
-            raise ReservationHoldError(
-                503, "visual index lane is OFF; reservation cannot stage")
-        groups = {}
+            raise ReservationHoldError(503, "visual index lane is OFF; reservation cannot stage")
+        candidates = []
+        days_by_group = {}
         for row in inserted:
-            if not isinstance(row, dict):
-                raise ReservationStoreError(502, "inserted row unreadable")
-            groups.setdefault(str(row.get("logical_post_id") or ""), []).append(row)
-        for logical_post_id, group in groups.items():
-            logical = self._reservation_uuid(logical_post_id, "logical_post_id")
-            days = {str(row.get("post_date") or "")[:10] for row in group}
-            if len(days) != 1 or not _DATE_RE.fullmatch(next(iter(days))):
-                raise ReservationStoreError(
-                    502, "a logical post's sibling rows span or lack a post_date")
-            reservation_id = None
-            for row in group:
-                row_id = self._reservation_uuid(row.get("id"), "calendar_row_id")
-                revision = self._reservation_snapshot_revision(row_id)
-                evidence_id = self._reservation_lineage_evidence(row_id, revision)
-                prepared = visual_index.attest(
-                    row_id, revision, evidence_id,
-                    gym_key=str(account_key), content_date=row.get("post_date"))
-                ids = ((prepared or {}).get("attestation_ids") or {})
-                attestation_ids = [ids.get(role) for role in visual_index.ROLES]
-                rid = self.reserve_forward_slot(
-                    row_id, logical, revision, attestation_ids)
-                if reservation_id is None:
-                    reservation_id = rid
-                elif rid != reservation_id:
-                    raise ReservationStoreError(
-                        502, "sibling rows resolved different reservations")
+            if (not isinstance(row, dict) or row.get("gym_id") != account_key
+                    or row.get("variant_status") != "candidate"
+                    or row.get("media_not_ready_reason") != "forward_reservation_staged"):
+                raise ReservationStoreError(502, "inactive candidate identity unavailable")
+            logical = self._reservation_uuid(row.get("logical_post_id"), "logical_post_id")
+            day = str(row.get("post_date") or "")[:10]
+            if not _DATE_RE.fullmatch(day) or days_by_group.setdefault(logical, day) != day:
+                raise ReservationStoreError(502, "logical post siblings span or lack a date")
+            row_id = self._reservation_uuid(row.get("id"), "calendar_row_id")
+            revision = self._reservation_snapshot_revision(row_id)
+            evidence_id = self._reservation_lineage_evidence(row_id, revision)
+            prepared = visual_index.attest(row_id, revision, evidence_id,
+                gym_key=str(account_key), content_date=row.get("post_date"))
+            ids = ((prepared or {}).get("attestation_ids") or {})
+            attestation_ids = [self._reservation_uuid(ids.get(role), "attestation_id")
+                               for role in visual_index.ROLES]
+            if len(set(attestation_ids)) != 3:
+                raise ReservationStoreError(502, "distinct role attestations required")
+            candidates.append({"calendar_row_id": row_id, "logical_post_id": logical,
+                "expected_revision": revision, "attestation_ids": attestation_ids})
+        return candidates
 
     def list_active_logical_post_rows(self, account_key, logical_post_id):
         """Every own-tenant active content_calendar row of one logical post,
@@ -2300,7 +2361,7 @@ class SupabaseCalendarStore:
         NOT itself the 'one row per post' read path (list_month is); this is
         the review-surface read that WANTS to see every candidate."""
         seed = self.get_row(account_key, row_id)
-        if seed is None:
+        if seed is None or seed.get("media_not_ready_reason") == "forward_reservation_staged":
             return []
         anchor = seed.get("variant_of") or seed.get("id")
         r = self._client().get(
@@ -2309,6 +2370,7 @@ class SupabaseCalendarStore:
                 "gym_id": f"eq.{account_key}",
                 "or": f"(id.eq.{anchor},variant_of.eq.{anchor})",
                 "variant_status": "in.(active,candidate)",
+                "and": "(or(media_not_ready_reason.is.null,media_not_ready_reason.neq.forward_reservation_staged))",
                 "order": "variant_status.desc,created_at",
             },
             headers=self._headers(), timeout=30,
@@ -2316,7 +2378,8 @@ class SupabaseCalendarStore:
         if r.status_code >= 400:
             raise PortalStoreError(r.status_code, _scrub((r.text or "")[:200]))
         return [row for row in (r.json() or [])
-                if str(row.get("gym_id")) == str(account_key)]
+                if str(row.get("gym_id")) == str(account_key)
+                and row.get("media_not_ready_reason") != "forward_reservation_staged"]
 
     def create_variant_candidate(self, account_key, anchor_row, image_url,
                                  caption=None, thumbnail_url=None,
@@ -4128,7 +4191,8 @@ class SupabaseCalendarStore:
 
     def insert_rows(self, account_key, rows, *, preserve_ids=False,
                     render_evidence_by_url=None, poster_render_evidence_by_url=None,
-                    required_feed_slots=None, prevalidated_cadence=False):
+                    required_feed_slots=None, prevalidated_cadence=False,
+                    expected_old_rows=None):
         """INSERT content_calendar rows for account_key WITHOUT sending an `id`, so the
         DB generates the uuid primary key itself. content_calendar.id is a Postgres uuid
         (DB default gen_random_uuid); sending a non-uuid string (a draft_id) is what
@@ -4139,8 +4203,11 @@ class SupabaseCalendarStore:
         Every row's gym_id is FORCED to account_key (a caller can never write another
         gym's row through this store). IDs are stripped by default. The explicit
         preserve_ids option accepts validated UUIDs for crash-safe automatic jobs.
-        No on_conflict/upsert: apply is delete-then-insert, so a plain insert is correct
-        and idempotent. Returns the list of inserted row dicts (each with its new uuid).
+        With the reservation gate OFF, rebuild uses the existing delete/insert path.
+        ON, explicit UUID candidates remain inactive until one attested batch RPC
+        activates all rows and archives only expected_old_rows. Preparation failure
+        leaves the old calendar intact; finalization response loss is unresolved.
+        Returns inserted row dicts only after the exact successful batch receipt.
 
         KEY NORMALIZATION: PostgREST rejects a heterogeneous batch with PGRST102 "All
         object keys must match". Our rows are NOT uniform — a video row carries
@@ -4148,6 +4215,15 @@ class SupabaseCalendarStore:
         and video posts) used to 400 the ENTIRE insert and write 0 rows (GritX rebuild
         stuck at 1 day). We normalize every row to the UNION of keys across the batch,
         filling missing keys with None, so the batch is always uniform."""
+        reservation_flag = forward_reservation_flag()
+        if reservation_flag is None:
+            raise CalendarInsertNotStartedError(503, "forward reservation gate unreadable before insert")
+        if expected_old_rows is not None and not reservation_flag:
+            raise CalendarInsertNotStartedError(503, "atomic replacement requires armed reservation gate")
+        if reservation_flag and expected_old_rows is None:
+            expected_old_rows = []  # Append-only caller; no authority to replace old rows.
+        if reservation_flag and not isinstance(expected_old_rows, list):
+            raise CalendarInsertNotStartedError(422, "exact old row manifest required")
         from . import forward_media_observation_bridge as _observation_bridge
         observation_bridge_on = _observation_bridge.enabled()
         observations_by_id = {}
@@ -4202,6 +4278,12 @@ class SupabaseCalendarStore:
                         "calendar_candidate_identity_duplicate")
                 observations_by_id[clean["id"]] = (row or {})[_observation_bridge.METADATA]
             clean["gym_id"] = account_key  # gym scope: never trust a foreign gym_id
+            if reservation_flag:
+                import uuid
+                clean.setdefault("id", str(uuid.uuid4()))
+                clean["variant_status"] = "candidate"
+                if clean.get("status") not in ("pending", "draft"):
+                    raise CalendarInsertNotStartedError(422, "inactive candidates must be pending or draft")
             # LOGICAL POST IDENTITY (2026-10-04): a caller may stamp each row with
             # the ONE logical_post_id minted upstream for the sibling group (IG
             # feed + FB mirror + paired Story share one UUID). We pass it through
@@ -4238,6 +4320,7 @@ class SupabaseCalendarStore:
                         "sibling rows of one logical post carry different "
                         "reservation byte proofs; refusing the batch")
             payload.append(clean)
+        planned_candidate_ids = {row.get("id") for row in payload} if reservation_flag else set()
         # STAGE-TIME BELTS (report-card build, 2026-08-28; both flags default OFF,
         # account-agnostic — LASSO and gyms share the bug class):
         #   1. AGENT_EMPTY_CAPTION_GUARD: a FEED row with zero visible characters
@@ -4296,31 +4379,38 @@ class SupabaseCalendarStore:
         # A previously inserted hold is the durable retry signal when its
         # support seed failed. Retry confirmed held rows before slot dedupe can
         # drop a repeated planner proposal; READY preserved rows never emit.
-        _retry_story_hold_provenance(self, account_key, payload)
-        payload, recovered = _reconcile_story_media_holds(self, account_key, payload)
-        # Retained holds own their exact slot until explicit recovery or wipe.
-        # Story recovery above uses its retained UUID; this barrier governs NEW
-        # rows of every format. Caption/image changes cannot bypass it, and it
-        # does not collapse numbered slots or channel siblings.
-        if not prevalidated_cadence:
-            payload = _preserve_held_slots(self, account_key, payload)
-            payload = _dedupe_slots(self, account_key, payload)
+        recovered = []
+        if reservation_flag:
+            # Do not PATCH/recover any old row while preparing a replacement.
+            # SQL checks human ownership, holds and concurrent slot occupants
+            # under the same locks used for reservation and activation.
+            payload = _dedupe_slots(self, account_key, payload, existing=set())
         else:
-            # Re-read only the durable/concurrent ownership barriers immediately
-            # before POST. Deterministic caption/media/in-batch filtering was frozen
-            # by preflight; these two checks must remain live so an approval or hold
-            # created after preflight is never stacked with a new row.
-            live_months = sorted({str(row.get("post_date") or "")[:7]
-                                  for row in payload
-                                  if str(row.get("post_date") or "")[:7]})
-            try:
-                payload, _ = _preserve_and_prune_strict(
-                    self, account_key, live_months, payload)
-            except Exception as exc:
-                raise CalendarInsertNotStartedError(
-                    503, "live human-owned slot read failed before calendar insert") from exc
-            payload = _preserve_held_slots(self, account_key, payload)
-            payload = _dedupe_slots(self, account_key, payload)
+            _retry_story_hold_provenance(self, account_key, payload)
+            payload, recovered = _reconcile_story_media_holds(self, account_key, payload)
+            # Retained holds own their exact slot until explicit recovery or wipe.
+            # Story recovery above uses its retained UUID; this barrier governs NEW
+            # rows of every format. Caption/image changes cannot bypass it, and it
+            # does not collapse numbered slots or channel siblings.
+            if not prevalidated_cadence:
+                payload = _preserve_held_slots(self, account_key, payload)
+                payload = _dedupe_slots(self, account_key, payload)
+            else:
+                # Re-read only the durable/concurrent ownership barriers immediately
+                # before POST. Deterministic caption/media/in-batch filtering was frozen
+                # by preflight; these two checks must remain live so an approval or hold
+                # created after preflight is never stacked with a new row.
+                live_months = sorted({str(row.get("post_date") or "")[:7]
+                                      for row in payload
+                                      if str(row.get("post_date") or "")[:7]})
+                try:
+                    payload, _ = _preserve_and_prune_strict(
+                        self, account_key, live_months, payload)
+                except Exception as exc:
+                    raise CalendarInsertNotStartedError(
+                        503, "live human-owned slot read failed before calendar insert") from exc
+                payload = _preserve_held_slots(self, account_key, payload)
+                payload = _dedupe_slots(self, account_key, payload)
         # A recovered Story was patched in place under its retained UUID and is
         # deliberately absent from the POST payload. Count the exact planned
         # Story slot as satisfied for companion atomicity without re-inserting it.
@@ -4338,6 +4428,8 @@ class SupabaseCalendarStore:
             if not required.issubset(actual):
                 raise CadencePreconditionError(
                     409, "calendar cadence precondition failed before insert")
+        if reservation_flag and {row.get("id") for row in payload} != planned_candidate_ids:
+            raise CalendarInsertNotStartedError(409, "atomic candidate batch filtered before insert")
         if not payload:
             return recovered
         from . import visual_writer_prepare
@@ -4374,15 +4466,12 @@ class SupabaseCalendarStore:
             for row in payload:
                 row.setdefault("id", str(uuid.uuid4()))
         # FORWARD SCHEDULE RESERVATION GATE (DRAFT, 2026-10-08; default OFF).
-        # Read ONCE per batch, before the POST, so an unreadable gate can never
+        # Freeze at batch entry and confirm before POST so an unreadable gate cannot
         # silently take the legacy path and an armed gate refuses rows that
         # could never reserve BEFORE anything is written. With the flag OFF
         # this block is inert and the legacy path is byte-identical.
-        reservation_flag = forward_reservation_flag()
-        if reservation_flag is None:
-            raise CalendarInsertNotStartedError(
-                503, "forward reservation gate is unreadable; refusing the "
-                "calendar insert before any write")
+        if forward_reservation_flag() is not reservation_flag:
+            raise CalendarInsertNotStartedError(503, "forward reservation gate changed before insert")
         if reservation_flag:
             seen_slot_bytes = {}
             for row in payload:
@@ -4407,73 +4496,61 @@ class SupabaseCalendarStore:
                         422, "the same source bytes are staged for two "
                         "different logical posts on one date; refusing before "
                         "any write")
+        if reservation_flag:
+            for row in payload:
+                if row.get("media_not_ready_reason") is not None:
+                    raise CalendarInsertNotStartedError(409, "candidate media is held before staging")
+                row["media_not_ready_reason"] = "forward_reservation_staged"
         all_keys = set()
         for r in payload:
             all_keys.update(r.keys())
         payload = [{k: r.get(k) for k in all_keys} for r in payload]
-        r = self._client().post(
-            self._rest(_TABLE),
-            headers=self._headers({
-                "Content-Type": "application/json",
-                "Prefer": "return=representation",
-            }),
-            json=payload,
-            timeout=30,
-        )
-        if r.status_code >= 400:
-            raise PortalStoreError(r.status_code, _scrub((r.text or "")[:200]))
-        out = r.json() or []
-        if prepared_write:
-            if not isinstance(out, list) or len(out) != len(payload):
-                raise PortalStoreError(502, "calendar insert returned unverified visual rows")
-            unmatched = list(payload)
-            seen_ids = set()
-            for row in out:
-                if not isinstance(row, dict) or not row.get("id") or row["id"] in seen_ids:
+        try:
+            r = self._client().post(
+                self._rest(_TABLE),
+                headers=self._headers({
+                    "Content-Type": "application/json",
+                    "Prefer": "return=representation",
+                }),
+                json=payload,
+                timeout=30,
+            )
+            if r.status_code >= 400:
+                raise PortalStoreError(r.status_code, _scrub((r.text or "")[:200]))
+            out = r.json() or []
+            if prepared_write or reservation_flag:
+                if not isinstance(out, list) or len(out) != len(payload):
                     raise PortalStoreError(502, "calendar insert returned unverified visual rows")
-                matches = [candidate for candidate in unmatched
-                           if all(key in row and row[key] == value for key, value in candidate.items())]
-                if not matches:
-                    raise PortalStoreError(502, "calendar insert returned unverified visual rows")
-                unmatched.remove(matches[0])
-                seen_ids.add(row["id"])
-        if observation_candidates:
-            # A crash or refusal after POST leaves no owner manifest/lineage and
-            # therefore no publish authority under the global guard. Raise a static
-            # hold; do not return a successful insert with lost observations.
-            _observation_bridge.persist_inserted(
-                self, payload, out, observation_candidates)
-        inserted = [x for x in out if str(x.get("gym_id")) == str(account_key)]
+                unmatched = list(payload)
+                seen_ids = set()
+                for row in out:
+                    if not isinstance(row, dict) or not row.get("id") or row["id"] in seen_ids:
+                        raise PortalStoreError(502, "calendar insert returned unverified visual rows")
+                    matches = [candidate for candidate in unmatched
+                               if all(key in row and row[key] == value for key, value in candidate.items())]
+                    if not matches:
+                        raise PortalStoreError(502, "calendar insert returned unverified visual rows")
+                    unmatched.remove(matches[0])
+                    seen_ids.add(row["id"])
+            if observation_candidates:
+                # A crash or refusal after POST leaves no owner manifest/lineage and
+                # therefore no publish authority under the global guard. Raise a static
+                # hold; do not return a successful insert with lost observations.
+                _observation_bridge.persist_inserted(
+                    self, payload, out, observation_candidates)
+            inserted = [x for x in out if str(x.get("gym_id")) == str(account_key)]
+            if reservation_flag and inserted:
+                candidates = self._stage_inserted_reservations(account_key, inserted)
+        except Exception as exc:
+            if reservation_flag:
+                raise ReservationStagingError(502,
+                    f"inactive batch preparation failed before finalization: {type(exc).__name__}") from exc
+            raise
         if reservation_flag and inserted:
-            # DRAFT reservation staging (armed only): bind every inserted
-            # logical-post group to its durable (tenant, post_date,
-            # logical_post_id) reservation via the trusted attester lane +
-            # reserve RPC. This runs AFTER the owner lineage persisted above
-            # (the attestations bind to it) and BEFORE the batch is reported
-            # staged. ANY failure is fail-closed: remove exactly the rows THIS
-            # call inserted, then report a definite pre-insert refusal so the
-            # caller's restore path brings the prior calendar back. If the
-            # cleanup itself fails the outcome is UNKNOWN -- raise
-            # ReservationStoreError instead so nothing is guessed.
-            try:
-                self._stage_inserted_reservations(account_key, inserted)
-            except Exception as exc:  # noqa: BLE001 - hold/conflict/gate/unknown all refuse
-                staged_ids = [str(x["id"]) for x in inserted if x.get("id")]
-                try:
-                    removed = self.delete_rows(account_key, staged_ids)
-                except Exception as cleanup_exc:  # noqa: BLE001
-                    raise ReservationStoreError(
-                        502, "reservation staging failed and the inserted rows "
-                        f"could not be removed: {type(exc).__name__} then "
-                        f"{type(cleanup_exc).__name__}") from exc
-                if removed != len(staged_ids):
-                    raise ReservationStoreError(
-                        502, "reservation staging failed and only "
-                        f"{removed}/{len(staged_ids)} inserted rows were "
-                        "removed; outcome unknown") from exc
-                raise CalendarInsertNotStartedError(
-                    409, f"forward reservation staging refused the insert: "
-                    f"{type(exc).__name__}") from exc
+            self.finalize_forward_schedule_batch(account_key, candidates, expected_old_rows)
+            # Literal exact batch receipt is the authority. No row readback can
+            # establish success after a lost response or justify a cleanup delete.
+            inserted = [dict(row, variant_status="active", media_not_ready_reason=None) for row in inserted]
         _record_confirmed_story_holds(account_key, inserted)
         # Wave 3 (AGENT_CAPTION_COOLDOWN): stamp each successfully staged row in
         # the caption ledger so future planner runs see the cooldown. Failure is

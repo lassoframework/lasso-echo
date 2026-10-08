@@ -1,260 +1,250 @@
-# Forward Schedule Reservation — DRAFT / OFF (2026-10-08)
+# Forward schedule reservation draft, October 8, 2026
 
-Unapplied draft. No production activation, provider calls, migrations applied,
-gates enabled or credentials provisioned. Requires, and never modifies, the
-base forward-media claim draft (`DRAFT_fixer_forward_media_claim_20261006.sql`)
-and the visual index draft (`DRAFT_fixer_forward_visual_index_20261008.sql`),
-plus the committed `logical_post_id_20261004.sql` column. The visual claim RPC
-remains the sole byte-occupancy and publication authority; this draft adds a
-FUTURE slot reservation layer in front of it. It does not re-implement,
-replace or bypass any visual, claim, approval or history check.
+**DRAFT / UNAPPLIED / DEFAULT OFF.** This work authorizes no production SQL,
+provider calls, gate activation or credential provisioning. It extends the
+base media claim and visual index drafts and requires the committed logical
+post identity column. All three draft gates retain their existing defaults.
 
-This note is the RPC contract Child 2 (Python coordinator) codes against.
+The SQL migration is authoritative. The coordinator must finish staging and
+trusted attestation before one atomic finalization RPC. Final publication is
+protected in SQL as well as checked by the Python caller.
 
-## Purpose
+## Trusted preparation release hold
 
-Committed visual claims protect publication but do not reserve FUTURE calendar
-slots: two planner passes (or a planner and a publisher retry) can select the
-same photo for different future days before either claims. The reservation
-authority binds one attested source/rendition proof to exactly one
-(tenant, post_date, logical_post_id) future slot, durably and atomically, so
-cross-day and cross-gym reuse is denied at selection time instead of only at
-send time. Unknown historical inventory always holds; it never counts as
-clearance or exhaustion.
+The atomic finalizer is implemented for candidates with **genuine persisted
+trusted proof**. Production observation writes are unverified and do not
+create registry, clearance, render manifests, lineage or visual attestations.
+The planner must preserve old rows and report `preparation_pending` when that
+proof is absent. It cannot borrow owner/attester credentials to finish inline.
 
-## Concepts
+The current trusted preparation pipeline still rejects the marked inactive
+stage in `fixer_record_forward_media_observation_20261007`,
+`fixer_forward_media_owner_pending_20261007`,
+`fixer_owner_photo_pending_20261007`, `fixer_prepare_owner_photo_20261007`,
+`fixer_forward_media_pending_attestations_20261006`, and the Python owner,
+owner-photo and manifest-binder prefilters/discovery. This SQL repair does not
+broaden those lanes. A separately reviewed two-phase runtime contract must
+prepare the same explicit staged UUIDs, then resume finalization with exact
+current proof and old-row snapshots. Its flags and credentials remain OFF.
 
-- Slot key: `(tenant_id, post_date, logical_post_id)`. `tenant_id` is the
-  canonical alias-resolved tenant (same resolution as the claim stack).
-  `logical_post_id` is the validated persisted `content_calendar`
-  column, NOT `visual_group_key`; the two stay separate.
-- A slot holds at most one ACTIVE reservation (partial unique index).
-- Sibling rows (IG feed / FB mirror / Story) of one logical post share the
-  slot: re-reserving the same slot with the identical source/proof is an
-  idempotent retry returning the existing reservation id. This is the exact
-  same-logical-post sibling retry path. Same tenant and same date alone are
-  NOT sufficient: a matching source_sha256 with a DIFFERENT logical_post_id
-  on that tenant/date is denied, against active reservations and committed
-  visual claims alike.
-- Reservations are durable. There is no delete. State transitions are
-  one-way: `active` -> `released` | `superseded` | `revoked`. Terminal rows
-  persist as occupancy evidence. Direct DML is revoked from every non-owner
-  role and a guard trigger enforces the transition rules.
+The attester discovery also excludes a row once current lineage exists. A
+visual-attestation failure after lineage commit therefore needs a separate
+current-lineage/missing-visual-role retry discovery, reusing immutable lineage
+and any existing role attestations. Creating a second lineage or blindly
+respawning a quarantined owner job is not a recovery contract. This remains a
+release blocker. Local PG fixtures provision genuine trusted proof directly
+under the isolated test roles; that establishes SQL behavior, not a completed
+production preparation service or resume workflow.
 
-## Gate
+## Immutable claim identity
 
-`public.forward_schedule_reservation_gate_20261008` — protected singleton,
-`enabled boolean not null default false`, installed `false`. Reserve refuses
-(`55000`) unless enabled. Release, revoke and the read-only conflict check
-remain callable while OFF (they only reduce occupancy or read). Gate writes
-take the exclusive graph lock via trigger; reserve takes the shared graph
-lock, so activation cannot race an in-flight reserve. No service, attester or
-media-owner role can mutate the gate. The matching Python flag is a Child 2
-handoff and must default OFF.
+`forward_visual_claim_identity_20261008` records a new visual claim's logical
+post ID in the transaction that inserts its visual proof. It has no calendar
+foreign key. A deleted, edited or reinserted calendar row cannot change this
+claim evidence. Existing visual proofs receive `historical_unknown` and NULL
+logical identity during migration. No historical authorization is inferred
+from a current calendar row. Unknown identity holds both reservation and final
+publication when the reservation authority is ON.
 
-## Table DDL (summary; migration is authoritative)
+Matching visual bytes or pHash similarity are reusable only for the exact same
+canonical tenant, post date and frozen logical post identity. Existing base
+byte ancestry and visual group constraints remain additional requirements;
+the extension grants no group, owner, clearance or approval bypass.
+
+## Stage and finalize contract
+
+Production accepts `variant_status` values `active`, `candidate`, `archived`.
+It accepts status values `draft`, `pending`, `approved`, `published`, `denied`,
+`killed`, `failed`, `publishing`, `deleted`, `coach_review`. The PG17 acceptance
+fixture includes these exact CHECKs. This draft introduces no new enum value
+and does not weaken a CHECK.
+
+1. Persist generated rows with explicit UUIDs, `variant_status='candidate'`,
+   `media_not_ready_reason='forward_reservation_staged'`, and `status='pending'`
+   or `draft`. This disjoint marker distinguishes reservation preparation
+   from other candidate rows. They remain inactive and unapproved.
+2. Obtain the existing trusted lineage and all three visual attestations for
+   every row. The existing media revision deliberately excludes mutable
+   status, variant status and media reason, so activation does not change
+   the attested revision. Staging performs no source reservation.
+3. Read exact raw old `content_calendar` row snapshots. Keep every column,
+   including NULLs. Do not use a display projection or transformed row.
+4. Invoke exactly one RPC for the entire prepared batch:
 
 ```sql
-public.forward_schedule_reservation (
-  reservation_id uuid primary key default gen_random_uuid(),
-  tenant_id text not null,
-  calendar_row_id uuid not null,          -- first reserving row (audit)
-  logical_post_id uuid not null,
-  post_date date not null,
-  source_asset_id text not null,
-  source_url text not null,               -- https only
-  source_sha256 text not null,            -- 64 lowercase hex, from the 'original' attestation
-  phash_version integer not null default 1 check (phash_version = 1),
-  phash_v1 bigint not null,               -- from the 'original' attestation
-  row_revision text not null,             -- persisted outgoing revision at reserve time
-  lineage_evidence_id uuid not null references fixer_forward_media_lineage_20261006,
-  attestation_ids uuid[] not null check (cardinality(attestation_ids) = 3),
-  state text not null default 'active' check (state in ('active','released','superseded','revoked')),
-  state_reason text,
-  created_at timestamptz not null default now(),
-  state_changed_at timestamptz
-);
-unique index (tenant_id, post_date, logical_post_id) where state = 'active';
+public.finalize_forward_schedule_batch_20261008(
+ p_tenant_id text,
+ p_candidates jsonb,
+ p_expected_old_rows jsonb
+) returns jsonb
 ```
-
-RLS enabled; all table privileges revoked from public/anon/authenticated/
-service_role/attester/owner. `service_role` receives SELECT only (planner
-readback). All writes go through the SECURITY DEFINER RPCs below; a
-SECURITY INVOKER guard trigger rejects any insert/update/delete/truncate
-whose `current_user` is not the RPC owner, and enforces transition rules.
-
-## RPC contract
-
-All functions are `security definer`, `set search_path = pg_catalog, public`,
-require READ COMMITTED (`25000` otherwise), and take locks in the existing
-stack order: graph (shared) -> census (exclusive) -> row (`for update`) ->
-slot advisory -> byte/token. None performs network or object I/O. Raises use
-`23514` for validation/conflict/hold, `22023` for malformed arguments,
-`55000` for gate OFF. Callers must treat any exception as HOLD (fail closed).
-
-### `public.reserve_forward_slot_20261008(p_calendar_row_id uuid, p_logical_post_id uuid, p_expected_revision text, p_attestation_ids uuid[], p_expected_reservation_id uuid default null) returns uuid`
-
-Executable by `service_role` only. Creates (or idempotently returns) the
-active reservation for the slot of the given calendar row.
-
-Validation, in order; any failure raises and nothing persists:
-
-1. Gate ON (`55000 'schedule reservation authority is OFF pending review'`).
-2. Row exists, `for update`; unsent (`status in
-   ('draft','pending','queued','approved')`, `publish_claim_token is null`,
-   `published_at is null`, `late_post_id is null`,
-   `variant_status = 'active'`, `media_not_ready_reason is null`,
-   `post_date is not null`). A publishing/published/ready row is refused —
-   reservations are for future planning only and are never a ready-row or
-   claim bypass.
-3. `row.logical_post_id = p_logical_post_id` (both non-null). The persisted
-   validated value is authoritative; the caller cannot invent one.
-4. Full persisted media identity present (gym, source asset/url, image url,
-   thumbnail url shape, render manifest digest) and
-   `fixer_forward_media_attestation_request_20261006(id)->>'revision'`
-   equals `p_expected_revision`. Changed media invalidates.
-5. Provenance + CURRENT clearance: the owner registry tuple must match and
-   `fixer_forward_media_history_clearance_20261006` must show
-   `cleared_unused` for the exact tuple with no fleet hold for the source
-   fingerprint. Missing or unknown history raises (fail closed).
-6. Revocation fence: any `revoked` reservation for the same
-   (tenant, source_asset_id) is terminal for that source under this draft.
-   Re-reservation raises `'reservation source revoked; fresh source identity
-   and clearance required'`. (Owner reinstatement, if ever desired, is a new
-   source identity with fresh clearance — see limits.)
-7. Attestation proof: exactly three distinct roles
-   (original/delivered/thumbnail), each bound to this tenant, the bigint
-   projection of the CURRENT revision, one shared lineage evidence id whose
-   lineage row matches row/revision/tenant/group/asset/manifest, exact
-   persisted URLs per role, and trusted object-read receipts whose MD5 and
-   length equal the attestation. Producer-asserted hashes are never
-   accepted; unknown attestation ids hold.
-8. Negatives: any `forward_media_visual_negative` matching the original
-   SHA256 exactly, or pHash v1 Hamming distance <= 30, raises
-   `'visual negative evidence blocks reservation'`.
-9. Committed visual occupancy: join visual attestations ->
-   `forward_media_visual_claim_proof_20261008` ->
-   `fixer_forward_media_claim_receipt_20261006`. Equal SHA256 raises
-   `'visual byte ancestry already consumed by another tenant/date/logical
-   post'` unless the claim is the exact same tenant AND post_date AND its
-   receipt's calendar row still carries the same persisted
-   `logical_post_id` (a deleted or unidentifiable claim row fails closed).
-   For different bytes, the pHash policy is unchanged: distance <= 6 outside
-   that exact logical-post sibling scope blocks; 7-30 raises `'visual
-   similarity held for review'`; > 30 no match.
-10. Active-reservation occupancy: equal SHA256 on any slot other than the
-    exact own (tenant, post_date, logical_post_id) slot raises `'source
-    already reserved for another tenant/date/logical post'` — including a
-    different logical_post_id on the same tenant/date. pHash policy
-    identical to step 9 against other active slots.
-11. Slot resolution under the slot advisory lock + partial unique index:
-    - No active reservation: insert `active` row, return new id.
-    - Active reservation with identical source_sha256: return the existing
-      id (idempotent same-slot retry / exact same-logical-post sibling
-      reuse). The caller's own per-row proof was fully validated in steps
-      5-10 above; sibling rows legitimately carry different revisions and
-      attestation ids.
-    - Active reservation with different source and
-      `p_expected_reservation_id` equal to its id: CAS replace — the old row
-      transitions `active -> superseded` and a new active row is inserted
-      atomically in the same transaction. Returns the new id.
-    - Otherwise raise `'schedule reservation slot conflict'` (wrong or
-      missing CAS token).
-
-### `public.release_forward_slot_20261008(p_reservation_id uuid, p_reason text) returns boolean`
-
-Executable by `service_role` only. Transitions the reservation
-`active -> released` under its row lock, freeing the slot for another
-source. Idempotent: an already-terminal reservation returns `true`. Unknown
-id raises `23514 'schedule reservation unavailable'`. Never deletes.
-
-### `public.revoke_source_reservations_20261008(p_tenant_id text, p_source_sha256 text, p_reason text) returns integer`
-
-Executable by `service_role` only. Transitions every active reservation for
-that tenant + source SHA256 to `revoked`, returns the count (0 is allowed).
-Fleet-wide byte eviction remains the negative-evidence authority of the
-visual stack; this RPC is the tenant-scoped reservation complement. Revoked
-sources fail step 6 of reserve until a fresh source identity + clearance
-exists.
-
-### `public.check_reservation_conflicts_20261008(p_tenant_id text, p_post_date date, p_logical_post_id uuid, p_source_sha256 text, p_phash_v1 bigint) returns jsonb`
-
-Executable by `service_role` only. Read-only ADVISORY candidate-screening
-helper for the planner; it takes no locks and grants no authority — only
-`reserve_forward_slot_20261008` admits occupancy. Returns:
 
 ```json
-{"allowed": bool,
- "conflicts": [{"kind": "negative" | "committed_claim" | "active_reservation" |
-                "phash_block" | "phash_review",
-                "reservation_id": ..., "claim_token": ...,
-                "tenant_id": ..., "post_date": ..., "distance": ...}]}
+{
+  "p_tenant_id": "canonical-tenant",
+  "p_candidates": [{
+    "calendar_row_id": "uuid",
+    "logical_post_id": "uuid",
+    "expected_revision": "32-character persisted revision",
+    "attestation_ids": ["original-uuid", "delivered-uuid", "thumbnail-uuid"],
+    "expected_reservation_id": null
+  }],
+  "p_expected_old_rows": [{"id": "old-uuid", "all_actual_columns": "including null values"}]
+}
 ```
 
-`allowed` is true only with zero conflicts. A bounded search that stops here
-without reserving proves nothing about depletion.
+`expected_reservation_id` is optional. Supply the exact incumbent reservation
+UUID only for a deliberate source replacement on the same logical/date slot.
+An omitted or wrong token holds a conflicting replacement. Old rows and new
+candidate IDs must each be unique and disjoint. Tenant aliases resolve through
+the existing protected alias authority.
 
-### `public.forward_reservation_proof_20261008(p_calendar_row_id uuid, p_source_sha256 text) returns jsonb`
+The return pairs remain in **candidate input order**:
 
-Executable by `service_role` only. The consult-the-exact-reservation helper
-for the final publication path. Recomputes tenant/revision from the
-persisted row and returns
-`{reservation_id, tenant_id, post_date, logical_post_id, source_sha256, row_revision, attestation_ids}`
-for the ACTIVE reservation matching (tenant, row.post_date,
-row.logical_post_id, p_source_sha256). Byte identity (SHA256) is the binding;
-per-row revision freshness remains with the claim stack, which revalidates
-revision, evidence and receipts at claim time. Raises `23514 'schedule
-reservation proof unavailable'` when none matches (wrong date/gym/logical
-post/source or released/superseded/revoked state). No other slot can borrow
-the reservation.
+```json
+{"row_ids": ["calendar-uuid"], "reservation_ids": ["reservation-uuid"]}
+```
 
-## Integration handoffs (NOT in this child scope)
+Sibling row IDs are distinct but may have the same reservation UUID. Preserve
+this positional association; do not independently deduplicate the arrays.
 
-- Final-claim enforcement: `fixer_forward_visual_index_claim_20261008` is
-  unchanged. Wiring publication to REQUIRE a matching
-  `forward_reservation_proof_20261008` result (publisher-side check plus a
-  future DB-side consult) belongs to the integrator (Child 2 publisher path
-  + Sol review). Until wired, both DB gates stay OFF.
-- Python coordinator (`gym_media_selector`, `client_month_run`,
-  `portal_calendar_store.insert_rows`, `forward_media_visual_index.attest`
-  pipeline) calls and the env flag are Child 2 scope.
-- Candidate exhaustion -> explicit held slot is a Child 2 behavior; the SQL
-  layer stores reservations only, never "exhausted" markers.
+The RPC takes shared graph, exclusive census, sorted calendar row locks, then
+slot/byte/token locks used by the existing stack. It validates every old row's
+full snapshot and tenant before changing anything. Old rows must be active,
+pending/draft, without media hold, publish claim token, reservation day,
+published timestamp or provider ID. Approved, queued, publishing and published
+rows are protected. NULL/unknown status holds. Candidates must be inactive with
+the exact stage marker and pending/draft; approved candidates are refused.
 
-## Concurrency and lock order
+Each candidate is activated and its marker cleared inside the transaction,
+then passed through the existing reservation's current owner provenance,
+clearance, source, lineage, revision, exact receipt and visual checks. **Any
+failed candidate aborts the entire RPC**, including prior candidate reservations
+and activation. Only after every candidate passes does it archive the exact
+old unapproved rows and release their obsolete reservations. Existing old
+approvals are never transferred to new content.
 
-Reserve serializes with attestation/negative/history appends (exclusive
-graph lock on their inserts vs shared here), with claims (shared graph +
-exclusive census), and with other reserves (exclusive census, then slot
-advisory, then the partial unique index as backstop). Two concurrent
-reserves for one slot with different sources: exactly one commits; the loser
-raises after the census/slot wait under a fresh READ COMMITTED snapshot and
-leaves no partial reservation. Reserve never takes the graph lock
-exclusively, so it cannot block attester evidence appends beyond its
-transaction.
+There is no per-row partial success contract and no exception catch that
+commits successful candidates. A caller must treat an error as a held batch.
+An ambiguous network outcome requires exact database readback, never a second
+planner attempt that assumes success or deletes prepared rows. A retry with
+old snapshots after successful finalization holds on the now changed old
+rows; this is deliberate fail-closed behavior.
 
-## Rollback limits
+Inactive stage rows can remain after a failed or interrupted preparation.
+Their existence is not an active reservation or successful calendar result.
+Preserve them on ambiguous finalization until exact readback proves the
+transaction outcome. After a known failure, the task owner may inspect and
+retire only its inactive, unclaimed stage rows through the normal cleanup
+workflow. Keep their trusted immutable evidence. This migration performs no
+blanket cleanup.
 
-Before any use: drop the new objects in dependency order (functions, gate,
-table) in a privileged session; nothing else references them. After use:
-preserve all reservation rows including terminal states — they are occupancy
-evidence. Do not apply over an armed visual/claim stack without the normal
-release gate. No production rollback or activation is authorized by this
-draft.
+## Reservation and publication RPCs
 
-## Acceptance
+`reserve_forward_slot_20261008(uuid,uuid,text,uuid[],uuid default null)` remains
+available for already existing unsent active rows. It returns one durable
+active reservation per `(tenant_id, post_date, logical_post_id)`. Exact source
+siblings share it only after each sibling's current proof passes validation.
+`forward_schedule_reservation_binding_20261008` stores an immutable per-row
+revision, lineage ID and attestation set. Reattestation with a different frozen
+set for an already bound revision holds. A source SHA match alone cannot lend
+another row's publication proof. Source replacement uses the exact incumbent
+reservation UUID and supersedes it atomically. Revocation is terminal for the
+same tenant/source asset identity.
+
+`forward_reservation_proof_20261008(uuid,text)` returns the active slot binding
+and the current caller row's frozen proof:
+
+```json
+{
+ "reservation_id": "uuid", "tenant_id": "tenant", "post_date": "YYYY-MM-DD",
+ "logical_post_id": "uuid", "source_sha256": "64 lowercase hex",
+ "row_revision": "revision", "lineage_evidence_id": "uuid",
+ "attestation_ids": ["uuid", "uuid", "uuid"]
+}
+```
+
+This response is advisory outside a transaction. It holds if the current row
+revision has no exact sibling binding. `fixer_forward_visual_proof_20261008`
+also returns the original attestation's trusted `source_sha256`, allowing the
+Python caller to compare its outgoing proof before claiming.
+
+The existing final publication RPC signature is preserved:
+
+```sql
+fixer_forward_visual_index_claim_20261008(
+ p_calendar_row_id uuid,p_claim_token uuid,p_evidence_id uuid,
+ p_expected_revision text,p_attestation_ids uuid[]
+) returns boolean
+```
+
+With the schedule gate OFF, this delegates to the preceding visual claim
+implementation, preserving the preactivation claim behavior. With the gate
+ON, SQL locks graph, census and the owned calendar row; independently derives
+the source SHA from the trusted original attestation; and requires the exact
+active reservation plus the current row's frozen revision, lineage and all
+three attestation IDs. It checks immutable committed logical identity for all
+outgoing roles, then invokes the existing visual/base claim stack in the same
+transaction. Current source clearance, exact object receipts, negatives,
+history, claim ownership and approval protections remain enforced there.
+
+The renamed implementation loses all service-role execute grants. The public
+base fallback refuses when either visual or schedule authority is armed, so
+turning the visual gate OFF cannot bypass reservation enforcement.
+
+`release_forward_slot_20261008(uuid,text)` and
+`revoke_source_reservations_20261008(text,text,text)` take the same shared graph
+and exclusive census transaction locks before touching reservations. Thus a
+revocation that commits first makes a waiting publisher fail with no receipt.
+A claim that passes first retains the authority fence through receipt commit,
+and a following release waits. A previously read Python proof does not
+permit publication after release or revocation.
+
+`check_reservation_conflicts_20261008(text,date,uuid,text,bigint)` remains a
+read-only advisory candidate screen. Equal SHA or pHash distance <=6 blocks
+outside the exact sibling scope; distance 7 through 30 holds for review.
+A bounded search and an empty index prove no historical clearance or depletion.
+
+## Gate and access
+
+The reservation singleton is installed `enabled=false`. Reserve and finalize
+hold while OFF. Release/revoke can reduce occupancy while OFF. Gates serialize
+with claims through the graph lock. Table writes and private claim execution
+are unavailable to service, public, anon, authenticated and attester roles.
+Service can read the protected activation bit, not mutate it. Reservations,
+per-row bindings and claim identities are immutable durable evidence.
+
+While ON, statement triggers acquire graph then census before calendar row
+locks. A service caller cannot directly insert an active logical row, activate
+an inactive row, retire or delete an active logical row. Activation/replacement
+belongs to the protected finalization RPC. Existing guarded approval and
+publication status transitions continue through their original workflow.
+Privileged migration ownership remains trusted; this is not a superuser fence.
+
+Malformed input raises `22023`; validation/conflict/history holds `23514`;
+OFF holds `55000`; unauthorized mutation `42501`; unsupported isolation
+`25000`. Reserve, finalize and final claim require READ COMMITTED. No SQL RPC
+performs network or object I/O.
+
+## Local acceptance and release limits
 
 ```sh
+python3 tests/test_forward_schedule_reservation_pg.py
 python3 -m pytest -q tests/test_forward_schedule_reservation_pg.py
 ```
 
-Real disposable PostgreSQL 17 (initdb/pg_ctl/psql on PATH; psycopg not
-required by this suite). Covers: OFF gate hold; happy path + idempotent
-retry; exact-logical-post sibling reuse; cross-logical-post (same date),
-cross-day, cross-gym denial for active reservations AND committed claims;
-CAS replace + wrong-token conflict; release/re-reserve; revocation terminal
-fence; committed-claim conflict (planner vs publisher occupancy); concurrent
-one-winner slot race with no loser occupancy; revision drift; logical-post
-forgery; ready-row bypass denial; reservation proof consult and borrow
-denial; advisory conflict check; ACL denials; isolation guard;
-immutable/transition guard; rollback-only installation.
+Uses an existing real disposable PG17 server and two clusters; no DSN,
+production connection, dependency installation or persistent cluster. The
+suite covers immutable deleted/reinserted claim identity, pre-migration
+historical unknown holds, source/sibling/tenant/date binding, visual conflicts,
+clearance/negative/revision drift, exact old snapshot CAS, full batch rollback
+on the second candidate, competing batch one-winner behavior, ACL/direct
+activation denial, approved-old preservation, current sibling proof, and
+revocation-before-claim / claim-before-release transaction fences.
+
+These are local acceptance results. Production application, independent
+integration acceptance, guarded release and separately authorized activation
+remain outside this SQL repair scope. Before use the draft objects can be
+removed in dependency order. After use, preserve durable evidence and restore
+public wrappers through a reviewed rollback migration; simply dropping a
+reservation table is not a valid rollback.

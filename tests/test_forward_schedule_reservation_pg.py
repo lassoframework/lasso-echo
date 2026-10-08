@@ -13,6 +13,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import tempfile
+import time
 import uuid
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -32,8 +33,15 @@ def _fresh_phash():
     raise AssertionError('independent pHash fixture pool exhausted')
 
 
+def _pg(name):
+    # Homebrew libpq can expose initdb without its postgres executable. Reuse
+    # the installed PG17 server runtime; never install a test dependency.
+    bundled = Path('/opt/homebrew/opt/postgresql@17/bin') / name
+    return str(bundled) if bundled.is_file() else shutil.which(name)
+
+
 def _skipped():
-    return any(not shutil.which(name) for name in ('initdb', 'pg_ctl', 'psql'))
+    return any(not _pg(name) for name in ('initdb', 'pg_ctl', 'psql'))
 
 
 def main():
@@ -45,12 +53,12 @@ def main():
         sock = work / 'sock'
         sock.mkdir()
         data = work / 'data'
-        subprocess.run(['initdb', '-D', str(data), '-U', 'postgres', '--no-sync'],
+        subprocess.run([_pg('initdb'), '-D', str(data), '-U', 'postgres', '--no-sync'],
                        check=True, capture_output=True, timeout=60)
-        subprocess.run(['pg_ctl', '-D', str(data), '-l', str(work / 'pg.log'),
+        subprocess.run([_pg('pg_ctl'), '-D', str(data), '-l', str(work / 'pg.log'),
                         '-o', f"-k {sock} -p 55471 -c listen_addresses=''", '-w', 'start'],
                        check=True, capture_output=True, timeout=60)
-        base = ['psql', '-X', '-qAt', '-v', 'ON_ERROR_STOP=1', '-h', str(sock),
+        base = [_pg('psql'), '-X', '-qAt', '-v', 'ON_ERROR_STOP=1', '-h', str(sock),
                 '-p', '55471', '-U', 'postgres', '-d', 'postgres']
 
         def sql(s, ok=True):
@@ -168,6 +176,11 @@ def main():
             revision = sql(f"select fixer_forward_media_attestation_request_20261006('{rid}')->>'revision';")
             evidence = sql(f"select evidence_id from fixer_forward_media_lineage_20261006 where calendar_row_id='{rid}';")
             arr = 'array[' + ','.join(f"'{i}'" for i in ids) + ']::uuid[]'
+            if sql("select to_regclass('public.forward_schedule_reservation_gate_20261008') is not null;") == 't':
+                if sql('select enabled from forward_schedule_reservation_gate_20261008;') == 't':
+                    sql(f"update content_calendar set status='pending',publish_claim_token=null where id='{rid}';")
+                    reserve(rid, logical, ids)
+                    sql(f"update content_calendar set status='publishing',publish_claim_token='{token}' where id='{rid}';")
             out = sql('set role service_role; select public.fixer_forward_visual_index_claim_20261008('
                       f"'{rid}','{token}','{evidence}','{revision}',{arr});")
             assert out == 't', out
@@ -176,17 +189,24 @@ def main():
         try:
             sql("create role anon; create role authenticated; create role service_role;"
                 "create table content_calendar(id uuid primary key,gym_id text,post_date date,"
-                "account text,format text,gbp_location_id text,status text,variant_status text,"
+                "account text,format text,gbp_location_id text,status text not null check(status in ('draft','pending','approved','published','denied','killed','failed','publishing','deleted','coach_review')),variant_status text not null check(variant_status in ('active','candidate','archived')),"
                 "published_at timestamptz,publish_claim_token uuid,"
                 "publish_reservation_day date,late_post_id text,image_url text,thumbnail_url text,"
                 "media_not_ready_reason text);")
             sql((ROOT / 'migrations/logical_post_id_20261004.sql').read_text())
             sql((ROOT / 'migrations/DRAFT_fixer_forward_media_claim_20261006.sql').read_text())
             sql((ROOT / 'migrations/DRAFT_fixer_forward_visual_index_20261008.sql').read_text())
+            sql('update forward_media_visual_gate_20261008 set enabled=true;')
+            historical_sha = uuid.uuid4().hex + uuid.uuid4().hex
+            historical_phash = _fresh_phash()
+            historical_row, historical_token, historical_logical = committed_claim('historical', '2026-10-14', historical_sha, historical_phash)
             sql((ROOT / 'migrations/DRAFT_fixer_forward_schedule_reservation_20261008.sql').read_text())
             sql('grant select,insert,update,delete on public.content_calendar to service_role;')
             assert sql("select current_setting('server_version_num')::integer between 170000 and 179999;") == 't'
 
+            sql('grant insert on content_calendar to authenticated;')
+            sql("set role authenticated; insert into content_calendar(id,gym_id,status,variant_status,logical_post_id) values(gen_random_uuid(),'off-role','pending','active',gen_random_uuid());")
+            assert 'permission denied' in sql('set role authenticated; select * from forward_schedule_reservation_gate_20261008;', ok=False)
             # OFF gate: reserve holds; nothing persists.
             off = planned_seed()
             assert 'OFF pending review' in reserve(off[0], off[2], off[7], ok=False)
@@ -295,14 +315,18 @@ def main():
                                     f"'{pub_tenant}','2026-10-12','{uuid.uuid4()}','{pub_sha}',0);"))
             assert screen['allowed'] is False
             assert any(c['kind'] == 'committed_claim' for c in screen['conflicts']), screen
-            # Deleted claim row: the receipt's logical post is no longer
-            # identifiable, so even the exact sibling scope fails closed.
+            # Deleted/reinserted mutable calendar cannot rewrite frozen claim identity.
             pub2_tenant = 'gym_' + uuid.uuid4().hex
             pub2_sha = uuid.uuid4().hex + uuid.uuid4().hex
             pub2_rid, _t2, pub2_logical = committed_claim(pub2_tenant, '2026-10-12', pub2_sha, _fresh_phash())
             sql(f"delete from content_calendar where id='{pub2_rid}';")
             orphan = planned_seed(tenant=pub2_tenant, day='2026-10-12', logical=pub2_logical, sha64=pub2_sha)
-            assert 'consumed by another tenant/date/logical post' in reserve(orphan[0], orphan[2], orphan[7], ok=False)
+            assert reserve(orphan[0], orphan[2], orphan[7])
+            forged_logical = str(uuid.uuid4())
+            sql(f"insert into content_calendar(id,gym_id,post_date,status,variant_status,logical_post_id) values('{pub2_rid}','{pub2_tenant}','2026-10-12','pending','active','{forged_logical}');")
+            forged = planned_seed(tenant=pub2_tenant,day='2026-10-12',logical=forged_logical,sha64=pub2_sha)
+            assert 'consumed by another tenant/date/logical post' in reserve(forged[0],forged[2],forged[7],ok=False)
+            assert sql(f"select logical_post_id from forward_visual_claim_identity_20261008 where claim_token='{_t2}';") == pub2_logical
             # Near-identical pHash against committed occupancy: <=6 blocks,
             # 7-30 holds for review, >30 is clean.
             j = planned_seed(tenant=pub_tenant, day='2026-10-13', phash=0x3f)  # distance 6
@@ -394,7 +418,7 @@ def main():
             winner = sql(f"select reservation_id from forward_schedule_reservation where tenant_id='{race_tenant}';")
             assert 'durable' in sql(f"delete from forward_schedule_reservation where reservation_id='{winner}';", ok=False)
             assert 'permission denied' in sql(f"set role service_role; delete from forward_schedule_reservation where reservation_id='{winner}';", ok=False)
-            assert 'immutable' in sql('truncate forward_schedule_reservation;', ok=False)
+            assert sql('truncate forward_schedule_reservation;', ok=False)
             # Guard trigger: even with table grants AND row visibility, direct
             # DML outside the RPC owner is refused; one-way transitions only.
             sql('grant insert,update on public.forward_schedule_reservation to service_role;')
@@ -428,18 +452,195 @@ def main():
             # Malformed arguments hold.
             assert 'binding required' in sql('set role service_role; select public.reserve_forward_slot_20261008(null,null,null,null);', ok=False)
 
+            # Historical evidence predating installation is explicitly unknown,
+            # even when the current calendar still has the matching logical ID.
+            assert sql(f"select identity_state from forward_visual_claim_identity_20261008 where claim_token='{historical_token}';") == 'historical_unknown'
+            unknown = planned_seed(tenant='historical', day='2026-10-14', logical=historical_logical,
+                                   sha64=historical_sha, phash=historical_phash)
+            assert 'consumed by another tenant/date/logical post' in reserve(unknown[0], unknown[2], unknown[7], ok=False)
+            assert 'permission denied' in sql("set role service_role; insert into forward_visual_claim_identity_20261008 values(gen_random_uuid(),gen_random_uuid(),'known');", ok=False)
+            assert 'immutable' in sql(f"update forward_visual_claim_identity_20261008 set logical_post_id=gen_random_uuid() where claim_token='{historical_token}';", ok=False)
+
+            def candidate(entry):
+                sql(f"update content_calendar set status='pending',variant_status='candidate',media_not_ready_reason='forward_reservation_staged' where id='{entry[0]}';")
+                return {'calendar_row_id': entry[0], 'logical_post_id': entry[2],
+                        'expected_revision': sql(f"select fixer_forward_media_attestation_request_20261006('{entry[0]}')->>'revision';"),
+                        'attestation_ids': entry[7]}
+
+            def snapshot(rid):
+                return json.loads(sql(f"select to_jsonb(r) from content_calendar r where id='{rid}';"))
+
+            def batch_command(tenant, candidates, old):
+                # Fixture values are UUIDs and generated URLs, never user text.
+                return "set role service_role; select finalize_forward_schedule_batch_20261008('" + tenant + "','" + json.dumps(candidates).replace("'", "''") + "'::jsonb,'" + json.dumps(old).replace("'", "''") + "'::jsonb);"
+
+            # Production CHECK values are used in this fixture: hidden candidate
+            # stage + explicit marker; new approval is never manufactured.
+            old = planned_seed()
+            sql(f"update content_calendar set status='pending' where id='{old[0]}';")
+            old_reservation = reserve(old[0], old[2], old[7])
+            old_snapshot = snapshot(old[0])
+            bx = planned_seed(tenant=old[1])
+            by = planned_seed(tenant=old[1])
+            batch_candidates = [candidate(bx), candidate(by)]
+            command = batch_command(old[1], batch_candidates, [old_snapshot])
+            sql('update forward_schedule_reservation_gate_20261008 set enabled=false;')
+            assert 'OFF pending review' in sql(command, ok=False)
+            sql('update forward_schedule_reservation_gate_20261008 set enabled=true;')
+            result = json.loads(sql(command))
+            assert result['row_ids'] == [bx[0], by[0]] and len(result['reservation_ids']) == 2
+            assert len(set(result['reservation_ids'])) == 2
+            assert sql(f"select variant_status||'|'||status from content_calendar where id='{old[0]}';") == 'archived|pending'
+            assert sql(f"select state from forward_schedule_reservation where reservation_id='{old_reservation}';") == 'released'
+            assert sql(f"select count(*) from content_calendar where id in ('{bx[0]}','{by[0]}') and variant_status='active' and status='pending' and media_not_ready_reason is null;") == '2'
+            assert 'old calendar snapshot changed' in sql(command, ok=False)
+
+            # Failing SECOND candidate rolls back FIRST reservation/activation
+            # and keeps the previous calendar + source reservation exact.
+            old2 = planned_seed()
+            sql(f"update content_calendar set status='pending' where id='{old2[0]}';")
+            keep = reserve(old2[0], old2[2], old2[7])
+            keep_snapshot = snapshot(old2[0])
+            cx = planned_seed(tenant=old2[1])
+            cy = planned_seed(tenant=old2[1], sha64=cx[5], phash=cx[6], url=cx[3], fp=cx[4])
+            partial = [candidate(cx), candidate(cy)]
+            assert 'another tenant/date/logical post' in sql(batch_command(old2[1], partial, [keep_snapshot]), ok=False)
+            assert snapshot(old2[0]) == keep_snapshot
+            assert sql(f"select state from forward_schedule_reservation where reservation_id='{keep}';") == 'active'
+            assert sql(f"select count(*) from forward_schedule_reservation where calendar_row_id in ('{cx[0]}','{cy[0]}');") == '0'
+            assert sql(f"select count(*) from content_calendar where id in ('{cx[0]}','{cy[0]}') and variant_status='candidate' and media_not_ready_reason='forward_reservation_staged';") == '2'
+            assert 'RPC-managed only' in sql(f"set role service_role; update content_calendar set variant_status='active',media_not_ready_reason=null where id='{cx[0]}';", ok=False)
+            assert 'RPC-managed only' in sql(f"set role service_role; update content_calendar set variant_status='archived' where id='{old2[0]}';", ok=False)
+            assert 'RPC-managed only' in sql(f"set role service_role; insert into content_calendar(id,gym_id,status,variant_status,logical_post_id) values(gen_random_uuid(),'{old2[1]}','pending','active',gen_random_uuid());", ok=False)
+            assert 'permission denied' in sql(batch_command(old2[1], partial, [keep_snapshot]).replace('set role service_role;', 'set role anon;'), ok=False)
+            # Exact CAS includes fields outside the attestation revision.
+            stale = planned_seed(tenant=old2[1])
+            stale_candidate = candidate(stale)
+            sql(f"update content_calendar set status='draft' where id='{old2[0]}';")
+            assert 'snapshot changed' in sql(batch_command(old2[1], [stale_candidate], [keep_snapshot]), ok=False)
+            assert sql(f"select count(*) from forward_schedule_reservation where calendar_row_id='{stale[0]}';") == '0'
+            # Approved rows, even with an exact snapshot, are protected.
+            protected = planned_seed(tenant=old2[1])
+            assert 'protected' in sql(batch_command(old2[1], [stale_candidate], [snapshot(protected[0])]), ok=False)
+            assert snapshot(protected[0])['status'] == 'approved'
+
+            # Competing exact old-row CAS batches have one winner; losing
+            # candidates remain inert and own zero active reservations.
+            race_old = planned_seed()
+            sql(f"update content_calendar set status='pending' where id='{race_old[0]}';")
+            race_snapshot = snapshot(race_old[0])
+            q1 = planned_seed(tenant=race_old[1])
+            q2 = planned_seed(tenant=race_old[1])
+            commands = [batch_command(race_old[1], [candidate(q)], [race_snapshot]) for q in (q1, q2)]
+            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+                results = list(pool.map(lambda cmd: subprocess.run(base, input=cmd, text=True, capture_output=True, timeout=30), commands))
+            assert sum(x.returncode == 0 for x in results) == 1, [x.stderr for x in results]
+            assert sql(f"select count(*) from forward_schedule_reservation where calendar_row_id in ('{q1[0]}','{q2[0]}') and state='active';") == '1'
+            assert sql(f"select count(*) from content_calendar where id in ('{q1[0]}','{q2[0]}') and variant_status='candidate';") == '1'
+
+            def publication_command(entry, token):
+                evidence = sql(f"select evidence_id from fixer_forward_media_lineage_20261006 where calendar_row_id='{entry[0]}';")
+                revision = sql(f"select fixer_forward_media_attestation_request_20261006('{entry[0]}')->>'revision';")
+                ids = 'array[' + ','.join("'" + ident + "'" for ident in entry[7]) + ']::uuid[]'
+                return f"set role service_role; select fixer_forward_visual_index_claim_20261008('{entry[0]}','{token}','{evidence}','{revision}',{ids});"
+
+            def publishing(entry):
+                token = str(uuid.uuid4())
+                sql(f"insert into fixer_forward_media_claim_gate_20261006 values('{entry[1]}',true) on conflict do nothing;")
+                sql(f"update content_calendar set status='publishing',publish_claim_token='{token}',publish_reservation_day=post_date where id='{entry[0]}';")
+                return token
+
+            # Current per-row proof is mandatory, including sibling bindings;
+            # advisory proof never authorizes a TOCTOU publication.
+            absent = planned_seed()
+            absent_token = publishing(absent)
+            assert 'proof unavailable' in sql(publication_command(absent, absent_token), ok=False)
+            assert sql(f"select count(*) from fixer_forward_media_claim_receipt_20261006 where claim_token='{absent_token}';") == '0'
+            reserved = planned_seed()
+            active_id = reserve(reserved[0], reserved[2], reserved[7])
+            before = json.loads(sql(f"set role service_role; select forward_reservation_proof_20261008('{reserved[0]}','{reserved[5]}');"))
+            reserved_token = publishing(reserved)
+            # Revoker holds the SAME census lock until its commit. Publisher
+            # starts after revocation executes but before that commit.
+            def fenced(command, name):
+                return subprocess.run(base, input="begin; set application_name='" + name + "'; " + command + " select pg_sleep(0.8); commit;", text=True, capture_output=True, timeout=30)
+
+            def await_transaction(name):
+                deadline = time.monotonic() + 5
+                while time.monotonic() < deadline:
+                    if sql(f"select count(*) from pg_stat_activity where application_name='{name}' and wait_event='PgSleep';") == '1':
+                        return
+                    time.sleep(0.01)
+                raise AssertionError('transaction did not reach commit fence: ' + name)
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+                revoke = pool.submit(fenced, f"set role service_role; select revoke_source_reservations_20261008('{reserved[1]}','{reserved[5]}','late-owner-revoke');", 'revoke_first')
+                await_transaction('revoke_first')
+                claim = pool.submit(lambda: subprocess.run(base, input=publication_command(reserved, reserved_token), text=True, capture_output=True, timeout=30))
+                claim_result, revoke_result = claim.result(), revoke.result()
+            assert revoke_result.returncode == 0 and claim_result.returncode != 0, (revoke_result.stderr, claim_result.stderr)
+            assert 'proof unavailable' in claim_result.stderr
+            assert sql(f"select count(*) from fixer_forward_media_claim_receipt_20261006 where claim_token='{reserved_token}';") == '0'
+            assert before['reservation_id'] == active_id  # prior Python proof cannot grant authority
+
+            # Different sibling proofs cannot be borrowed, even for the exact
+            # same source/slot. Proper same-logical/group sibling still claims.
+            family = planned_seed()
+            family_reservation = reserve(family[0], family[2], family[7])
+            sister_id = planned_row(family[1], family[2], family[3])
+            group = sql(f"select visual_group_key from content_calendar where id='{family[0]}';")
+            sql(f"update content_calendar set visual_group_key='{group}' where id='{sister_id}';")
+            attest(sister_id, family[4])
+            sister_ids = visual_attest(sister_id, family[1], family[5], family[6])
+            sister = (sister_id, family[1], family[2], family[3], family[4], family[5], family[6], sister_ids)
+            assert reserve(sister_id, family[2], sister_ids) == family_reservation
+            sister_token = publishing(sister)
+            sister_command = publication_command(sister, sister_token)
+            family_evidence = sql(f"select evidence_id from fixer_forward_media_lineage_20261006 where calendar_row_id='{family[0]}';")
+            sister_evidence = sql(f"select evidence_id from fixer_forward_media_lineage_20261006 where calendar_row_id='{sister_id}';")
+            assert 'sibling reservation proof differs' in sql(sister_command.replace(sister_evidence, family_evidence), ok=False)
+            wrong_ids = sister_command
+            for own, borrowed in zip(sister_ids, family[7]):
+                wrong_ids = wrong_ids.replace(own, borrowed)
+            assert 'sibling reservation proof differs' in sql(wrong_ids, ok=False)
+            # The helper itself fails for a changed current persisted revision.
+            sql(f"update content_calendar set image_url='https://scratch.example/drift' where id='{sister_id}';")
+            assert 'current sibling reservation proof unavailable' in sql(sister_command, ok=False)
+            sql(f"update content_calendar set image_url='{family[3]}' where id='{sister_id}';")
+            assert sql(sister_command) == 't'
+
+            # The reverse order permits an active claim to commit BEFORE the
+            # release, which waits on its transaction and then reduces state.
+            committed = planned_seed()
+            committed_reservation = reserve(committed[0], committed[2], committed[7])
+            committed_token = publishing(committed)
+            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+                claim = pool.submit(fenced, publication_command(committed, committed_token), 'claim_first')
+                await_transaction('claim_first')
+                release = pool.submit(lambda: subprocess.run(base, input=f"set role service_role; select release_forward_slot_20261008('{committed_reservation}','after-claim');", text=True, capture_output=True, timeout=30))
+                claim_result, release_result = claim.result(), release.result()
+            assert claim_result.returncode == release_result.returncode == 0, (claim_result.stderr, release_result.stderr)
+            assert sql(f"select count(*) from fixer_forward_media_claim_receipt_20261006 where claim_token='{committed_token}';") == '1'
+            assert sql(f"select logical_post_id from forward_visual_claim_identity_20261008 where claim_token='{committed_token}';") == committed[2]
+            assert sql(f"select state from forward_schedule_reservation where reservation_id='{committed_reservation}';") == 'released'
+            assert 'proof unavailable' in sql(publication_command(committed, committed_token), ok=False)
+            assert 'permission denied' in sql('set role service_role; select fixer_forward_visual_index_claim_internal_schedule_20261008(null,null,null,null,null);', ok=False)
+            sql('update forward_media_visual_gate_20261008 set enabled=false;')
+            assert 'protected claim proof required' in sql('set role service_role; select fixer_claim_forward_media_20261006(null,null,null,null);', ok=False)
+            sql('update forward_media_visual_gate_20261008 set enabled=true;')
+
             # Rollback-only installation: install into a second disposable
             # cluster, verify objects, destroy entirely.
             rb_sock = work / 'rb_sock'
             rb_sock.mkdir()
             rb_data = work / 'rb_data'
-            subprocess.run(['initdb', '-D', str(rb_data), '-U', 'postgres', '--no-sync'],
+            subprocess.run([_pg('initdb'), '-D', str(rb_data), '-U', 'postgres', '--no-sync'],
                            check=True, capture_output=True, timeout=60)
-            subprocess.run(['pg_ctl', '-D', str(rb_data), '-l', str(work / 'rb_pg.log'),
+            subprocess.run([_pg('pg_ctl'), '-D', str(rb_data), '-l', str(work / 'rb_pg.log'),
                             '-o', f"-k {rb_sock} -p 55472 -c listen_addresses=''", '-w', 'start'],
                            check=True, capture_output=True, timeout=60)
             try:
-                rb = ['psql', '-X', '-qAt', '-v', 'ON_ERROR_STOP=1', '-h', str(rb_sock),
+                rb = [_pg('psql'), '-X', '-qAt', '-v', 'ON_ERROR_STOP=1', '-h', str(rb_sock),
                       '-p', '55472', '-U', 'postgres', '-d', 'postgres']
 
                 def rsql(s):
@@ -450,7 +651,7 @@ def main():
 
                 rsql("create role anon; create role authenticated; create role service_role;"
                      "create table content_calendar(id uuid primary key,gym_id text,post_date date,"
-                     "account text,format text,gbp_location_id text,status text,variant_status text,"
+                     "account text,format text,gbp_location_id text,status text not null check(status in ('draft','pending','approved','published','denied','killed','failed','publishing','deleted','coach_review')),variant_status text not null check(variant_status in ('active','candidate','archived')),"
                      "published_at timestamptz,publish_claim_token uuid,"
                      "publish_reservation_day date,late_post_id text,image_url text,thumbnail_url text,"
                      "media_not_ready_reason text);")
@@ -464,9 +665,9 @@ def main():
                             " ('forward_schedule_reservation','forward_schedule_reservation_gate_20261008');") == '2'
                 assert rsql('select enabled from forward_schedule_reservation_gate_20261008;') == 'f'
             finally:
-                subprocess.run(['pg_ctl', '-D', str(rb_data), '-m', 'immediate', '-w', 'stop'],
+                subprocess.run([_pg('pg_ctl'), '-D', str(rb_data), '-m', 'immediate', '-w', 'stop'],
                                capture_output=True, timeout=60)
-            assert not subprocess.run(['pg_ctl', '-D', str(rb_data), 'status'],
+            assert not subprocess.run([_pg('pg_ctl'), '-D', str(rb_data), 'status'],
                                       capture_output=True, timeout=30).returncode == 0
 
             print('PASS: PG17 forward schedule reservation; OFF gate hold; happy path + idempotent retry; '
@@ -478,9 +679,11 @@ def main():
                   'forgery; ready-row bypass denial; reservation proof consult and borrow denial; '
                   'advisory conflict screen; concurrent one-winner slot race with no loser occupancy; '
                   'durability (no delete/truncate); RPC-owner write guard; ACL denials; isolation '
-                  'guard; rollback-only installation')
+                  'guard; atomic batch success/partial rollback/stale CAS/approved preservation; '
+                  'competing batch one-winner; exact sibling proof + revision drift; '
+                  'revoke-before-claim and claim-before-release SQL fences; OFF compatibility; rollback-only installation')
         finally:
-            subprocess.run(['pg_ctl', '-D', str(data), '-m', 'immediate', '-w', 'stop'],
+            subprocess.run([_pg('pg_ctl'), '-D', str(data), '-m', 'immediate', '-w', 'stop'],
                            capture_output=True, timeout=60)
 
 

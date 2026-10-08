@@ -266,12 +266,18 @@ def test_insert_rows_invalid_proof_refuses_even_when_flag_off(monkeypatch):
 
 
 def _armed_http(rows, *, reserve_resp=None):
-    inserted = _inserted(rows)
-    posts = {
-        "content_calendar": _Resp(201, inserted),
-        pcs._SNAPSHOT_RPC: _Resp(200, {"revision": "rev-1"}),
-        pcs._RESERVE_RPC: reserve_resp or _Resp(200, RID),
-    }
+    inserted = []
+    def stage(payload):
+        inserted[:] = [dict(row) for row in payload]
+        return _Resp(201, inserted)
+    def finalize(args):
+        if reserve_resp is not None:
+            return reserve_resp(args) if callable(reserve_resp) else reserve_resp
+        return _Resp(200, {"row_ids": [c["calendar_row_id"] for c in args["p_candidates"]],
+                           "reservation_ids": [RID] * len(args["p_candidates"])})
+    posts = {"content_calendar": stage,
+             pcs._SNAPSHOT_RPC: _Resp(200, {"revision": "rev-1"}),
+             pcs._FINALIZE_RPC: finalize}
     lineage = [{"evidence_id": str(uuid.uuid4())}]
     return http_with(posts, lineage, inserted), inserted
 
@@ -297,28 +303,31 @@ def test_insert_rows_armed_stages_reservation(monkeypatch):
     out = _store(http).insert_rows("lasso", rows)
     assert len(out) == 3
     posts = [c for c in http.calls if c[0] == "post"]
-    reserves = [c for c in posts if c[1].endswith(pcs._RESERVE_RPC)]
-    assert len(reserves) == 3, "one reserve per sibling row"
-    for call in reserves:
-        assert call[2]["p_logical_post_id"] == LPID
-        assert call[2]["p_expected_revision"] == "rev-1"
-        assert len(call[2]["p_attestation_ids"]) == 3
+    finalizations = [c for c in posts if c[1].endswith(pcs._FINALIZE_RPC)]
+    assert len(finalizations) == 1, "one atomic finalization for the entire batch"
+    assert not [c for c in posts if c[1].endswith(pcs._RESERVE_RPC)]
+    candidates = finalizations[0][2]["p_candidates"]
+    assert len(candidates) == 3
+    for candidate in candidates:
+        assert candidate["logical_post_id"] == LPID
+        assert candidate["expected_revision"] == "rev-1"
+        assert len(candidate["attestation_ids"]) == 3
+    assert all(row["variant_status"] == "active" for row in out)
     # The proof metadata never reaches content_calendar.
     calendar_post = [c for c in posts if c[1].endswith("content_calendar")][0]
     assert all(pcs.RESERVATION_PROOF not in row for row in calendar_post[2])
 
 
-def test_insert_rows_armed_reserve_hold_removes_inserted_rows(monkeypatch):
+def test_insert_rows_armed_finalize_hold_preserves_old_and_inactive_rows(monkeypatch):
     monkeypatch.setenv(pcs.FORWARD_RESERVATION_FLAG_ENV, "1")
     _arm_attester(monkeypatch)
     rows = _group_rows()
     http, inserted = _armed_http(rows, reserve_resp=_err("23514", "slot conflict"))
-    with pytest.raises(pcs.CalendarInsertNotStartedError):
+    with pytest.raises(pcs.ReservationHoldError):
         _store(http).insert_rows("lasso", rows)
-    deletes = [c for c in http.calls if c[0] == "delete"]
-    assert deletes, "the rows this call inserted must be removed again"
-    for row in inserted:
-        assert row["id"] in deletes[0][2]["id"]
+    assert not [c for c in http.calls if c[0] == "delete"]
+    assert all(row["variant_status"] == "candidate" for row in inserted)
+    assert all(row["media_not_ready_reason"] == "forward_reservation_staged" for row in inserted)
 
 
 def test_insert_rows_flag_off_legacy_path_unchanged(monkeypatch):
@@ -350,37 +359,31 @@ def test_insert_rows_armed_refuses_cross_lpid_same_date_same_source(monkeypatch)
     assert not [c for c in http.calls if c[0] == "post"], "no POST may happen"
 
 
-def test_insert_rows_armed_sibling_reservation_mismatch_cleans_up(monkeypatch):
-    """Siblings of one logical post share ONE reservation strictly: a divergent
-    id from the RPC removes the just-inserted rows and refuses the batch."""
+def test_insert_rows_armed_sibling_reservation_mismatch_is_unknown(monkeypatch):
+    """An invalid receipt never justifies deleting possibly activated rows."""
     monkeypatch.setenv(pcs.FORWARD_RESERVATION_FLAG_ENV, "1")
     _arm_attester(monkeypatch)
-    other_rid = str(uuid.uuid4())
-    answers = iter([RID, other_rid, other_rid])
     rows = _group_rows()
-    http, inserted = _armed_http(
-        rows, reserve_resp=lambda _json: _Resp(200, next(answers)))
-    with pytest.raises(pcs.CalendarInsertNotStartedError):
+    def mismatch(args):
+        return _Resp(200, {"row_ids": [c["calendar_row_id"] for c in args["p_candidates"]],
+                           "reservation_ids": [RID, str(uuid.uuid4()), RID]})
+    http, inserted = _armed_http(rows, reserve_resp=mismatch)
+    with pytest.raises(pcs.ReservationStoreError):
         _store(http).insert_rows("lasso", rows)
-    deletes = [c for c in http.calls if c[0] == "delete"]
-    assert deletes, "the rows this call inserted must be removed again"
-    for row in inserted:
-        assert row["id"] in deletes[0][2]["id"]
+    assert not [c for c in http.calls if c[0] == "delete"]
 
 
-def test_insert_rows_armed_siblings_share_one_reservation(monkeypatch):
-    """The happy path pinned: IG feed + FB mirror + Story of ONE logical post
-    each reserve and all resolve to the SAME reservation id."""
+def test_insert_rows_armed_siblings_share_one_atomic_reservation(monkeypatch):
     monkeypatch.setenv(pcs.FORWARD_RESERVATION_FLAG_ENV, "1")
     _arm_attester(monkeypatch)
     rows = _group_rows()
     http, _inserted_rows = _armed_http(rows)
     out = _store(http).insert_rows("lasso", rows)
     assert len(out) == 3
-    reserves = [c for c in http.calls
-                if c[0] == "post" and c[1].endswith(pcs._RESERVE_RPC)]
-    assert len(reserves) == 3
-    assert {c[2]["p_logical_post_id"] for c in reserves} == {LPID}
+    finalizations = [c for c in http.calls
+                    if c[0] == "post" and c[1].endswith(pcs._FINALIZE_RPC)]
+    assert len(finalizations) == 1
+    assert {c["logical_post_id"] for c in finalizations[0][2]["p_candidates"]} == {LPID}
 
 
 # ---- planner advisory screen (gym_media_builder) -------------------------------
@@ -456,7 +459,8 @@ class _ApplyStore:
         self.deleted.append(month)
         return [] if return_rows else 0
 
-    def insert_rows(self, base_key, rows, **kwargs):
+    def insert_rows(self, base_key, rows, *, expected_old_rows=None, **kwargs):
+        self.expected_old_rows = expected_old_rows
         self.inserted.extend(rows)
         return rows
 
@@ -502,6 +506,8 @@ def test_apply_armed_bound_rows_proceed(monkeypatch):
                      date(2026, 10, 20), 1, store, lambda m: None)
     assert res["ok"] is True, res
     assert store.inserted, "bound rows proceed to the insert"
+    assert store.deleted == [], "armed apply never calls delete_month"
+    assert store.expected_old_rows == []
 
 
 # ---- before_claim reservation consult ------------------------------------------
@@ -540,7 +546,7 @@ def test_before_claim_armed_requires_source_bytes(monkeypatch):
 def test_before_claim_armed_consults_reservation_proof(monkeypatch):
     _before_claim_env(monkeypatch, "1")
     posts = {
-        "fixer_forward_visual_proof_20261008": _Resp(200, {"attestation_ids": ATT_IDS}),
+        "fixer_forward_visual_proof_20261008": _Resp(200, {"attestation_ids": ATT_IDS, "source_sha256": SHA}),
         pcs._PROOF_RPC: _Resp(200, {
             "reservation_id": RID, "tenant_id": "tenant", "post_date": DAY,
             "logical_post_id": LPID, "source_sha256": SHA,
@@ -556,7 +562,7 @@ def test_before_claim_armed_consults_reservation_proof(monkeypatch):
 def test_before_claim_armed_missing_reservation_holds(monkeypatch):
     _before_claim_env(monkeypatch, "1")
     posts = {
-        "fixer_forward_visual_proof_20261008": _Resp(200, {"attestation_ids": ATT_IDS}),
+        "fixer_forward_visual_proof_20261008": _Resp(200, {"attestation_ids": ATT_IDS, "source_sha256": SHA}),
         pcs._PROOF_RPC: _err("23514", "schedule reservation proof unavailable"),
     }
     with pytest.raises(ForwardMediaVerificationHold):

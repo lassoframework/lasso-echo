@@ -2406,7 +2406,8 @@ def _poster_render_evidence_by_url(drafts):
 def _insert_rows_with_poster_evidence(insert_rows, base_key, rows, evidence_by_url,
                                       render_evidence_by_url=None,
                                       required_feed_slots=None,
-                                      prevalidated_cadence=False):
+                                      prevalidated_cadence=False,
+                                      expected_old_rows=None):
     """Forward poster proof through the prepared writer boundary.
 
     A TypeError from a prepared call is ambiguous: the store may have written before
@@ -2414,6 +2415,14 @@ def _insert_rows_with_poster_evidence(insert_rows, base_key, rows, evidence_by_u
     the plain legacy call for older stores and test fakes.
     """
     kwargs = {}
+    if expected_old_rows is not None:
+        # Never degrade an armed replacement into an older delete/insert store.
+        import inspect
+        parameters = inspect.signature(insert_rows).parameters
+        if "expected_old_rows" not in parameters:
+            from .portal_calendar_store import CalendarInsertNotStartedError
+            raise CalendarInsertNotStartedError(503, "atomic schedule replacement store unavailable")
+        kwargs["expected_old_rows"] = expected_old_rows
     if required_feed_slots is not None:
         import inspect
         try:
@@ -2860,10 +2869,57 @@ def _out_of_span_preserve_dates(months, span_first, span_last,
     return keep
 
 
+def _forward_replacement_rows(store, base_key, months, first, last, locked_days):
+    """Freeze full own-tenant rows for exact SQL comparison; partial reads hold.
+
+    Unknown legacy state and all claimed/scheduled/held generations stay outside
+    replacement authority. Story incident protection is retained conservatively.
+    """
+    from . import portal_calendar_store as pcs
+    reader = getattr(store, "list_month", None)
+    if not callable(reader):
+        raise pcs.CalendarInsertNotStartedError(503, "exact old calendar reader unavailable")
+    keep = {str(day)[:10] for day in locked_days or ()}
+    old, seen = [], set()
+    for month in months:
+        rows = reader(base_key, month)
+        if not isinstance(rows, list) or len(rows) >= 1000:
+            raise pcs.CalendarInsertNotStartedError(503, "exact old calendar read incomplete")
+        for row in rows:
+            if not isinstance(row, dict) or row.get("gym_id") != base_key:
+                raise pcs.CalendarInsertNotStartedError(503, "exact old calendar read unbound")
+            day = str(row.get("post_date") or "")[:10]
+            if (not first <= day <= last or day in keep
+                    or row.get("variant_status") != "active"
+                    or row.get("status") not in ("pending", "draft")
+                    or row.get("media_not_ready_reason") is not None
+                    or any(row.get(field) is not None for field in (
+                        "publish_claim_token", "publish_reservation_day", "scheduled_at",
+                        "published_at", "provider_post_id", "post_id"))):
+                continue
+            if row.get("format") == "story":
+                try:
+                    targets = pcs._story_incident_targets(store, base_key, first, last)
+                    from .fixer_business_seed import validate_story_created_at
+                    if (row.get("id"), validate_story_created_at(row.get("created_at"))) in targets:
+                        continue
+                except Exception:
+                    # A provenance read failure cannot erase an existing hold.
+                    continue
+            ident = str(uuid.UUID(str(row.get("id") or "")))
+            if ident in seen:
+                raise pcs.CalendarInsertNotStartedError(503, "duplicate old calendar identity")
+            seen.add(ident)
+            old.append(dict(row))
+    return old
+
+
 def _apply(base_key, rows, start, days, store, log, locked_days=(),
            allow_reshape=False, poster_render_evidence_by_url=None,
            render_evidence_by_url=None):
-    """Delete-then-insert, gym-scoped, across every month the rows land in PLUS the full
+    """Gym-scoped replacement: armed reservations use inactive prepare/atomic finalize.
+
+    With the reservation gate OFF, delete-then-insert across every month PLUS the full
     planned span. Rows are inserted WITHOUT an id (DB mints the uuid). Mirrors
     apply_month_plan. Refuses the demo gym id. Never raises out.
 
@@ -2910,6 +2966,7 @@ def _apply(base_key, rows, start, days, store, log, locked_days=(),
     deleted_row_snapshots = []
     insert_started = False
     planned_reservation_ids = set()
+    reservation_flag = False
     try:
         # PRESERVE APPROVALS: drop any incoming row that would collide with a slot the
         # gym has already approved/published, and let delete_month keep those rows in
@@ -3199,6 +3256,32 @@ def _apply(base_key, rows, start, days, store, log, locked_days=(),
         span_claim = _span_scoped_delete_claim(store, base_key, months,
                                                span_first, span_last,
                                                preserve_dates=locked_days, log=log)
+        if reservation_flag:
+            old_rows = _forward_replacement_rows(
+                store, base_key, months, span_first, span_last, locked_days)
+            insert_rows = getattr(store, "insert_rows", None)
+            if not callable(insert_rows):
+                raise _pcs.CalendarInsertNotStartedError(503, "atomic schedule store unavailable")
+            store_rows = [{k: v for k, v in row.items()
+                           if k != "_served_reservation_id"} for row in clean_rows]
+            # No delete_month call is allowed in this lane. The transaction
+            # replaces only the frozen old manifest after reserving ALL rows.
+            if not store_rows:
+                return {"ok": True, "upserted": 0, "inserted": 0,
+                        "deleted": 0, "months": months}
+            insert_started = True
+            inserted_rows = _insert_rows_with_poster_evidence(
+                insert_rows, base_key, store_rows, poster_render_evidence_by_url,
+                render_evidence_by_url=render_evidence_by_url,
+                required_feed_slots=new_feed_slots,
+                prevalidated_cadence=cadence_prevalidated,
+                expected_old_rows=old_rows) or []
+            if (len(inserted_rows) != len(store_rows)
+                    or _instagram_feed_slots(inserted_rows) != new_feed_slots):
+                raise _pcs.ReservationStoreError(502, "atomic batch result incomplete; outcome unknown")
+            return {"ok": True, "upserted": len(inserted_rows), "inserted": len(inserted_rows),
+                    "deleted": 0, "deleted_total": 0, "superseded": len(old_rows), "months": months,
+                    "retained_reservation_ids": sorted(planned_reservation_ids)}
         delete_preserve = _out_of_span_preserve_dates(
             months, span_first, span_last, preserve_dates=locked_days)
         bounded_delete_read = callable(getattr(store, "list_month", None))
@@ -3261,6 +3344,19 @@ def _apply(base_key, rows, start, days, store, log, locked_days=(),
                 exc, CalendarInsertNotStartedError)
         except Exception:  # noqa: BLE001
             known_pre_post_refusal = False
+        if reservation_flag:
+            from .portal_calendar_store import (ReservationHoldError, ReservationArgumentError,
+                                                 ReservationGateError, ReservationStagingError)
+            definite_refusal = known_pre_post_refusal or isinstance(
+                exc, (ReservationHoldError, ReservationArgumentError, ReservationGateError,
+                      ReservationStagingError))
+            log(f"atomic schedule write refused: {type(exc).__name__}")
+            return {"ok": False, "reason": f"atomic schedule write failed: {type(exc).__name__}",
+                    "upserted": 0, "inserted": 0, "deleted": 0 if definite_refusal else None,
+                    "deleted_total": 0 if definite_refusal else None, "months": months,
+                    "old_calendar_preserved": bool(not insert_started or definite_refusal),
+                    "retained_reservation_ids": sorted(planned_reservation_ids) if insert_started else [],
+                    "insert_outcome_unknown": bool(insert_started and not definite_refusal)}
         restore = getattr(store, "restore_deleted_rows", None)
         definite_pre_post_failure = not insert_started
         if ((known_pre_post_refusal or definite_pre_post_failure)

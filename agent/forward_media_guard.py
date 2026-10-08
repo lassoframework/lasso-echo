@@ -31,8 +31,9 @@ def _base_enabled():
 def enabled():
     # Every existing publisher/transport fence consults this effective switch.
     # An independently armed visual flag must never fall through their OFF path.
+    from .portal_calendar_store import forward_reservation_flag
     return (_base_enabled() or os.getenv('AGENT_FORWARD_MEDIA_VISUAL_INDEX', '').lower()
-            in ('1', 'true', 'yes', 'on'))
+            in ('1', 'true', 'yes', 'on') or forward_reservation_flag() is not False)
 
 
 def _uuid(value):
@@ -193,6 +194,9 @@ def claim(store, calendar_row_id, claim_token, evidence_id, expected_revision):
     arguments['p_expected_revision'] = expected_revision
     from . import forward_media_visual_index as visual_index
     rpc = 'rpc/fixer_claim_forward_media_20261006'
+    from .portal_calendar_store import forward_reservation_flag
+    if forward_reservation_flag() is not False and not visual_index.enabled():
+        raise ForwardMediaVerificationHold('forward reservation requires visual claim proof')
     if visual_index.enabled():
         if not _base_enabled():
             raise ForwardMediaVerificationHold('visual index requires forward media guard configuration')

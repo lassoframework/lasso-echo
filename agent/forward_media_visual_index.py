@@ -224,7 +224,7 @@ def attest(calendar_row_id, expected_revision, lineage_receipt_id, *,
             pass
 
 
-def _reservation_proof_for_claim(store, calendar_row_id, source_sha256):
+def _reservation_proof_for_claim(store, calendar_row_id, source_sha256, expected_revision, attestation_ids):
     """Consult the EXACT active forward reservation for this row + source bytes
     (DRAFT, 2026-10-08; only consulted when the reservation gate is armed or
     unreadable -- fail closed either way).
@@ -265,9 +265,11 @@ def _reservation_proof_for_claim(store, calendar_row_id, source_sha256):
             or not isinstance(proof.get('tenant_id'), str)
             or not proof['tenant_id']
             or not isinstance(proof.get('row_revision'), str)
-            or not proof['row_revision']
+            or proof['row_revision'] != expected_revision
             or not isinstance(proof.get('attestation_ids'), list)
-            or len(proof['attestation_ids']) != 3):
+            or len(proof['attestation_ids']) != 3
+            or set(proof['attestation_ids']) != set(attestation_ids)):
+
         raise ForwardMediaVerificationHold(
             'persisted reservation proof unavailable')
     return {'reservation_id': _uuid(proof['reservation_id']),
@@ -275,6 +277,7 @@ def _reservation_proof_for_claim(store, calendar_row_id, source_sha256):
             'post_date': str(proof.get('post_date') or ''),
             'logical_post_id': _uuid(proof.get('logical_post_id')),
             'row_revision': proof['row_revision'],
+            'source_sha256': source_sha256,
             'attestation_ids': [_uuid(a) for a in proof['attestation_ids']]}
 
 
@@ -287,8 +290,14 @@ def before_claim(calendar_row_id, expected_revision, lineage_receipt_id, *, stor
     When the forward reservation draft gate is armed, the exact active
     reservation for this row + source bytes must also resolve
     (``forward_reservation_proof_20261008``); anything less holds."""
+    from .portal_calendar_store import forward_reservation_flag, _SHA256_RE
+    reservation_flag = forward_reservation_flag()
+    if reservation_flag is not False and not enabled():
+        raise ForwardMediaVerificationHold('forward reservation requires visual claim proof')
     if not enabled():
         return None
+    if reservation_flag is None:
+        raise ForwardMediaVerificationHold('forward reservation gate unreadable; claim held')
     if store is None or claim_token is None:
         raise ForwardMediaVerificationHold('persisted visual proof store required')
     arguments = {'p_calendar_row_id': _uuid(calendar_row_id),
@@ -307,8 +316,16 @@ def before_claim(calendar_row_id, expected_revision, lineage_receipt_id, *, stor
         if not isinstance(ids, list) or len(ids) != 3 or len(set(ids)) != 3:
             raise ForwardMediaVerificationHold('persisted visual claim proof unavailable')
         result = {'attestation_ids': [_uuid(ident) for ident in ids]}
+        if reservation_flag:
+            # SQL derives this hash from the current row's original attestation;
+            # the publisher must never invent bytes from a URL or planner stamp.
+            observed_sha = proof.get('source_sha256')
+            if (not isinstance(observed_sha, str) or not _SHA256_RE.fullmatch(observed_sha)
+                    or (source_sha256 is not None and source_sha256 != observed_sha)):
+                raise ForwardMediaVerificationHold('exact attested source bytes unavailable')
+            source_sha256 = observed_sha
         reservation = _reservation_proof_for_claim(
-            store, calendar_row_id, source_sha256)
+            store, calendar_row_id, source_sha256, expected_revision, result['attestation_ids'])
         if reservation is not None:
             result['reservation'] = reservation
         return result
