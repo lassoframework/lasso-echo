@@ -605,6 +605,159 @@ def main():
                                                      + stage_command(rb_tenant, str(uuid.uuid4()), [member(rb_tenant)]).replace('set role service_role; ', '')
                                                      + ' commit;', ok=False)
 
+            # Actual planner entrypoint against real service-role alias reads
+            # and stage/status RPCs. Only HTTP transport is replaced.
+            from agent import portal_calendar_store as pcs
+            from agent import forward_media_observation_bridge as bridge
+            from agent.gym_media_builder import still_materialization_observation
+            from agent.forward_media_visual_index import phash_v1
+            from io import BytesIO
+            from PIL import Image
+            from unittest.mock import patch
+            import copy
+            import os
+            alias_raw = 'alias_' + uuid.uuid4().hex
+            alias_tenant = 'gym_' + uuid.uuid4().hex
+            sql('insert into fixer_forward_media_tenant_alias_20261006 values('
+                + lit(alias_raw) + ',' + lit(alias_tenant) + ');')
+            old_alias_id = str(uuid.uuid4())
+            sql('insert into content_calendar(id,gym_id,post_date,status,variant_status,caption) '
+                'values(' + lit(old_alias_id) + ',' + lit(alias_raw)
+                + ",'2026-10-10','pending','active','SYNTHETIC retained old row');")
+            old_alias = json.loads(sql('select to_jsonb(r) from content_calendar r where id='
+                                       + lit(old_alias_id) + ';'))
+            alias_entry = member(alias_raw, with_obs=False)
+            alias_row = dict(alias_entry['row'])
+            png = BytesIO()
+            Image.new('RGB', (24, 32), (31, 84, 120)).save(png, format='PNG')
+            source_bytes = png.getvalue()
+            producer_observation = still_materialization_observation(
+                source_bytes, source_bytes, alias_row['image_url'], tenant=alias_raw,
+                source_asset_id=alias_row['source_media_asset_id'],
+                source_url=alias_row['source_media_url'], bytes_fn=lambda _: source_bytes)
+            assert producer_observation['tenant'] == alias_raw
+            raw_packet = bridge.prepare(dict(alias_row, variant_status='candidate',
+                media_not_ready_reason='forward_reservation_staged'), [producer_observation])
+            raw_packet = {k: raw_packet[k] for k in ('observation_json', 'digest_input')}
+            raw_member = {'row': alias_row, 'observation': raw_packet}
+            assert 'canonical observation media binding invalid' in stage(
+                alias_tenant, str(uuid.uuid4()), [raw_member], ok=False)
+            assert sql('select count(*) from content_calendar where id=' + lit(alias_row['id']) + ';') == '0'
+            alias_row[bridge.METADATA] = [producer_observation]
+            alias_row[pcs.RESERVATION_PROOF] = {
+                'source_sha256': hashlib.sha256(source_bytes).hexdigest(),
+                'phash_v1': phash_v1(source_bytes),
+                'source_media_asset_id': alias_row['source_media_asset_id']}
+            producer_before = copy.deepcopy(alias_row)
+
+            class PlannerResponse:
+                status_code = 200
+                def __init__(self, payload): self.payload = payload
+                def json(self): return self.payload
+
+            class PlannerPGHTTP:
+                def __init__(self): self.calls = []
+                def get(self, url, *, params, headers, timeout):
+                    self.calls.append(('get', url, params))
+                    assert url.endswith('/' + pcs._FORWARD_TENANT_ALIAS_TABLE)
+                    assert params == {'select': 'alias_key,tenant_id',
+                                      'alias_key': 'eq.' + alias_raw, 'limit': '2'}
+                    assert headers['Authorization'] == 'Bearer SYNTHETIC service credential'
+                    aliases = sql('set role service_role; select coalesce(jsonb_agg('
+                                  "jsonb_build_object('alias_key',alias_key,'tenant_id',tenant_id)),'[]'::jsonb) "
+                                  'from fixer_forward_media_tenant_alias_20261006 where alias_key='
+                                  + lit(alias_raw) + ';')
+                    return PlannerResponse(json.loads(aliases))
+                def post(self, url, *, headers, json, timeout):
+                    self.calls.append(('post', url, json))
+                    if url.endswith('/rpc/' + pcs._STAGE_RPC):
+                        result = sql('set role service_role; select public.' + pcs._STAGE_RPC
+                                     + '(' + ','.join(lit(json[k]) for k in
+                                         ('p_tenant_id', 'p_batch_id', 'p_request', 'p_request_digest')) + ');')
+                    elif url.endswith('/rpc/' + bridge.READY_RPC):
+                        assert json == {}
+                        result = sql('set role service_role; select to_jsonb(public.'
+                                     + bridge.READY_RPC + '());')
+                    else:
+                        assert url.endswith('/rpc/' + pcs._BATCH_STATUS_RPC)
+                        result = sql('set role service_role; select public.' + pcs._BATCH_STATUS_RPC
+                                     + '(' + lit(json['p_batch_id']) + ');')
+                    return PlannerResponse(__import__('json').loads(result))
+
+            alias_http = PlannerPGHTTP()
+            alias_store = pcs.SupabaseCalendarStore(url='https://SYNTHETIC.invalid',
+                service_key='SYNTHETIC service credential', http=alias_http)
+            # Exercise producer -> bridge.prepare -> actual insert_rows ->
+            # real stage SQL. Cadence is prevalidated; authority gates are real.
+            with patch.dict(os.environ, {pcs.FORWARD_RESERVATION_FLAG_ENV: '1', bridge.ENV: '1'}):
+                alias_inserted = alias_store.insert_rows(alias_raw, [alias_row],
+                    expected_old_rows=[old_alias], prevalidated_cadence=True)
+            assert alias_row == producer_before
+            alias_receipt = alias_store.last_forward_stage
+            assert alias_receipt['tenant_id'] == alias_tenant
+            alias_attempt = alias_store.last_forward_stage_attempt
+            assert alias_attempt['tenant_id'] == alias_tenant
+            alias_request = json.loads(next(c[2]['p_request'] for c in alias_http.calls
+                                            if c[1].endswith(pcs._STAGE_RPC)))
+            assert alias_request['tenant_id'] == alias_tenant
+            assert alias_request['members'][0]['row']['gym_id'] == alias_raw
+            assert alias_request['old_rows'] == [old_alias]
+            projected_packet = alias_request['members'][0]['observation']
+            projected = json.loads(projected_packet['observation_json'])
+            assert projected['tenant'] == alias_tenant
+            assert projected['observation_digest'] == hashlib.sha256(
+                projected_packet['digest_input'].encode()).hexdigest()
+            assert json.loads(projected_packet['digest_input']) == {
+                k: v for k, v in projected.items() if k != 'observation_digest'}
+            assert {k: v for k, v in projected.items() if k not in ('tenant', 'observation_digest')} == {
+                k: v for k, v in producer_observation.items() if k not in ('tenant', 'observation_digest')}
+            alias_id = alias_inserted[0]['id']
+            persisted = json.loads(sql('select to_jsonb(o) from fixer_forward_media_observation_20261007 o '
+                                       'where calendar_row_id=' + lit(alias_id) + ';'))
+            assert persisted['tenant_id'] == alias_tenant and persisted['gym_id'] == alias_raw
+            assert persisted['observation_json'] == projected_packet['observation_json']
+            assert persisted['digest_input'] == projected_packet['digest_input']
+            assert alias_receipt['batch_id'] == pcs.forward_batch_identity(
+                alias_tenant, alias_attempt['request_digest'])
+            assert alias_store.resolve_forward_stage_attempt() == alias_receipt
+            assert eligible(alias_id) == {
+                'eligible': True, 'mode': 'staged', 'tenant_id': alias_tenant,
+                'batch_id': alias_receipt['batch_id'], 'reason': None}
+            assert sql('select gym_id from content_calendar where id=' + lit(alias_id) + ';') == alias_raw
+            assert sql('select variant_status from content_calendar where id=' + lit(old_alias_id) + ';') == 'active'
+            another_alias = 'alias_' + uuid.uuid4().hex
+            sql('insert into fixer_forward_media_tenant_alias_20261006 values('
+                + lit(another_alias) + ',' + lit(alias_tenant) + ');')
+            foreign = dict(alias_entry['row'], id=str(uuid.uuid4()), gym_id=another_alias)
+            count_before = len(alias_http.calls)
+            try:
+                alias_store.stage_forward_schedule_batch(alias_raw, [foreign], [old_alias])
+                raise AssertionError('planner alias expanded raw row ownership')
+            except pcs.ReservationArgumentError:
+                pass
+            assert len(alias_http.calls) == count_before
+            for attack in ('foreign_observation', 'forged_digest'):
+                bad_row = copy.deepcopy(alias_row)
+                bad_observation = bad_row[bridge.METADATA][0]
+                if attack == 'foreign_observation':
+                    # Even another alias of the same canonical tenant is not
+                    # this raw account's producer packet.
+                    bad_observation['tenant'] = another_alias
+                    bad_observation['observation_digest'] = hashlib.sha256(bridge._json({
+                        k: v for k, v in bad_observation.items() if k != 'observation_digest'}).encode()).hexdigest()
+                else:
+                    bad_observation['source_sha256'] = 'f' * 64
+                posts_before = len([c for c in alias_http.calls if c[1].endswith(pcs._STAGE_RPC)])
+                with patch.dict(os.environ, {pcs.FORWARD_RESERVATION_FLAG_ENV: '1', bridge.ENV: '1'}):
+                    try:
+                        alias_store.insert_rows(alias_raw, [bad_row], expected_old_rows=[old_alias],
+                                                prevalidated_cadence=True)
+                        raise AssertionError('foreign/forged producer observation staged')
+                    except (pcs.CalendarInsertNotStartedError, pcs.ReservationArgumentError):
+                        pass
+                assert len([c for c in alias_http.calls if c[1].endswith(pcs._STAGE_RPC)]) == posts_before
+            assert sql('select count(*) from content_calendar where gym_id=' + lit(alias_raw) + ';') == '2'
+
             print('PASS: PG17 forward schedule stage; OFF gate hold; digest binding; atomic stage of '
                   'inactive candidates + unverified observations + immutable membership; exact retry '
                   'receipt + changed digest refusal + lost-response readback; already-staged conflict; '
@@ -622,7 +775,11 @@ def main():
                   'slot conflict hold; atomic finalize with terminal receipt, exact retry and '
                   'changed-request refusal; two-session stage race (one winner, loser refused) and '
                   'two-session finalize race (identical receipts, one finalization); '
-                  'second-candidate full rollback; isolation guard')
+                  'second-candidate full rollback; isolation guard; actual planner alias entrypoint '
+                  'producer PNG -> bridge -> insert_rows routes canonical batch/observation while '
+                  'preserving raw member/old ownership and byte/recipe/hold observations, '
+                  'canonical request digest/attempt/status, raw packet SQL refusal, and '
+                  'same-tenant foreign raw-account/observation and forged-digest refusal')
         finally:
             subprocess.run([_pg('pg_ctl'), '-D', str(data), '-m', 'immediate', '-w', 'stop'],
                            capture_output=True, timeout=60)

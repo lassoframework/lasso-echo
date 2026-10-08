@@ -395,6 +395,7 @@ _FINALIZE_RPC = "finalize_forward_schedule_staged_batch_20261008"
 _STAGE_RPC = "stage_forward_schedule_batch_20261008"
 _BATCH_STATUS_RPC = "forward_schedule_batch_status_20261008"
 _PREPARATION_ELIGIBLE_RPC = "forward_schedule_preparation_eligible_20261008"
+_FORWARD_TENANT_ALIAS_TABLE = "fixer_forward_media_tenant_alias_20261006"
 _RESERVE_RPC = "reserve_forward_slot_20261008"
 _RELEASE_RPC = "release_forward_slot_20261008"
 _REVOKE_RPC = "revoke_source_reservations_20261008"
@@ -1695,14 +1696,97 @@ class SupabaseCalendarStore:
             raise ReservationStoreError(502, "different groups share reservation; outcome unknown")
         return data
 
+    def _forward_batch_tenant(self, account_key):
+        """Resolve only batch routing through the existing service-read alias
+        table. Raw account ownership and calendar filters remain unchanged.
+        A successful empty read means the raw key is canonical, matching SQL;
+        failed or ambiguous reads never establish an unmapped tenant."""
+        raw_key = str(account_key or "").strip()
+        predicate = _eq_filter(raw_key)
+        if not raw_key or predicate is None:
+            raise CalendarInsertNotStartedError(422, "forward batch account key invalid")
+        try:
+            response = self._client().get(
+                self._rest(_FORWARD_TENANT_ALIAS_TABLE),
+                params={"select": "alias_key,tenant_id", "alias_key": predicate, "limit": "2"},
+                headers=self._headers(), timeout=30)
+            aliases = response.json()
+            if not 200 <= response.status_code < 300 or not isinstance(aliases, list):
+                raise ValueError("alias read unavailable")
+            if not aliases:
+                return raw_key
+            if (len(aliases) != 1 or not isinstance(aliases[0], dict)
+                    or aliases[0].get("alias_key") != raw_key
+                    or not isinstance(aliases[0].get("tenant_id"), str)
+                    or not aliases[0]["tenant_id"]
+                    or aliases[0]["tenant_id"] != aliases[0]["tenant_id"].strip()):
+                raise ValueError("alias binding malformed")
+            return aliases[0]["tenant_id"]
+        except Exception as exc:
+            raise CalendarInsertNotStartedError(
+                503, "canonical batch tenant unavailable before staging") from exc
+
+    @staticmethod
+    def _forward_batch_observation(row, packet, account_key, tenant):
+        """Project an intact unverified producer packet to canonical routing.
+
+        The producer's own raw account (or its resolved canonical tenant) and
+        exact media edge must agree before changing anything. This self-hash
+        is packaging integrity, never registry, manifest or signed authority.
+        All observed bytes, recipe and holds survive the detached projection.
+        """
+        from . import forward_media_observation_bridge as bridge
+        import hashlib
+        import json
+        try:
+            if (not isinstance(packet, dict)
+                    or any(not isinstance(packet.get(k), str)
+                           or not packet[k]
+                           or len(packet[k].encode('utf-8')) > bridge.MAX_JSON_BYTES
+                           for k in ('observation_json', 'digest_input'))):
+                raise ValueError('bounded packet required')
+            observation = json.loads(packet['observation_json'])
+            if (not isinstance(observation, dict)
+                    or observation.get('tenant') not in (account_key, tenant)):
+                raise ValueError('own observation tenant required')
+            original_input = packet['digest_input']
+            original_digest = observation.get('observation_digest')
+            without_digest = {k: v for k, v in observation.items()
+                              if k != 'observation_digest'}
+            if (not isinstance(original_digest, str)
+                    or not _SHA256_RE.fullmatch(original_digest)
+                    or hashlib.sha256(original_input.encode('utf-8')).hexdigest() != original_digest
+                    or json.loads(original_input) != without_digest):
+                raise ValueError('observation preimage differs')
+            # SQL hashes the exact supplied preimage; valid direct callers can
+            # use different JSON spacing. Verify that first, then use the
+            # bridge's canonical packet validator on a detached self-hash.
+            checked = dict(observation, observation_digest=hashlib.sha256(
+                bridge._json(without_digest).encode('utf-8')).hexdigest())
+            bridge.prepare(
+                dict(row, variant_status='candidate',
+                     media_not_ready_reason='forward_reservation_staged'),
+                [checked])
+            observation['tenant'] = tenant
+            digest_input = bridge._json({k: v for k, v in observation.items()
+                                         if k != 'observation_digest'})
+            observation['observation_digest'] = hashlib.sha256(
+                digest_input.encode('utf-8')).hexdigest()
+            return {'observation_json': bridge._json(observation),
+                    'digest_input': digest_input}
+        except Exception as exc:
+            raise ReservationArgumentError(
+                422, 'own unverified observation packet invalid before staging') from exc
+
     def stage_forward_schedule_batch(self, account_key, rows, old_rows=None):
         """Atomically stage one immutable inactive batch; returns the receipt.
 
         The single service-role RPC registers the immutable batch (batch id,
-        tenant, request digest, membership, content/media snapshots AND the
+        canonical tenant, request digest, membership, content/media snapshots AND the
         frozen old-row snapshot), creates the inactive marked candidate rows
         and records the unverified observations in ONE transaction. The
-        request is ONE canonical JSON text ({"members": [{"row": {...},
+        request is ONE canonical JSON text ({"tenant_id": <resolved tenant>,
+        "members": [{"row": {...},
         "observation": {...}|null}, ...], "old_rows": [{<every column,
         including NULLs>}]}); the persisted digest is SHA-256 of its exact
         bytes, recomputed in SQL. The old-row snapshot is frozen ONCE here
@@ -1750,7 +1834,13 @@ class SupabaseCalendarStore:
                    for old in frozen_old]
         if set(old_ids) & set(planned_ids):
             raise ReservationArgumentError(422, "old row overlaps a staged candidate")
-        request_text = _canonical_json({"members": members, "old_rows": frozen_old})
+        tenant = self._forward_batch_tenant(account_key)
+        for member in members:
+            if member['observation'] is not None:
+                member['observation'] = self._forward_batch_observation(
+                    member['row'], member['observation'], account_key, tenant)
+        request_text = _canonical_json({"tenant_id": tenant,
+                                        "members": members, "old_rows": frozen_old})
         digest = hashlib.sha256(request_text.encode("utf-8")).hexdigest()
         batch_id = forward_batch_identity(tenant, digest)
         self.last_forward_stage = None
