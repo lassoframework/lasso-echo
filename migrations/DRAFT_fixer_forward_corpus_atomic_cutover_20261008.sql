@@ -1,5 +1,6 @@
 -- DRAFT / UNAPPLIED / DEFAULT OFF. No production DDL is authorized.
--- Apply AFTER B's calendar/media/LASSO entry migrations and owner-photo stack.
+-- Apply AFTER ALL B P1/calendar/media/publish-caption/LASSO entry migrations.
+-- The complete resulting function inventory is a required atomic prerequisite.
 -- This is ONE atomic cutover: ordinary statement guards and removal of ONLY
 -- the two frozen content_calendar SHARE ROW EXCLUSIVE clauses commit together.
 -- Never apply individual sections or install the blocking trigger beforehand.
@@ -46,22 +47,58 @@ declare f record; v_proc record; t text;
 begin
  if current_user is distinct from 'postgres' then
   raise exception 'atomic corpus cutover requires postgres' using errcode='23514'; end if;
+ -- FULL ENTRY INVENTORY: 22 P2 replacements, helper, four P1 authority
+ -- entries, two unchanged delegating wrappers and owner-photo corpus guard.
+ -- A missing/legacy row-first entry invalidates blocking statement safety.
  for f in select * from (values
-  ('portal_action_receipt_apply','p_gym_id text, p_action_id text, p_request_fingerprint text, p_prepared jsonb','3e17e0f6392bbc4ba4dd8ea72ff718f8',true),
-  ('stage_lasso_campaign_row','p_row jsonb, p_artifact_tenant text, p_source_hash text, p_policy_version text, p_image_sha256 text','9054fad04a968a88a5cfb4db8a23347b',true),
-  ('fixer_forward_calendar_entry_lock_20261008','','f7804f90164613bff2e70d7f7bc5b4e2',true),
-  ('fixer_owner_photo_corpus_write_lock_20261007','','12af6fc87e424ab5a5041a4c6d8765d5',true)
- ) as expected(name,identity_args,body_md5,security_definer) loop
+  ('fixer_forward_calendar_entry_lock_20261008','','f7804f90164613bff2e70d7f7bc5b4e2',true,array['search_path=pg_catalog, public']::text[],'void',false,0),
+  ('approve_calendar_row_if_media_ready','p_row_id uuid, p_gym_id text, p_expected jsonb','8124b945c06d8adeaa5c63cf4712a73f',true,array['search_path=public']::text[],'setof content_calendar',true,1),
+  ('calendar_recover_unproved_approval','p_row_id uuid, p_gym_id text, p_expected jsonb','4d0ac4fd7d68e60e78850dbd7f2a1876',true,array['search_path=public']::text[],'setof content_calendar',true,0),
+  ('calendar_stamp_verified_approval','p_gym_id uuid, p_calendar_id uuid, p_clerk_actor_id text, p_echo_approval_digest text','efba82fc5f34a108c7ad96c42dba48ee',true,array['search_path=public']::text[],'table(id uuid, gym_id uuid, clerk_actor_id text, approval_digest text)',true,0),
+  ('claim_calendar_gbp_publish_owned','p_row_id uuid, p_gym_id text','5503a8abf954c5fc7967b4c92918111a',true,array['search_path=public']::text[],'setof content_calendar',true,0),
+  ('claim_calendar_publish_slot_owned','p_row_id uuid, p_gym_id text, p_day date, p_timezone text, p_capacity integer, p_approved_only boolean, p_require_approval_proof boolean','7c09844f2c8c00190e007b1bca83d2a0',true,array['search_path=public']::text[],'uuid',false,1),
+  ('content_calendar_swap_variant','p_gym_id text, p_candidate_id uuid, p_actor text','5251cf2b4d6015ac9c66b070af8f4f5d',true,array['search_path=public']::text[],'jsonb',false,1),
+  ('record_gym_media_review','p_gym_id text, p_asset_id text, p_expected_hash text, p_expected_status text, p_expected_reviewed_at timestamp with time zone, p_fields jsonb','77a98f3101f79302828328be7b783b45',true,array['search_path=public']::text[],'boolean',false,0),
+  ('claim_gym_media_sync','','0ccb81e5836ab7f0d0c40850016ceb84',true,array['search_path=public']::text[],'setof media_source',true,0),
+  ('request_gym_media_sync','p_source_id text, p_gym_id text','665c64d946b0c63ebe79fb52a14f0790',true,array['search_path=public']::text[],'boolean',false,0),
+  ('finish_gym_media_sync','p_source_id text, p_token text, p_ok boolean, p_error text','7b071942070e868362ff075a5e036d2f',true,array['search_path=public']::text[],'boolean',false,1),
+  ('portal_action_receipt_begin','p_gym_id text, p_action_id text, p_action text, p_row_id uuid, p_actor_id text, p_request_fingerprint text','3425d3c0e5d40a10b475e1a432ce293e',true,array['search_path=public']::text[],'portal_action_receipt',false,0),
+  ('portal_action_receipt_claim_selection','p_gym_id text, p_action_id text, p_request_fingerprint text, p_selected_asset jsonb, p_planned_siblings jsonb','a4ad7749288d195d5b75c0707696cfb9',true,array['search_path=public']::text[],'portal_action_receipt',false,0),
+  ('portal_action_receipt_apply','p_gym_id text, p_action_id text, p_request_fingerprint text, p_prepared jsonb','3e17e0f6392bbc4ba4dd8ea72ff718f8',true,array['search_path=public']::text[],'portal_action_receipt',false,0),
+  ('calendar_patch_caption_autonomous_clean','p_row_id uuid, p_gym_id text, p_expected_status text, p_expected_caption text, p_clean_caption text','3c955479952e70aa093a571d41c360bf',true,array['search_path=public']::text[],'setof content_calendar',true,0),
+  ('calendar_patch_caption_manual_format','p_row_id uuid, p_gym_id text, p_expected_status text, p_expected_caption text, p_clean_caption text','acc86a7be80cac06ee424b818010aaf6',true,array['search_path=public']::text[],'setof content_calendar',true,0),
+  ('claim_calendar_publish_slot','p_row_id uuid, p_gym_id text, p_day date, p_timezone text, p_capacity integer, p_approved_only boolean','745b7946b1e0e70c82bda9fe00ff7489',true,array['search_path=public']::text[],'boolean',false,0),
+  ('release_lasso_backlog_feed_hold','p_feed_id uuid, p_story_id uuid, p_expected_feed jsonb, p_expected_story jsonb','5fd99dc9400795622446972fa8182328',true,array['search_path=public']::text[],'jsonb',false,0),
+  ('release_lasso_paired_story_hold','p_story_id uuid','6e1cbe16ae094ea0b563a8915b75c221',true,array['search_path=public']::text[],'jsonb',false,0),
+  ('repair_lasso_paired_story','p_story_id uuid, p_feed_id uuid, p_expected_story jsonb, p_expected_feed jsonb, p_story_image_url text, p_story_sha256 text, p_artifact_tenant text, p_source_hash text, p_policy_version text, p_story_scheduled_at timestamp with time zone','18c1f2ae9dbbcfe0c4a11ce41253d761',true,array['search_path=public']::text[],'jsonb',false,0),
+  ('stage_lasso_campaign_row','p_row jsonb, p_artifact_tenant text, p_source_hash text, p_policy_version text, p_image_sha256 text','9054fad04a968a88a5cfb4db8a23347b',true,array['search_path=public']::text[],'jsonb',false,0),
+  ('stage_lasso_paired_story','p_feed_id uuid, p_account text, p_day date, p_slot integer, p_feed_status text, p_feed_caption text, p_feed_image_url text, p_feed_scheduled_at timestamp with time zone, p_feed_logical_post_id uuid, p_story_id uuid, p_story_image_url text, p_story_sha256 text, p_artifact_tenant text, p_source_hash text, p_policy_version text, p_story_scheduled_at timestamp with time zone','613ed6cbb44e2d460f83b974632efec5',true,array['search_path=public']::text[],'jsonb',false,0),
+  ('stage_lasso_third_story','p_feed_id uuid, p_feed_caption text, p_feed_image_url text, p_story_id uuid, p_story_image_url text, p_story_source_url text, p_story_sha256 text, p_source_hash text, p_policy_version text, p_scheduled_at timestamp with time zone, p_caption_hash text','2357e36b0e3f77a08c84cce85ea28164',true,array['search_path=public']::text[],'jsonb',false,1),
+  ('fixer_attest_forward_media_20261006','p_calendar_row_id uuid, p_expected_revision text, p_evidence_id uuid, p_source_fingerprint text, p_source_length bigint, p_image_fingerprint text, p_image_length bigint, p_thumbnail_fingerprint text, p_thumbnail_length bigint, p_operation text, p_evidence_ref text','be6aded33788957b4ab8f67cb8c380a7',true,array['search_path=pg_catalog, public','lock_timeout=5s']::text[],'uuid',false,0),
+  ('fixer_record_forward_media_observation_20261007','p_calendar_row_id uuid, p_expected_row jsonb, p_observation_json text, p_digest_input text','1f67896a66d76c28e7971248621f13fa',true,array['search_path=pg_catalog, public']::text[],'jsonb',false,0),
+  ('fixer_prepare_owner_photo_20261007','p_audit_id uuid, p_original jsonb, p_manifest jsonb','e06e9c5f7ef4ae6acd9b56e7023c53da',true,array['search_path=pg_catalog, public']::text[],'jsonb',false,0),
+  ('fixer_forward_media_provenance_lookup_20261006','p_calendar_row_id uuid','580681bc8c89005be887eda56403d7e7',true,array['search_path=pg_catalog, public']::text[],'jsonb',false,0),
+  ('fixer_owner_photo_corpus_write_lock_20261007','','12af6fc87e424ab5a5041a4c6d8765d5',true,array['search_path=pg_catalog, public']::text[],'trigger',false,0),
+  ('claim_calendar_gbp_publish_with_mode_owned','p_row_id uuid, p_gym_id text','528dcc3c13a98f705cf3c021d0a60dae',true,array['search_path=public']::text[],'jsonb',false,0),
+  ('claim_calendar_publish_slot_proven_owned','p_row_id uuid, p_gym_id text, p_day date, p_timezone text, p_capacity integer, p_approved_only boolean','c36ca7a901a9a84c772dad34c1c439b2',true,array['search_path=public']::text[],'jsonb',false,0)
+ ) as expected(name,identity_args,body_md5,security_definer,config,result,retset,default_count) loop
   if (select count(*) from pg_proc p join pg_namespace n on n.oid=p.pronamespace
       where n.nspname='public' and p.proname=f.name) <> 1 then
    raise exception 'atomic corpus cutover function count drift: %',f.name using errcode='23514'; end if;
-  select p.*,pg_get_function_identity_arguments(p.oid) as identity_args
+  select p.*,pg_get_function_identity_arguments(p.oid) as identity_args,
+   l.lanname,lower(pg_get_function_result(p.oid)) as result
    into v_proc from pg_proc p join pg_namespace n on n.oid=p.pronamespace
+   join pg_language l on l.oid=p.prolang
    where n.nspname='public' and p.proname=f.name;
   if v_proc.identity_args is distinct from f.identity_args
    or md5(v_proc.prosrc) is distinct from f.body_md5
    or pg_get_userbyid(v_proc.proowner) is distinct from 'postgres'
-   or v_proc.prosecdef is distinct from f.security_definer or v_proc.provolatile <> 'v' then
+   or v_proc.prosecdef is distinct from f.security_definer or v_proc.provolatile <> 'v'
+   or v_proc.lanname is distinct from 'plpgsql' or v_proc.prokind <> 'f'
+   or v_proc.proisstrict or v_proc.proleakproof or v_proc.proparallel <> 'u'
+   or v_proc.proconfig is distinct from f.config
+   or v_proc.result is distinct from f.result or v_proc.proretset is distinct from f.retset
+   or v_proc.pronargdefaults is distinct from f.default_count then
    raise exception 'atomic corpus cutover definition drift: %',f.name using errcode='23514'; end if;
  end loop;
  -- #345 is stacked later; if already present, only its exact reviewed body

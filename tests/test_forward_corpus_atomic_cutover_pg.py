@@ -37,14 +37,40 @@ def function(text, name, delimiter='function'):
     return match[0]
 
 
+def entry_sql(tranche):
+    # Every prerequisite is tracked in the integrated B branch. No local task
+    # evidence directory, git history or network fallback is permitted.
+    return (ROOT / f'migrations/DRAFT_fixer_forward_lock_entry_{tranche}_20261008.sql').read_text()
+
+
 def lasso_sql():
-    path = ROOT / 'migrations/DRAFT_fixer_forward_lock_entry_lasso_20261008.sql'
-    if path.exists():
-        return path.read_text()
-    # P3 worker started at 61773b3b before P2b landed. Frozen shared-repo object
-    # is the only fallback; no branch movement or network lookup is performed.
-    return subprocess.check_output(['git', 'show', 'f68d2375:migrations/DRAFT_fixer_forward_lock_entry_lasso_20261008.sql'],
-                                   cwd=ROOT, text=True)
+    return entry_sql('lasso')
+
+
+def entry_definitions():
+    definitions = {}
+    for tranche in ('calendar', 'media', 'publish_caption', 'lasso'):
+        text = entry_sql(tranche)
+        for name in re.findall(r'CREATE OR REPLACE FUNCTION public\.(\w+)\(', text):
+            definitions[name] = function(text, name)
+    assert len(definitions) == 22
+    definitions['fixer_forward_calendar_entry_lock_20261008'] = function(
+        entry_sql('calendar'), 'fixer_forward_calendar_entry_lock_20261008', 'dollar')
+    for filename, names in (
+        ('DRAFT_fixer_forward_media_claim_20261006.sql', ('fixer_attest_forward_media_20261006',)),
+        ('DRAFT_fixer_forward_media_observation_bridge_20261007.sql', ('fixer_record_forward_media_observation_20261007',)),
+        ('DRAFT_fixer_owner_photo_clearance_20261007.sql', ('fixer_prepare_owner_photo_20261007', 'fixer_forward_media_provenance_lookup_20261006', 'fixer_owner_photo_corpus_write_lock_20261007')),
+    ):
+        text = (ROOT / 'migrations' / filename).read_text()
+        for name in names:
+            definitions[name] = function(text, name, 'dollar')
+    # These wrappers intentionally retain their frozen production bodies; the
+    # cutover pins them because adding a pre-delegation row lock would invert C.
+    wrappers = (ROOT / 'migrations/calendar_approval_provenance_20261005.sql').read_text()
+    for name in ('claim_calendar_gbp_publish_with_mode_owned', 'claim_calendar_publish_slot_proven_owned'):
+        definitions[name] = function(wrappers, name, 'dollar')
+    assert len(definitions) == 30
+    return definitions
 
 
 # Exact #345 guard, captured from its reviewed draft. Keep its whitespace so
@@ -68,21 +94,15 @@ create trigger generated_inventory_lock before insert or update or delete or tru
 
 def test_cutover_hashes_pin_the_actual_entry_drafts():
     candidate = (ROOT / 'migrations/DRAFT_fixer_forward_corpus_atomic_cutover_20261008.sql').read_text()
-    sources = [
-        ('portal_action_receipt_apply', (ROOT / 'migrations/DRAFT_fixer_forward_lock_entry_media_20261008.sql').read_text(), 'function'),
-        ('stage_lasso_campaign_row', lasso_sql(), 'function'),
-        ('fixer_forward_calendar_entry_lock_20261008', (ROOT / 'migrations/DRAFT_fixer_forward_lock_entry_calendar_20261008.sql').read_text(), 'dollar'),
-        ('fixer_owner_photo_corpus_write_lock_20261007', (ROOT / 'migrations/DRAFT_fixer_owner_photo_clearance_20261007.sql').read_text(), 'dollar'),
-        ('fixer_generated_inventory_lock_20261007', GENERATED, 'dollar'),
-    ]
-    for name, source, delimiter in sources:
-        marker = '$function$' if delimiter == 'function' else '$$'
-        body = function(source, name, delimiter).split(marker)[1]
+    for name, definition in entry_definitions().items():
+        marker = '$function$' if '$function$' in definition else '$$'
+        body = definition.split(marker)[1]
         assert hashlib.md5(body.encode()).hexdigest() in candidate, name
         if name in ('portal_action_receipt_apply', 'stage_lasso_campaign_row'):
             after = re.sub(r'(?im)^  lock table public\.content_calendar in share row exclusive mode;\n', '', body)
             assert after != body
             assert hashlib.md5(after.encode()).hexdigest() in candidate, name
+    assert hashlib.md5(GENERATED.split('$$')[1].encode()).hexdigest() in candidate
 
 
 def main():
@@ -148,7 +168,11 @@ def main():
                 'pillar text,slot_index integer,scheduled_at timestamptz);'
                 'create table media_source(id text primary key,gym_id text,kind text,folder_id text,active boolean);'
                 'create table media_asset(id text primary key,source_id text,gym_id text,content_hash text,'
-                'rendition_url text,eligible boolean,excluded_by_coach boolean);'
+                'rendition_url text,eligible boolean,excluded_by_coach boolean,review_status text,'
+                'reviewed_at timestamptz,reviewed_by text,review_note text,review_content_hash text,'
+                'consent_status text,release_ref text,consent_member_ref text,consent_expires_at timestamptz);'
+                'create table media_asset_review_event(gym_id text,asset_id text,content_hash text,prior_status text,'
+                'decision text,reviewed_by text,reviewed_at timestamptz,review_note text);'
                 'create table echo_infographic_artifacts(tenant text,image_url text,image_sha256 text,evidence jsonb,source_identity jsonb);')
             for name in ('DRAFT_fixer_forward_media_claim_20261006.sql',
                          'DRAFT_fixer_forward_media_observation_bridge_20261007.sql',
@@ -159,12 +183,15 @@ def main():
             receipt_sql = (ROOT / 'migrations/portal_action_receipt_draft_20261004.sql').read_text()
             sql(receipt_sql[receipt_sql.index('CREATE TABLE IF NOT EXISTS public.portal_action_receipt ('):
                             receipt_sql.index('-- Trusted public media origin:')])
-            helper = function((ROOT / 'migrations/DRAFT_fixer_forward_lock_entry_calendar_20261008.sql').read_text(),
-                              'fixer_forward_calendar_entry_lock_20261008', 'dollar')
-            receipt = function((ROOT / 'migrations/DRAFT_fixer_forward_lock_entry_media_20261008.sql').read_text(),
-                               'portal_action_receipt_apply')
-            stage = function(lasso_sql(), 'stage_lasso_campaign_row')
-            sql(helper + receipt + stage)
+            definitions = entry_definitions()
+            # Install the complete real B entry stack, including the unchanged
+            # wrappers. Validation is deferred solely because this synthetic
+            # schema omits production tables used by unrelated business paths.
+            sql("set check_function_bodies=off")
+            for name, definition in definitions.items():
+                if name.startswith('fixer_') and name != 'fixer_forward_calendar_entry_lock_20261008':
+                    continue  # Already installed by the full actual P1 drafts.
+                sql(definition)
             sql('revoke all on function fixer_forward_calendar_entry_lock_20261008() from public,anon,authenticated,service_role;'
                 'revoke all on function portal_action_receipt_apply(text,text,text,jsonb),'
                 'stage_lasso_campaign_row(jsonb,text,text,text,text) from public,anon,authenticated;'
@@ -179,6 +206,88 @@ def main():
                            "('portal_action_receipt_apply','stage_lasso_campaign_row') order by proname")
             before = {name: sql('select prosrc from pg_proc where proname=%s', (name,))[0][0]
                       for name in ('portal_action_receipt_apply', 'stage_lasso_campaign_row')}
+            # Regress every P2 entry and delegating wrapper independently.
+            # Legacy entries retain their tracked business bodies but omit G/C;
+            # each missing/overloaded/legacy prerequisite must reject the whole
+            # candidate before guards, lock removals or privileges change.
+            entry_names = [name for name in definitions if not name.startswith('fixer_')]
+
+            def assert_prerequisite_rejected(name):
+                try:
+                    sql(candidate)
+                    raise AssertionError('unsafe prerequisite accepted: ' + name)
+                except psycopg.Error as exc:
+                    assert exc.sqlstate == '23514' and name in str(exc), (name, exc)
+                    sql('rollback')
+                assert sql('select count(*) from pg_trigger where tgname=%s', (TRIGGER,)) == [(0,)]
+                assert sql("select has_table_privilege('anon','content_calendar','truncate')") == [(True,)]
+
+            for name in entry_names:
+                signature = sql("select oid::regprocedure::text from pg_proc where proname=%s", (name,))[0][0]
+                sql('drop function ' + signature)
+                assert_prerequisite_rejected(name)
+                sql(definitions[name])
+                sql('create function public.' + name + '(integer) returns integer language sql as $$select $1$$;')
+                assert_prerequisite_rejected(name)
+                sql('drop function public.' + name + '(integer)')
+                if name == 'record_gym_media_review':
+                    # Exact catalog-reported legacy body is already tracked.
+                    legacy = function((ROOT / 'migrations/media_asset_review_binding_20260918.sql').read_text(), name, 'dollar')
+                    assert hashlib.md5(legacy.split('$$')[1].encode()).hexdigest() == '626aedcebdd94728ead0475897246004'
+                    sql(legacy)
+                elif name not in ('claim_calendar_gbp_publish_with_mode_owned', 'claim_calendar_publish_slot_proven_owned'):
+                    legacy = definitions[name].replace('perform public.fixer_forward_calendar_entry_lock_20261008();', '', 1)
+                    assert legacy != definitions[name]
+                    sql(legacy)
+                else:
+                    sql(definitions[name].replace('begin\n', 'begin\n  perform 1 from public.media_asset for update;\n', 1))
+                assert_prerequisite_rejected(name)
+                sql(definitions[name])
+            # P1/helper/body flags are equally required. A same-body owner,
+            # security/language/config alteration cannot pass a hash-only check.
+            for name in (name for name in definitions if name.startswith('fixer_') and name != 'fixer_owner_photo_corpus_write_lock_20261007'):
+                definition = definitions[name]
+                replaceable = re.sub(r'create function', 'create or replace function', definition, count=1, flags=re.I)
+                signature = sql("select oid::regprocedure::text from pg_proc where proname=%s", (name,))[0][0]
+                sql('drop function ' + signature)
+                assert_prerequisite_rejected(name)
+                sql(replaceable)
+                sql('create function public.' + name + '(integer) returns integer language sql as $$select $1$$;')
+                assert_prerequisite_rejected(name)
+                sql('drop function public.' + name + '(integer)')
+                legacy = re.sub(r"(?m)^.*perform pg_advisory_xact_lock\(hashtextextended\('fixer_forward_photo_census_20261007', *0\)\);\n", '', replaceable, count=1)
+                if name == 'fixer_record_forward_media_observation_20261007':
+                    legacy = re.sub(r"(?m)^.*perform pg_advisory_xact_lock_shared\(hashtextextended\('fixer_forward_graph_20261006', *0\)\);\n", '', legacy, count=1)
+                assert legacy != replaceable, name
+                sql(legacy)
+                assert_prerequisite_rejected(name)
+                sql(replaceable)
+            helper_sig = 'fixer_forward_calendar_entry_lock_20261008()'
+            sql('alter function ' + helper_sig + ' owner to service_role')
+            assert_prerequisite_rejected('fixer_forward_calendar_entry_lock_20261008')
+            sql('alter function ' + helper_sig + ' owner to postgres')
+            sql('alter function ' + helper_sig + ' set search_path=public')
+            assert_prerequisite_rejected('fixer_forward_calendar_entry_lock_20261008')
+            sql('alter function ' + helper_sig + ' set search_path=pg_catalog,public')
+            sql('alter function ' + helper_sig + ' security invoker')
+            assert_prerequisite_rejected('fixer_forward_calendar_entry_lock_20261008')
+            sql('alter function ' + helper_sig + ' security definer')
+            sql('alter function ' + helper_sig + ' stable')
+            assert_prerequisite_rejected('fixer_forward_calendar_entry_lock_20261008')
+            sql('alter function ' + helper_sig + ' volatile')
+            sql('revoke all on function fixer_forward_calendar_entry_lock_20261008() from public,anon,authenticated,service_role;'
+                'revoke all on function portal_action_receipt_apply(text,text,text,jsonb),'
+                'stage_lasso_campaign_row(jsonb,text,text,text,text) from public,anon,authenticated;'
+                'grant execute on function portal_action_receipt_apply(text,text,text,jsonb),'
+                'stage_lasso_campaign_row(jsonb,text,text,text,text) to service_role;')
+            # DROP/recreate drift probes naturally allocate new OIDs. Freeze
+            # metadata only after all prerequisites have been restored, before
+            # applying the candidate; the cutover itself must preserve it.
+            metadata = sql("select oid,proname,proowner,proacl,prosecdef,provolatile,proconfig,"
+                           "pg_get_function_identity_arguments(oid) from pg_proc where proname in "
+                           "('portal_action_receipt_apply','stage_lasso_campaign_row') order by proname")
+            print('PASS: complete B prerequisite inventory rejects legacy/missing/overloaded entries and helper owner/config/security/volatility drift before atomic cutover', flush=True)
+
             # Overload drift rejects ALL sections; no early statement guard and
             # no lock removal/privilege change may escape the failed transaction.
             sql('create function stage_lasso_campaign_row(integer) returns integer language sql as $$select $1$$;')
@@ -339,6 +448,39 @@ def main():
                         assert locks('inventory_waiter', GRAPH) == [('ShareLock', True)]
                         holder.commit()
                         assert future.result(timeout=5)[0] is None
+            # Exercise the exact media-review entry implicated by the legacy
+            # row-first reproduction. The real repaired function waits on C
+            # without owning its target row, so a C holder can update that asset
+            # and commit while the review waits; no C/row cycle can form.
+            asset = str(uuid.uuid4())
+            sql("insert into media_asset(id,gym_id,content_hash,review_status) values(%s,'gym','synthetic-hash','pending_review')", (asset,))
+            review_call = 'select record_gym_media_review(%s,%s,%s,%s,%s,%s)'
+            review_fields = Jsonb({'review_content_hash': 'synthetic-hash', 'review_status': 'approved',
+                                  'reviewed_by': 'synthetic reviewer', 'reviewed_at': '2026-10-08T00:00:00Z'})
+            review_args = ('gym', asset, 'synthetic-hash', 'pending_review', None, review_fields)
+            with lane('review_holder') as holder, lane('review_waiter') as reviewer, ThreadPoolExecutor(max_workers=1) as pool:
+                holder.execute('select fixer_forward_calendar_entry_lock_20261008()')
+                future = pool.submit(run, reviewer, review_call, review_args)
+                wait_c('review_waiter')
+                with lane('review_row_probe') as probe:
+                    probe.execute('select id from media_asset where id=%s for update nowait', (asset,))
+                    probe.rollback()
+                holder.execute('update media_asset set eligible=true where id=%s', (asset,))
+                holder.commit()
+                assert future.result(timeout=5) == (None, (True,))
+            assert sql('select count(*) from media_asset_review_event where asset_id=%s', (asset,)) == [(1,)]
+            # The waiting function also observes a coach edit committed before
+            # its C acquisition and refuses the stale expected review state.
+            with lane('review_direct') as direct, lane('review_stale') as reviewer, ThreadPoolExecutor(max_workers=1) as pool:
+                direct.execute("update media_asset set review_status='rejected' where id=%s", (asset,))
+                current_at = sql('select reviewed_at from media_asset where id=%s', (asset,))[0][0]
+                future = pool.submit(run, reviewer, review_call, ('gym', asset, 'synthetic-hash', 'approved', current_at, review_fields))
+                wait_c('review_stale')
+                direct.commit()
+                assert future.result(timeout=5) == (None, (False,))
+            assert sql('select count(*) from media_asset_review_event where asset_id=%s', (asset,)) == [(1,)]
+            print('PASS: actual full-B media-review RPC waits before asset row; C-holder edit completes and stale review refuses without new event', flush=True)
+
             # Real authority holders may outlast five seconds. With the caller
             # deliberately permitting that wait, the candidate trigger must not
             # replace its deadline with a function-local five-second timeout.
