@@ -58,6 +58,10 @@ OWNER_DSN_ENV = 'FORWARD_MEDIA_OWNER_DSN'
 _FORBIDDEN_ENV_NAME = re.compile(
     r'(SERVICE[_-]?ROLE|PUBLISH[_-]?(KEY|TOKEN|SECRET)|SUPABASE_.*_(KEY|SECRET))',
     re.IGNORECASE)
+_FORBIDDEN_EXACT_ENV_NAMES = frozenset({
+    'AGENT_SOCIALAPI_KEY', 'AGENT_SOCIALAPI_ENC_KEY',
+    'AGENT_GBP_ACCESS_TOKEN', 'ZERNIO_API_KEY',
+})
 
 _URL_RE = re.compile(r'^https://[^\s]+$')
 _MD5_RE = re.compile(r'^md5:[0-9a-f]{32}$')
@@ -116,7 +120,8 @@ class EnvironmentGuardError(OwnerPersistenceError):
 def check_environment(environ=None):
     """Require a dedicated owner DSN and absence of publisher/service credentials."""
     environ = os.environ if environ is None else environ
-    offenders = sorted(k for k in environ if _FORBIDDEN_ENV_NAME.search(k))
+    offenders = sorted(k for k in environ if _FORBIDDEN_ENV_NAME.search(k)
+                       or k.upper() in _FORBIDDEN_EXACT_ENV_NAMES)
     if offenders:
         raise EnvironmentGuardError(
             'publisher/service credentials present in environment; refusing '

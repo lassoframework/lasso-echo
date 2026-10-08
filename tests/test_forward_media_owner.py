@@ -266,6 +266,16 @@ def test_publisher_token_in_environment_fails():
         check_environment(env)
 
 
+@pytest.mark.parametrize('credential', [
+    'AGENT_SOCIALAPI_KEY', 'AGENT_SOCIALAPI_ENC_KEY',
+    'AGENT_GBP_ACCESS_TOKEN', 'ZERNIO_API_KEY',
+])
+def test_provider_credential_in_owner_environment_fails(credential):
+    env = {'FORWARD_MEDIA_OWNER_DSN': 'postgres://owner@x/db', credential: 'secret'}
+    with pytest.raises(EnvironmentGuardError, match=credential):
+        check_environment(env)
+
+
 def test_clean_environment_passes():
     env = {'FORWARD_MEDIA_OWNER_DSN': 'postgres://owner@x/db', 'PATH': '/usr/bin'}
     check_environment(env)
