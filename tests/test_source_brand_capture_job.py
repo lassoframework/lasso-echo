@@ -18,7 +18,7 @@ from test_source_brand_startup import authority
 OTHER_GYM = 'a1b2c3d4-1111-2222-3333-444455556666'
 
 
-def job_env(tmp_path, overrides=None):
+def job_env(tmp_path, monkeypatch, overrides=None):
     original, storage, zernio, apify, _ = setup(tmp_path)
     entries = [asdict(x) for x in original.collector._resolve._approved.values()]
     path = authority(tmp_path, entries)
@@ -29,6 +29,21 @@ def job_env(tmp_path, overrides=None):
         ECHO_SOURCE_CAPTURE_JOURNAL_DIR=str(tmp_path),
         ECHO_SOURCE_CAPTURE_APPROVED_MAPPINGS_FILE=str(path))
     env.update(overrides or {})
+    # Deterministic offline capture: the runner composed here by the trusted
+    # startup path must not depend on real DNS/network for the allowlisted
+    # gym's website (CI runs network-disabled; DNS for the mapped host is not
+    # a test input). Swap in the same synthetic website transport the runner
+    # tests use — pinned-IP assert, no socket I/O. Production behavior and the
+    # fail-closed CaptureError path are unchanged.
+    real_initialize = run_job.__globals__['initialize_source_capture']
+    def wrapped(**kw):
+        runner = real_initialize(**kw)
+        if runner is not None:
+            runner.collector._website_factory = original.collector._website_factory
+            runner.collector._min_host_delay = 0
+        return runner
+    monkeypatch.setattr('agent.source_brand_capture_job.initialize_source_capture',
+                        wrapped)
     return env, original, storage, zernio, apify
 
 
@@ -82,8 +97,8 @@ def test_enabled_missing_authority_holds_without_fallback(tmp_path):
     assert not list(tmp_path.iterdir())  # no journals, no untrusted fallback
 
 
-def test_one_allowlisted_gym_captured(tmp_path):
-    env, original, storage, zernio, apify = job_env(tmp_path)
+def test_one_allowlisted_gym_captured(tmp_path, monkeypatch):
+    env, original, storage, zernio, apify = job_env(tmp_path, monkeypatch)
     receipt = run_job(environ=env, http=storage, identity_http=zernio,
                       apify_client=apify)
     assert receipt['state'] == 'complete'
@@ -95,15 +110,8 @@ def test_one_allowlisted_gym_captured(tmp_path):
 
 
 def test_retry_same_scheduled_day_reuses_durable_request(tmp_path, monkeypatch):
-    env, original, storage, zernio, apify = job_env(tmp_path)
-    real_initialize = run_job.__globals__['initialize_source_capture']
-    def wrapped(**kw):
-        runner = real_initialize(**kw)
-        if runner is not None:
-            runner.collector._website_factory = original.collector._website_factory
-            runner.collector._min_host_delay = 0
-        return runner
-    monkeypatch.setattr('agent.source_brand_capture_job.initialize_source_capture', wrapped)
+    # job_env already pins the synthetic offline website transport.
+    env, original, storage, zernio, apify = job_env(tmp_path, monkeypatch)
     first = run_job(environ=env, http=storage, identity_http=zernio,
                     apify_client=apify)
     posts = [m for m, _ in apify.calls].count('POST')
