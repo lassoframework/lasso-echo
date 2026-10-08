@@ -20,6 +20,8 @@ import uuid
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
+from agent.forward_media_visual_index import row_revision_from
+
 # Explicit threshold vectors plus deterministic independent codewords; every
 # allocated value remains more than 30 bits from every previous fixture.
 _USED_PHASH = [0, 0x3f, (1 << 28) - 1, 0x7FFFFFFF00000000]
@@ -107,8 +109,12 @@ def main():
             return rid, token, evidence
 
         def revision_bigint(rid):
-            return sql("select ('x'||substr("
-                       f"fixer_forward_media_attestation_request_20261006('{rid}')->>'revision',1,15))::bit(60)::bigint;")
+            revision = sql(f"select fixer_forward_media_attestation_request_20261006('{rid}')->>'revision';")
+            actual = row_revision_from(revision)
+            sql_value = sql("select ('x'||substr("
+                            f"fixer_forward_media_attestation_request_20261006('{rid}')->>'revision',1,15))::bit(60)::bigint;")
+            assert actual == int(sql_value), 'Python/SQL row revision parity drift'
+            return actual
 
         def visual_attest(rid, tenant, sha64, phash, ok=True):
             """Trusted-attester visual evidence for every role of a row."""
@@ -212,7 +218,11 @@ def main():
             actual_tenant='runtime_'+uuid.uuid4().hex
             actual_url='https://scratch.example/'+uuid.uuid4().hex
             sql(f"insert into fixer_forward_media_claim_gate_20261006 values('{actual_tenant}',true);")
-            ar,at,ae=attest(row(actual_tenant,'runtime_group',actual_url),'md5:'+hashlib.md5(actual).hexdigest(), lengths=(len(actual),len(actual),len(actual)))
+            actual_image_url=actual_url+'/image'
+            actual_thumbnail_url=actual_url+'/thumbnail'
+            ar,at,ae=attest(row(actual_tenant,'runtime_group',actual_url, image=actual_image_url, thumbnail=actual_thumbnail_url),
+                'md5:'+hashlib.md5(actual).hexdigest(), thumb_fp='md5:'+hashlib.md5(actual).hexdigest(), operation='render',
+                lengths=(len(actual),len(actual),len(actual)))
             arev=sql(f"select fixer_forward_media_attestation_request_20261006('{ar}')->>'revision';")
             def attester_connection():
                 conn=psycopg.connect(host=str(sock),port=55469,user='postgres',dbname='postgres')
@@ -221,9 +231,24 @@ def main():
             from agent import visual_writer_prepare
             saved_host=visual_writer_prepare._own_media_url
             try:
-                visual_writer_prepare._own_media_url=lambda url:url==actual_url
+                visual_writer_prepare._own_media_url=lambda url:url in (actual_url,actual_image_url,actual_thumbnail_url)
+                negative_count=sql('select count(*) from forward_media_visual_negative;')
+                for unreadable_url in (actual_image_url,actual_thumbnail_url):
+                    def outage_read(url):
+                        if url==unreadable_url: raise OSError('temporary storage outage')
+                        return actual
+                    try:
+                        runtime_index.attest(ar,arev,ae,connection_factory=attester_connection,read_bytes=outage_read)
+                        raise AssertionError('unreadable role authorized')
+                    except runtime_index.ForwardMediaVerificationHold: pass
+                    assert sql('select count(*) from forward_media_visual_negative;')==negative_count
+                    assert sql(f"select count(*) from forward_media_visual_attestation where tenant_key='{actual_tenant}';")=='0'
+                # Recovery of the same valid bytes must remain possible; no
+                # successful sibling hash was persisted as a global negative.
                 prepared=runtime_index.attest(ar,arev,ae,connection_factory=attester_connection,read_bytes=lambda _:actual)
                 assert len(prepared['attestation_ids'])==3
+                assert sql('select count(*) from forward_media_visual_negative;')==negative_count
+                assert sql("select count(*) from forward_media_visual_negative where source_sha256='"+hashlib.sha256(actual).hexdigest()+"';")=='0'
                 # Corrupt bytes holds and persists an actual negative via the
                 # attester RPC; write privilege is not silently discarded.
                 try:

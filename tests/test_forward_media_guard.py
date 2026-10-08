@@ -133,6 +133,11 @@ def test_unconfigured_lane_defaults_off(monkeypatch):
     (503, {}, guard.ForwardMediaVerificationHold),
     (400, {'code': '23514', 'message': 'original source and delivered bytes must be owner attested'}, guard.ForwardMediaVerificationHold),
     (400, {'code': '23514', 'message': 'source or rendition already consumed by another tenant/date/group'}, guard.ForwardMediaDuplicateHold),
+    (400, {'code': '23514', 'message': 'visual byte ancestry already consumed by another tenant/date/group'}, guard.ForwardMediaDuplicateHold),
+    (400, {'code': '23514', 'message': 'visual similarity held for review'}, guard.ForwardMediaDuplicateHold),
+    (400, {'code': '23514', 'message': 'visual negative evidence blocks claim'}, guard.ForwardMediaVerificationHold),
+    (400, {'code': '23514', 'message': 'visual attestation evidence invalid'}, guard.ForwardMediaVerificationHold),
+    (400, {'code': 'XX000', 'message': 'visual similarity held for review'}, guard.ForwardMediaVerificationHold),
 ])
 def test_claim_only_literal_true_and_distinct_duplicate(status, payload, error):
     response=SimpleNamespace(status_code=status,json=lambda:payload)
@@ -140,7 +145,8 @@ def test_claim_only_literal_true_and_distinct_duplicate(status, payload, error):
                           _rest=lambda url:url, _headers=lambda headers:headers)
     args=(store,*[str(uuid.uuid4()) for _ in range(3)], 'outgoing-revision')
     if error:
-        with pytest.raises(error): guard.claim(*args)
+        with pytest.raises(error) as caught: guard.claim(*args)
+        assert type(caught.value) is error
     else:
         assert guard.claim(*args) is True
 

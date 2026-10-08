@@ -153,23 +153,23 @@ def test_revision_change_holds_before_any_fetch(lane):
         run(lane)
 
 
-def test_incomplete_evidence_holds_and_records_negative(lane):
-    lane[1].snapshot['source_url'] = None
+@pytest.mark.parametrize('field', ['source_url', 'image_url', 'thumbnail_url'])
+def test_incomplete_evidence_holds_without_blacklisting_other_roles(lane, field):
+    lane[1].snapshot[field] = ['invalid'] if field == 'thumbnail_url' else ''
     with pytest.raises(guard.ForwardMediaVerificationHold, match='requires original'):
         run(lane)
     conn = lane[1]
     assert not conn.inserted
-    # The negative evidence append commits on its own; no attestation commits.
-    assert any('incomplete role evidence' in args[4] for args in conn.negatives)
+    assert not conn.negatives and not conn.committed
 
 
-def test_spoofed_url_outside_host_holds_and_records_negative(lane):
+def test_spoofed_url_outside_host_holds_without_blacklisting_other_roles(lane):
     lane[1].snapshot['image_url'] = 'https://unowned.example/delivered'
     with pytest.raises(guard.ForwardMediaVerificationHold, match='object evidence unavailable'):
         run(lane)
     conn = lane[1]
     assert not conn.inserted
-    assert any(args[4].startswith('spoofed or unreadable object') for args in conn.negatives)
+    assert not conn.negatives and not conn.committed
 
 
 def test_undecodable_bytes_hold_and_record_negative(lane):
@@ -183,10 +183,101 @@ def test_undecodable_bytes_hold_and_record_negative(lane):
                and args[3] is None for args in conn.negatives)
 
 
-def test_contradictory_tenant_holds_and_records_negative(lane):
+@pytest.mark.parametrize('failure', ['missing_fingerprint', 'hash_exception'])
+def test_hash_runtime_failure_holds_without_blacklisting_valid_bytes(lane, monkeypatch, failure):
+    if failure == 'missing_fingerprint':
+        monkeypatch.setattr(index, 'phash_v1', lambda _: None)
+    else:
+        from agent import vision
+        monkeypatch.setattr(vision, 'dct_phash', lambda _: (_ for _ in ()).throw(RuntimeError('hash runtime failure')))
+    with pytest.raises(guard.ForwardMediaVerificationHold, match='fingerprint unavailable'):
+        run(lane)
+    assert not lane[1].negatives and not lane[1].inserted
+
+
+def test_decode_runtime_failure_is_not_negative_evidence(lane, monkeypatch):
+    monkeypatch.setattr(index, 'phash_v1', lambda _: None)
+    monkeypatch.setattr(Image, 'open', lambda _: (_ for _ in ()).throw(MemoryError('decoder unavailable')))
+    with pytest.raises(guard.ForwardMediaVerificationHold, match='fingerprint unavailable'):
+        run(lane)
+    assert not lane[1].negatives and not lane[1].inserted
+
+
+def test_contradictory_tenant_holds_without_blacklisting_valid_media(lane):
     with pytest.raises(guard.ForwardMediaVerificationHold, match='contradicts'):
         run(lane, tenant_key='other-tenant')
-    assert any('contradictory' in args[4] for args in lane[1].negatives)
+    assert not lane[1].negatives and not lane[1].committed
+
+
+@pytest.mark.parametrize('field', ['source_url', 'image_url', 'thumbnail_url'])
+@pytest.mark.parametrize('on_recheck', [False, True])
+def test_object_read_failure_holds_without_blacklisting_successful_role(lane, field, on_recheck):
+    row_id, conn, data = lane
+    reads = {}
+    failed_url = conn.snapshot[field]
+    def read(url):
+        reads[url] = reads.get(url, 0) + 1
+        if url == failed_url and reads[url] == (2 if on_recheck else 1):
+            raise OSError('temporary storage outage')
+        return data[url]
+    with pytest.raises(guard.ForwardMediaVerificationHold):
+        index.attest(row_id, REVISION, LINEAGE, connection_factory=lambda: conn, read_bytes=read)
+    assert not conn.negatives and not conn.inserted and not conn.committed
+
+
+@pytest.mark.parametrize('field', ['source_url', 'image_url', 'thumbnail_url'])
+def test_changed_object_holds_without_blacklisting_either_valid_sample(lane, field):
+    row_id, conn, data = lane
+    reads = {}
+    changed_url = conn.snapshot[field]
+    def read(url):
+        reads[url] = reads.get(url, 0) + 1
+        if url == changed_url and reads[url] == 2:
+            return image_bytes((25, 50, 75))
+        return data[url]
+    with pytest.raises(guard.ForwardMediaVerificationHold, match='changed bytes'):
+        index.attest(row_id, REVISION, LINEAGE, connection_factory=lambda: conn, read_bytes=read)
+    assert not conn.negatives and not conn.inserted and not conn.committed
+
+
+@pytest.mark.parametrize('stage', ['snapshot', 'receipts', 'insert', 'commit'])
+def test_database_failure_holds_without_blacklisting_observed_media(lane, monkeypatch, stage):
+    conn = lane[1]
+    original_execute = Cursor.execute
+    def execute(cur, sql, args=None):
+        if ((stage == 'snapshot' and 'attestation_request' in sql)
+                or (stage == 'receipts' and 'fixer_forward_visual_receipts' in sql)
+                or (stage == 'insert' and 'forward_media_visual_attestation' in sql)):
+            raise RuntimeError('database unavailable')
+        return original_execute(cur, sql, args)
+    monkeypatch.setattr(Cursor, 'execute', execute)
+    if stage == 'commit':
+        monkeypatch.setattr(conn, 'commit', lambda: (_ for _ in ()).throw(RuntimeError('commit lost')))
+    with pytest.raises(guard.ForwardMediaVerificationHold, match='transaction failed'):
+        run(lane)
+    assert not conn.negatives and conn.rolled_back and conn.closed
+
+
+def test_database_connect_failure_is_hold_without_object_reads(lane):
+    def connect():
+        raise RuntimeError('database unavailable')
+    with pytest.raises(guard.ForwardMediaVerificationHold, match='database unavailable'):
+        index.attest(lane[0], REVISION, LINEAGE, connection_factory=connect,
+                     read_bytes=lambda _: pytest.fail('connection failure must not fetch media'))
+    assert not lane[1].negatives
+
+
+def test_attributable_bad_bytes_negative_failure_preserves_hold(lane, monkeypatch):
+    lane[2]['https://owned.example/delivered'] = b'not an image'
+    original_execute = Cursor.execute
+    def execute(cur, sql, args=None):
+        if 'fixer_forward_visual_negative_append' in sql:
+            raise RuntimeError('negative append unavailable')
+        return original_execute(cur, sql, args)
+    monkeypatch.setattr(Cursor, 'execute', execute)
+    with pytest.raises(guard.ForwardMediaVerificationHold, match='undecodable'):
+        run(lane)
+    assert not lane[1].inserted and not lane[1].committed
 
 
 @pytest.mark.parametrize('role', ['postgres', 'service_role', 'authenticated'])
