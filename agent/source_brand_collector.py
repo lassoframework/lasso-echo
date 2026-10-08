@@ -590,6 +590,8 @@ class AuthenticatedZernioIdentityReader:
                     _fail('independent_social_id_evidence_missing')
                 identity = dict(connected=True, account_id=a['_id'],
                                 platform_user_id=values[0], handle=handles[0])
+            if self._now() - _timestamp(status['observed_at']) > timedelta(minutes=15):
+                _fail('authenticated_social_status_expired')
             status.update(lookup_status='complete', instagram=identity)
         except Exception:
             # Persist the negative/partial lookup as a hold, never as proof of
