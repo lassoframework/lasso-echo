@@ -384,3 +384,130 @@ def test_final_authority_stage_rejects_a_network_reader(lane):
     transport._final_phase = True
     with pytest.raises(worker.OwnerWorkerHold, match='verified_local_byte_cache_required'):
         transport.stage_authority(lane[0].candidate,persistence,(),local_reader=lane[2])
+
+
+# ---- staged lane (DRAFT worker discovery 20261008) -------------------------
+
+STAGED_BATCH = '00000000-0000-0000-0000-0000000000b1'
+
+
+def staged_lane(lane, monkeypatch, state=None):
+    """Dedicated-transport fixture with the staged discovery/predicate seam."""
+    from agent.forward_media_owner_transport import DedicatedOwnerTransport
+    monkeypatch.setenv(worker.STAGED_ENV, 'true')
+    persistence = owner.ForwardMediaOwnerPersistence(None, 'isolated_owner', lane[2])
+    dedicated = object.__new__(DedicatedOwnerTransport)
+    dedicated.persistence = persistence
+    dedicated._conn = None
+    dedicated._broken = False
+    dedicated._active = None
+    dedicated._recorded = False
+    dedicated._final_phase = False
+    candidate = dict(lane[0].candidate, batch_id=STAGED_BATCH, tenant_id='gym')
+    calls = {'reserved': 0}
+    dedicated.pending_staged = lambda tenants, limit: [candidate]
+    dedicated.preparation_eligible = lambda row_id: (
+        state if state is not None else
+        {'eligible': True, 'mode': 'staged', 'tenant_id': 'gym',
+         'batch_id': STAGED_BATCH, 'reason': None})
+
+    def forbidden_reserve(_candidate):
+        calls['reserved'] += 1
+        raise AssertionError('unauthorized staged candidate must never be reserved')
+    dedicated.reserved_current = forbidden_reserve
+    return dedicated, persistence, lane[2], candidate, calls
+
+
+def test_staged_pass_is_default_off(lane, monkeypatch):
+    transport, persistence, reader = lane
+    monkeypatch.delenv(worker.WORKER_ENV, raising=False)
+    monkeypatch.delenv(worker.STAGED_ENV, raising=False)
+    report = worker.run_staged_pass(transport=transport, persistence=persistence, reader=reader)
+    assert report == {'status': 'disabled', 'rows': []}
+    assert transport.pending_calls == 0
+
+
+def test_staged_pass_requires_dedicated_shared_transaction(lane, monkeypatch):
+    transport, _, reader = lane
+    monkeypatch.setenv(worker.STAGED_ENV, 'true')
+    real = owner.ForwardMediaOwnerPersistence(None, 'isolated_owner', reader)
+    report = worker.run_staged_pass(transport=transport, persistence=real, reader=reader)
+    assert report == {'status': 'hold', 'reason': 'owner_transaction_contract_required', 'rows': []}
+    assert transport.pending_calls == 0
+
+
+def test_staged_marker_alone_never_authorizes(lane, monkeypatch):
+    # Predicate says the row is not eligible: forged/unregistered marker,
+    # terminal batch and drifted binding all collapse to the same static hold
+    # and no reservation or progress write ever happens.
+    for state in ({'eligible': False, 'mode': None, 'tenant_id': 'gym',
+                   'batch_id': None, 'reason': 'unregistered staged row'},
+                  {'eligible': False, 'mode': None, 'tenant_id': 'gym',
+                   'batch_id': STAGED_BATCH, 'reason': 'stage batch terminal or unavailable'},
+                  {'eligible': False, 'mode': None, 'tenant_id': 'gym',
+                   'batch_id': STAGED_BATCH, 'reason': 'content/media binding changed'}):
+        dedicated, persistence, reader, candidate, calls = staged_lane(lane, monkeypatch, state=state)
+        report = worker.run_staged_pass(transport=dedicated, persistence=persistence, reader=reader)
+        assert report['rows'] == [{'calendar_row_id': ROW, 'revision': 'a' * 32,
+                                   'status': 'hold', 'reason': 'staged_preparation_not_eligible'}]
+        assert report['status'] == 'partial_hold'
+        assert calls['reserved'] == 0
+
+
+def test_staged_active_mode_and_tenant_or_batch_mismatch_hold(lane, monkeypatch):
+    # An ordinary ACTIVE row (mode 'active'), a foreign canonical tenant and a
+    # batch readback mismatch must never be admitted by the staged lane.
+    for state in ({'eligible': True, 'mode': 'active', 'tenant_id': 'gym',
+                   'batch_id': None, 'reason': None},
+                  {'eligible': True, 'mode': 'staged', 'tenant_id': 'other-tenant',
+                   'batch_id': STAGED_BATCH, 'reason': None},
+                  {'eligible': True, 'mode': 'staged', 'tenant_id': 'gym',
+                   'batch_id': '00000000-0000-0000-0000-0000000000b2', 'reason': None}):
+        dedicated, persistence, reader, candidate, calls = staged_lane(lane, monkeypatch, state=state)
+        report = worker.run_staged_pass(transport=dedicated, persistence=persistence, reader=reader)
+        assert report['rows'][0]['reason'] == 'staged_preparation_not_eligible'
+        assert calls['reserved'] == 0
+
+
+def test_staged_candidate_batch_identity_must_parse(lane, monkeypatch):
+    dedicated, persistence, reader, candidate, calls = staged_lane(lane, monkeypatch)
+    dedicated.pending_staged = lambda tenants, limit: [dict(candidate, batch_id='not-a-uuid')]
+    report = worker.run_staged_pass(transport=dedicated, persistence=persistence, reader=reader)
+    assert report['rows'][0]['reason'] == 'staged_candidate_batch_invalid'
+    assert calls['reserved'] == 0
+
+
+def test_staged_authorized_candidate_proceeds_to_quarantine(lane, monkeypatch):
+    dedicated, persistence, reader, candidate, calls = staged_lane(lane, monkeypatch)
+    def halted(_candidate):
+        calls['reserved'] += 1
+        raise worker.OwnerWorkerHold('owner_manual_reconciliation_required')
+    dedicated.reserved_current = halted
+    report = worker.run_staged_pass(transport=dedicated, persistence=persistence, reader=reader)
+    assert calls['reserved'] == 1
+    assert report == {'status': 'hold', 'reason': 'owner_manual_reconciliation_required', 'rows': []}
+
+
+def test_staged_candidate_context_binds_marker_tenant_and_state(lane):
+    transport, _, _ = lane
+    candidate = transport.candidate
+    current = json.loads(json.dumps(transport.current))
+    row = current['calendar']
+    row['variant_status'] = 'candidate'
+    row['media_not_ready_reason'] = 'forward_reservation_staged'
+    row['status'] = 'pending'
+    context = worker._candidate_context(candidate, current, ('gym',), mode='staged',
+                                        canonical_tenant='gym')
+    assert context[0]['id'] == ROW
+    # Marker drift, active variant, approved status or an unallowlisted
+    # canonical tenant all hold; Python never overrides the SQL predicate.
+    for mutate, tenant in (
+            (lambda r: r.update(media_not_ready_reason=None), 'gym'),
+            (lambda r: r.update(variant_status='active'), 'gym'),
+            (lambda r: r.update(status='approved'), 'gym'),
+            (lambda r: None, 'other-tenant')):
+        tampered = json.loads(json.dumps(current))
+        mutate(tampered['calendar'])
+        with pytest.raises(worker.OwnerWorkerHold):
+            worker._candidate_context(candidate, tampered, ('gym',), mode='staged',
+                                      canonical_tenant=tenant)

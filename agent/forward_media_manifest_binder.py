@@ -29,6 +29,7 @@ from . import forward_media_guard as guard
 TENANTS_ENV = 'AGENT_FORWARD_MEDIA_BINDER_TENANTS'
 WORKER_ENV = 'AGENT_FORWARD_MEDIA_BINDER_WORKER'
 RPC_NAME = 'fixer_bind_forward_media_manifest_20261006'
+STAGED_PENDING_RPC = 'fixer_forward_schedule_staged_binder_pending_20261008'
 
 _TENANT = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,127}\Z')
 _SELECT = ('id,gym_id,status,variant_status,post_date,visual_group_key,'
@@ -38,6 +39,7 @@ _SELECT = ('id,gym_id,status,variant_status,post_date,visual_group_key,'
 # RPC remains the sole authority and re-verifies everything server-side.
 _CANDIDATE_STATUSES = ('draft', 'pending', 'queued', 'approved')
 _HTTPS = re.compile(r'https://\S+\Z')
+_STAGED_DIGEST = re.compile(r'sha256:[0-9a-f]{64}\Z')
 
 
 class ForwardMediaBinderHold(RuntimeError):
@@ -179,6 +181,55 @@ def _bind_row(store, row_id):
     if bound is not True:
         raise ForwardMediaBinderHold('rpc_bind_refused')
     return True
+
+
+def staged_candidates(store, *, env=None, limit=None):
+    """Read-only discovery of SQL-authorized STAGED binder candidates.
+
+    The SQL RPC joins registered nonterminal batch membership, the canonical
+    tenant and the exact owner authority tuple, and requires the preparation
+    eligibility predicate; this client sends only the tenant allowlist and a
+    bound — never a digest, URL, claim token or credential. There is NO staged
+    bind authority: fixer_bind_forward_media_manifest_20261006 remains
+    active-only, so the result is evidence for review/finalize-time wiring and
+    is never passed to the bind RPC here. The active lane is unchanged.
+    """
+    if not binder_enabled():
+        raise ForwardMediaBinderHold('binder_lane_disabled')
+    tenants = tenants_from_environment(env)
+    env = os.environ if env is None else env
+    if limit is None:
+        limit = _integer(env, 'AGENT_FORWARD_MEDIA_BINDER_BATCH_SIZE', 25, 1, 100)
+    try:
+        response = store._client().post(
+            store._rest(f'rpc/{STAGED_PENDING_RPC}'),
+            headers=store._headers({'Content-Type': 'application/json'}),
+            json={'p_tenants': list(tenants), 'p_limit': limit}, timeout=30)
+    except Exception:
+        raise ForwardMediaBinderHold('candidate_discovery_unavailable') from None
+    if response.status_code != 200:
+        raise ForwardMediaBinderHold('candidate_discovery_unavailable')
+    try:
+        rows = response.json()
+    except Exception:
+        raise ForwardMediaBinderHold('candidate_discovery_malformed') from None
+    if not isinstance(rows, list) or len(rows) > limit:
+        raise ForwardMediaBinderHold('candidate_discovery_malformed')
+    admitted = []
+    for row in rows:
+        if not isinstance(row, dict) or row.get('tenant_id') not in tenants:
+            raise ForwardMediaBinderHold('candidate_discovery_malformed')
+        digest = row.get('manifest_digest')
+        if not isinstance(digest, str) or not _STAGED_DIGEST.fullmatch(digest):
+            raise ForwardMediaBinderHold('candidate_discovery_malformed')
+        try:
+            row_id = _row_id(row.get('calendar_row_id'))
+            batch_id = _row_id(row.get('batch_id'))
+        except ForwardMediaBinderHold:
+            raise ForwardMediaBinderHold('candidate_discovery_malformed') from None
+        admitted.append({'calendar_row_id': row_id, 'batch_id': batch_id,
+                         'manifest_digest': digest})
+    return admitted
 
 
 def run_once(*, store=None, env=None, cursors=None, held=None,

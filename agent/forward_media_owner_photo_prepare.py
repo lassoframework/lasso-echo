@@ -193,6 +193,47 @@ def stage_prepared_photo(persistence, prepared):
     return frozen.persist_in_transaction(original, clearance, prepared.manifest)
 
 
+def staged_photo_candidates(persistence, *, tenants, limit):
+    """Read-only STAGED photo discovery through the owner-only SQL RPC.
+
+    The RPC joins registered nonterminal batch membership, the canonical
+    tenant and the complete signed certificate chain, and requires the
+    preparation eligibility predicate. Every returned candidate is re-verified
+    here through public.forward_schedule_preparation_eligible_20261008 on the
+    SAME owner connection; only an exact eligible/staged result with a matching
+    allowlisted tenant admits a candidate. The marker alone never authorizes.
+    No staged photo grant authority exists (fixer_prepare_owner_photo_20261007
+    remains active-only), so this discovers only and never stages authority.
+    """
+    if type(persistence) is not ForwardMediaOwnerPersistence:
+        raise PhotoCertificateHold('dedicated_prepared_owner_photo_required')
+    tenants = tuple(t for t in (tenants or ()) if isinstance(t, str) and t.strip())
+    if not tenants or len(tenants) > 32 or not isinstance(limit, int) or not 1 <= limit <= 100:
+        raise PhotoCertificateHold('certified_owner_batch_invalid')
+    persistence._assert_owner_identity()
+    with persistence._conn.cursor() as cursor:
+        cursor.execute('select public.fixer_forward_schedule_staged_photo_pending_20261008(%s,%s)',
+                       (list(tenants), limit))
+        row = cursor.fetchone()
+        candidates = row[0] if row else None
+        if not isinstance(candidates, list) or len(candidates) > limit:
+            raise PhotoCertificateHold('certified_owner_batch_invalid')
+        admitted = []
+        for candidate in candidates:
+            if not isinstance(candidate, dict) or not candidate.get('calendar_row_id'):
+                raise PhotoCertificateHold('certified_owner_batch_invalid')
+            cursor.execute('select public.forward_schedule_preparation_eligible_20261008(%s)',
+                           (str(candidate['calendar_row_id']),))
+            state_row = cursor.fetchone()
+            state = state_row[0] if state_row else None
+            if (isinstance(state, dict) and state.get('eligible') is True
+                    and state.get('mode') == 'staged'
+                    and state.get('tenant_id') in tenants):
+                admitted.append(candidate)
+    persistence._conn.rollback()  # Read-only pass; end its transaction.
+    return admitted
+
+
 def run_photo_pass(*, persistence, reader, drive_reader, tenants, limit):
     """Bounded signed-certificate worker pass, reached by owner_worker.run_once.
 

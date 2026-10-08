@@ -27,6 +27,7 @@ from .forward_media_prepare import register_original
 WORKER_ENV = 'AGENT_FORWARD_MEDIA_OWNER_WORKER'
 TENANTS_ENV = 'AGENT_FORWARD_MEDIA_OWNER_TENANTS'
 PHOTO_CLEARANCE_ENV = 'AGENT_FORWARD_MEDIA_OWNER_PHOTO_CLEARANCE'
+STAGED_ENV = 'AGENT_FORWARD_MEDIA_OWNER_STAGED_WORKER'
 _TENANT = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,127}\Z')
 _FORBIDDEN = ('AGENT_SOCIALAPI_KEY', 'AGENT_SOCIALAPI_ENC_KEY', 'ZERNIO_API_KEY',
               'AGENT_GBP_ACCESS_TOKEN', 'AGENT_FORWARD_MEDIA_ATTESTER_DSN',
@@ -54,6 +55,7 @@ _REASONS = frozenset({
     'source_read_deadline_exceeded', 'drive_timeout_contract_unavailable',
     'historical_original_bytes_unknown', 'preexisting_original_has_no_fresh_production_proof',
     'historical_scan_bound_exceeded', 'trusted_original_bytes_previously_used',
+    'staged_preparation_not_eligible', 'staged_candidate_batch_invalid',
 })
 
 
@@ -95,6 +97,11 @@ def worker_enabled():
     return os.getenv(WORKER_ENV, '').lower() in ('1', 'true', 'yes', 'on')
 
 
+def staged_enabled():
+    """Default-OFF staged lane selector; never activates the active lane."""
+    return os.getenv(STAGED_ENV, '').lower() in ('1', 'true', 'yes', 'on')
+
+
 def settings_from_environment():
     try:
         owner.check_environment()
@@ -130,23 +137,41 @@ def _identity(candidate):
         raise OwnerWorkerHold('candidate_identity_invalid') from None
 
 
-def _candidate_context(candidate, current, tenants, *, asset_binding=True):
+def _candidate_context(candidate, current, tenants, *, asset_binding=True,
+                       mode='active', canonical_tenant=None):
     row_id, revision, digest = _identity(candidate)
     if current.get('hold_reason'):
         raise OwnerWorkerHold(current['hold_reason'])
     row, asset, observation = current['calendar'], current['asset'], current['observation']
     if current.get('revision') != revision or row.get('id') != row_id:
         raise OwnerWorkerHold('canonical_revision_changed')
-    tenant = row.get('gym_id')
-    if (tenant not in tenants or asset.get('gym_id') != tenant
-            or row.get('source_media_asset_id') != asset.get('id')):
-        raise OwnerWorkerHold('canonical_tenant_asset_mismatch')
-    if (row.get('status') not in ('draft', 'pending', 'queued', 'approved')
-            or row.get('variant_status') != 'active' or not row.get('post_date')
-            or not row.get('visual_group_key')
-            or any(row.get(k) is not None for k in ('publish_claim_token', 'published_at',
-                                                   'late_post_id', 'render_manifest_digest'))):
-        raise OwnerWorkerHold('calendar_not_unsent_candidate')
+    if mode == 'staged':
+        # The canonical tenant comes ONLY from the SQL predicate readback, never
+        # from the row or the forward_reservation_staged marker itself.
+        tenant = canonical_tenant
+        if (not isinstance(tenant, str) or tenant not in tenants
+                or not str(row.get('gym_id') or '').strip()
+                or asset.get('gym_id') != row.get('gym_id')
+                or row.get('source_media_asset_id') != asset.get('id')):
+            raise OwnerWorkerHold('canonical_tenant_asset_mismatch')
+        if (row.get('status') not in ('draft', 'pending')
+                or row.get('variant_status') != 'candidate'
+                or row.get('media_not_ready_reason') != 'forward_reservation_staged'
+                or not row.get('post_date') or not row.get('visual_group_key')
+                or any(row.get(k) is not None for k in ('publish_claim_token', 'published_at',
+                                                        'late_post_id', 'render_manifest_digest'))):
+            raise OwnerWorkerHold('calendar_not_unsent_candidate')
+    else:
+        tenant = row.get('gym_id')
+        if (tenant not in tenants or asset.get('gym_id') != tenant
+                or row.get('source_media_asset_id') != asset.get('id')):
+            raise OwnerWorkerHold('canonical_tenant_asset_mismatch')
+        if (row.get('status') not in ('draft', 'pending', 'queued', 'approved')
+                or row.get('variant_status') != 'active' or not row.get('post_date')
+                or not row.get('visual_group_key')
+                or any(row.get(k) is not None for k in ('publish_claim_token', 'published_at',
+                                                       'late_post_id', 'render_manifest_digest'))):
+            raise OwnerWorkerHold('calendar_not_unsent_candidate')
     if asset_binding and (not asset.get('source_url') or not asset.get('registry_evidence_ref')):
         raise OwnerWorkerHold('owner_asset_source_binding_missing')
     source_url = asset.get('source_url') if asset_binding else row.get('source_media_url')
@@ -204,10 +229,12 @@ def _prepare(candidate, current, transport, reader, tenants):
     return prepared
 
 
-def _prepare_remote(candidate, current, reader, drive_reader, tenants):
+def _prepare_remote(candidate, current, reader, drive_reader, tenants,
+                    *, mode='active', canonical_tenant=None):
     """All source fetches, delivered reads and expensive render replay here."""
     from .forward_media_source_verifier import verify_source
-    row, asset, observation, recipe = _candidate_context(candidate, current, tenants, asset_binding=False)
+    row, asset, observation, recipe = _candidate_context(candidate, current, tenants,
+        asset_binding=False, mode=mode, canonical_tenant=canonical_tenant)
     verified = verify_source(current, drive_reader, reader)
     source_bytes = verified.source_bytes
     image_bytes = source_bytes if row['image_url'] == row['source_media_url'] else reader.read(row['image_url'])
@@ -219,7 +246,8 @@ def _prepare_remote(candidate, current, reader, drive_reader, tenants):
     return verified
 
 
-def _run_dedicated_candidate(candidate, transport, persistence, reader, drive_reader, tenants):
+def _run_dedicated_candidate(candidate, transport, persistence, reader, drive_reader, tenants,
+                             *, mode='active', canonical_tenant=None):
     """Reserve → remote verification without tx → final recheck/atomic commit."""
     from .forward_media_source_history import SourceHistoryStore
     from .forward_media_source_verifier import SourceVerificationHold
@@ -230,7 +258,8 @@ def _run_dedicated_candidate(candidate, transport, persistence, reader, drive_re
         try:
             if snapshot.get('hold_reason'):
                 raise OwnerWorkerHold(snapshot['hold_reason'])
-            prepared = _prepare_remote(candidate, snapshot, reader, drive_reader, tenants)
+            prepared = _prepare_remote(candidate, snapshot, reader, drive_reader, tenants,
+                                       mode=mode, canonical_tenant=canonical_tenant)
         except (OwnerWorkerHold, SourceVerificationHold) as exc:
             remote_reason = str(OwnerWorkerHold(str(exc)))
         except Exception:
@@ -356,6 +385,88 @@ def run_adapter(*, transport, persistence, reader, drive_reader=None):
             'rows': rows}
 
 
+def _staged_authorization(transport, candidate, tenants):
+    """Predicate readback is the ONLY authorization for a staged candidate.
+
+    The discovery SQL already filters by the predicate; this fresh per-row
+    readback on the owner connection is the admitting check. The
+    forward_reservation_staged marker, the membership row or any Python-side
+    prefilter alone never authorizes preparation.
+    """
+    key = _identity(candidate)
+    try:
+        batch_id = str(uuid.UUID(str(candidate.get('batch_id'))))
+    except (ValueError, TypeError, AttributeError):
+        raise OwnerWorkerHold('staged_candidate_batch_invalid') from None
+    tenant_id = candidate.get('tenant_id')
+    state = transport.preparation_eligible(key[0])
+    if (state.get('eligible') is not True or state.get('mode') != 'staged'
+            or not isinstance(tenant_id, str) or tenant_id not in tenants
+            or state.get('tenant_id') != tenant_id
+            or str(state.get('batch_id')) != batch_id):
+        raise OwnerWorkerHold('staged_preparation_not_eligible')
+    return tenant_id
+
+
+def _run_staged_candidate(candidate, transport, persistence, reader, drive_reader, tenants):
+    """Staged preparation is evidence-only: outcomes are always durable holds
+    with source/history receipts. No staged authority or bind RPC exists, so a
+    staged row can never be reported persisted here."""
+    key = _identity(candidate)
+    try:
+        tenant_id = _staged_authorization(transport, candidate, tenants)
+    except OwnerWorkerHold as exc:
+        # No reservation or progress write for an unauthorized candidate.
+        return {'calendar_row_id': key[0], 'revision': key[1],
+                'status': 'hold', 'reason': str(exc)}
+    return _run_dedicated_candidate(candidate, transport, persistence, reader,
+                                    drive_reader, tenants, mode='staged',
+                                    canonical_tenant=tenant_id)
+
+
+def run_staged_pass(*, transport, persistence, reader, drive_reader=None):
+    """One bounded STAGED owner pass over exact staged observation candidates.
+
+    Default OFF: requires both the worker flag and the staged flag. Discovery
+    and admission come only from the SQL staged-discovery RPC plus the
+    per-row eligibility predicate readback on the same owner connection; the
+    Python side never authorizes from the marker alone. Uses the existing
+    variant-agnostic reserve/snapshot/locked/record quarantine stack, which
+    fails closed on staged rows whose media/source binding is incomplete.
+    """
+    if not worker_enabled() or not staged_enabled():
+        return {'status': 'disabled', 'rows': []}
+    rows = []
+    try:
+        tenants, limit = settings_from_environment()
+        if not isinstance(persistence, owner.ForwardMediaOwnerPersistence):
+            raise OwnerWorkerHold('owner_environment_invalid')
+        from .forward_media_owner_transport import DedicatedOwnerTransport
+        if type(transport) is not DedicatedOwnerTransport or transport.persistence is not persistence:
+            # A caller-supplied boolean cannot attest shared transaction semantics.
+            raise OwnerWorkerHold('owner_transaction_contract_required')
+        candidates = transport.pending_staged(tenants, limit)
+        if not isinstance(candidates, (list, tuple)) or len(candidates) > limit:
+            raise OwnerWorkerHold('candidate_batch_invalid')
+        seen = set()
+        for candidate in candidates:
+            key = _identity(candidate)
+            if key in seen:
+                continue
+            seen.add(key)
+            from .forward_media_source_verifier import OriginalDriveReader
+            rows.append(_run_staged_candidate(candidate, transport, persistence, reader,
+                drive_reader if drive_reader is not None else OriginalDriveReader(), tenants))
+    except owner.UncertainCommitError:
+        return {'status': 'hold', 'reason': 'uncertain_authority_commit', 'rows': rows}
+    except OwnerWorkerHold as exc:
+        return {'status': 'hold', 'reason': str(exc), 'rows': rows}
+    except Exception:
+        return {'status': 'hold', 'reason': 'owner_transport_unavailable', 'rows': rows}
+    return {'status': 'partial_hold' if any(r['status'] == 'hold' for r in rows) else 'complete',
+            'rows': rows}
+
+
 def run_once():
     """One isolated owner pass, default OFF; signed clearance separately gated.
 
@@ -382,8 +493,12 @@ def run_once():
                                     drive_reader=OriginalDriveReader(), tenants=tenants, limit=limit)
         else:
             transport = DedicatedOwnerTransport(persistence)
-            report = run_adapter(transport=transport, persistence=persistence,
-                                 reader=reader, drive_reader=OriginalDriveReader())
+            if staged_enabled():
+                report = run_staged_pass(transport=transport, persistence=persistence,
+                                         reader=reader, drive_reader=OriginalDriveReader())
+            else:
+                report = run_adapter(transport=transport, persistence=persistence,
+                                     reader=reader, drive_reader=OriginalDriveReader())
     except owner.UncertainCommitError:
         report = {'status': 'hold', 'reason': 'uncertain_authority_commit', 'rows': []}
     except OwnerWorkerHold as exc:

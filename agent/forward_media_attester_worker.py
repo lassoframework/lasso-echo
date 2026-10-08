@@ -18,12 +18,25 @@ from . import forward_media_guard as guard
 
 TENANTS_ENV = 'AGENT_FORWARD_MEDIA_ATTESTER_TENANTS'
 WORKER_ENV = 'AGENT_FORWARD_MEDIA_ATTESTER_WORKER'
+# Explicit staged-preparation lane (two-phase schedule contract, DRAFT 20261008).
+# A staged row is NEVER discoverable through the pending RPC (active rows only),
+# so the operator supplies exact staged row UUIDs; each must independently pass
+# the SQL predicate public.forward_schedule_preparation_eligible_20261008 with
+# mode='staged'. The Python marker is never consulted as authority.
+STAGED_ROWS_ENV = 'AGENT_FORWARD_MEDIA_ATTESTER_STAGED_ROWS'
+# Missing-visual-role recovery lane: exact "row_uuid:lineage_evidence_uuid"
+# pairs for rows whose lineage committed but whose visual role attestations are
+# incomplete after a crash. The SAME lineage is reused; no new lineage, claim,
+# publish or approval is ever created here.
+RECOVER_ROWS_ENV = 'AGENT_FORWARD_MEDIA_ATTESTER_RECOVER_ROWS'
 _FORBIDDEN_CREDENTIALS = (
     'SUPABASE_SERVICE_ROLE_KEY', 'AGENT_SOCIALAPI_KEY', 'AGENT_SOCIALAPI_ENC_KEY',
     'ZERNIO_API_KEY', 'AGENT_GBP_ACCESS_TOKEN',
 )
 _TENANT = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,127}\Z')
 _REVISION = re.compile(r'[0-9a-f]{32}\Z')
+_ELIGIBLE_RPC = 'select public.forward_schedule_preparation_eligible_20261008(%s)'
+_SNAPSHOT_RPC = 'select public.fixer_forward_media_attestation_request_20261006(%s)'
 
 
 class WorkerConfigurationHold(RuntimeError):
@@ -35,6 +48,39 @@ class Settings:
     tenants: tuple[str, ...]
     batch_size: int = 50
     interval_seconds: int = 60
+    staged_rows: tuple[str, ...] = ()
+    recoveries: tuple[tuple[str, str], ...] = ()
+
+
+def _uuid_list(raw, *, limit=100):
+    values = []
+    for token in raw.split(','):
+        token = token.strip()
+        if token:
+            try:
+                values.append(guard._uuid(token))
+            except guard.ForwardMediaVerificationHold:
+                raise WorkerConfigurationHold('worker_bounds_invalid') from None
+    if len(values) > limit or len(set(values)) != len(values):
+        raise WorkerConfigurationHold('worker_bounds_invalid')
+    return tuple(values)
+
+
+def _recovery_list(raw, *, limit=100):
+    pairs = []
+    for token in raw.split(','):
+        token = token.strip()
+        if token:
+            parts = token.split(':')
+            if len(parts) != 2:
+                raise WorkerConfigurationHold('worker_bounds_invalid')
+            try:
+                pairs.append((guard._uuid(parts[0]), guard._uuid(parts[1])))
+            except guard.ForwardMediaVerificationHold:
+                raise WorkerConfigurationHold('worker_bounds_invalid') from None
+    if len(pairs) > limit or len({row for row, _ in pairs}) != len(pairs):
+        raise WorkerConfigurationHold('worker_bounds_invalid')
+    return tuple(pairs)
 
 
 def _integer(env, name, default, minimum, maximum):
@@ -61,6 +107,8 @@ def settings_from_environment(env=None):
         tenants,
         _integer(env, 'AGENT_FORWARD_MEDIA_ATTESTER_BATCH_SIZE', 50, 1, 100),
         _integer(env, 'AGENT_FORWARD_MEDIA_ATTESTER_INTERVAL_SECONDS', 60, 5, 60),
+        _uuid_list(env.get(STAGED_ROWS_ENV, '')),
+        _recovery_list(env.get(RECOVER_ROWS_ENV, '')),
     )
 
 
@@ -86,8 +134,94 @@ def _row_identity(snapshot, tenant):
     return row_id, revision
 
 
+def _eligibility(cur, row_id):
+    """Strictly parsed SQL predicate result; the ONLY preparation authority."""
+    cur.execute(_ELIGIBLE_RPC, (row_id,))
+    result = cur.fetchone()
+    data = result[0] if result else None
+    if (not isinstance(data, dict) or type(data.get('eligible')) is not bool
+            or data.get('mode') not in ('active', 'staged', None)
+            or (data['eligible'] and data['mode'] is None)
+            or (not data['eligible'] and data['mode'] is not None)
+            or (data.get('tenant_id') is not None and not isinstance(data['tenant_id'], str))):
+        raise ValueError('preparation_eligibility_invalid')
+    return data
+
+
+def _lock_tenant(cur, tenant):
+    cur.execute("select pg_try_advisory_lock(hashtextextended(%s,0))",
+                ('fixer_attester_worker_20261006:' + tenant,))
+    return cur.fetchone() == (True,)
+
+
+def _snapshot_revision(cur, row_id, tenant):
+    cur.execute(_SNAPSHOT_RPC, (row_id,))
+    result = cur.fetchone()
+    snapshot = result[0] if result else None
+    return _row_identity(snapshot, tenant)[1]
+
+
+def _prepare_staged(conn, row_id, config, attest):
+    """Isolated ATTESTATION PREPARATION for one exact staged member row.
+
+    Authorization comes from the SQL predicate alone (mode='staged', tenant
+    inside the configured allowlist, batch identity bound); the calendar row
+    is never read directly and the stage marker is never trusted by itself.
+    Ends the read transaction before attest's network/object work."""
+    with conn.cursor() as cur:
+        data = _eligibility(cur, row_id)
+        sql_reason = data.get('reason')
+        if (not data['eligible'] or data['mode'] != 'staged'
+                or data.get('tenant_id') not in config.tenants):
+            return {'status': 'hold', 'reason': 'preparation_ineligible',
+                    'sql_reason': sql_reason}
+        tenant = data['tenant_id']
+        batch_id = guard._uuid(data.get('batch_id'))
+        if not _lock_tenant(cur, tenant):
+            return {'status': 'hold', 'reason': 'tenant_busy'}
+        revision = _snapshot_revision(cur, row_id, tenant)
+    conn.commit()
+    result = attest(row_id, revision)
+    if not isinstance(result, dict) or result.get('revision') != revision:
+        raise ValueError('attester_response_invalid')
+    return {'status': 'attested', 'mode': 'staged', 'tenant': tenant,
+            'batch_id': batch_id, 'evidence_id': guard._uuid(result.get('evidence_id'))}
+
+
+def _recover_visual(conn, row_id, evidence_id, config, recover):
+    """Resume the missing visual roles of one exact lineage after a crash.
+
+    The row must still pass the SQL preparation predicate (either lane); the
+    SAME persisted lineage is reused and only missing roles are appended. No
+    claim, publish, approval or second lineage is ever created here."""
+    from . import forward_media_visual_index as visual_index
+    if not visual_index.enabled():
+        return {'status': 'hold', 'reason': 'visual_index_disabled'}
+    with conn.cursor() as cur:
+        data = _eligibility(cur, row_id)
+        sql_reason = data.get('reason')
+        if (not data['eligible'] or data.get('tenant_id') not in config.tenants):
+            return {'status': 'hold', 'reason': 'preparation_ineligible',
+                    'sql_reason': sql_reason}
+        tenant = data['tenant_id']
+        if not _lock_tenant(cur, tenant):
+            return {'status': 'hold', 'reason': 'tenant_busy'}
+        revision = _snapshot_revision(cur, row_id, tenant)
+    conn.commit()
+    result = recover(row_id, revision, evidence_id, tenant_key=tenant)
+    ids = (result or {}).get('attestation_ids') if isinstance(result, dict) else None
+    if (not isinstance(ids, dict) or set(ids) != set(visual_index.ROLES)
+            or result.get('tenant_key') != tenant):
+        raise ValueError('visual_recovery_response_invalid')
+    for role in visual_index.ROLES:
+        guard._uuid(ids[role])
+    return {'status': 'recovered' if result.get('recovered') else 'complete',
+            'mode': data['mode'], 'tenant': tenant,
+            'appended': list(result.get('appended') or [])}
+
+
 def run_once(*, settings=None, tenant_offset=0, cursors=None,
-             connection_factory=None, attest_fn=None):
+             connection_factory=None, attest_fn=None, recover_fn=None):
     """Bound one pass; connection/attest injection is for offline fixtures only.
 
     No immediate retry queue: each pass discovers persisted pending revisions
@@ -110,6 +244,9 @@ def run_once(*, settings=None, tenant_offset=0, cursors=None,
         return {'status': 'hold', 'reason': str(exc), 'rows': []}
     connect = connection_factory or guard._connect
     attest = attest_fn or guard.attest
+    if recover_fn is None:
+        from . import forward_media_visual_index as visual_index
+        recover_fn = visual_index.recover
     tenants = config.tenants[tenant_offset % len(config.tenants):] + config.tenants[:tenant_offset % len(config.tenants)]
     report = {'status': 'complete', 'rows': [], 'tenants': []}
     remaining = config.batch_size
@@ -187,6 +324,45 @@ def run_once(*, settings=None, tenant_offset=0, cursors=None,
             report['tenants'].append({'tenant': tenant, 'status': 'hold', 'reason': str(exc)})
         except Exception:
             report['tenants'].append({'tenant': tenant, 'status': 'hold', 'reason': 'discovery_unavailable'})
+        finally:
+            if conn is not None:
+                _close(conn)
+    # Explicit staged-preparation and missing-visual-role recovery lanes. These
+    # rows are never discoverable through the active-only pending RPC; the
+    # operator supplies exact identities, and each row must independently pass
+    # the SQL eligibility predicate before any preparation is attempted.
+    if config.staged_rows or config.recoveries:
+        conn = None
+        try:
+            conn = connect()
+            with conn.cursor() as cur:
+                cur.execute('select current_user')
+                if cur.fetchone() != (guard.ROLE,):
+                    raise WorkerConfigurationHold('attester_role_mismatch')
+            for row_id in config.staged_rows:
+                row_report = {'calendar_row_id': row_id, 'mode': 'staged', 'status': 'hold'}
+                try:
+                    row_report.update(_prepare_staged(conn, row_id, config, attest))
+                except guard.ForwardMediaVerificationHold:
+                    row_report['reason'] = 'verification_hold'
+                except Exception:
+                    row_report['reason'] = 'attestation_unavailable_or_invalid'
+                report['rows'].append(row_report)
+            for row_id, evidence_id in config.recoveries:
+                row_report = {'calendar_row_id': row_id, 'mode': 'recovery',
+                              'status': 'hold'}
+                try:
+                    row_report.update(_recover_visual(conn, row_id, evidence_id,
+                                                      config, recover_fn))
+                except guard.ForwardMediaVerificationHold:
+                    row_report['reason'] = 'verification_hold'
+                except Exception:
+                    row_report['reason'] = 'attestation_unavailable_or_invalid'
+                report['rows'].append(row_report)
+        except WorkerConfigurationHold as exc:
+            report['tenants'].append({'tenant': None, 'status': 'hold', 'reason': str(exc)})
+        except Exception:
+            report['tenants'].append({'tenant': None, 'status': 'hold', 'reason': 'discovery_unavailable'})
         finally:
             if conn is not None:
                 _close(conn)

@@ -44,6 +44,10 @@ class Cursor:
         self.conn.calls.append((query, params))
         if query == 'select current_user':
             self.result = (self.conn.role,)
+        elif 'forward_schedule_preparation_eligible_20261008' in query:
+            self.result = (self.conn.eligible.get(params[0]),)
+        elif 'attestation_request_20261006' in query:
+            self.result = (self.conn.snapshots.get(params[0]),)
         elif 'pg_try_advisory_lock' in query:
             self.result = (self.conn.lock,)
         elif 'pending_attestations_20261006' in query:
@@ -62,8 +66,11 @@ class Cursor:
 
 
 class Connection:
-    def __init__(self, pending=None, role=None, lock=True, over_bound=False):
+    def __init__(self, pending=None, role=None, lock=True, over_bound=False,
+                 eligible=None, snapshots=None):
         self.pending = pending or {}
+        self.eligible = eligible or {}
+        self.snapshots = snapshots or {}
         self.role = role or worker.guard.ROLE
         self.lock = lock
         self.over_bound = over_bound
@@ -302,3 +309,167 @@ def test_cli_once_configuration_hold_has_nonzero_exit_and_no_secret(monkeypatch,
     output = capsys.readouterr().out
     assert json.loads(output)['reason'] == 'publisher_or_service_credentials_present'
     assert SECRET not in output
+
+
+# --------------------------------------------------------------------------
+# Staged preparation + missing-visual-role recovery lanes (DRAFT 20261008).
+# Authorization comes ONLY from the SQL predicate; the stage marker alone is
+# never consulted (the worker never reads content_calendar directly).
+# --------------------------------------------------------------------------
+
+BATCH = str(uuid.UUID(int=9))
+
+
+def eligible_result(eligible=True, mode='staged', tenant='pierce', batch=BATCH,
+                    reason=None):
+    return {'eligible': eligible, 'mode': mode, 'tenant_id': tenant,
+            'batch_id': batch, 'reason': reason}
+
+
+def staged_conn(**kwargs):
+    kwargs.setdefault('eligible', {ROW: eligible_result()})
+    kwargs.setdefault('snapshots', {ROW: snapshot()})
+    return Connection(**kwargs)
+
+
+def staged_settings(rows=(ROW,), recoveries=()):
+    return worker.Settings(('pierce',), staged_rows=rows, recoveries=recoveries)
+
+
+def attest_ok(row_id, revision):
+    return {'evidence_id': EVIDENCE, 'revision': revision}
+
+
+def test_staged_member_attests_with_sql_predicate_authorization():
+    conn = staged_conn()
+    result = worker.run_once(settings=staged_settings(),
+                             connection_factory=lambda: conn, attest_fn=attest_ok)
+    row = result['rows'][0]
+    assert row['status'] == 'attested' and row['mode'] == 'staged'
+    assert row['batch_id'] == BATCH and row['evidence_id'] == EVIDENCE
+    queries = [q for q, _ in conn.calls]
+    assert any('forward_schedule_preparation_eligible_20261008' in q for q in queries)
+    assert all('content_calendar' not in q for q in queries)
+    assert result['status'] == 'complete'
+
+
+def test_predicate_ineligible_or_marker_only_never_attests():
+    for outcome in (eligible_result(eligible=False, mode=None, reason='not a staged schedule candidate'),
+                    eligible_result(eligible=True, mode='active', batch=None),
+                    eligible_result(eligible=False, mode=None, batch=None, reason='unregistered staged row')):
+        conn = staged_conn(eligible={ROW: outcome})
+        result = worker.run_once(settings=staged_settings(),
+                                 connection_factory=lambda: conn,
+                                 attest_fn=lambda *_: pytest.fail('must not attest'))
+        assert result['rows'][0]['status'] == 'hold'
+        assert result['rows'][0]['reason'] == 'preparation_ineligible'
+        assert result['status'] == 'partial_hold'
+
+
+def test_staged_tenant_outside_allowlist_never_attests():
+    conn = staged_conn(eligible={ROW: eligible_result(tenant='other')})
+    result = worker.run_once(settings=staged_settings(),
+                             connection_factory=lambda: conn,
+                             attest_fn=lambda *_: pytest.fail('must not attest'))
+    assert result['rows'][0]['reason'] == 'preparation_ineligible'
+
+
+def test_malformed_predicate_result_holds_without_attesting():
+    for bad in (None, {'eligible': 'yes'}, {'eligible': True, 'mode': None},
+                {'eligible': False, 'mode': 'staged'}, 'junk'):
+        conn = staged_conn(eligible={ROW: bad})
+        result = worker.run_once(settings=staged_settings(),
+                                 connection_factory=lambda: conn,
+                                 attest_fn=lambda *_: pytest.fail('must not attest'))
+        assert result['rows'][0]['status'] == 'hold'
+        assert result['rows'][0]['reason'] == 'attestation_unavailable_or_invalid'
+
+
+def test_staged_terminal_batch_or_changed_binding_holds():
+    outcome = eligible_result(eligible=False, mode=None, reason='content/media binding changed')
+    conn = staged_conn(eligible={ROW: outcome})
+    result = worker.run_once(settings=staged_settings(),
+                             connection_factory=lambda: conn,
+                             attest_fn=lambda *_: pytest.fail('must not attest'))
+    assert result['rows'][0]['reason'] == 'preparation_ineligible'
+    assert result['rows'][0]['sql_reason'] == 'content/media binding changed'
+
+
+def test_staged_revision_mismatch_from_attester_holds():
+    conn = staged_conn()
+    result = worker.run_once(settings=staged_settings(), connection_factory=lambda: conn,
+                             attest_fn=lambda *_: {'evidence_id': EVIDENCE, 'revision': 'b' * 32})
+    assert result['rows'][0]['reason'] == 'attestation_unavailable_or_invalid'
+
+
+@pytest.mark.parametrize('env_value', ['not-a-uuid', ROW + ',' + ROW, ROW + ':extra'])
+def test_staged_rows_configuration_bounds_fail_closed(env_value):
+    with pytest.raises(worker.WorkerConfigurationHold, match='worker_bounds_invalid'):
+        worker.settings_from_environment({
+            'AGENT_FORWARD_MEDIA_ATTESTER_DSN': 'postgresql://dedicated-attester',
+            'AGENT_FORWARD_MEDIA_ATTESTER_ROLE': worker.guard.ROLE,
+            worker.TENANTS_ENV: 'pierce',
+            worker.STAGED_ROWS_ENV: env_value})
+
+
+def test_recovery_requires_armed_visual_index():
+    conn = staged_conn()
+    settings = staged_settings(rows=(), recoveries=((ROW, EVIDENCE),))
+    result = worker.run_once(settings=settings, connection_factory=lambda: conn,
+                             recover_fn=lambda *_: pytest.fail('must not recover'))
+    assert result['rows'][0]['reason'] == 'visual_index_disabled'
+
+
+def test_recovery_reuses_same_lineage_and_appends_missing_roles(monkeypatch):
+    monkeypatch.setenv('AGENT_FORWARD_MEDIA_VISUAL_INDEX', '1')
+    ids = {role: str(uuid.uuid4()) for role in ('original', 'delivered', 'thumbnail')}
+    calls = []
+    def recover(row_id, revision, lineage, *, tenant_key=None):
+        calls.append((row_id, revision, lineage, tenant_key))
+        return {'attestation_ids': ids, 'tenant_key': 'pierce',
+                'appended': ['thumbnail'], 'recovered': True}
+    conn = staged_conn(eligible={ROW: eligible_result(mode='active', batch=None)})
+    settings = staged_settings(rows=(), recoveries=((ROW, EVIDENCE),))
+    result = worker.run_once(settings=settings, connection_factory=lambda: conn,
+                             recover_fn=recover)
+    assert calls == [(ROW, REVISION, EVIDENCE, 'pierce')]
+    row = result['rows'][0]
+    assert row['status'] == 'recovered' and row['appended'] == ['thumbnail']
+    assert row['mode'] == 'active'
+
+
+def test_recovery_ineligible_row_never_touches_lineage(monkeypatch):
+    monkeypatch.setenv('AGENT_FORWARD_MEDIA_VISUAL_INDEX', '1')
+    conn = staged_conn(eligible={ROW: eligible_result(eligible=False, mode=None)})
+    settings = staged_settings(rows=(), recoveries=((ROW, EVIDENCE),))
+    result = worker.run_once(settings=settings, connection_factory=lambda: conn,
+                             recover_fn=lambda *_: pytest.fail('must not recover'))
+    assert result['rows'][0]['reason'] == 'preparation_ineligible'
+
+
+def test_recovery_malformed_result_holds_without_claiming(monkeypatch):
+    monkeypatch.setenv('AGENT_FORWARD_MEDIA_VISUAL_INDEX', '1')
+    conn = staged_conn(eligible={ROW: eligible_result(mode='active', batch=None)})
+    settings = staged_settings(rows=(), recoveries=((ROW, EVIDENCE),))
+    result = worker.run_once(settings=settings, connection_factory=lambda: conn,
+                             recover_fn=lambda *_: {'attestation_ids': {'original': EVIDENCE},
+                                                    'tenant_key': 'pierce'})
+    assert result['rows'][0]['reason'] == 'attestation_unavailable_or_invalid'
+
+
+def test_recovery_pairs_configuration_bounds_fail_closed():
+    with pytest.raises(worker.WorkerConfigurationHold, match='worker_bounds_invalid'):
+        worker.settings_from_environment({
+            'AGENT_FORWARD_MEDIA_ATTESTER_DSN': 'postgresql://dedicated-attester',
+            'AGENT_FORWARD_MEDIA_ATTESTER_ROLE': worker.guard.ROLE,
+            worker.TENANTS_ENV: 'pierce',
+            worker.RECOVER_ROWS_ENV: ROW})
+
+
+def test_staged_lane_wrong_role_holds_everything():
+    conn = staged_conn(role='service_role')
+    result = worker.run_once(settings=staged_settings(), connection_factory=lambda: conn,
+                             attest_fn=lambda *_: pytest.fail('must not attest'))
+    assert result['rows'] == []
+    assert result['tenants'][-1]['reason'] == 'attester_role_mismatch'
+    assert result['status'] == 'partial_hold'

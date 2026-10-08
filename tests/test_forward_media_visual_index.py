@@ -47,6 +47,8 @@ class Cursor:
             self.result = (self.conn.snapshot,)
         elif 'fixer_forward_visual_receipts' in sql:
             self.result = (RECEIPTS[0], RECEIPTS[1], RECEIPTS[1] if self.conn.snapshot.get('thumbnail_url') is None else RECEIPTS[2])
+        elif sql.startswith('select role,attestation_id,media_url'):
+            self.result = list(self.conn.existing)
         elif 'forward_media_visual_attestation' in sql:
             self.conn.inserted.append(args)
             self.result = (uuid.uuid4(),)
@@ -59,10 +61,14 @@ class Cursor:
     def fetchone(self):
         return self.result
 
+    def fetchall(self):
+        return self.result if self.result is not None else []
+
 
 class Connection:
-    def __init__(self, snapshot, role=index.ROLE):
+    def __init__(self, snapshot, role=index.ROLE, existing=()):
         self.snapshot, self.role = snapshot, role
+        self.existing = list(existing)
         self.calls, self.inserted, self.negatives = [], [], []
         self.committed = self.rolled_back = self.closed = False
 
@@ -451,3 +457,118 @@ def test_both_flags_off_preserves_real_provider_behavior(publisher_lane, monkeyp
     assert guard.enabled() is False and bridge.authorize(None, {}, None) is True
     assert publish().ok is True
     assert requests and authority.calls == []
+
+
+# --------------------------------------------------------------------------
+# Missing-visual-role recovery (two-phase schedule contract, 2026-10-08):
+# a crash after lineage commit leaves the row outside active-only discovery;
+# recovery reuses the SAME lineage and appends only the missing roles.
+# --------------------------------------------------------------------------
+
+def recover_run(lane, existing=(), **kwargs):
+    row_id, conn, data = lane
+    conn.existing = list(existing)
+    return index.recover(row_id, REVISION, LINEAGE,
+                         connection_factory=lambda: conn,
+                         read_bytes=data.get, **kwargs)
+
+
+def existing_role(role, url, attestation_id=None):
+    return (role, str(attestation_id or uuid.uuid4()),
+            url)
+
+
+URLS = {'original': 'https://owned.example/original',
+        'delivered': 'https://owned.example/delivered',
+        'thumbnail': 'https://owned.example/thumbnail'}
+
+
+def test_recover_appends_all_roles_when_none_exist(lane):
+    result = recover_run(lane)
+    conn = lane[1]
+    assert result['recovered'] is True
+    assert sorted(result['appended']) == sorted(index.ROLES)
+    assert set(result['attestation_ids']) == set(index.ROLES)
+    assert len(conn.inserted) == 3 and conn.committed and conn.closed
+
+
+def test_recover_reuses_existing_roles_and_appends_only_missing(lane):
+    kept = existing_role('original', URLS['original'])
+    result = recover_run(lane, existing=[kept])
+    conn = lane[1]
+    assert result['recovered'] is True
+    assert sorted(result['appended']) == ['delivered', 'thumbnail']
+    assert result['attestation_ids']['original'] == kept[1]
+    assert [args[2] for args in conn.inserted] == ['delivered', 'thumbnail']
+    assert all(args[9] == LINEAGE for args in conn.inserted)
+
+
+def test_recover_complete_lineage_is_a_noop(lane):
+    existing = [existing_role(role, URLS[role]) for role in index.ROLES]
+    result = recover_run(lane, existing=existing)
+    conn = lane[1]
+    assert result['recovered'] is False and result['appended'] == []
+    assert result['attestation_ids'] == {role: item[1] for role, item in
+                                         zip(index.ROLES, existing)}
+    assert not conn.inserted and not conn.committed
+    # Read-only validation transaction ended before returning.
+    assert conn.rolled_back and conn.closed
+
+
+def test_recover_existing_role_url_contradiction_holds_without_writes(lane):
+    bad = existing_role('original', 'https://owned.example/foreign')
+    with pytest.raises(guard.ForwardMediaVerificationHold, match='contradicts'):
+        recover_run(lane, existing=[bad])
+    assert not lane[1].inserted and not lane[1].committed
+
+
+def test_recover_duplicate_existing_role_is_ambiguous_and_holds(lane):
+    dup = [existing_role('original', URLS['original']),
+           existing_role('original', URLS['original'])]
+    with pytest.raises(guard.ForwardMediaVerificationHold, match='ambiguous'):
+        recover_run(lane, existing=dup)
+    assert not lane[1].inserted
+
+
+def test_recover_revision_change_holds_before_any_fetch(lane):
+    lane[1].snapshot['revision'] = 'f' * 32
+    with pytest.raises(guard.ForwardMediaVerificationHold, match='revision changed'):
+        recover_run(lane)
+    assert not lane[1].inserted
+
+
+def test_recover_changed_object_bytes_hold_without_commit(lane):
+    row_id, conn, data = lane
+    changed = image_bytes((1, 2, 3))
+    reads = {}
+    def read(url):
+        reads[url] = reads.get(url, 0) + 1
+        return data[url] if reads[url] == 1 else changed
+    with pytest.raises(guard.ForwardMediaVerificationHold, match='changed bytes'):
+        index.recover(row_id, REVISION, LINEAGE,
+                      connection_factory=lambda: conn, read_bytes=read)
+    assert not conn.inserted and not conn.committed
+
+
+def test_recover_undecodable_missing_role_records_negative_and_holds(lane):
+    lane[2]['https://owned.example/delivered'] = b'not an image'
+    with pytest.raises(guard.ForwardMediaVerificationHold, match='undecodable'):
+        recover_run(lane)
+    conn = lane[1]
+    # The negative append commits its own evidence (same as the attest path);
+    # no role attestation is written.
+    assert not conn.inserted
+    assert any(args[4] == 'undecodable media bytes' for args in conn.negatives)
+
+
+def test_recover_contradictory_tenant_holds(lane):
+    with pytest.raises(guard.ForwardMediaVerificationHold, match='contradicts'):
+        recover_run(lane, tenant_key='other-tenant')
+    assert not lane[1].inserted and not lane[1].committed
+
+
+def test_recover_rejects_broad_roles(lane):
+    lane[1].role = 'service_role'
+    with pytest.raises(guard.ForwardMediaVerificationHold, match='role mismatch'):
+        recover_run(lane)
+    assert not lane[1].inserted

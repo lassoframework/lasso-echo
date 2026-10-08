@@ -273,3 +273,50 @@ def test_module_import_has_no_side_effects(monkeypatch):
     import importlib
     importlib.reload(binder)
     assert not binder.binder_enabled()
+
+
+# ---- staged discovery (DRAFT worker discovery 20261008) --------------------
+
+def staged_row(tenant='gym-a'):
+    return {'calendar_row_id': str(uuid.uuid4()), 'batch_id': str(uuid.uuid4()),
+            'tenant_id': tenant, 'manifest_digest': 'sha256:' + uuid.uuid4().hex + uuid.uuid4().hex}
+
+
+def test_staged_discovery_is_off_without_lane(enabled, monkeypatch):
+    monkeypatch.delenv('AGENT_FORWARD_MEDIA_GUARD', raising=False)
+    with pytest.raises(binder.ForwardMediaBinderHold) as exc:
+        binder.staged_candidates(make_store(FakeHTTP()))
+    assert 'binder_lane_disabled' in str(exc.value)
+
+
+def test_staged_discovery_sends_only_allowlist_and_bound(enabled):
+    http = FakeHTTP(rpc_payload=[staged_row()])
+    rows = binder.staged_candidates(make_store(http))
+    assert len(rows) == 1
+    call = http.posts[0]
+    assert call['url'].endswith(f"rpc/{binder.STAGED_PENDING_RPC}")
+    assert set(call['json']) == {'p_tenants', 'p_limit'}
+    assert call['json']['p_tenants'] == ['gym-a', 'gym-b']
+    assert isinstance(call['json']['p_limit'], int)
+    # Discovery never binds: the active-only bind RPC is never called.
+    assert all(binder.RPC_NAME not in p['url'] for p in http.posts)
+
+
+def test_staged_discovery_rejects_wrong_tenant_and_bad_digest(enabled):
+    with pytest.raises(binder.ForwardMediaBinderHold) as exc:
+        binder.staged_candidates(make_store(FakeHTTP(rpc_payload=[staged_row('foreign')])))
+    assert 'candidate_discovery_malformed' in str(exc.value)
+    bad = staged_row()
+    bad['manifest_digest'] = 'sha256:not-hex'
+    with pytest.raises(binder.ForwardMediaBinderHold):
+        binder.staged_candidates(make_store(FakeHTTP(rpc_payload=[bad])))
+    broken = staged_row()
+    broken['batch_id'] = 'not-a-uuid'
+    with pytest.raises(binder.ForwardMediaBinderHold):
+        binder.staged_candidates(make_store(FakeHTTP(rpc_payload=[broken])))
+
+
+def test_staged_discovery_transport_and_status_failures_are_holds(enabled):
+    with pytest.raises(binder.ForwardMediaBinderHold) as exc:
+        binder.staged_candidates(make_store(FakeHTTP(rpc_status=500, rpc_payload=[])))
+    assert 'candidate_discovery_unavailable' in str(exc.value)
