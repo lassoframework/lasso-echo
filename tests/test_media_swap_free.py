@@ -1400,3 +1400,125 @@ def test_disabled_preparation_readback_requires_exact_identity_clearing(monkeypa
     assert ps._verified_swap_readback(store, "zanshin", before, candidate, saved) == saved
     store._rows["p1"][field] = before[field]
     assert ps._verified_swap_readback(store, "zanshin", before, candidate, saved) is None
+
+
+# ---- guarded local reservation release (binding propagation) ----------------------
+class _MutationAuthority:
+    """In-memory mutation authority; mirrors tests/test_rotation_inventory_mutation."""
+
+    def __init__(self):
+        self.events = []
+
+    def begin(self, request):
+        self.events.append("begin")
+        self.receipt = dict(request, state="pending", generation=1,
+                            result_digest=None, begun_at="now")
+        return dict(self.receipt)
+
+    def complete(self, request, result_digest):
+        self.events.append("complete")
+        return dict(self.receipt, state="complete", result_digest=result_digest,
+                    completed_at="later")
+
+    def close(self):
+        pass
+
+
+def _arm_local_mutation(monkeypatch, tmp_path, gym="zanshin"):
+    """Arm the local-inventory mutation fence with one real library photo."""
+    import uuid
+    from agent import config, db, local_inventory_mutation as mutation
+    library = tmp_path / "library"
+    gym_dir = library / gym
+    gym_dir.mkdir(parents=True)
+    monkeypatch.setattr(config, "LIBRARY_PATH", str(library))
+    monkeypatch.setenv("AGENT_LOCAL_INVENTORY_MUTATIONS_ENABLED", "true")
+    monkeypatch.setenv("AGENT_DB_PATH", str(tmp_path / "mutation.db"))
+    monkeypatch.setenv("AGENT_ROTATION_STATE_DIR", str(tmp_path))
+    monkeypatch.setenv("LOCAL_INVENTORY_MUTATION_EPOCH", str(uuid.uuid4()))
+    db.connect().close()
+    asset = gym_dir / "class.jpg"
+    asset.write_bytes(b"swap candidate photo bytes")
+    auth = _MutationAuthority()
+    monkeypatch.setattr(mutation.MutationAuthority, "from_environment", lambda: auth)
+    return asset
+
+
+def _reserve_local(monkeypatch, tmp_path):
+    asset = _arm_local_mutation(monkeypatch, tmp_path)
+    pick = {"source": "local", "kind": "photo", "path": str(asset)}
+    assert msw.reserve_local_pick(
+        "zanshin", {"post_date": "2026-10-08"}, pick) is True
+    return asset, pick
+
+
+def test_guarded_local_release_with_complete_binding(monkeypatch, tmp_path):
+    """Mutation fence ON: the pick carries its reserve-time account, rotation key,
+    canonical path and SHA-256 hash through to release_served, which re-proves the
+    binding and deletes exactly the unlanded reservation row."""
+    from agent import rotation
+    asset, pick = _reserve_local(monkeypatch, tmp_path)
+    assert pick["_served_reservation_account"] == "zanshin_ig"
+    assert pick["_served_reservation_key"] == asset.name
+    assert pick["_served_reservation_path"] == str(asset)
+    assert pick["_served_reservation_hash"] == rotation.local_content_hash(str(asset))
+    served = rotation.load_served_strict().get("zanshin_ig", [])
+    assert len(served) == 1
+
+    assert msw.release_local_pick(pick) is True
+
+    assert rotation.load_served_strict().get("zanshin_ig", []) == []
+    assert "_served_reservation_id" not in pick
+
+
+@pytest.mark.parametrize("field,bad", [
+    ("_served_reservation_account", "neighbor_ig"),
+    ("_served_reservation_key", "different.jpg"),
+    ("_served_reservation_path", "different.jpg"),
+    ("_served_reservation_hash", "0" * 64),
+])
+def test_guarded_local_release_wrong_gym_key_path_or_hash_holds(
+        monkeypatch, tmp_path, field, bad):
+    """A mismatched gym, rotation key, canonical path, or content hash can never
+    prove the reservation is the exact unlanded row: the release holds and the
+    reservation is retained."""
+    from agent import rotation
+    asset, pick = _reserve_local(monkeypatch, tmp_path)
+    if field == "_served_reservation_path":
+        bad = str(asset.with_name(bad))
+    pick[field] = bad
+
+    assert msw.release_local_pick(pick) is False
+
+    served = rotation.load_served_strict().get("zanshin_ig", [])
+    assert len(served) == 1, f"tampered {field} must retain the reservation"
+    assert pick.get("_served_reservation_id"), "the binding stays for reconciliation"
+
+
+def test_local_release_unknown_outcome_retains_reservation(monkeypatch, tmp_path):
+    """Mutation fence OFF: a release whose outcome is unknown (the guarded call
+    itself fails) retains the reservation and reports not-released."""
+    from agent import rotation
+    _asset, pick = _reserve_local(monkeypatch, tmp_path)
+    monkeypatch.setenv("AGENT_LOCAL_INVENTORY_MUTATIONS_ENABLED", "false")
+
+    def lost(*args, **kwargs):
+        raise RuntimeError("ledger response lost")
+
+    monkeypatch.setattr(rotation, "release_served", lost)
+    assert msw.release_local_pick(pick) is False
+    assert pick["_served_reservation_id"], "unknown outcome keeps the reservation"
+    served = rotation.load_served_strict().get("zanshin_ig", [])
+    assert len(served) == 1
+
+
+def test_flag_off_local_release_still_deletes_by_reservation_id(monkeypatch, tmp_path):
+    """Flag-OFF API behavior is unchanged: release_served is called with the binding
+    but the dormant path deletes by reservation id exactly as before."""
+    from agent import rotation
+    _asset, pick = _reserve_local(monkeypatch, tmp_path)
+    monkeypatch.setenv("AGENT_LOCAL_INVENTORY_MUTATIONS_ENABLED", "false")
+    assert len(rotation.load_served_strict().get("zanshin_ig", [])) == 1
+    assert msw.release_local_pick(pick) is True
+    assert rotation.load_served_strict().get("zanshin_ig", []) == []
+    assert "_served_reservation_id" not in pick

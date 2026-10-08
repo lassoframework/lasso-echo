@@ -410,6 +410,26 @@ def _complete_drive_claim(pick):
         pick["claim_id"], pick["claim_account"], str(pick["asset"]["id"]))
 
 
+def _release_local_reservation(binding):
+    """Release one exact local reservation using its reserve-time binding.
+
+    The guarded release re-proves the reservation account, rotation key,
+    canonical path and SHA-256 bytes before deleting. A hold or any failure is
+    an unknown outcome: the reservation is retained, never deleted by tuple
+    guesswork. Returns True only when the exact row was released."""
+    reservation_id, account_key, key, path, content_hash = binding
+    if not reservation_id:
+        return False
+    try:
+        return bool(rotation.release_served(
+            reservation_id, account_key=account_key, key=key, path=path,
+            content_hash=content_hash))
+    except Exception as exc:  # noqa: BLE001 - unknown outcome: retain
+        print(f"[gbp-planner] local reservation {reservation_id} release held "
+              f"({type(exc).__name__}); reservation retained")
+        return False
+
+
 def _calendar_row_key(row):
     return (str((row or {}).get("post_date") or ""),
             str((row or {}).get("format") or ""),
@@ -854,6 +874,9 @@ def plan_gbp_month(portal_gym_key, account_gen_key, *, voice, library_path, city
     # Reserve local photos before the batch write, then release the exact
     # reservation for every row that does not land. A successful run keeps the
     # durable record so every later platform/planner run sees the photo consumed.
+    # Each reservation carries its reserve-time binding (account, rotation key,
+    # canonical path, SHA-256 content hash) so the guarded release can re-prove
+    # it is deleting the exact unlanded row and nothing else.
     local_reservations = {}
     stamp_failures = []
     claim_receipt_failures = []
@@ -862,17 +885,31 @@ def plan_gbp_month(portal_gym_key, account_gen_key, *, voice, library_path, city
     for row, pick in media_claims:
         if pick.get("kind") != "local":
             continue
-        rid = rotation.reserve_local_photo_once(
-            _gbp_rotation_key, pick.get("rotation_key"),
-            pick.get("pillar") or "photo", pick["day_key"], path=pick["path"])
+        path = str(pick.get("path") or "")
+        canonical = os.path.abspath(path) if path else ""
+        try:
+            digest = rotation.local_content_hash(canonical) if canonical else ""
+        except OSError:
+            digest = ""
+        try:
+            rid = rotation.reserve_local_photo_once(
+                _gbp_rotation_key, pick.get("rotation_key"),
+                pick.get("pillar") or "photo", pick["day_key"],
+                path=canonical or path)
+        except Exception:  # noqa: BLE001 - a reserve hold is a failed reservation
+            rid = None
         if rid is None:
-            for prior in local_reservations.values():
-                rotation.release_served(prior)
+            # No calendar row exists yet: every prior reservation is a proven
+            # never-landed selection and releases with its exact binding.
+            for binding in local_reservations.values():
+                _release_local_reservation(binding)
             for prior in drive_claims:
                 _release_drive_claim(prior)
             return {"ok": False, "reason": "local photo reservation failed",
                     "planned": 0, "skips": dict(skips), **counts}
-        local_reservations[id(row)] = rid
+        local_reservations[id(row)] = (rid, _gbp_rotation_key,
+                                       pick.get("rotation_key"),
+                                       canonical or path, digest)
     try:
         if _global_writer_enabled():
             # Render evidence is NOT a row column; it binds source/delivered bytes at
@@ -915,7 +952,8 @@ def plan_gbp_month(portal_gym_key, account_gen_key, *, voice, library_path, city
     for row, pick in media_claims:
         landed = _calendar_row_key(row) in inserted_keys
         if pick.get("kind") == "local" and not landed and not insert_readback_recovered:
-            rotation.release_served(local_reservations.get(id(row)))
+            _release_local_reservation(
+                local_reservations.get(id(row), (None, None, None, None, None)))
         if pick.get("kind") == "drive" and not landed and not insert_readback_recovered:
             _release_drive_claim(pick)
         if pick.get("kind") == "drive" and landed:

@@ -1089,15 +1089,24 @@ def reserve_local_pick(base_key, row, pick):
         return False
     try:
         from . import dam, rotation
+        account_key = f"{base_key}_ig"
+        key = dam.rotation_key(path)
+        canonical = os.path.abspath(path)
+        digest = rotation.local_content_hash(canonical)
         reserve = (rotation.reserve_local_media_once if pick.get("kind") == "video"
                    else rotation.reserve_local_photo_once)
-        reservation_id = reserve(
-            f"{base_key}_ig", dam.rotation_key(path), "", day, path=path)
+        reservation_id = reserve(account_key, key, "", day, path=canonical)
     except Exception:  # noqa: BLE001
         reservation_id = None
     if reservation_id:
         pick["_served_reserved"] = True
         pick["_served_reservation_id"] = reservation_id
+        # The exact reserve-time identity the guarded release must re-prove:
+        # reservation account, rotation key, canonical path, SHA-256 bytes.
+        pick["_served_reservation_account"] = account_key
+        pick["_served_reservation_key"] = key
+        pick["_served_reservation_path"] = canonical
+        pick["_served_reservation_hash"] = digest
     return bool(reservation_id)
 
 
@@ -1129,10 +1138,23 @@ def release_local_pick(pick):
     if not reservation_id:
         return (pick or {}).get("source") != "local"
     from . import rotation
-    released = rotation.release_served(reservation_id)
+    try:
+        released = rotation.release_served(
+            reservation_id,
+            account_key=pick.get("_served_reservation_account"),
+            key=pick.get("_served_reservation_key"),
+            path=pick.get("_served_reservation_path"),
+            content_hash=pick.get("_served_reservation_hash"))
+    except Exception as exc:  # noqa: BLE001 - a guarded-release hold is an unknown
+        # outcome: retain the reservation rather than guess at a deletion.
+        _log(f"local swap reservation {reservation_id} release held "
+             f"({type(exc).__name__}); reservation retained")
+        return False
     if released:
-        pick.pop("_served_reservation_id", None)
-        pick.pop("_served_reserved", None)
+        for marker in ("_served_reservation_id", "_served_reserved",
+                       "_served_reservation_account", "_served_reservation_key",
+                       "_served_reservation_path", "_served_reservation_hash"):
+            pick.pop(marker, None)
     return released
 
 

@@ -133,6 +133,31 @@ def test_client_daily_fallback_releases_unbuilt_draft(monkeypatch, tmp_path):
     assert rotation.load_served_strict().get("gym_ig", []) == []
 
 
+def test_client_daily_fallback_release_passes_exact_identity(monkeypatch, tmp_path):
+    """The unbuilt-draft release must carry the original account_key/key/path/hash."""
+    monkeypatch.setenv("AGENT_DB_PATH", str(tmp_path / "echo.db"))
+    library = tmp_path / "lib"
+    library.mkdir()
+    (library / "a.jpg").write_bytes(b"img")
+    from agent import dam, rotation
+    from agent import runner as runmod
+    releases = []
+    monkeypatch.setattr(rotation, "release_served",
+                        lambda rid, **kw: releases.append((rid, kw)))
+    monkeypatch.setattr(runmod, "draft_post", lambda *a, **k: None)
+
+    assert runmod._client_library_fallback(
+        _acct(key="gym_ig"), "2026-07-01", _voice(), str(library)) is None
+
+    assert len(releases) == 1
+    rid, kw = releases[0]
+    path = str(library / "a.jpg")
+    assert rid
+    assert kw == {"account_key": "gym_ig", "key": dam.rotation_key(path),
+                  "path": path,
+                  "content_hash": rotation.local_content_hash(path)}
+
+
 # ---- GATE: missing voice doc blocks drafting --------------------------------
 def test_missing_voice_blocks_drafting(monkeypatch, tmp_path):
     monkeypatch.setenv("AGENT_ENABLED", "true")
