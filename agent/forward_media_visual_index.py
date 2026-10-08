@@ -18,7 +18,7 @@ Database protocol: the snapshot/lineage reads happen first, the read-only
 transaction is ended (rollback) BEFORE any object fetch so no DB lock or
 snapshot is held across network work, then a fresh transaction appends the
 attestation rows. Incomplete, spoofed, contradictory or undecodable evidence
-holds when armed and best-effort appends negative evidence to
+holds when armed. Only attributable offending bytes append negative evidence to
 ``forward_media_visual_negative`` (which survives deletion/replacement).
 When the flag is OFF the publisher claim path remains a no-op pass-through;
 explicit isolated attester preparation never grants claim eligibility.
@@ -82,6 +82,27 @@ def phash_v1(data):
     return value - (1 << 64) if value >= (1 << 63) else value
 
 
+
+def _proven_non_image(data):
+    """Only a recognized invalid-image error supports a permanent byte negative.
+
+    The pHash helper returns None for both decode and runtime failures. Missing
+    dependencies or failed hashing must not blacklist valid bytes.
+    """
+    try:
+        import io
+        from PIL import Image, UnidentifiedImageError
+    except ImportError:
+        return False
+    try:
+        with Image.open(io.BytesIO(data)) as image:
+            image.load()
+    except UnidentifiedImageError:
+        return True
+    except Exception:
+        return False
+    return False
+
 def _connect():
     from . import forward_media_guard as guard
     return guard._connect()
@@ -109,16 +130,6 @@ def _record_negative(conn, tenant_key, reason, *, lineage_id=None, source_sha256
             pass
 
 
-def _negative_sha(urls, read_bytes):
-    """Best-effort sha256 occupancy evidence from any readable role object."""
-    for url in urls:
-        try:
-            return hashlib.sha256(_read(url, read_bytes)).hexdigest()
-        except Exception:
-            continue
-    return None
-
-
 def _snapshot_and_receipts(cur, row_id, expected_revision, lineage_receipt_id):
     cur.execute('select ' + _SNAPSHOT_RPC, (row_id,))
     snapshot = cur.fetchone()[0]
@@ -137,13 +148,19 @@ def attest(calendar_row_id, expected_revision, lineage_receipt_id, *,
     """Fetch actual bytes for all three roles and append visual attestations.
 
     Raises ``ForwardMediaVerificationHold`` on incomplete, spoofed,
-    contradictory or undecodable evidence; when armed the hold is accompanied
-    by best-effort negative evidence. Returns the appended attestation ids.
+    contradictory or undecodable evidence. Only attributable offending bytes
+    produce best-effort negative evidence. Returns the appended attestation ids.
     """
     row_id = _uuid(calendar_row_id)
     lineage_id = _uuid(lineage_receipt_id)
     row_revision = row_revision_from(expected_revision)
-    conn = connection_factory() if connection_factory else _connect()
+    try:
+        conn = connection_factory() if connection_factory else _connect()
+    except ForwardMediaVerificationHold:
+        raise
+    except Exception as exc:
+        raise ForwardMediaVerificationHold(
+            'visual index attester database unavailable') from exc
     tenant = tenant_key
     try:
         with conn.cursor() as cur:
@@ -159,43 +176,43 @@ def attest(calendar_row_id, expected_revision, lineage_receipt_id, *,
         # negative-evidence reads): no DB lock or snapshot is held across
         # network work.
         conn.rollback()
+        # Missing/read-failed roles, caller contradictions and infrastructure
+        # failures establish a hold, not globally bad media. Never substitute
+        # another readable role's hash or blacklist otherwise valid bytes.
         # Contradictory caller-supplied identity can never attest the snapshot.
         if ((tenant_key is not None and tenant_key != snapshot.get('tenant_id'))
                 or (gym_key is not None and gym_key != snapshot.get('gym_id'))
                 or (content_date is not None
                     and str(content_date) != str(snapshot.get('post_date')))):
-            _record_negative(conn, tenant, 'contradictory tenant/date/gym evidence',
-                             lineage_id=lineage_id, source_sha256=_negative_sha(urls, read_bytes))
             raise ForwardMediaVerificationHold('visual index evidence contradicts persisted snapshot')
         # All three roles are required; a missing object is incomplete evidence.
         if any(not isinstance(url, str) or not url for url in urls):
-            _record_negative(conn, tenant, 'incomplete role evidence',
-                             lineage_id=lineage_id, source_sha256=_negative_sha(
-                                 [url for url in urls if isinstance(url, str) and url],
-                                 read_bytes))
             raise ForwardMediaVerificationHold('visual index requires original, delivered and thumbnail objects')
         observations = []
         actual_bytes = {}
+        # Fetch each distinct URL exactly once so aliased roles (a NULL
+        # thumbnail_url reuses image_url) observe identical bytes; the final
+        # reread below then validates the same bytes every role attested.
+        def fetch_once(url):
+            if url not in actual_bytes:
+                try:
+                    actual_bytes[url] = _read(url, read_bytes)
+                except ForwardMediaVerificationHold as exc:
+                    raise ForwardMediaVerificationHold('visual index object evidence unavailable') from exc
+            return actual_bytes[url]
         for role, url, receipt in zip(ROLES, urls, receipts):
-            try:
-                data = _read(url, read_bytes)
-            except ForwardMediaVerificationHold as exc:
-                _record_negative(conn, tenant, 'spoofed or unreadable object: ' + str(exc),
-                                 lineage_id=lineage_id, source_sha256=_negative_sha(
-                                     [u for u in urls if u != url], read_bytes))
-                raise ForwardMediaVerificationHold('visual index object evidence unavailable') from exc
-            actual_bytes[url] = data
+            data = fetch_once(url)
             sha = hashlib.sha256(data).hexdigest()
             phash = phash_v1(data)
             if phash is None:
-                _record_negative(conn, tenant, 'undecodable media bytes', lineage_id=lineage_id, source_sha256=sha)
-                raise ForwardMediaVerificationHold('visual index media bytes are undecodable')
+                if _proven_non_image(data):
+                    _record_negative(conn, tenant, 'undecodable media bytes', lineage_id=lineage_id, source_sha256=sha)
+                    raise ForwardMediaVerificationHold('visual index media bytes are undecodable')
+                raise ForwardMediaVerificationHold('visual index media fingerprint unavailable')
             observations.append((role, url, str(uuid.UUID(str(receipt))), sha,
                                  hashlib.md5(data).hexdigest(), len(data), phash))
         for url, observed in actual_bytes.items():
             if _read(url, read_bytes) != observed:
-                _record_negative(conn, tenant, 'observed media object changed bytes', lineage_id=lineage_id,
-                                 source_sha256=hashlib.sha256(observed).hexdigest())
                 raise ForwardMediaVerificationHold('observed media object changed bytes')
         with conn.cursor() as cur:
             ids = {}
@@ -213,9 +230,6 @@ def attest(calendar_row_id, expected_revision, lineage_receipt_id, *,
             pass
         if isinstance(exc, ForwardMediaVerificationHold):
             raise
-        observed = locals().get('observations') or []
-        _record_negative(conn, tenant, 'attestation transaction failed',
-                         lineage_id=lineage_id, source_sha256=observed[0][3] if observed else None)
         raise ForwardMediaVerificationHold('visual index attestation transaction failed') from exc
     finally:
         try:

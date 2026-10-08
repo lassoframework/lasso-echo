@@ -219,9 +219,12 @@ def claim(store, calendar_row_id, claim_token, evidence_id, expected_revision):
         payload = response.json()
         if not 200 <= response.status_code < 300:
             if (isinstance(payload, dict) and payload.get('code') == '23514'
-                    and payload.get('message') ==
-                    'source or rendition already consumed by another tenant/date/group'):
-                raise ForwardMediaDuplicateHold('media bytes were already consumed')
+                    and payload.get('message') in {
+                        'source or rendition already consumed by another tenant/date/group',
+                        'visual byte ancestry already consumed by another tenant/date/group',
+                        'visual similarity held for review',
+                    }):
+                raise ForwardMediaDuplicateHold(payload['message'])
             raise ForwardMediaVerificationHold('atomic forward media authority refused publication')
         if payload is not True:
             raise ForwardMediaVerificationHold('atomic forward media authority refused publication')
