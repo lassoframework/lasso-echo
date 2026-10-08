@@ -49,6 +49,7 @@ def system(case, active, monkeypatch):
                          logical_post_id=case.request['logical_post_id'], group_key='vg_bound',
                          caption=caption),
             'photo_inventory_complete': True, 'eligible_photo_count': 0,
+            'local_census_current': True,
             'history_complete': True,
             'history': dict(rows=[], scope_complete=True, spine_digest='history-v1')}
     monkeypatch.setattr(guard, 'generated_snapshot', lambda p, rid: copy.deepcopy(snap))
@@ -354,6 +355,13 @@ def test_flag_off_has_no_owner_provider_or_store_calls(system, monkeypatch):
     monkeypatch.delenv(runtime.FLAG, raising=False)
     assert run(system)['reason'] == 'generated_runtime_disabled'
     assert system.case.provider.calls == 0 and not system.conn.events
+
+
+def test_owner_loader_fails_closed_without_guarded_local_census(system):
+    system.snap['local_census_current'] = False
+    with pytest.raises(runtime.RuntimeHold, match='generated_local_census_unverified'):
+        system.loader.load(system.row_id, 'same-gym', system.account)
+    assert system.case.provider.calls == 0 and system.conn.events == ['rollback']
 
 
 def test_legacy_fill_not_called_when_fresh_lane_is_enabled(monkeypatch):

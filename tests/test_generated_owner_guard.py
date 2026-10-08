@@ -40,7 +40,7 @@ def trusted(snapshot=None):
         'history_revision':'history','copy_digest':'copy digest','palette_digest':'palette digest',
         'approved_source_revision':APPROVED_SOURCE_REVISION,
         'photo_inventory_complete':True,'eligible_photo_count':0,'history_complete':True,
-        'copy_verified':True,'palette_verified':True,**(snapshot or {})}
+        'local_census_current':True,'copy_verified':True,'palette_verified':True,**(snapshot or {})}
 
 
 class Conn:
@@ -91,7 +91,7 @@ def test_owner_computes_original_and_ends_read_transaction_before_remote_work(la
 
 
 @pytest.mark.parametrize('field,value',[
- ('photo_inventory_complete',False),('eligible_photo_count',1),('history_complete',False),
+ ('photo_inventory_complete',False),('local_census_current',False),('eligible_photo_count',1),('history_complete',False),
  ('palette_verified',False),('copy_verified',False),('palette_revision','changed'),
  ('copy_revision','changed'),('inventory_revision','changed'),('palette_digest','changed'),
  ('copy_digest','changed'),('gym_id','other'),('local_date','2026-10-11'),('logical_post_id','other')])

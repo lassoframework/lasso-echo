@@ -266,7 +266,7 @@ def generated_snapshot(persistence, calendar_row_id):
         raise ForwardMediaVerificationHold('dedicated generated owner required')
     persistence._assert_owner_identity()
     with persistence._conn.cursor() as cur:
-        cur.execute('select public.fixer_generated_snapshot_20261007(%s)',
+        cur.execute('select public.fixer_generated_snapshot_guarded_20261008(%s)',
                     (_uuid(calendar_row_id),))
         return cur.fetchone()[0]
 
@@ -303,6 +303,7 @@ def reserve_generated(persistence, calendar_row_id, candidate, trusted_snapshot,
             or candidate.get('provider') != 'astra'
             or candidate.get('model') != 'gpt-6-astra'
             or trusted_snapshot.get('photo_inventory_complete') is not True
+            or trusted_snapshot.get('local_census_current') is not True
             or trusted_snapshot.get('eligible_photo_count') != 0
             or trusted_snapshot.get('history_complete') is not True
             or trusted_snapshot.get('palette_verified') is not True
@@ -353,6 +354,7 @@ def reserve_generated(persistence, calendar_row_id, candidate, trusted_snapshot,
         if key in trusted_snapshot and current.get(key) != trusted_snapshot[key]:
             raise ForwardMediaVerificationHold('generated database snapshot changed: ' + key)
     if (current.get('photo_inventory_complete') is not True
+            or current.get('local_census_current') is not True
             or current.get('eligible_photo_count') != 0 or current.get('history_complete') is not True):
         raise ForwardMediaVerificationHold('generated database depletion/history unverified')
     # End read-only identity/snapshot work BEFORE bounded remote object reads.

@@ -483,6 +483,11 @@ class OwnerSnapshotLoader:
                 or snap.get('account') != ('instagram' if key.endswith('_ig') else 'facebook')
                 or snap.get('format') != 'feed'):
             raise RuntimeHold('generated_calendar_binding_changed')
+        # Generated fallback is allowed only when the guarded owner RPC has
+        # certified the exact latest complete, fresh zero census for this
+        # inventory generation and epoch. Legacy/raw snapshots cannot prove it.
+        if snap.get('local_census_current') is not True:
+            raise RuntimeHold('generated_local_census_unverified')
         copy = snap.get('copy')
         if (not isinstance(copy, dict) or copy.get('gym_id') != base
                 or any(copy.get(k) != snap.get(k) for k in ('local_date', 'logical_post_id', 'group_key'))
