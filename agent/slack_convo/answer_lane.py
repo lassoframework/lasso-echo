@@ -101,7 +101,67 @@ def default_fetch_state(ticket, who):
         facts["calendar_this_month"] = by or {"unavailable": "no rows"}
     except Exception as e:  # noqa: BLE001
         facts["calendar_this_month"] = {"unavailable": type(e).__name__}
+    try:
+        facts["posts_on_hold"] = posts_on_hold_fact(st, who.account_key)
+    except Exception as e:  # noqa: BLE001
+        facts["posts_on_hold"] = {"unavailable": type(e).__name__}
     return facts
+
+
+# Posts on hold (2026-10-08, Tough Temple ticket effb834f): the portal labels a post
+# "On hold" whenever its calendar row carries a media_not_ready_reason, but the FACTS
+# block only counted rows by status. "Why is my account on hold?" therefore had nothing
+# to ground on, the model correctly said NO_ANSWER, and the bridge escalated the ticket
+# as question_not_groundable with no owner. This fact mirrors the portal's own predicate
+# (lasso-ops-portal isMediaHeldPost: a nonterminal row with a nonblank reason) over the
+# visible window (this month and next, today onward) and states each reason in the same
+# client-safe words the portal shows. Internal reason strings never enter the facts.
+_HOLD_TERMINAL = frozenset({"published", "denied", "killed", "failed", "deleted"})
+_HOLD_REPEAT_REASON = "cross_date_media_repeat_needs_new_visual"
+_HOLD_REPEAT_TEXT = ("needs a different photo or video, because the same visual can not "
+                     "run on two different days")
+_HOLD_REVIEW_TEXT = ("held while LASSO reviews its photo or video; it will not publish "
+                     "until that review is complete")
+_HOLD_SCOPE_TEXT = ("A hold applies to individual posts on the content calendar. Each held "
+                    "post shows On hold in the portal and does not publish while held.")
+_HOLD_MAX_DATES = 10
+
+
+def _next_month(month):
+    year, mon = int(month[:4]), int(month[5:7])
+    return f"{year + 1}-01" if mon == 12 else f"{year}-{mon + 1:02d}"
+
+
+def posts_on_hold_fact(store, account_key, today=None):
+    """Client-safe summary of the account's held posts from today onward (this month and
+    next). Raises on a failed read so the caller records the seam as unavailable."""
+    from datetime import date
+    day = today or date.today()
+    month = day.strftime("%Y-%m")
+    today_iso = day.isoformat()
+    rows = list(store.list_month(account_key, month) or [])
+    rows += list(store.list_month(account_key, _next_month(month)) or [])
+    groups = {}
+    for r in rows:
+        if (r.get("status") or "") in _HOLD_TERMINAL:
+            continue
+        reason = (r.get("media_not_ready_reason") or "").strip()
+        when = str(r.get("post_date") or "")[:10]
+        if not reason or not when or when < today_iso:
+            continue
+        text = _HOLD_REPEAT_TEXT if reason == _HOLD_REPEAT_REASON else _HOLD_REVIEW_TEXT
+        groups.setdefault(text, []).append(when)
+    total = sum(len(v) for v in groups.values())
+    if not total:
+        return {"count": 0, "window": f"{today_iso} onward", "scope": _HOLD_SCOPE_TEXT}
+    return {
+        "count": total,
+        "window": f"{today_iso} onward",
+        "scope": _HOLD_SCOPE_TEXT,
+        "reasons": [{"reason": text, "count": len(days),
+                     "post_dates": sorted(set(days))[:_HOLD_MAX_DATES]}
+                    for text, days in sorted(groups.items(), key=lambda kv: -len(kv[1]))],
+    }
 
 
 def default_llm(system, user, *, model=None):
