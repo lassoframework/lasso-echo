@@ -61,17 +61,34 @@ credentials, or mapping contents.
 - `1` — any armed hold (whole-run or per-gym, including `source_observation_disabled` and held/negative semantic observations) or any per-gym error.
 - `2` — bad CLI arguments: `--gym` (repeatable) may only **narrow** the configured `ECHO_SOURCE_OBSERVATION_JOB_ALLOWLIST`; an invalid/duplicate UUID or a `--gym` outside the configured allowlist is rejected before the job runs.
 
-## Railway config (`railway.source-observation.json`)
+## Railway config (`railway.source-observation.json`) — NON-DEPLOYABLE
 
-The file exists as the deploy config **template** for a future dedicated cron
-service, mirroring `railway.source-capture.json`. Per official Railway docs,
-`cronSchedule` is per-service deploy config: this file has no effect until a
-Railway service is created and pointed at it (the existing service uses the
-default `railway.json`). The start command uses `/opt/venv/bin/python`
-explicitly — ad-hoc/container-default `python` is Nix's interpreter without
-Echo's dependencies, and `PATH` must not be changed to compensate (see
-`AGENTS.md`). All enable flags default OFF; no service was created or
-scheduled by this repo file.
+The file exists as the historical deploy config **template** for a dedicated
+cron service, mirroring `railway.source-capture.json`. Per official Railway
+docs, `cronSchedule` is per-service deploy config: this file has no effect
+until a Railway service is created and pointed at it (the existing service
+uses the default `railway.json`).
+
+**This separate-service topology is NON-DEPLOYABLE as-is.** The capture
+receipt journal is a local SQLite file under
+`ECHO_SOURCE_CAPTURE_JOURNAL_DIR` on a service's private volume. Two
+independent Railway services get two independent volumes — **never infer
+that they share data**. A dedicated observation service would see an empty
+journal, so every observation would hold on an unverifiable capture. This
+template must not be deployed without a verified shared authenticated
+journal topology (operator-provisioned and proven, not assumed).
+
+The SUPPORTED topology is the single-service sequential pipeline:
+`agent.source_brand_pipeline_job` (see `railway.source-pipeline.json`) runs
+capture then observation in ONE process on ONE service, so both phases share
+ONE private durable journal volume via the same
+`ECHO_SOURCE_CAPTURE_JOURNAL_DIR`. Observation there never runs after a
+capture hold/error, both phases require exact matching allowlists and
+explicit enablement, and any hold/error exits nonzero. The start command
+uses `/opt/venv/bin/python` explicitly — ad-hoc/container-default `python`
+is Nix's interpreter without Echo's dependencies, and `PATH` must not be
+changed to compensate (see `AGENTS.md`). All enable flags default OFF; no
+service was created or scheduled by either repo file.
 
 ## Held contract gaps (not bypassed)
 
