@@ -260,3 +260,14 @@ def test_daily_summit_ig_fb_share_one_generated_source_artifact():
     assert first.creative_public_url == second.creative_public_url == "https://cdn/one-shared.png"
     assert len(artifacts.saved) == 1
     assert len(artifacts.claimed) == len(artifacts.released) == 1
+
+
+def test_source_only_catalog_draft_avoids_paid_render_and_artifact_claim():
+    from types import SimpleNamespace
+    account = SimpleNamespace(key="lasso_fb", platform="facebook")
+    def forbidden(*a, **kw):
+        raise AssertionError("source-only must not render or host")
+    draft = summit.build_daily_summit(account, "2026-10-08", source_only=True,
+        enabled_fn=lambda day: True, creative_generate=forbidden, host_fn=forbidden)
+    assert draft and draft.caption and draft.source_fragments
+    assert not draft.creative_public_url and draft.source_identity["source_hash"]

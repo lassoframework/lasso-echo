@@ -886,7 +886,8 @@ def _default_book_dates():
 # ---- draft assembly (injectable builders; missing source is SKIPPED, never faked) -----
 
 def build_month_drafts(plan, builders, *, story_builder=None, account=None,
-                       logger=None, sprint_builder=None, sprint_story_builder=None):
+                       logger=None, sprint_builder=None, sprint_story_builder=None,
+                       source_only=False):
     """For each slot in `plan`, produce a real Draft via the injected builder for that
     slot's category. Feed and story become SEPARATE Draft objects.
 
@@ -961,7 +962,8 @@ def build_month_drafts(plan, builders, *, story_builder=None, account=None,
             try:
                 from .lasso_daily_summit import build_daily_summit
                 daily_target = target if target is not None else account
-                draft = build_daily_summit(daily_target, slot.post_date)
+                draft = (build_daily_summit(daily_target, slot.post_date, source_only=True)
+                         if source_only else build_daily_summit(daily_target, slot.post_date))
             except Exception as exc:  # noqa: BLE001 - one missing dated asset holds one slot
                 log(f"skip {slot.post_date} Summit daily feed: "
                     f"{type(exc).__name__}: {exc}")

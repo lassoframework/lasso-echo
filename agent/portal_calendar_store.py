@@ -4669,6 +4669,20 @@ class SupabaseCalendarStore:
         filtered = _dedupe_slots(self, account_key, filtered, existing=set())
         return _drop_companions_missing_instagram_feed(planned, filtered)
 
+    def stage_lasso_runway_feed(self, row, *, policy_version, brain_snapshot):
+        """Append one exact reviewed owned feed through the empty-slot RPC."""
+        response = self._client().post(
+            self._rest("rpc/stage_lasso_runway_feed"), headers=self._headers(),
+            json={"p_row": row, "p_policy_version": policy_version,
+                  "p_brain_snapshot": brain_snapshot}, timeout=30)
+        if response.status_code >= 400:
+            raise PortalStoreError(response.status_code, "LASSO runway stage RPC failed")
+        result = response.json()
+        if not isinstance(result, dict) or result.get("result") not in (
+                "inserted", "idempotent", "occupied", "conflict"):
+            raise PortalStoreError(502, "LASSO runway stage RPC malformed receipt")
+        return result
+
     def insert_rows(self, account_key, rows, *, preserve_ids=False,
                     render_evidence_by_url=None, poster_render_evidence_by_url=None,
                     required_feed_slots=None, prevalidated_cadence=False,

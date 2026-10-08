@@ -178,6 +178,13 @@ def run_prep_once(account_key, *, now=None, store=None, artifact_store=None):
                    "day": day}
         _record(summary["worker"], dict(receipt, state="begun"))
         from agent.jobs import lasso_daily_paired_stories, lasso_held_media_repair
+        from agent.jobs import lasso_feed_runway
+        try:
+            runway = lasso_feed_runway.run(now=instant, account_key=account_key,
+                                          store=store, artifact_store=artifact_store)
+        except Exception as exc:
+            runway = {"ok": False, "reason": type(exc).__name__}
+
         repair = {}
         try:
             repair = lasso_held_media_repair.run(
@@ -194,9 +201,10 @@ def run_prep_once(account_key, *, now=None, store=None, artifact_store=None):
         except Exception as exc:  # noqa: BLE001
             stories = {"ok": False, "reason": type(exc).__name__}
         summary.update({
-            "ok": (repair.get("ok") is True and stories.get("ok") is True
+            "ok": (runway.get("ok") is True and repair.get("ok") is True and stories.get("ok") is True
                    and not repair.get("errors") and not stories.get("blocked")),
             "day": day,
+            "runway": runway,
             "repair": {k: repair.get(k) for k in
                        ("ok", "attempted", "generated", "reused", "repaired",
                         "skipped", "errors", "reason") if k in repair},
