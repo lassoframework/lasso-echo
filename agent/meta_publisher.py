@@ -332,7 +332,7 @@ def _publish_instagram(client, account, draft, caption, token):
             "Host it and set public_url in its sidecar. See AGENT_README.md."
         )
     base = config.GRAPH_API_BASE
-    boundary('meta',draft=draft,account=account,format='feed',target=ig_id,attempt=True)
+    boundary('meta',draft=draft,account=account,format='feed',target=ig_id,attempt=True,caption=caption)
     media_param = "video_url" if draft.platform and _is_video(draft.creative_public_url) else "image_url"
     # step 1: create container
     r1 = client.post(
@@ -614,7 +614,7 @@ def _publish_fb_page(client, account, draft, caption, token):
     if not page_id:
         raise PublishError(f"No Page id for '{account.key}'.")
     base = config.GRAPH_API_BASE
-    boundary('meta',draft=draft,account=account,format='feed',target=page_id,attempt=True)
+    boundary('meta',draft=draft,account=account,format='feed',target=page_id,attempt=True,caption=caption)
     if draft.creative_public_url and (_is_video(draft.creative_public_url)
                                       or _is_video(draft.creative_path)):
         # A reel/video posts to the Page /videos endpoint (file_url), NOT /photos

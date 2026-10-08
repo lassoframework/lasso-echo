@@ -713,3 +713,26 @@ def fill_gaps(base, account, store, *, voice, logger=None, now=None,
         from .media_bridge import notify_bridge
         notify_bridge(base, account, logger=log)
     return {"ok": True, "filled": filled, "rows": inserted, "gaps": len(gaps)}
+
+
+def prepare_verified_infographic_candidate(request, snapshot, *, jobs, provider,
+                                          reviewer, storage=None, enabled=False,
+                                          now=None):
+    """Prepare the autonomous fallback without legacy coach tags/calendar writes.
+
+    The owner supplies current approved copy/palette/history and complete Drive
+    inventory evidence. Existing photo selection is checked again before costly
+    generation. Only the final owner transaction may reserve/stage this result.
+    """
+    from .generated_infographic_preparation import prepare_candidate
+    if not enabled:
+        return {"ok": False, "held": True, "reason": "generated_preparation_disabled"}
+    if not isinstance(request, dict) or not request.get("gym_id"):
+        return {"ok": False, "held": True, "reason": "generated_request_invalid"}
+    state, _ = real_media_status(request["gym_id"], now=now)
+    if state != MEDIA_DEPLETED:
+        return {"ok": False, "held": True,
+                "reason": "generated_photo_available" if state == MEDIA_AVAILABLE
+                else "generated_photo_inventory_uncertain"}
+    return prepare_candidate(request, snapshot, jobs=jobs, provider=provider,
+                             reviewer=reviewer, storage=storage, enabled=True)

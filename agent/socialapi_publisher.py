@@ -272,11 +272,11 @@ def publish(draft, account, http=None):
         data = _fetch_bytes(media_url, client)
         delivered_bytes(data,media_url)
         filename, mime = _media_meta(media_url)
-        boundary('socialapi',draft=draft,account=account,attempt=True)
+        boundary('socialapi',draft=draft,account=account,attempt=True,caption=text)
         media_id = socialapi_client.upload_media(data, filename, mime, http=client)
         if not media_id:
             raise SocialApiPublishError("SocialAPI returned no media_id for the upload.")
-        boundary('socialapi',draft=draft,account=account,attempt=True)
+        boundary('socialapi',draft=draft,account=account,attempt=True,caption=text)
         resp = socialapi_client.create_post(
             sapi_account_id, text, [media_id], content_type=content_type,
             http=client, idempotency_key=draft.draft_id)

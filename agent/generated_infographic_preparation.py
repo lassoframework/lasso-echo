@@ -1,0 +1,432 @@
+"""Fresh Astra candidates for the photo-depleted lane; never calendar authority.
+
+An owner snapshot supplies approved copy, verified palette and complete inventory
+and history. SQLite persists one job per exact binding before any provider I/O.
+A lost provider response holds the job for reconciliation rather than issuing a
+second image. Final acceptance/reservation belongs to the database owner lane.
+"""
+from __future__ import annotations
+
+import base64
+from datetime import date
+import hashlib
+import io
+import json
+import os
+import re
+import sqlite3
+import time
+import uuid
+
+BINDING_FIELDS = ("gym_id", "local_date", "logical_post_id", "copy_revision",
+                  "palette_revision", "inventory_revision", "history_revision")
+POLICY = "gym-infographic-copy-palette-v1"
+MAX_BYTES = 134217728
+MAX_PROVIDER_ATTEMPTS = 3
+PROVIDER_RETRY_BASE_SECONDS = 60
+
+
+class PreparationHold(RuntimeError):
+    """Static diagnostic only; no provider body, credentials or private data."""
+
+
+class DefiniteProviderRejection(PreparationHold):
+    """A received HTTP rejection establishes that no image job was accepted."""
+    def __init__(self, status):
+        if status not in (400, 429):
+            raise ValueError("Not a definite retryable rejection")
+        self.status = status
+        super().__init__("generated_provider_rejected")
+
+
+def canonical(value):
+    return json.dumps(value, sort_keys=True, separators=(",", ":"),
+                      ensure_ascii=False, allow_nan=False)
+
+
+def digest(value):
+    return hashlib.sha256(canonical(value).encode()).hexdigest()
+
+
+def validated_binding(request):
+    if not isinstance(request, dict) or set(request) != set(BINDING_FIELDS):
+        raise PreparationHold("generated_request_invalid")
+    result = dict(request)
+    if any(not isinstance(v, str) or not v.strip() for v in result.values()):
+        raise PreparationHold("generated_request_invalid")
+    try:
+        if not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,127}", result["gym_id"]):
+            raise ValueError()
+        if date.fromisoformat(result["local_date"]).isoformat() != result["local_date"]:
+            raise ValueError()
+        if str(uuid.UUID(result["logical_post_id"])) != result["logical_post_id"]:
+            raise ValueError()
+    except (ValueError, TypeError):
+        raise PreparationHold("generated_request_invalid") from None
+    return result
+
+
+
+def authority_binding(value, base):
+    """Strict delegated witness binding; this grants no DB authority."""
+    if 'authority_pins' not in value and 'copy_derivation_receipt' not in value:
+        return {}
+    try:
+        from .generated_infographic_runtime import validate_authority_pins
+        pins = validate_authority_pins(value['authority_pins'], base)
+        receipt = value['copy_derivation_receipt']
+        if (not isinstance(receipt, dict) or set(receipt) != {'policy', 'caption', 'copy_digest', 'fact_witness'}
+                or receipt['policy'] != 'verbatim_selected_fact_v1'
+                or not isinstance(receipt['caption'], str) or not receipt['caption'].strip()
+                or not isinstance(receipt['fact_witness'], dict)
+                or set(receipt['fact_witness']) != {'key','capture_id','bytes_sha256','source_locator','byte_offset','byte_length','text'}
+                or receipt['fact_witness']['text'] != receipt['caption']
+                or receipt['copy_digest'] != value['copy_digest']
+                or digest(receipt) != pins['derivation_sha256']):
+            raise ValueError()
+        fact = receipt['fact_witness']
+        if (type(fact['byte_offset']) is not int or fact['byte_offset'] < 0
+                or type(fact['byte_length']) is not int or not 1 <= fact['byte_length'] <= 2000
+                or len(fact['text'].encode()) != fact['byte_length']
+                or not re.fullmatch(r'[0-9a-f]{64}', fact['bytes_sha256'])
+                or str(uuid.UUID(fact['capture_id'])) != fact['capture_id']
+                or not isinstance(fact['key'], str) or not 1 <= len(fact['key']) <= 100
+                or not isinstance(fact['source_locator'], str) or not fact['source_locator'].startswith('https://')):
+            raise ValueError()
+        copy = dict(headline=receipt['caption'], facts=[receipt['caption']], cta='', footer='')
+        if digest(copy) != receipt['copy_digest'] or ('copy' in value and value['copy'] != copy):
+            raise ValueError()
+    except Exception:
+        raise PreparationHold('generated_bundle_derivation_invalid') from None
+    return dict(authority_pins=pins, copy_derivation_receipt=receipt)
+
+def checked_snapshot(request, snapshot):
+    if (not isinstance(snapshot, dict)
+            or any(snapshot.get(k) != request[k] for k in BINDING_FIELDS)):
+        raise PreparationHold("generated_snapshot_binding_changed")
+    if snapshot.get("photo_inventory_complete") is not True:
+        raise PreparationHold("generated_photo_inventory_uncertain")
+    if type(snapshot.get("eligible_photo_count")) is not int:
+        raise PreparationHold("generated_photo_inventory_uncertain")
+    if snapshot["eligible_photo_count"] != 0:
+        raise PreparationHold("generated_photo_available")
+    if snapshot.get("history_complete") is not True:
+        raise PreparationHold("generated_history_uncertain")
+    if 'authority_pins' in snapshot:
+        authority_binding(snapshot, request['gym_id'])
+        if snapshot.get('copy_approved') is not False or snapshot.get('copy_verified') is not True:
+            raise PreparationHold('generated_bundle_policy_invalid')
+    elif snapshot.get("copy_approved") is not True:
+        raise PreparationHold("generated_copy_unapproved")
+    copy = snapshot.get("copy")
+    if (not isinstance(copy, dict) or set(copy) != {"headline", "facts", "cta", "footer"}
+            or any(not isinstance(copy[k], str) for k in ("headline", "cta", "footer"))
+            or not copy["headline"].strip()
+            or not isinstance(copy["facts"], list) or not copy["facts"]
+            or any(not isinstance(v, str) or not v.strip() for v in copy["facts"])):
+        raise PreparationHold("generated_copy_invalid")
+    # Reject unsupported display punctuation up front, never silently rewrite
+    # approved words then claim that the generated card matches the source.
+    if any(c in text for text in [copy["headline"], *copy["facts"], copy["cta"], copy["footer"]]
+           for c in ("-", "–", "—", ":", ";")):
+        raise PreparationHold("generated_copy_style_invalid")
+    palette = snapshot.get("palette")
+    from .astra_prompt import build_verified_gym_content_brief
+    try:
+        brief = build_verified_gym_content_brief(request["gym_id"], copy, palette)
+    except (ValueError, TypeError):
+        raise PreparationHold("generated_palette_unverified") from None
+    return copy, palette, brief
+
+
+class SQLiteGenerationJobs:
+    """Durable execution journal, shared by workers using the same configured file.
+
+    Short BEGIN IMMEDIATE transactions fence provider execution; network I/O is
+    outside the transaction. Ambiguous jobs are retained until reconciled. This
+    journal conveys no trusted source approval or final DB reservation.
+    """
+    def __init__(self, path, *, clock=None):
+        self.path = os.fspath(path)
+        self.clock = clock or time.time
+        fd = os.open(self.path, os.O_CREAT | os.O_RDWR, 0o600)
+        os.close(fd)
+        os.chmod(self.path, 0o600)
+        with self._connect() as con:
+            con.execute("BEGIN IMMEDIATE")
+            con.execute("CREATE TABLE IF NOT EXISTS generated_jobs ("
+                        "job_id TEXT PRIMARY KEY, binding TEXT NOT NULL, "
+                        "state TEXT NOT NULL, response TEXT, candidate TEXT)")
+            # Upgrade existing journals without releasing ambiguous executions.
+            columns = {row[1] for row in con.execute("PRAGMA table_info(generated_jobs)")}
+            if "attempts" not in columns:
+                con.execute("ALTER TABLE generated_jobs ADD COLUMN attempts INTEGER NOT NULL DEFAULT 1")
+            if "retry_after" not in columns:
+                con.execute("ALTER TABLE generated_jobs ADD COLUMN retry_after REAL NOT NULL DEFAULT 0")
+
+    def _connect(self):
+        return sqlite3.connect(self.path, timeout=10)
+
+    def start(self, job_id, binding):
+        with self._connect() as con:
+            con.execute("BEGIN IMMEDIATE")
+            row = con.execute("SELECT binding,state,response,candidate,attempts,retry_after FROM generated_jobs "
+                              "WHERE job_id=?", (job_id,)).fetchone()
+            if row:
+                if row[0] != canonical(binding):
+                    raise PreparationHold("generated_job_binding_changed")
+                if row[1] == "rejected":
+                    if row[4] >= MAX_PROVIDER_ATTEMPTS:
+                        raise PreparationHold("generated_provider_retry_exhausted")
+                    if self.clock() < row[5]:
+                        raise PreparationHold("generated_provider_retry_delayed")
+                    con.execute("UPDATE generated_jobs SET state='generating', attempts=attempts+1 "
+                                "WHERE job_id=? AND state='rejected'", (job_id,))
+                    return {"state": "new"}
+                return {"state": row[1], "response": json.loads(row[2]) if row[2] else None,
+                        "candidate": json.loads(row[3]) if row[3] else None}
+            con.execute("INSERT INTO generated_jobs(job_id,binding,state) VALUES (?,?,?)",
+                        (job_id, canonical(binding), "generating"))
+            return {"state": "new"}
+
+    def provider_rejected(self, job_id):
+        """Release only a definite rejection for a capped, atomic later retry."""
+        with self._connect() as con:
+            con.execute("BEGIN IMMEDIATE")
+            row = con.execute("SELECT attempts FROM generated_jobs WHERE job_id=? AND state='generating'",
+                              (job_id,)).fetchone()
+            if not row:
+                raise PreparationHold("generated_job_state_changed")
+            delay = min(PROVIDER_RETRY_BASE_SECONDS * 2 ** (row[0] - 1), 300)
+            con.execute("UPDATE generated_jobs SET state='rejected', retry_after=? WHERE job_id=?",
+                        (self.clock() + delay, job_id))
+
+    def provider_completed(self, job_id, response):
+        with self._connect() as con:
+            cur = con.execute("UPDATE generated_jobs SET state='reviewing', response=? "
+                              "WHERE job_id=? AND state='generating'",
+                              (canonical(response), job_id))
+            if cur.rowcount != 1:
+                raise PreparationHold("generated_job_state_changed")
+
+    def finish(self, job_id, candidate):
+        with self._connect() as con:
+            cur = con.execute("UPDATE generated_jobs SET state='prepared', candidate=? "
+                              "WHERE job_id=? AND state='reviewing'",
+                              (canonical(candidate), job_id))
+            if cur.rowcount != 1:
+                raise PreparationHold("generated_job_state_changed")
+
+
+class AstraOriginalProvider:
+    """Existing Astra HTTP route with original inline bytes kept before resizing."""
+    def __init__(self, api_key, transport=None):
+        from .image_engine import AstraImageEngine
+        self.engine = AstraImageEngine(api_key, transport=transport)
+
+    def create(self, brief, job_id):
+        from .image_engine import astra_image_model
+        status, body = self.engine._post({
+            "model": "gpt-6-astra", "store": True,
+            "metadata": {"echo_generation_job_id": job_id}, "input": brief,
+            "tools": [{"type": "image_generation", "model": astra_image_model(),
+                       "action": "generate", "size": "1024x1280"}],
+            "tool_choice": {"type": "image_generation"},
+        })
+        if status in (400, 429):
+            raise DefiniteProviderRejection(status)
+        if status != 200:
+            raise PreparationHold("generated_provider_unavailable")
+        try:
+            return json.loads(body)
+        except (ValueError, TypeError):
+            raise PreparationHold("generated_provider_response_invalid") from None
+
+
+def original_bytes(response, job_id):
+    try:
+        if (response.get("status") != "completed"
+                or response.get("model") != "gpt-6-astra"
+                or response.get("metadata", {}).get("echo_generation_job_id") != job_id
+                or not isinstance(response.get("id"), str) or not response["id"].strip()):
+            raise ValueError()
+        outputs = [x for x in response["output"] if x.get("type") == "image_generation_call"]
+        if len(outputs) != 1 or not str(outputs[0].get("id") or "").strip():
+            raise ValueError()
+        data = base64.b64decode(outputs[0]["result"], validate=True)
+        if not data or len(data) > MAX_BYTES:
+            raise ValueError()
+        from PIL import Image
+        with Image.open(io.BytesIO(data)) as image:
+            if image.format != "PNG" or image.size != (1024, 1280):
+                raise ValueError()
+            image.load()
+        return data, outputs[0]["id"]
+    except (ValueError, TypeError, KeyError, AttributeError, OSError):
+        raise PreparationHold("generated_original_invalid") from None
+
+
+class GymPaletteReviewer:
+    """Add an explicit palette check to the existing independent pixel rubric."""
+    def __init__(self, reviewer, palette):
+        self.reviewer, self.palette = reviewer, palette
+
+    def ask_image(self, data, question):
+        raw = self.reviewer.ask_image(data, question +
+            " PALETTE REQUIREMENT overrides the general palette latitude above. "
+            "Use actual pixels to verify this gym's exact approved colors " +
+            canonical(self.palette["colors"]) +
+            ". Add palette_matches boolean to the JSON. False or uncertainty blocks.")
+        result = json.loads(raw)
+        if result.get("palette_matches") is not True:
+            raise PreparationHold("generated_palette_review_failed")
+        return canonical(result)
+
+
+def prepare_candidate(request, snapshot, *, jobs, provider, reviewer, storage=None,
+                      enabled=False):
+    """Return a verified candidate dict or HOLD; does not stage, approve or send.
+
+    Call with the owner's current snapshot on every retry. Final owner rechecks
+    all revisions/history under its reservation locks, including late photos.
+    Provider calls only occur for a new durable job. Review/storage may retry on
+    the already journaled original, never generate another image for that job.
+    """
+    if not enabled:
+        return {"ok": False, "held": True, "reason": "generated_preparation_disabled"}
+    try:
+        request = validated_binding(request)
+        # Freeze mutable caller structures before remote I/O. A changed palette
+        # or copy may not mutate the pixels' binding while review is in flight.
+        snapshot = json.loads(canonical(snapshot))
+        copy, palette, brief = checked_snapshot(request, snapshot)
+        binding = {**request, "copy_digest": digest(copy), "palette_digest": digest(palette),
+                   "review_policy_id": POLICY, **authority_binding(snapshot, request["gym_id"])}
+        job_id = str(uuid.uuid5(uuid.NAMESPACE_URL, "echo-astra:" + canonical(binding)))
+        job = jobs.start(job_id, binding)
+        if job["state"] == "generating":
+            raise PreparationHold("generated_execution_pending_reconciliation")
+        if job["state"] == "prepared":
+            candidate = job["candidate"]
+            # Changed object bytes invalidate even an otherwise identical retry.
+            from .media_host import host_generated_original
+            data, output_id = original_bytes(job["response"], job_id)
+            validate_candidate(candidate, data)
+            if (candidate["provider_response_id"] != job["response"]["id"]
+                    or candidate["provider_output_id"] != output_id
+                    or any(candidate[k] != v for k, v in binding.items())):
+                raise PreparationHold("generated_job_binding_changed")
+            receipt = host_generated_original(data, request["gym_id"], client=storage)
+            if not receipt or any(candidate[k] != v for k, v in receipt.items()):
+                raise PreparationHold("generated_storage_readback_failed")
+            return {"ok": True, "candidate": candidate}
+        if job["state"] == "new":
+            try:
+                response = provider.create(brief, job_id)
+            except DefiniteProviderRejection:
+                jobs.provider_rejected(job_id)
+                raise
+            # Journal the full provider original before reviewing or hosting.
+            jobs.provider_completed(job_id, response)
+        elif job["state"] == "reviewing":
+            response = job["response"]
+        else:
+            raise PreparationHold("generated_job_state_invalid")
+        data, output_id = original_bytes(response, job_id)
+        from .visual_scene import scene_fingerprint
+        phash = scene_fingerprint(data)
+        if not phash:
+            raise PreparationHold("generated_perceptual_hash_unavailable")
+        from .infographic_review import evaluate
+        grade = evaluate(data, headline=copy["headline"], facts=copy["facts"],
+                         cta=copy["cta"], footer=copy["footer"], surface="feed",
+                         vision_client=GymPaletteReviewer(reviewer, palette))
+        review_id = str(getattr(reviewer, "response_id", "") or "")
+        if (not grade.passed or grade.status != "PASS" or not review_id
+                or review_id == response["id"]):
+            raise PreparationHold("generated_automated_review_failed")
+        from .media_host import host_generated_original
+        receipt = host_generated_original(data, request["gym_id"], client=storage)
+        if not receipt:
+            raise PreparationHold("generated_storage_readback_failed")
+        candidate = {"schema_version": 2 if "authority_pins" in binding else 1, "source_type": "generated_astra_infographic",
+                     **binding, "job_id": job_id, "provider": "astra", "model": "gpt-6-astra",
+                     "provider_response_id": response["id"], "provider_output_id": output_id,
+                     "original_sha256": hashlib.sha256(data).hexdigest(),
+                     "original_md5": hashlib.md5(data).hexdigest(), "original_length": len(data),
+                     "original_phash": phash, "width": 1024, "height": 1280,
+                     "review_response_id": review_id, **receipt}
+        validate_candidate(candidate, data)
+        jobs.finish(job_id, candidate)
+        return {"ok": True, "candidate": candidate}
+    except PreparationHold as exc:
+        return {"ok": False, "held": True, "reason": str(exc)}
+    except Exception:
+        # A transport/process exception after job claim is ambiguous. Preserve
+        # the generating journal; no second provider call may occur on retry.
+        return {"ok": False, "held": True, "reason": "generated_preparation_unavailable"}
+
+
+def validate_candidate(candidate, data=None):
+    """Validate shape and optional exact original bytes; conveys no owner grant."""
+    fields = {"schema_version", "source_type", *BINDING_FIELDS, "copy_digest", "palette_digest",
+              "review_policy_id", "job_id", "provider", "model", "provider_response_id",
+              "provider_output_id", "original_sha256", "original_md5", "original_length",
+              "original_phash", "width", "height", "review_response_id", "storage_key",
+              "original_url", "storage_readback_sha256"}
+    try:
+        delegated = isinstance(candidate, dict) and candidate.get('schema_version') == 2
+        if delegated:
+            fields |= {'authority_pins', 'copy_derivation_receipt'}
+        if not isinstance(candidate, dict) or set(candidate) != fields:
+            raise ValueError()
+        request = validated_binding({k: candidate[k] for k in BINDING_FIELDS})
+        if (type(candidate["schema_version"]) is not int or candidate["schema_version"] != (2 if delegated else 1)
+                or candidate["source_type"] != "generated_astra_infographic"
+                or candidate["provider"] != "astra" or candidate["model"] != "gpt-6-astra"
+                or candidate["review_policy_id"] != POLICY):
+            raise ValueError()
+        for field in ("copy_digest", "palette_digest", "original_sha256", "storage_readback_sha256"):
+            if not isinstance(candidate[field], str) or not re.fullmatch(r"[0-9a-f]{64}", candidate[field]):
+                raise ValueError()
+        if (not isinstance(candidate["original_md5"], str)
+                or not re.fullmatch(r"[0-9a-f]{32}", candidate["original_md5"])):
+            raise ValueError()
+        from .visual_scene import normalize_scene, scene_fingerprint
+        if (not isinstance(candidate["original_phash"], str) or not candidate["original_phash"]
+                or normalize_scene(candidate["original_phash"]) != candidate["original_phash"]):
+            raise ValueError()
+        if any(not isinstance(candidate[k], str) or not candidate[k].strip()
+               for k in ("provider_response_id", "provider_output_id", "review_response_id")):
+            raise ValueError()
+        binding = {**request, "copy_digest": candidate["copy_digest"],
+                   "palette_digest": candidate["palette_digest"], "review_policy_id": POLICY,
+                   **authority_binding(candidate, request["gym_id"])}
+        if candidate["job_id"] != str(uuid.uuid5(uuid.NAMESPACE_URL, "echo-astra:" + canonical(binding))):
+            raise ValueError()
+        if (type(candidate["original_length"]) is not int
+                or not 0 < candidate["original_length"] <= MAX_BYTES
+                or type(candidate["width"]) is not int or candidate["width"] != 1024
+                or type(candidate["height"]) is not int or candidate["height"] != 1280
+                or candidate["storage_readback_sha256"] != candidate["original_sha256"]
+                or candidate["storage_key"] != f"echo-generated-originals/{request['gym_id']}/{candidate['original_sha256']}.png"):
+            raise ValueError()
+        from .media_host import public_url_for
+        from urllib.parse import urlsplit
+        if (candidate["original_url"] != public_url_for(candidate["storage_key"])
+                or urlsplit(candidate["original_url"]).scheme != "https"):
+            raise ValueError()
+        if data is not None:
+            if (not isinstance(data, bytes) or len(data) != candidate["original_length"]
+                    or hashlib.sha256(data).hexdigest() != candidate["original_sha256"]
+                    or hashlib.md5(data).hexdigest() != candidate["original_md5"]
+                    or scene_fingerprint(data) != candidate["original_phash"]):
+                raise ValueError()
+            from PIL import Image
+            with Image.open(io.BytesIO(data)) as image:
+                if image.format != "PNG" or image.size != (candidate["width"], candidate["height"]):
+                    raise ValueError()
+                image.load()
+    except (ValueError, TypeError, KeyError, OSError, PreparationHold):
+        raise PreparationHold("generated_candidate_invalid") from None
+    return dict(candidate)

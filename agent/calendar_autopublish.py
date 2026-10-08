@@ -1595,6 +1595,15 @@ def publish_due(run_date, *, gym_id="lasso", store=None, publisher=None,
                 _legacy_igfill_blocked_alert(row_id, gym_id)
             continue
 
+        # File-backed generated palette must still match before any calendar
+        # claim. The lower forward-media bridge repeats it before provider I/O.
+        try:
+            from .generated_infographic_runtime import validate_publish_palette
+            validate_publish_palette(row, store=store)
+        except Exception:
+            skipped.append(row_id)
+            continue
+
         # CLIENT approval gate: when approved_only (client gyms), a row that the client
         # has not approved yet is left UNTOUCHED (never claimed, never published). LASSO
         # (approved_only=False) is unchanged: it auto-publishes pending rows at slot time.

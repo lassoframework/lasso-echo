@@ -332,7 +332,7 @@ def publish(draft, account, client=None, scheduled_for=None,
 
     if scheduled_for:
         unsupported('scheduled provider send')
-    boundary('zernio',draft=draft,account=account,attempt=True)
+    boundary('zernio',draft=draft,account=account,attempt=True,caption=body)
 
     try:
         from . import forward_media_guard as _fmg

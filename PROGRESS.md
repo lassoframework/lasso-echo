@@ -4929,3 +4929,19 @@ settled.
 - [~] Integrated the same-day signed source sibling fix into the released thumbnail candidate branch. Optional signed thumbnail URL, SHA256, MD5 and length now bind replay-verified retained bytes through owner preparation, immutable reservation/manifest, fleet census, final provenance, attestation and claim rechecks. Existing null-thumbnail certificates remain valid. Remote thumbnail reads end the read-only lookup transaction first.
 - [x] Local synthetic evidence only: 372 forward-media Python checks and seven disposable PG17 scripts passed (owner photo clearance, photo certificate, forward claim, source history, GBP send authority, owner transport, owner chain). The extended owner-photo script proves transformed thumbnails and image aliases through the actual owner worker, wrong bytes/recipe rollback, same-day shared thumbnail bytes, thumbnail-only cross-date/tenant collisions, concurrent stale contenders, final hosted-byte drift, unknown history, epoch and revocation holds. `git diff --check` passed.
 - [ ] Independent review and integration remain pending. No production SQL, key provisioning, send, flag, deployment, push, PR or merge occurred in this isolated lane.
+
+### Generated canonical send boundary intermediate (2026-10-07)
+
+- [~] Draft approval-time canonical source/palette pins and lower-provider durable
+  lease wiring built and tested locally; see
+  `docs/GENERATED_INFOGRAPHIC_RUNTIME_20261007.md` for exact scope/evidence.
+- [ ] Canonical original-byte intake and generation owner binding remain required.
+  Existing local-source candidates lack canonical pins and are held. Draft SQL is
+  unapplied; generated runtime activation and live delivery are unverified.
+
+Canonical owner follow-up audit (2026-10-07): [ ] blocked on an authenticated
+original-byte intake and explicit source/palette receipt producer. Existing
+SQLite source approval labels and palette JSON notes do not establish that
+provenance. Exact inspected paths and required receipt bindings are recorded in
+`docs/GENERATED_INFOGRAPHIC_RUNTIME_20261007.md`. No owner rewrite or activation
+was attempted; the previously verified missing-pin publisher hold remains.

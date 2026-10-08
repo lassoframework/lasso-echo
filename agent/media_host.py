@@ -104,6 +104,11 @@ class _S3Client:
         except Exception:
             return None
 
+    def put_bytes_if_absent(self, key, data):
+        """Conditional creation of an original without a mutable local filename."""
+        self._s3.put_object(Bucket=self._bucket, Key=key, Body=data,
+                            ContentType="image/png", IfNoneMatch="*")
+
     def list_prefix(self, prefix):
         """List objects under prefix. Returns [{key, size, last_modified}]."""
         paginator = self._s3.get_paginator("list_objects_v2")
@@ -241,6 +246,42 @@ def host_media(local_path, tenant, client=None):
 def _local_bytes(path):
     with open(path, "rb") as fh:
         return fh.read()
+
+
+def host_generated_original(data, gym_id, *, client=None):
+    """Return exact-readback evidence for fresh provider bytes in existing R2.
+
+    This is ordinary conditional storage, not a version/retention attestation.
+    No overwrite fallback is permitted, including when conditional PUT fails.
+    """
+    if not config.hosting_enabled():
+        return None
+    if (not isinstance(data, bytes) or not data or len(data) > 134217728
+            or not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,127}", str(gym_id))):
+        return None
+    client = client or _default_client()
+    if (client is None or not callable(getattr(client, "put_bytes_if_absent", None))
+            or not callable(getattr(client, "get_bytes", None))):
+        return None
+    digest = hashlib.sha256(data).hexdigest()
+    key = f"echo-generated-originals/{gym_id}/{digest}.png"
+    from urllib.parse import urlsplit
+    if urlsplit(_public_url(key)).scheme != "https":
+        return None
+    try:
+        client.put_bytes_if_absent(key, data)
+    except Exception:
+        # An existing exact object or an ambiguous successful write can be
+        # recovered by readback; a different object must never be overwritten.
+        pass
+    try:
+        observed = client.get_bytes(key)
+    except Exception:
+        return None
+    if not isinstance(observed, bytes) or observed != data:
+        return None
+    return {"storage_key": key, "original_url": _public_url(key),
+            "storage_readback_sha256": hashlib.sha256(observed).hexdigest()}
 
 
 def _key_from_public_url(url):

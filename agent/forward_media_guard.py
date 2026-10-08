@@ -8,6 +8,7 @@ controlled render itself and compares its output with the hosted object.
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import uuid
 
@@ -221,3 +222,185 @@ def claim(store, calendar_row_id, claim_token, evidence_id, expected_revision):
     except Exception as exc:
         raise ForwardMediaVerificationHold('atomic forward media authority unavailable') from exc
     return True
+
+
+def generated_snapshot(persistence, calendar_row_id):
+    """Read owner DB facts before generation; caller ends this read transaction.
+
+    Inventory covers every same-gym asset/source; history covers the existing
+    sealed fleet census and permanent generated reservations. This lookup never
+    grants eligibility and retains no graph lock across provider/storage work.
+    """
+    from .forward_media_owner import ForwardMediaOwnerPersistence
+    if type(persistence) is not ForwardMediaOwnerPersistence:
+        raise ForwardMediaVerificationHold('dedicated generated owner required')
+    persistence._assert_owner_identity()
+    with persistence._conn.cursor() as cur:
+        cur.execute('select public.fixer_generated_snapshot_20261007(%s)',
+                    (_uuid(calendar_row_id),))
+        return cur.fetchone()[0]
+
+
+def reserve_generated(persistence, calendar_row_id, candidate, trusted_snapshot, *,
+                      history_visuals, read_bytes=None):
+    """Existing dedicated owner prepares an Astra original atomically.
+
+    The configured owner must reload its verified copy/palette/depletion facts
+    after generation. ``trusted_snapshot`` is that fresh owner result, never a
+    publisher request or the producer's old generation snapshot. Remote bytes
+    finish before the final DB transaction. SQL rechecks DB copy/inventory/history
+    and binds the original to one gym, content date and logical sibling group.
+    History visuals are exact-byte pHashes independently read by this owner.
+    Missing history evidence holds; no human coach review is introduced.
+
+    Caller owns final COMMIT and its uncertain-outcome reconciliation. This
+    function does not commit, send, approve, or clear an existing calendar hold.
+    """
+    from .forward_media_owner import ForwardMediaOwnerPersistence
+    from . import forward_media_prepare as prepare, visual_scene
+    if type(persistence) is not ForwardMediaOwnerPersistence:
+        raise ForwardMediaVerificationHold('dedicated generated owner required')
+    if persistence._conn.autocommit is not False:
+        raise ForwardMediaVerificationHold('generated owner requires transaction')
+    # Never discard another owner operation when ending read-only remote prep.
+    info = getattr(persistence._conn, 'info', None)
+    if info is not None and int(info.transaction_status) != 0:
+        raise ForwardMediaVerificationHold('generated remote preparation requires idle owner connection')
+    persistence._assert_owner_identity()
+    if (not isinstance(candidate, dict) or not isinstance(trusted_snapshot, dict)
+            or candidate.get('schema_version') not in (1, 2)
+            or candidate.get('source_type') != 'generated_astra_infographic'
+            or candidate.get('provider') != 'astra'
+            or candidate.get('model') != 'gpt-6-astra'
+            or trusted_snapshot.get('photo_inventory_complete') is not True
+            or trusted_snapshot.get('eligible_photo_count') != 0
+            or trusted_snapshot.get('history_complete') is not True
+            or trusted_snapshot.get('palette_verified') is not True
+            or trusted_snapshot.get('copy_verified') is not True):
+        raise ForwardMediaVerificationHold('fresh verified generated owner facts required')
+    import re
+    delegated = candidate['schema_version'] == 2
+    approved_source_revision = trusted_snapshot.get('approved_source_revision')
+    if delegated:
+        from . import generated_infographic_preparation as prep, generated_infographic_runtime as runtime
+        prep.validate_candidate(candidate)
+        if (candidate['authority_pins'] != trusted_snapshot.get('authority_pins')
+                or candidate['copy_derivation_receipt'] != trusted_snapshot.get('copy_derivation_receipt')
+                or trusted_snapshot.get('copy_approved') is not False):
+            raise ForwardMediaVerificationHold('generated canonical bundle pins changed')
+        active = runtime._owner_bundle_readback(persistence, candidate['gym_id'])
+        authority = runtime.delegated_copy(active, candidate['gym_id'],
+            caption=candidate['copy_derivation_receipt']['caption'])
+        if (authority['authority_pins'] != candidate['authority_pins']
+                or authority['source_revision'] != approved_source_revision
+                or candidate['copy_digest'] != prep.digest(authority['copy'])
+                or candidate['palette_digest'] != prep.digest(authority['palette'])
+                or candidate['palette_revision'] != authority['palette_revision']):
+            raise ForwardMediaVerificationHold('generated canonical bundle changed')
+    elif (not isinstance(approved_source_revision, str) or not re.fullmatch(
+            r'client-source:sha256:[0-9a-f]{64}', approved_source_revision)):
+        raise ForwardMediaVerificationHold('verified approved source revision required')
+    for key in ('gym_id', 'local_date', 'logical_post_id', 'copy_revision',
+                'palette_revision', 'inventory_revision',
+                'copy_digest', 'palette_digest'):
+        if (not isinstance(candidate.get(key), str) or not candidate[key]
+                or candidate[key] != trusted_snapshot.get(key)):
+            raise ForwardMediaVerificationHold('generated owner revision changed: ' + key)
+    if not isinstance(candidate.get('history_revision'), str) or not candidate['history_revision']:
+        raise ForwardMediaVerificationHold('generated historical revision required')
+    for key in ('provider_response_id', 'provider_output_id', 'storage_key',
+                'review_response_id', 'review_policy_id'):
+        if not isinstance(candidate.get(key), str) or not candidate[key].strip():
+            raise ForwardMediaVerificationHold('generated provenance unavailable: ' + key)
+    _uuid(candidate.get('job_id'))
+    # Only this authenticated DB lookup can issue reusable historical proof.
+    # Producer/scheduler flags in a supplied history list cannot skip byte reads.
+    current = generated_snapshot(persistence, calendar_row_id)
+    for key in ('gym_id', 'local_date', 'logical_post_id', 'copy_revision', 'inventory_revision'):
+        if current.get(key) != trusted_snapshot.get(key):
+            raise ForwardMediaVerificationHold('generated database snapshot changed: ' + key)
+    for key in ('account', 'format'):
+        if key in trusted_snapshot and current.get(key) != trusted_snapshot[key]:
+            raise ForwardMediaVerificationHold('generated database snapshot changed: ' + key)
+    if (current.get('photo_inventory_complete') is not True
+            or current.get('eligible_photo_count') != 0 or current.get('history_complete') is not True):
+        raise ForwardMediaVerificationHold('generated database depletion/history unverified')
+    # End read-only identity/snapshot work BEFORE bounded remote object reads.
+    persistence._conn.rollback()
+    data = _read(candidate.get('original_url'), read_bytes)
+    if (candidate.get('original_sha256') != hashlib.sha256(data).hexdigest()
+            or candidate.get('original_md5') != hashlib.md5(data).hexdigest()
+            or candidate.get('storage_readback_sha256') != candidate.get('original_sha256')
+            or candidate.get('original_length') != len(data)
+            or candidate.get('original_phash') != visual_scene.scene_fingerprint(data)):
+        raise ForwardMediaVerificationHold('generated original byte or perceptual proof changed')
+    # Decode, reject animation, and verify exact original dimensions too.
+    import io
+    from PIL import Image
+    with Image.open(io.BytesIO(data)) as im:
+        if (getattr(im, 'n_frames', 1) != 1 or im.width != candidate.get('width')
+                or im.height != candidate.get('height') or im.width * im.height > 40_000_000):
+            raise ForwardMediaVerificationHold('generated original dimensions changed')
+        im.verify()
+    checked_visuals = []
+    byte_cache = {candidate['original_url']: data}
+    visual_cache = {candidate['original_url']:
+                    ('sha256:' + candidate['original_sha256'], candidate['original_phash'])}
+    if not isinstance(history_visuals, list):
+        raise ForwardMediaVerificationHold('complete historical visual bytes required')
+    supplied = {}
+    for item in history_visuals:
+        if not isinstance(item, dict):
+            raise ForwardMediaVerificationHold('historical visual evidence malformed')
+        key = (item.get('history_key'), item.get('published_binding_ref'), item.get('visual_url'))
+        if key in supplied:
+            raise ForwardMediaVerificationHold('historical visual evidence ambiguous')
+        supplied[key] = item
+    rows = current.get('history', {}).get('rows')
+    if not isinstance(rows, list):
+        raise ForwardMediaVerificationHold('complete database historical inventory required')
+    for item in rows:
+        key = (item.get('history_key'), item.get('published_binding_ref'), item.get('visual_url'))
+        asserted = supplied.pop(key, None)
+        if (item.get('history_proof_ref') and item.get('visual_sha256')
+                and visual_scene.normalize_scene(item.get('phash'))):
+            # Immutable SQL-issued proof is tied to the exact current history
+            # identity, published binding, URL, SHA and pHash. Deleted/missing
+            # remote objects do not erase the already observed historical visual.
+            if asserted and asserted.get('visual_sha256') != item['visual_sha256']:
+                raise ForwardMediaVerificationHold('historical visual bytes changed')
+            checked_visuals.append(dict(item))
+            continue
+        url = item.get('visual_url')
+        if url not in byte_cache:
+            byte_cache[url] = _read(url, read_bytes)
+        prior = byte_cache[url]
+        if url not in visual_cache:
+            visual_cache[url] = ('sha256:' + hashlib.sha256(prior).hexdigest(),
+                                 visual_scene.scene_fingerprint(prior))
+        sha, phash = visual_cache[url]
+        if ((item.get('visual_sha256') is not None and item['visual_sha256'] != sha)
+                or (asserted and asserted.get('visual_sha256') != sha)):
+            raise ForwardMediaVerificationHold('historical visual bytes changed')
+        if phash is None:
+            raise ForwardMediaVerificationHold('historical perceptual evidence unavailable')
+        checked_visuals.append({**item, 'visual_sha256': sha, 'phash': phash})
+    if supplied:
+        raise ForwardMediaVerificationHold('historical visual evidence outside database inventory')
+    if _read(candidate['original_url'], read_bytes) != data:
+        raise ForwardMediaVerificationHold('generated original changed during observation')
+    original = prepare.register_original(
+        candidate['gym_id'], 'generated-astra:' + candidate['job_id'],
+        candidate['original_url'], data, 'astra-job:' + candidate['job_id'])
+    manifest = prepare.build_render_manifest(original, original.source_url, data,
+        'same_object', 'generated-astra:' + candidate['job_id'])
+    persistence._assert_owner_identity()
+    with persistence._conn.cursor() as cur:
+        operation = 'fixer_reserve_generated_bundle_20261007' if delegated else 'fixer_reserve_generated_20261007'
+        cur.execute('select public.' + operation + '(%s,%s::jsonb,%s::jsonb,%s::jsonb,%s::text)',
+                    (_uuid(calendar_row_id), json.dumps(candidate),
+                     json.dumps(checked_visuals), json.dumps(manifest.row()), approved_source_revision))
+        result = cur.fetchone()[0]
+    if not isinstance(result, dict) or result.get('reserved') is not True:
+        raise ForwardMediaVerificationHold('atomic generated owner reservation refused')
+    return result

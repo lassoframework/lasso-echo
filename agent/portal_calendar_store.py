@@ -1556,6 +1556,185 @@ class SupabaseCalendarStore:
             return None
         return after
 
+    @staticmethod
+    def _repeat_media_future(current, today):
+        """An explicit caller-supplied account-local ISO day is required."""
+        from datetime import date
+        if not isinstance(current, dict):
+            return False
+        try:
+            day = current.get("post_date")
+            if (not isinstance(today, str) or not isinstance(day, str)
+                    or date.fromisoformat(today).isoformat() != today
+                    or date.fromisoformat(day).isoformat() != day):
+                return False
+            return day > today
+        except ValueError:
+            return False
+
+    @staticmethod
+    def _repeat_media_stage_reason(original, staged):
+        """Persist a digest binding the observed before image and replacement.
+
+        The digest is a staging receipt, not an authorization token. Normal
+        tenant/approval gates still apply. Keeping it in the hold field avoids
+        inventing a not-yet-migrated calendar column; any nonblank hold blocks
+        publication. Exact-reason repair jobs intentionally skip staged rows.
+        """
+        import hashlib
+        import json
+        identity = ("image_url", "source_media_url", "source_media_asset_id",
+                    "thumbnail_url", *_DRAFT_SCENE_CAS_COLUMNS)
+        evidence = {
+            "before": {key: original[key] for key in
+                       ("id", "gym_id", *_VISUAL_MEDIA_CAS_COLUMNS) if key in original},
+            "replacement": {key: staged[key] for key in identity if key in staged},
+        }
+        digest = hashlib.sha256(json.dumps(
+            evidence, sort_keys=True, separators=(",", ":"),
+            ensure_ascii=False, allow_nan=False).encode("utf-8")).hexdigest()
+        return "cross_date_media_repeat_needs_new_visual:staged:" + digest
+
+    def replace_future_repeat_media(self, account_key, current, *, image_url,
+                                    source_media_asset_id, source_media_url=None,
+                                    today=None, render_evidence=None,
+                                    poster_render_evidence=None):
+        """Stage replacement media by exact CAS, retaining a persisted hold.
+
+        Requires explicit new source URL, approved source asset (verified by
+        caller), and caller-supplied account-local `today` in YYYY-MM-DD form.
+        Only future active pending/approved rows carrying the original repeat
+        hold and no publish claim/reservation/schedule are eligible. Stale
+        thumbnail and scene provenance are cleared or replaced by preparation.
+        Status/caption/approval/date/slot are preserved. The persisted staging
+        digest binds the original before image and replacement identity; retain
+        that original for release after independently reading/verifying media.
+        A failed readback never authorizes release.
+        """
+        hold_reason = "cross_date_media_repeat_needs_new_visual"
+        required_null = ("published_at", "late_post_id", "publish_claim_token",
+                         "publish_reservation_day", "scheduled_at")
+        new_url = image_url.strip() if isinstance(image_url, str) else ""
+        new_source = source_media_url.strip() if isinstance(source_media_url, str) else ""
+        new_asset = source_media_asset_id.strip() if isinstance(source_media_asset_id, str) else ""
+        if (not isinstance(current, dict)
+                or str(current.get("gym_id")) != str(account_key)
+                or current.get("id") is None
+                or current.get("status") not in ("pending", "approved")
+                or current.get("variant_status") != "active"
+                or any(key not in current for key in _CORE_VISUAL_MEDIA_CAS_COLUMNS)
+                or any(current[key] is not None for key in required_null)
+                or current.get("media_not_ready_reason") != hold_reason
+                or not self._repeat_media_future(current, today)
+                or not new_url.startswith("https://")
+                or not new_source.startswith("https://")
+                or not new_asset
+                or new_asset == current.get("source_media_asset_id")
+                or new_url in (current.get("image_url"), current.get("source_media_url"))
+                or new_source in (current.get("image_url"), current.get("source_media_url"))):
+            return None
+        params = {"id": f'eq.{current["id"]}', "gym_id": f"eq.{account_key}"}
+        for key in _VISUAL_MEDIA_CAS_COLUMNS:
+            if key not in current:
+                continue
+            encoded = _eq_filter(current[key])
+            if encoded is None:
+                raise PortalStoreError(422, f"repeat media replacement CAS blocked: field {key!r} has no safe equality encoding")
+            params[key] = encoded
+        payload = {"image_url": new_url, "source_media_url": new_source,
+                   "source_media_asset_id": new_asset, "thumbnail_url": None}
+        for key in _DRAFT_SCENE_CAS_COLUMNS:
+            if key in current:
+                payload[key] = None
+        from . import visual_writer_prepare
+        prepared_write = visual_writer_prepare.enabled()
+        if prepared_write:
+            payload = self._prepare_visual_replacement(
+                account_key, current, payload, render_evidence, poster_render_evidence)
+            # The initial CAS above already pins every observed column,
+            # including all required core fields. Do not add predicates for
+            # draft-scene columns absent from this row/schema. Preparation may
+            # produce values for those columns, though, so fail closed before
+            # PATCH rather than sending an invalid payload to an unmigrated
+            # content_calendar table.
+            absent_prepared_columns = [
+                key for key in _DRAFT_SCENE_CAS_COLUMNS
+                if key in payload and key not in current
+            ]
+            if absent_prepared_columns:
+                raise PortalStoreError(
+                    422,
+                    "repeat media replacement preparation requires migrated "
+                    "draft-scene columns: " + ", ".join(sorted(absent_prepared_columns)))
+        payload["media_not_ready_reason"] = self._repeat_media_stage_reason(
+            current, {**current, **payload})
+        response = self._client().patch(
+            self._rest(_TABLE), params=params,
+            headers=self._headers({"Content-Type": "application/json",
+                                   "Prefer": "return=representation"}),
+            json=payload, timeout=30)
+        if response.status_code >= 400:
+            raise PortalStoreError(response.status_code, "repeat media replacement CAS failed")
+        return self._visual_media_result(response.json(), account_key, current, payload)
+
+    def release_future_repeat_media_hold(self, account_key, current, *, original=None,
+                                         today=None):
+        """Release only an independently verified persisted replacement stage.
+
+        `original` is the full before image passed to staging; `current` must
+        be the separately read/verified staged after image. Its persisted digest
+        must match both images, with a different new source/asset and unchanged
+        nonmedia fields. Explicit account-local `today` is required again: a
+        stage that aged into today/past remains held. Exact CAS pins all observed
+        fields, so changes after verification lose the race. Only the hold is
+        cleared; the caller still owns byte approval and unique-photo checks.
+        """
+        hold_reason = "cross_date_media_repeat_needs_new_visual"
+        required_null = ("published_at", "late_post_id", "publish_claim_token",
+                         "publish_reservation_day", "scheduled_at")
+        for row in (original, current):
+            if (not isinstance(row, dict)
+                    or str(row.get("gym_id")) != str(account_key)
+                    or row.get("id") is None
+                    or row.get("status") not in ("pending", "approved")
+                    or row.get("variant_status") != "active"
+                    or any(key not in row for key in _CORE_VISUAL_MEDIA_CAS_COLUMNS)
+                    or any(row[key] is not None for key in required_null)
+                    or not self._repeat_media_future(row, today)):
+                return None
+        media = {"image_url", "source_media_url", "source_media_asset_id",
+                 "thumbnail_url", "media_not_ready_reason", *_DRAFT_SCENE_CAS_COLUMNS}
+        if (original.get("media_not_ready_reason") != hold_reason
+                or current["id"] != original["id"]
+                or any(current.get(key) != original.get(key)
+                       for key in _VISUAL_MEDIA_CAS_COLUMNS if key not in media)
+                or any(not isinstance(current.get(key), str)
+                       or not current[key].startswith("https://")
+                       or current[key] in (original["image_url"], original["source_media_url"])
+                       for key in ("image_url", "source_media_url"))
+                or not isinstance(current.get("source_media_asset_id"), str)
+                or not current["source_media_asset_id"].strip()
+                or current["source_media_asset_id"] == original["source_media_asset_id"]
+                or current.get("media_not_ready_reason") != self._repeat_media_stage_reason(original, current)):
+            return None
+        params = {"id": f'eq.{current["id"]}', "gym_id": f"eq.{account_key}"}
+        for key in _VISUAL_MEDIA_CAS_COLUMNS:
+            if key not in current:
+                continue
+            encoded = _eq_filter(current[key])
+            if encoded is None:
+                raise PortalStoreError(422, f"repeat media hold release CAS blocked: field {key!r} has no safe equality encoding")
+            params[key] = encoded
+        response = self._client().patch(
+            self._rest(_TABLE), params=params,
+            headers=self._headers({"Content-Type": "application/json",
+                                   "Prefer": "return=representation"}),
+            json={"media_not_ready_reason": None}, timeout=30)
+        if response.status_code >= 400:
+            raise PortalStoreError(response.status_code, "repeat media hold release CAS failed")
+        return self._visual_media_result(response.json(), account_key, current,
+                                         {"media_not_ready_reason": None})
+
     def replace_future_infographic_media(self, account_key, current, *, image_url,
                                          source_media_url, source_media_asset_id,
                                          reason, thumbnail_url=None, render_evidence=None,
