@@ -13,9 +13,15 @@ from agent import forward_media_source_verifier as source_module
 @pytest.fixture
 def runtime(monkeypatch):
     monkeypatch.delenv(worker.PHOTO_CLEARANCE_ENV, raising=False)
-    for key in list(os.environ):
-        if owner._FORBIDDEN_ENV_NAME.search(key) or key in worker._FORBIDDEN:
-            monkeypatch.delenv(key)
+    for key in owner.forbidden_credential_names(os.environ):
+        monkeypatch.delenv(key)
+    class ProcessEnvironment:
+        @property
+        def environ(self):
+            return {k:v for k,v in os.environ.items() if k != 'PYTEST_CURRENT_TEST'}
+        getenv = staticmethod(os.getenv)
+    monkeypatch.setattr(owner, 'os', ProcessEnvironment())
+    monkeypatch.setattr(worker, 'os', ProcessEnvironment())
     monkeypatch.setenv(worker.WORKER_ENV, 'true')
     monkeypatch.setenv(worker.TENANTS_ENV, 'gym')
     monkeypatch.setenv('FORWARD_MEDIA_OWNER_DSN', 'postgres://isolated-owner@example.invalid/x')
