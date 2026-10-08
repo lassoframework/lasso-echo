@@ -104,6 +104,7 @@ def run_status_job(event_store, calendar_store, *, today=None, logger=None):
     Returns a summary dict. Never publishes."""
     log = logger or (lambda m: print(f"[event-status] {m}"))
     flipped, ended, denied, topped_up = 0, 0, 0, 0
+    terminal_sweeps_ok = True
     try:
         active = event_store.list_active() or []
     except Exception as exc:  # noqa: BLE001
@@ -135,6 +136,10 @@ def run_status_job(event_store, calendar_store, *, today=None, logger=None):
                 res = ec.cancel_event(calendar_store, event.gym_id, event.id,
                                       ended=True, logger=logger)
                 denied += res.get("denied", 0)
+                if res.get("ok") is False:
+                    terminal_sweeps_ok = False
+                    log(f"terminal sweep {event.id} failed: "
+                        f"{res.get('error') or 'unknown'}")
                 # Recap photo request the morning after the end (best-effort).
                 try:
                     recap_photo_request(event, logger=logger)
@@ -157,7 +162,7 @@ def run_status_job(event_store, calendar_store, *, today=None, logger=None):
                         f"{event.gym_id}/{event.id}")
             except Exception as exc:  # noqa: BLE001
                 log(f"top_up_arc {event.id} failed {type(exc).__name__}")
-    return {"ok": True, "flipped": flipped, "ended": ended, "denied": denied,
+    return {"ok": terminal_sweeps_ok, "flipped": flipped, "ended": ended, "denied": denied,
             "topped_up": topped_up}
 
 

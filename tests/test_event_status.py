@@ -211,6 +211,26 @@ class _CalStore:
             return r
         return None
 
+    def deny_wipeable_with_reason(self, gym_id, row_id, reason):
+        r = self.rows.get(row_id)
+        if (r and r.get("gym_id") == gym_id
+                and r.get("status") in ("pending", "draft", "queued")):
+            r["status"] = "denied"
+            r["reject_reason"] = reason
+            self.denied.append((row_id, reason))
+            return r
+        return None
+
+    def deny_event_wipeable_with_reason(self, gym_id, event_id, row_id, reason):
+        r = self.rows.get(row_id)
+        if (r and r.get("gym_id") == gym_id and r.get("event_id") == event_id
+                and r.get("status") in ("pending", "draft", "queued")):
+            r["status"] = "denied"
+            r["reject_reason"] = reason
+            self.denied.append((row_id, reason))
+            return r
+        return None
+
 
 def test_status_job_flips_ended_and_sweeps(monkeypatch):
     monkeypatch.setenv("AGENT_EVENT_CAMPAIGNS_PETE", "true")
@@ -232,6 +252,32 @@ def test_status_job_flips_ended_and_sweeps(monkeypatch):
     assert cstore.rows["a1"]["status"] == "denied"
     assert cstore.rows["a1"]["reject_reason"] == ec.REJECT_ENDED
     assert cstore.rows["a2"]["status"] == "approved"
+
+
+def test_status_job_reports_terminal_calendar_read_failure(monkeypatch):
+    monkeypatch.setenv("AGENT_EVENT_CAMPAIGNS_PETE", "true")
+    import agent.ops_alerts as oa
+    monkeypatch.setattr(oa, "alert", lambda *a, **k: None)
+    ev_row = dict(id="evt_baf_x", gym_id="pete", name="Bring a Friend Week",
+                  type="bring_a_friend", starts_on="2026-09-22", ends_on="2026-09-28",
+                  tz="America/New_York", offer_text="free week", link="",
+                  brief="", media_ids=[], status="live")
+    estore = _EventStore([ev_row])
+
+    class _UnreadableCalendar:
+        def list_event_rows(self, *_args):
+            raise RuntimeError("calendar unavailable")
+
+        def deny_event_wipeable_with_reason(self, *_args):
+            raise AssertionError("no unsafe write")
+
+    result = es.run_status_job(
+        estore, _UnreadableCalendar(), today=date(2026, 9, 29),
+        logger=lambda *_: None)
+
+    assert result["ok"] is False
+    assert result["ended"] == 1
+    assert result["denied"] == 0
 
 
 def test_status_job_skips_unarmed_gym(monkeypatch):

@@ -3652,7 +3652,8 @@ class SupabaseCalendarStore:
 
     def insert_rows(self, account_key, rows, *, preserve_ids=False,
                     render_evidence_by_url=None, poster_render_evidence_by_url=None,
-                    required_feed_slots=None, prevalidated_cadence=False):
+                    required_feed_slots=None, prevalidated_cadence=False,
+                    return_write_receipt=False):
         """INSERT content_calendar rows for account_key WITHOUT sending an `id`, so the
         DB generates the uuid primary key itself. content_calendar.id is a Postgres uuid
         (DB default gen_random_uuid); sending a non-uuid string (a draft_id) is what
@@ -3665,6 +3666,9 @@ class SupabaseCalendarStore:
         preserve_ids option accepts validated UUIDs for crash-safe automatic jobs.
         No on_conflict/upsert: apply is delete-then-insert, so a plain insert is correct
         and idempotent. Returns the list of inserted row dicts (each with its new uuid).
+        With ``return_write_receipt``, returns those rows plus the exact normalized
+        post-belt payload the store intended to write; event edits use that receipt to
+        distinguish legitimate filtering from an incomplete durable insert.
 
         KEY NORMALIZATION: PostgREST rejects a heterogeneous batch with PGRST102 "All
         object keys must match". Our rows are NOT uniform — a video row carries
@@ -3823,6 +3827,8 @@ class SupabaseCalendarStore:
                 raise CadencePreconditionError(
                     409, "calendar cadence precondition failed before insert")
         if not payload:
+            if return_write_receipt:
+                return {"inserted_rows": recovered, "expected_rows": []}
             return recovered
         from . import visual_writer_prepare
         prepared_write = visual_writer_prepare.enabled()
@@ -3892,7 +3898,14 @@ class SupabaseCalendarStore:
                         _ledger.record_staged(account_key, caption, post_date)
             except Exception:
                 pass  # ledger stamp failure is never fatal
-        return recovered + inserted
+        written = recovered + inserted
+        if return_write_receipt:
+            # Event edits need the authoritative write set after every persistence
+            # belt.  A pre-store count cannot distinguish a legitimate held/caption/
+            # cross-day-media refusal from a partial or ambiguous database insert.
+            return {"inserted_rows": written,
+                    "expected_rows": [dict(row) for row in payload]}
+        return written
 
     def recover_story_media_hold(self, account_key, current, proposed, *,
                                  poster_render_evidence=None):
@@ -4142,6 +4155,97 @@ class SupabaseCalendarStore:
             if str(row.get("gym_id")) == str(account_key):
                 return row
         return None
+
+    def deny_wipeable_with_reason(self, account_key, row_id, reject_reason):
+        """Compensate one machine-owned row only while it remains wipeable.
+
+        The status predicate is part of the PATCH, so an approval, publish claim,
+        publication, denial, kill, failure, or hold that wins after the caller's read
+        cannot be overwritten by cleanup from a stale event edit.
+        """
+        params = {
+            "id": f"eq.{row_id}",
+            "gym_id": f"eq.{account_key}",
+            "status": f"in.({','.join(_WIPEABLE_STATUSES)})",
+            # A media hold is an operator/system decision even while the row remains
+            # pending. Preserve a hold that races stale event cleanup just as we
+            # preserve an approval or publish claim.
+            "media_not_ready_reason": "is.null",
+        }
+        r = self._client().patch(
+            self._rest(_TABLE),
+            params=params,
+            headers=self._headers({
+                "Content-Type": "application/json",
+                "Prefer": "return=representation",
+            }),
+            json={"status": "denied", "reject_reason": reject_reason},
+            timeout=30,
+        )
+        if r.status_code >= 400:
+            raise PortalStoreError(r.status_code, _scrub((r.text or "")[:200]))
+        for row in (r.json() or []):
+            if (str(row.get("id")) == str(row_id)
+                    and str(row.get("gym_id")) == str(account_key)
+                    and row.get("status") == "denied"):
+                return row
+        return None
+
+    def deny_event_wipeable_with_reason(self, account_key, event_id, row_id,
+                                        reject_reason):
+        """Deny one exact event row after its event becomes terminal.
+
+        Unlike stale edit compensation, terminal cleanup intentionally includes
+        media-held pending/draft/queued rows. The server-side status CAS preserves a
+        concurrent approval, publish claim, publication, or other protected state;
+        event_id prevents a stale event sweep from touching a row outside its arc.
+        """
+        params = {
+            "id": f"eq.{row_id}",
+            "gym_id": f"eq.{account_key}",
+            "event_id": f"eq.{event_id}",
+            "status": f"in.({','.join(_WIPEABLE_STATUSES)})",
+        }
+        r = self._client().patch(
+            self._rest(_TABLE),
+            params=params,
+            headers=self._headers({
+                "Content-Type": "application/json",
+                "Prefer": "return=representation",
+            }),
+            json={"status": "denied", "reject_reason": reject_reason},
+            timeout=30,
+        )
+        if r.status_code >= 400:
+            raise PortalStoreError(r.status_code, _scrub((r.text or "")[:200]))
+        for row in (r.json() or []):
+            if (str(row.get("id")) == str(row_id)
+                    and str(row.get("gym_id")) == str(account_key)
+                    and str(row.get("event_id")) == str(event_id)
+                    and row.get("status") == "denied"):
+                return row
+        return None
+
+    def list_rows_by_ids(self, account_key, row_ids):
+        """Read exact calendar UUIDs within one gym for ambiguous-write reconciliation."""
+        import uuid
+
+        ids = sorted({str(uuid.UUID(str(row_id))) for row_id in (row_ids or [])})
+        if not ids:
+            return []
+        if len(ids) > 200:
+            raise ValueError("operation row reconciliation exceeds 200 ids")
+        r = self._client().get(
+            self._rest(_TABLE),
+            params={"gym_id": f"eq.{account_key}",
+                    "id": f"in.({','.join(ids)})", "limit": str(len(ids))},
+            headers=self._headers(), timeout=30)
+        if r.status_code >= 400:
+            raise PortalStoreError(r.status_code, _scrub((r.text or "")[:200]))
+        expected = set(ids)
+        return [row for row in (r.json() or [])
+                if str(row.get("gym_id")) == str(account_key)
+                and str(row.get("id")) in expected]
 
     def patch_pending_plan(self, account_key, row_id, *, caption=None, pillar=None,
                            levers=None, expected_row=None,

@@ -33,6 +33,8 @@ _WIPEABLE = ("pending", "draft", "queued")
 REJECT_CANCELLED = "event_cancelled"
 REJECT_ENDED = "event_ended"
 REJECT_DEAD_LINK = "event_link_dead"
+REJECT_EDIT_CONFLICT = "event_edit_conflict"
+REJECT_EDIT_SUPERSEDED = "event_edit_superseded"
 
 # The A-gate protects an ALREADY-POPULATED month from being broken by an arc insert.
 # Below this many existing rows the calendar is a sparse seed (a brand-new gym or the
@@ -338,7 +340,8 @@ def sweep_arc_rows(arc_rows, reason):
 # ---------------------------------------------------------------------------
 
 def stage_arc(store, event, arc_rows, *, profile="GYM", logger=None,
-              media_picker=None, media_host_fn=None, gate="hard"):
+              media_picker=None, media_host_fn=None, gate="hard",
+              operation_id=None):
     """Insert `arc_rows` into the gym's live month plan through `store`, re-grade, and
     stage the kept rows as 'pending'. Returns a summary dict. Never publishes.
 
@@ -362,15 +365,33 @@ def stage_arc(store, event, arc_rows, *, profile="GYM", logger=None,
     if isinstance(event, dict):
         event = ge.GymEvent.from_row(event)
     gym_id = event.gym_id
+    operation_row_ids = set()
+    if operation_id is not None:
+        # Stamp the complete requested arc before any planner, occupancy, recap, or
+        # media filter can remove a row.  The UUID identity includes the semantic
+        # event/date/account/format/arc-kind key, so edit callers can prove that every
+        # requested replacement was durably inserted rather than relying on a count.
+        operation_row_ids = _stamp_operation_row_ids(arc_rows, operation_id, log)
+        if operation_row_ids is None:
+            return {"ok": False, "reason": "invalid staging operation", "staged": 0}
     months = sorted({str(r.get("post_date"))[:7] for r in arc_rows if r.get("post_date")})
 
     existing = []
     lister = getattr(store, "list_month", None)
+    if operation_id is not None and lister is None:
+        return {"ok": False, "reason": "calendar occupancy reader unavailable",
+                "staged": 0, "_inserted_rows": []}
     if lister is not None:
         for m in months:
             try:
                 existing.extend(lister(gym_id, m) or [])
             except Exception as exc:  # noqa: BLE001
+                if operation_id is not None:
+                    log(f"stage_arc: list_month {m} failed {type(exc).__name__}; "
+                        "refusing event edit staging")
+                    return {"ok": False,
+                            "reason": "calendar occupancy read failed",
+                            "staged": 0, "_inserted_rows": []}
                 log(f"stage_arc: list_month {m} failed {type(exc).__name__}; treating as empty")
 
     # THE MONTH THE AUDIENCE SEES (Zanshin top-up refusal, 2026-08-31): list_month
@@ -441,10 +462,23 @@ def stage_arc(store, event, arc_rows, *, profile="GYM", logger=None,
     for r in existing:
         if str(r.get("event_id") or "") != str(event.id):
             continue
+        status = _status(r)
+        # An edit operation owns only its deterministic row UUIDs. Rows inserted by
+        # another edit may still be compensated by that loser, so they cannot satisfy
+        # this operation's occupancy check or the winner could adopt disappearing rows.
+        # Only machine-wipeable rows can disappear that way. Human/publisher/terminal
+        # states remain permanent occupancy and must still block a duplicate slot.
+        if operation_id is not None and str(r.get("id") or "") not in operation_row_ids:
+            if status in _WIPEABLE:
+                continue
+            already.add((str(r.get("post_date"))[:10],
+                         str(r.get("account") or "").lower(),
+                         str(r.get("format") or "").lower()))
+            continue
         slot = (str(r.get("post_date"))[:10],
                 str(r.get("account") or "").lower(),
                 str(r.get("format") or "").lower())
-        if _status(r) == "denied":
+        if status == "denied":
             denied_count[slot] = denied_count.get(slot, 0) + 1
         else:
             already.add(slot)
@@ -471,17 +505,42 @@ def stage_arc(store, event, arc_rows, *, profile="GYM", logger=None,
     if not _stamp_logical_post_ids(to_stage, log):
         return {"ok": False, "reason": "logical post id stamp failed", "staged": 0}
     inserted = 0
+    inserted_rows = []
+    # This is the exact post-planner write set. Rows intentionally removed by the
+    # offer ceiling, recap hold, existing-slot guard, or media hold are not missing
+    # inserts. Edit callers compare durable receipts only against this set so those
+    # legitimate omissions can advance while a partial database insert still forces
+    # compensation and rollback.
+    expected_rows = [dict(_db_row(row), gym_id=gym_id) for row in to_stage]
     inserter = getattr(store, "insert_rows", None)
     if inserter is not None and to_stage:
         # Strip the transient planner-only keys the DB does not carry.
         payload = [_db_row(r) for r in to_stage]
         try:
-            written = inserter(gym_id, payload) or []
+            if operation_id is None:
+                written = inserter(gym_id, payload) or []
+            else:
+                receipt = inserter(
+                    gym_id, payload, preserve_ids=True,
+                    return_write_receipt=True)
+                if (not isinstance(receipt, dict)
+                        or not isinstance(receipt.get("inserted_rows"), (list, tuple))
+                        or not isinstance(receipt.get("expected_rows"), (list, tuple))):
+                    raise ValueError("unverified calendar write receipt")
+                written = receipt["inserted_rows"]
+                authoritative = receipt["expected_rows"]
+                if any(not isinstance(row, dict)
+                       or str(row.get("gym_id") or "") != str(gym_id)
+                       or str(row.get("id") or "") not in operation_row_ids
+                       for row in authoritative):
+                    raise ValueError("invalid calendar expected-write receipt")
+                expected_rows = [dict(row) for row in authoritative]
             inserted = len(written) if not isinstance(written, int) else written
             # A Drive asset is globally burned only after the store returns the exact
             # inserted row. _attach_media reserves IDs within this call, but stamping
             # before durable confirmation could consume a photo with no calendar row.
             if isinstance(written, (list, tuple)):
+                inserted_rows = [dict(row) for row in written if isinstance(row, dict)]
                 waiting = {}
                 for row in to_stage:
                     ident = _media_write_identity(row, gym_id)
@@ -498,13 +557,111 @@ def stage_arc(store, event, arc_rows, *, profile="GYM", logger=None,
                 durable_rows = []
             _stamp_media_usage(gym_id, durable_rows)
         except Exception as exc:  # noqa: BLE001
+            attempted_rows = [dict(row, gym_id=gym_id) for row in payload]
             return {"ok": False, "reason": f"insert failed {type(exc).__name__}",
-                    "staged": 0}
+                    "staged": 0, "ambiguous_insert": True,
+                    "_inserted_rows": [], "_attempted_rows": attempted_rows,
+                    "_expected_rows": expected_rows}
     return {"ok": True, "staged": inserted, "held_recap": len(held_recap),
             "held_media": len(held_media),
             "thinned": len(arc_rows) - len(thinned),
             "grade": (grade.total if grade else None),
-            "letter": (grade.letter if grade else None), "months": months}
+            "letter": (grade.letter if grade else None), "months": months,
+            # Internal durability receipt for callers that must compensate an
+            # event transition racing after staging. Production insert_rows returns
+            # exact persisted rows; a count alone is deliberately not treated as
+            # enough identity to undo anything.
+            "_inserted_rows": inserted_rows, "_expected_rows": expected_rows}
+
+
+def compensate_staged_rows(store, gym_id, rows, *, reason=REJECT_EDIT_CONFLICT,
+                           logger=None):
+    """Deny only the exact newly inserted pending rows from a lost event edit race.
+
+    This is the post-insert half of the edit/cancel serialization fence. It never
+    touches approved or published rows, and every write remains scoped by gym id and
+    the database-returned row id. Callers use ``cancel_event`` instead when the event
+    is terminal, because cancellation/ending owns every still-pending row in the arc.
+    """
+    log = logger or (lambda m: print(f"[event-calendar] {m}"))
+    denier = getattr(store, "deny_wipeable_with_reason", None)
+    denied = 0
+    failed = False
+    if denier is None:
+        return {"ok": False, "denied": 0, "reason": reason}
+    for row in rows or ():
+        if (_status(row) not in _WIPEABLE or not row.get("id")
+                or str(row.get("gym_id") or "") != str(gym_id)):
+            continue
+        try:
+            if denier(gym_id, row["id"], reason):
+                denied += 1
+        except Exception as exc:  # noqa: BLE001
+            log(f"event edit compensation: deny {row.get('id')} failed "
+                f"{type(exc).__name__}")
+            failed = True
+    return {"ok": not failed, "denied": denied, "reason": reason,
+            **({"error": "edit_compensation_incomplete"} if failed else {})}
+
+
+def confirm_staged_rows_inactive(store, gym_id, rows, *, logger=None):
+    """Confirm exact operation-owned IDs are absent or no longer machine-wipeable.
+
+    An insert request can commit and then lose its response. Its deterministic row IDs
+    remain the only safe reconciliation handle. A rollback is permitted only after an
+    exact gym-scoped read proves none of those IDs can still publish as active drafts.
+    """
+    log = logger or (lambda m: print(f"[event-calendar] {m}"))
+    row_ids = sorted({str(row.get("id") or "") for row in rows or ()
+                      if row.get("id")
+                      and str(row.get("gym_id") or "") == str(gym_id)})
+    if not row_ids:
+        return {"ok": True, "active": 0}
+    reader = getattr(store, "list_rows_by_ids", None)
+    if reader is None:
+        return {"ok": False, "active": 0,
+                "error": "operation_rows_reader_unavailable"}
+    try:
+        current = reader(gym_id, row_ids) or []
+    except Exception as exc:  # noqa: BLE001
+        log(f"event edit reconciliation read failed {type(exc).__name__}")
+        return {"ok": False, "active": 0,
+                "error": "operation_rows_read_failed"}
+    expected = set(row_ids)
+    # Only an absent row or an explicit non-publishing terminal denial/kill is safe
+    # before rolling the event revision back. An approval or publish claim that races
+    # cleanup is human/publisher owned and must keep the new event revision it refers
+    # to; even a held/failed row may be retried or released later.
+    active = [row for row in current
+              if str(row.get("id") or "") in expected
+              and str(row.get("gym_id") or "") == str(gym_id)
+              and _status(row) not in ("denied", "killed")]
+    return {"ok": not active, "active": len(active),
+            **({"error": "operation_rows_still_active"} if active else {})}
+
+
+def _stamp_operation_row_ids(rows, operation_id, log):
+    """Stamp deterministic UUIDs owned by one event-edit staging operation."""
+    import uuid
+
+    try:
+        namespace = uuid.UUID(str(operation_id))
+    except (AttributeError, TypeError, ValueError):
+        log("event edit staging: refusing invalid operation UUID")
+        return None
+    owned = set()
+    for index, row in enumerate(rows):
+        identity = "|".join((
+            str(index), str(row.get("event_id") or ""),
+            str(row.get("post_date") or "")[:10],
+            str(row.get("account") or "").lower(),
+            str(row.get("format") or "").lower(),
+            str(row.get("arc_kind") or ""),
+        ))
+        row_id = str(uuid.uuid5(namespace, identity))
+        row["id"] = row_id
+        owned.add(row_id)
+    return owned
 
 
 def backfill_missing_media(store, gym_id, event_id, *, statuses=("pending", "approved"),
@@ -758,29 +915,41 @@ def cancel_event(store, gym_id, event_id, *, ended=False, logger=None):
     Returns a summary. Reason is event_ended when `ended` else event_cancelled."""
     log = logger or (lambda m: print(f"[event-calendar] {m}"))
     reason = REJECT_ENDED if ended else REJECT_CANCELLED
-    rows = _event_rows(store, gym_id, event_id)
-    denier = getattr(store, "deny_with_reason", None)
+    try:
+        rows = _event_rows(store, gym_id, event_id)
+    except Exception as exc:  # noqa: BLE001 - never claim a terminal sweep we could not read
+        log(f"cancel_event: event row read failed {type(exc).__name__}")
+        return {"ok": False, "denied": 0, "reason": reason,
+                "error": "event_rows_unavailable"}
+    # Terminal state owns every remaining machine-wipeable event row, including a
+    # pending/draft/queued row carrying a media hold. This deliberately uses a
+    # separate store CAS from edit compensation: stale edit cleanup preserves holds,
+    # while terminal cleanup binds the exact event id and may retire them.
+    denier = getattr(store, "deny_event_wipeable_with_reason", None)
     denied = 0
+    failed = False
     for row in rows:
-        if _status(row) in _WIPEABLE and row.get("id") and denier is not None:
+        if _status(row) in _WIPEABLE and row.get("id"):
+            if denier is None:
+                failed = True
+                continue
             try:
-                if denier(gym_id, row["id"], reason):
+                if denier(gym_id, event_id, row["id"], reason):
                     denied += 1
             except Exception as exc:  # noqa: BLE001
                 log(f"cancel_event: deny {row.get('id')} failed {type(exc).__name__}")
-    return {"ok": True, "denied": denied, "reason": reason}
+                failed = True
+    return {"ok": not failed, "denied": denied, "reason": reason,
+            **({"error": "terminal_sweep_incomplete"} if failed else {})}
 
 
 def _event_rows(store, gym_id, event_id):
     """Every content_calendar row carrying this event_id for the gym. Uses the store's
     event-scoped reader when present, else filters a month read. Gym-scoped."""
     getter = getattr(store, "list_event_rows", None)
-    if getter is not None:
-        try:
-            return getter(gym_id, event_id) or []
-        except Exception:
-            return []
-    return []
+    if getter is None:
+        raise RuntimeError("event-scoped calendar reader unavailable")
+    return getter(gym_id, event_id) or []
 
 
 def guard_publish(store, event, row, *, http=None, today=None, logger=None):

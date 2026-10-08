@@ -33,10 +33,11 @@ class _Resp:
 
 
 class _FakeHTTP:
-    def __init__(self, get_resp=None, delete_resp=None):
+    def __init__(self, get_resp=None, delete_resp=None, patch_resp=None):
         self.calls = []
         self._get_resp = get_resp or _Resp(200, [])
         self._delete_resp = delete_resp or _Resp(200, [])
+        self._patch_resp = patch_resp or _Resp(200, [])
 
     def get(self, url, params=None, headers=None, timeout=None):
         self.calls.append(("get", url, params or {}, headers or {}))
@@ -45,6 +46,10 @@ class _FakeHTTP:
     def delete(self, url, params=None, headers=None, json=None, timeout=None):
         self.calls.append(("delete", url, params or {}, headers or {}, json))
         return self._delete_resp
+
+    def patch(self, url, params=None, headers=None, json=None, timeout=None):
+        self.calls.append(("patch", url, params or {}, headers or {}, json))
+        return self._patch_resp
 
 
 @pytest.fixture(autouse=True)
@@ -76,6 +81,56 @@ def test_human_owned_statuses_are_never_wipeable():
 
 def test_wipeable_set_is_exactly_the_machine_draft_statuses():
     assert set(pcs._WIPEABLE_STATUSES) == {"pending", "draft", "queued"}
+
+
+def test_event_edit_compensation_has_server_side_wipeable_status_cas(monkeypatch):
+    updated = {"id": "row-1", "gym_id": "eng", "status": "denied"}
+    http = _FakeHTTP(patch_resp=_Resp(200, [updated]))
+    monkeypatch.setattr(pcs.SupabaseCalendarStore, "_client", lambda self: http)
+
+    result = pcs.SupabaseCalendarStore().deny_wipeable_with_reason(
+        "eng", "row-1", "event_edit_conflict")
+
+    assert result == updated
+    _, _, params, _, body = next(call for call in http.calls if call[0] == "patch")
+    assert params == {
+        "id": "eq.row-1", "gym_id": "eq.eng",
+        "status": "in.(pending,draft,queued)",
+        "media_not_ready_reason": "is.null",
+    }
+    assert body == {"status": "denied", "reject_reason": "event_edit_conflict"}
+
+
+def test_event_edit_compensation_preserves_concurrent_pending_media_hold(monkeypatch):
+    http = _FakeHTTP(patch_resp=_Resp(200, []))
+    monkeypatch.setattr(pcs.SupabaseCalendarStore, "_client", lambda self: http)
+
+    result = pcs.SupabaseCalendarStore().deny_wipeable_with_reason(
+        "eng", "row-1", "event_edit_superseded")
+
+    assert result is None
+    _, _, params, _, _ = next(call for call in http.calls if call[0] == "patch")
+    assert params["status"] == "in.(pending,draft,queued)"
+    assert params["media_not_ready_reason"] == "is.null"
+
+
+def test_operation_row_reconciliation_is_exact_and_gym_scoped(monkeypatch):
+    first = "11111111-1111-4111-8111-111111111111"
+    second = "22222222-2222-4222-8222-222222222222"
+    payload = [
+        {"id": first, "gym_id": "eng", "status": "pending"},
+        {"id": second, "gym_id": "other", "status": "pending"},
+    ]
+    http = _FakeHTTP(get_resp=_Resp(200, payload))
+    monkeypatch.setattr(pcs.SupabaseCalendarStore, "_client", lambda self: http)
+
+    rows = pcs.SupabaseCalendarStore().list_rows_by_ids("eng", [second, first])
+
+    assert rows == [payload[0]]
+    _, _, params, _ = next(call for call in http.calls if call[0] == "get")
+    assert params == {
+        "gym_id": "eq.eng", f"id": f"in.({first},{second})", "limit": "2",
+    }
 
 
 # ---- delete_month status guard -------------------------------------------
@@ -437,6 +492,21 @@ def test_held_slot_barrier_preserves_numbered_slots_time_slots_and_channel_sibli
     result = store.insert_rows('eng', [blocked] + allowed)
     assert len(result) == len(allowed)
     assert {pcs._held_slot_key(r) for r in result} == {pcs._held_slot_key(r) for r in allowed}
+    assert http.rows[0] == held
+
+
+def test_write_receipt_excludes_exact_slot_refused_by_held_barrier(monkeypatch):
+    held = _persisted(slot_index=0, time_slot='morning')
+    store, http = _state_store(monkeypatch, [held])
+    blocked = dict(held, caption='Blocked replacement', media_not_ready_reason=None)
+    allowed = dict(blocked, slot_index=1, caption='Free replacement')
+
+    receipt = store.insert_rows(
+        'eng', [blocked, allowed], return_write_receipt=True)
+
+    assert [pcs._held_slot_key(r) for r in receipt['expected_rows']] == [
+        pcs._held_slot_key(allowed)]
+    assert len(receipt['inserted_rows']) == 1
     assert http.rows[0] == held
 
 

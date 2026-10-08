@@ -209,6 +209,26 @@ class _FakeStore:
             return r
         return None
 
+    def deny_wipeable_with_reason(self, gym_id, row_id, reason):
+        r = self.rows.get(row_id)
+        if (r and r.get("gym_id") == gym_id
+                and r.get("status") in ("pending", "draft", "queued")):
+            r["status"] = "denied"
+            r["reject_reason"] = reason
+            self.denied.append((row_id, reason))
+            return r
+        return None
+
+    def deny_event_wipeable_with_reason(self, gym_id, event_id, row_id, reason):
+        r = self.rows.get(row_id)
+        if (r and r.get("gym_id") == gym_id and r.get("event_id") == event_id
+                and r.get("status") in ("pending", "draft", "queued")):
+            r["status"] = "denied"
+            r["reject_reason"] = reason
+            self.denied.append((row_id, reason))
+            return r
+        return None
+
 
 def test_cancel_flips_pending_arc_rows_denied():
     ev = _event()
@@ -230,6 +250,50 @@ def test_cancel_flips_pending_arc_rows_denied():
                for i in range(1, len(arc)))
 
 
+@pytest.mark.parametrize("protected_status", [
+    "approved", "publishing", "published", "denied", "killed", "failed", "held",
+])
+def test_edit_compensation_cannot_overwrite_concurrent_protected_status(
+        protected_status):
+    class _RaceStore:
+        def __init__(self):
+            self.row = {"id": "row-1", "gym_id": "pete", "status": protected_status}
+
+        def deny_with_reason(self, *_args):
+            raise AssertionError("generic denier is unsafe for compensation")
+
+        def deny_wipeable_with_reason(self, gym_id, row_id, reason):
+            if (self.row["gym_id"] == gym_id and self.row["id"] == row_id
+                    and self.row["status"] in ("pending", "draft", "queued")):
+                self.row.update(status="denied", reject_reason=reason)
+                return dict(self.row)
+            return None
+
+    store = _RaceStore()
+    stale_insert_receipt = {"id": "row-1", "gym_id": "pete", "status": "pending"}
+
+    result = ec.compensate_staged_rows(store, "pete", [stale_insert_receipt])
+
+    assert result["denied"] == 0
+    assert store.row["status"] == protected_status
+
+
+def test_edit_compensation_reports_patch_failure():
+    class _BrokenStore:
+        def deny_wipeable_with_reason(self, *_args):
+            raise RuntimeError("calendar write unavailable")
+
+    result = ec.compensate_staged_rows(
+        _BrokenStore(), "pete",
+        [{"id": "row-1", "gym_id": "pete", "status": "pending"}],
+        logger=lambda *_: None)
+
+    assert result == {
+        "ok": False, "denied": 0, "reason": ec.REJECT_EDIT_CONFLICT,
+        "error": "edit_compensation_incomplete",
+    }
+
+
 def test_ended_uses_event_ended_reason():
     ev = _event()
     arc = _arc_rows(ev)
@@ -240,6 +304,58 @@ def test_ended_uses_event_ended_reason():
     store = _FakeStore(arc)
     res = ec.cancel_event(store, "pete", ev.id, ended=True)
     assert res["reason"] == ec.REJECT_ENDED
+
+
+@pytest.mark.parametrize("ended", [False, True])
+@pytest.mark.parametrize("status", ["pending", "draft", "queued"])
+def test_terminal_sweep_denies_media_held_wipeable_rows(ended, status):
+    ev = _event()
+    row = {"id": "held-row", "gym_id": "pete", "event_id": ev.id,
+           "status": status, "media_not_ready_reason": "manual_visual_review"}
+    store = _FakeStore([row])
+
+    result = ec.cancel_event(store, "pete", ev.id, ended=ended)
+
+    assert result["ok"] is True
+    assert result["denied"] == 1
+    assert store.rows["held-row"]["status"] == "denied"
+    assert store.rows["held-row"]["reject_reason"] == (
+        ec.REJECT_ENDED if ended else ec.REJECT_CANCELLED)
+
+
+@pytest.mark.parametrize("claimed_status", ["approved", "publishing", "published"])
+def test_terminal_sweep_cannot_overwrite_concurrent_claim(claimed_status):
+    class _ClaimRaceStore(_FakeStore):
+        def list_event_rows(self, gym_id, event_id):
+            snapshot = super().list_event_rows(gym_id, event_id)
+            self.rows["arc0"]["status"] = claimed_status
+            return snapshot
+
+    ev = _event()
+    row = {"id": "arc0", "gym_id": "pete", "event_id": ev.id,
+           "status": "pending"}
+    store = _ClaimRaceStore([row])
+
+    result = ec.cancel_event(store, "pete", ev.id, ended=True)
+
+    assert result["ok"] is True
+    assert result["denied"] == 0
+    assert store.rows["arc0"]["status"] == claimed_status
+
+
+def test_terminal_sweep_read_failure_never_reports_success():
+    class _ReadFailureStore:
+        def list_event_rows(self, *_args):
+            raise RuntimeError("calendar unavailable")
+
+        def deny_event_wipeable_with_reason(self, *_args):
+            raise AssertionError("no row identity was safely read")
+
+    result = ec.cancel_event(_ReadFailureStore(), "pete", "event-1", ended=True)
+
+    assert result["ok"] is False
+    assert result["denied"] == 0
+    assert result["error"] == "event_rows_unavailable"
 
 
 # ---- stage_arc through a fake store: pending + recap held -----------------------
@@ -586,8 +702,12 @@ class _ReStageStore:
         return [r for r in self._existing
                 if str(r.get("post_date", ""))[:7] == month]
 
-    def insert_rows(self, gym_id, rows):
+    def insert_rows(self, gym_id, rows, *, preserve_ids=False,
+                    return_write_receipt=False):
         self.inserted.extend(rows)
+        if return_write_receipt:
+            normalized = [dict(row, gym_id=gym_id) for row in rows]
+            return {"inserted_rows": normalized, "expected_rows": normalized}
         return rows
 
 
@@ -613,6 +733,29 @@ def test_restaging_an_arc_tops_up_instead_of_duplicating(monkeypatch):
     assert not (staged_days & already), "a day already on the calendar was staged twice"
     assert res["staged"] == len(store.inserted)
     assert store.inserted, "the genuinely new days should still be topped up"
+
+
+@pytest.mark.parametrize("protected_status", ["approved", "published"])
+def test_operation_owned_restaging_still_blocks_protected_slot(
+        monkeypatch, protected_status):
+    import uuid
+    ev = _event()
+    arc = _arc_rows(ev)
+    existing = [dict(arc[0], id="protected-row", gym_id=ev.gym_id,
+                     event_id=ev.id, status=protected_status)]
+    store = _ReStageStore(existing)
+    monkeypatch.setattr(ec, "_attach_media",
+                        lambda gym_id, rows, log, picker=None, host=None: (rows, []))
+
+    result = ec.stage_arc(
+        store, ev, arc, profile="GYM", operation_id=str(uuid.uuid4()))
+
+    protected_slot = (str(existing[0]["post_date"])[:10],
+                      existing[0].get("account"), existing[0].get("format"))
+    staged_slots = {(str(row["post_date"])[:10], row.get("account"), row.get("format"))
+                    for row in store.inserted}
+    assert protected_slot not in staged_slots
+    assert result["staged"] == len(store.inserted)
 
 
 # ---- deny = recreate: a denied slot reopens ONCE, twice-denied stays closed -----

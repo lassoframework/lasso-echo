@@ -561,6 +561,27 @@ def test_specialized_caption_patches_format_before_write(monkeypatch):
     assert http.calls[1][4] == {"caption": expected, "status": "pending"}
 
 
+def test_terminal_event_deny_cas_includes_held_rows_but_preserves_protected(
+        monkeypatch):
+    returned = _row("row-1", gym_id="pete", status="denied")
+    returned["event_id"] = "event-1"
+    http = _FakeHTTP(patch_resp=_Resp(200, [returned]))
+    monkeypatch.setattr(pcs.SupabaseCalendarStore, "_client", lambda self: http)
+
+    result = pcs.SupabaseCalendarStore().deny_event_wipeable_with_reason(
+        "pete", "event-1", "row-1", "event_cancelled")
+
+    assert result == returned
+    method, _, params, _, payload = http.calls[0]
+    assert method == "patch"
+    assert params == {
+        "id": "eq.row-1", "gym_id": "eq.pete", "event_id": "eq.event-1",
+        "status": "in.(pending,draft,queued)",
+    }
+    assert "media_not_ready_reason" not in params
+    assert payload == {"status": "denied", "reject_reason": "event_cancelled"}
+
+
 def test_existing_pending_feed_caption_correction_uses_exact_cas(monkeypatch):
     before = "Start here. Meet your coach; book a class."
     after = "Start here.\n\nMeet your coach, book a class."
@@ -1466,11 +1487,13 @@ def test_media_belt_refuses_a_photo_already_on_a_different_day_of_the_book(monke
     rows = [_mrow("2026-09-18", "https://cdn/photo_07.jpg"),   # collides with the book
             _mrow("2026-09-19", "https://cdn/photo_11.jpg"),   # free
             _mrow("2026-09-20", "")]                           # no image: not our concern
-    store.insert_rows("gritx", rows)
+    receipt = store.insert_rows("gritx", rows, return_write_receipt=True)
     sent = _staged(http)
     dates = sorted(r["post_date"] for r in sent)
     assert dates == ["2026-09-19", "2026-09-20"], \
         "only the photo already on ANOTHER day of the book may be refused"
+    assert sorted(r["post_date"] for r in receipt["expected_rows"]) == dates
+    assert receipt["inserted_rows"] == []
 
     # And a ONE-ROW insert (story_studio, client_infographic_fill, a deny backfill --
     # exactly the lanes that never consulted media_guard) obeys the rule like everyone
@@ -1579,6 +1602,38 @@ def test_insert_rows_rejects_non_uuid_before_network_when_preserving():
     with pytest.raises(ValueError):
         store.insert_rows("lasso", [{"id": "not-a-uuid"}], preserve_ids=True)
     assert not http.calls
+
+
+def test_write_receipt_excludes_rows_removed_by_stage_caption_belt(monkeypatch):
+    store, http = _belt_store(monkeypatch, [])
+    monkeypatch.setenv("AGENT_MEDIA_CROSS_DAY_GUARD", "false")
+    monkeypatch.setattr(pcs.config, "empty_caption_guard_enabled", lambda: True)
+    monkeypatch.setattr(pcs.config, "caption_cooldown_enabled", lambda: False)
+    rows = [_mrow("2026-09-18", "https://cdn/a.jpg", caption=""),
+            _mrow("2026-09-19", "https://cdn/b.jpg", caption="Real words")]
+
+    receipt = store.insert_rows("gritx", rows, return_write_receipt=True)
+
+    assert [r["post_date"] for r in receipt["expected_rows"]] == ["2026-09-19"]
+    assert [r["post_date"] for r in _staged(http)] == ["2026-09-19"]
+
+
+def test_write_receipt_excludes_rows_removed_by_caption_cooldown(monkeypatch):
+    from agent import caption_ledger
+    store, http = _belt_store(monkeypatch, [])
+    monkeypatch.setenv("AGENT_MEDIA_CROSS_DAY_GUARD", "false")
+    monkeypatch.setattr(pcs.config, "empty_caption_guard_enabled", lambda: False)
+    monkeypatch.setattr(pcs.config, "caption_cooldown_enabled", lambda: True)
+    monkeypatch.setattr(
+        caption_ledger, "is_verbatim_blocked",
+        lambda gym_id, caption, post_date: caption == "Already used")
+    rows = [_mrow("2026-09-18", "https://cdn/a.jpg", caption="Already used"),
+            _mrow("2026-09-19", "https://cdn/b.jpg", caption="Fresh words")]
+
+    receipt = store.insert_rows("gritx", rows, return_write_receipt=True)
+
+    assert [r["post_date"] for r in receipt["expected_rows"]] == ["2026-09-19"]
+    assert [r["post_date"] for r in _staged(http)] == ["2026-09-19"]
 
 
 def test_insert_rows_one_bad_caption_does_not_abort_the_batch():

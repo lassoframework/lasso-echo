@@ -24,6 +24,10 @@ from datetime import date
 from . import config, gym_event as ge, event_calendar as ec, event_engine as ee
 
 
+def _edit_conflict():
+    return 409, {"error": "this promotion can no longer be edited"}
+
+
 def _flag_off():
     """A disabled gym / feature is a 404, indistinguishable from an unknown route."""
     return 404, {"error": "not found"}
@@ -143,7 +147,8 @@ def handle_edit_event(account_key, event_id, body, *, store=None, event_store=No
     re-stages ONLY changed rows; approved unaffected rows stay approved. Body carries
     the changed fields (starts_on/ends_on/offer_text/link/brief/media_ids). Gym-scoped.
 
-    Returns (200, {event, restaged, kept, removed}) or (404)."""
+    Returns (200, {event, restaged, kept, removed}), 409 for a terminal/non-editable
+    status, or 404 when the gym-scoped event does not exist."""
     if not config.event_campaigns_enabled_for(account_key):
         return _flag_off()
     _store, _estore = _stores(store, event_store)
@@ -155,6 +160,16 @@ def handle_edit_event(account_key, event_id, body, *, store=None, event_store=No
         return 502, {"error": f"read failed: {type(exc).__name__}"}
     if not cur:
         return 404, {"error": "not found"}
+
+    # Status is a server-side write boundary, not a UI convention. A stale browser or
+    # crafted request must not resurrect a terminal offer by changing its dates and
+    # re-staging an arc after the status job ended it or an owner cancelled it. Keep an
+    # explicit allowlist so malformed/future states also fail closed before we inspect
+    # calendar rows, persist a merged event, or stage anything.
+    current_status = cur.get("status")
+    if (not isinstance(current_status, str)
+            or current_status not in ge.EDITABLE_EVENT_STATUSES):
+        return _edit_conflict()
 
     merged = dict(cur)
     for k in ("name", "type", "starts_on", "ends_on", "tz", "offer_text",
@@ -168,36 +183,179 @@ def handle_edit_event(account_key, event_id, body, *, store=None, event_store=No
 
     # Read the current arc rows to compute what moved.
     old_arc = []
-    if _store is not None and hasattr(_store, "list_event_rows"):
+    if _store is not None:
+        event_reader = getattr(_store, "list_event_rows", None)
+        if event_reader is None:
+            return 502, {"error": "calendar event reader unavailable"}
         try:
-            old_arc = _store.list_event_rows(account_key, event_id) or []
-        except Exception:
-            old_arc = []
+            old_arc = event_reader(account_key, event_id) or []
+        except Exception as exc:  # noqa: BLE001
+            return 502, {"error": f"calendar event read failed: {type(exc).__name__}"}
     restage, keep, remove_keys = ec.retime_arc(old_arc, new_event, today=today,
                                                avatar=avatar)
+    remove_key_set = set(remove_keys)
+    superseded_rows = [row for row in old_arc
+                       if (str(row.get("post_date"))[:10],
+                           str(row.get("account") or "").lower(),
+                           str(row.get("format") or "").lower()) in remove_key_set]
 
-    # Persist the event with the new dates + an audit row.
+    # Operation-owned staging must know the complete occupancy before the event
+    # revision is persisted. A failed/partial month read cannot be treated as an empty
+    # calendar: doing so can duplicate pending rows or collide with a protected human
+    # row. stage_arc repeats the reads immediately before insert as a second fence.
+    if _store is not None and restage:
+        month_reader = getattr(_store, "list_month", None)
+        if month_reader is None:
+            return 502, {"error": "calendar occupancy reader unavailable"}
+        months = sorted({str(row.get("post_date") or "")[:7]
+                         for row in restage if row.get("post_date")})
+        try:
+            for month in months:
+                month_reader(account_key, month)
+        except Exception as exc:  # noqa: BLE001
+            return 502, {"error": f"calendar occupancy read failed: {type(exc).__name__}"}
+
+    # Persist the event with the new dates + an audit row. This final write is a
+    # compare-and-set against the exact status we read. A concurrent cancel/end/status
+    # transition therefore wins and cannot be overwritten by this stale merged row.
+    # retime_arc above is pure; calendar staging remains strictly after this fence.
+    import uuid
+    # This UUID is the durable edit revision and the owner of every deterministic
+    # calendar row staged by this operation. Content alone is not a revision: two
+    # identical edits can interleave around the insert and otherwise both appear
+    # current (an ABA race). Lifecycle status ticks leave this revision untouched.
+    edit_revision = str(uuid.uuid4())
     audit = list(cur.get("audit") or [])
     audit.append({"action": "edit", "actor": str((body or {}).get("actor_id") or ""),
-                  "at": _now_iso()})
+                  "at": _now_iso(), "revision": edit_revision})
     try:
-        _estore.upsert_event({**_event_row(new_event), "audit": audit})
+        saved = _estore.update_event_if_status(
+            account_key, event_id, current_status, cur,
+            {**_event_row(new_event), "audit": audit})
     except Exception as exc:  # noqa: BLE001
         return 502, {"error": f"save failed: {type(exc).__name__}"}
+    if saved is None:
+        return _edit_conflict()
 
     # Stage only the changed rows (pending); approved unaffected rows are left as-is.
     staged = 0
     held_media = 0
     stage_reason = ""
+    inserted_rows = []
     if _store is not None and restage:
         res = ec.stage_arc(_store, new_event, restage,
-                           profile=_profile_for(account_key))
+                           profile=_profile_for(account_key),
+                           operation_id=edit_revision)
         staged = res.get("staged", 0)
         held_media = res.get("held_media", 0)
         stage_reason = res.get("reason", "")
-    return 200, {"event": _event_row(new_event), "restaged": staged,
+        inserted_rows = res.get("_inserted_rows", [])
+        # Prove exact durable coverage for the rows stage_arc actually attempted after
+        # its legitimate offer-ceiling, recap, occupancy, and media holds. Every such
+        # row carries a deterministic operation UUID. Intentionally held/thinned rows
+        # are not lost inserts, but a partial durable write still fails atomically.
+        expected_receipt = res.get("_expected_rows")
+        expected_rows = (expected_receipt
+                         if isinstance(expected_receipt, (list, tuple)) else [])
+        required_replacement_ids = {
+            str(row.get("id")) for row in expected_rows if row.get("id")
+        }
+        durable_replacement_ids = {
+            str(row.get("id")) for row in inserted_rows
+            if row.get("id")
+            and str(row.get("gym_id") or "") == str(account_key)
+        }
+        replacement_shortfall = (
+            not isinstance(expected_receipt, (list, tuple))
+            or len(required_replacement_ids) != len(expected_rows)
+            or any(str(row.get("gym_id") or "") != str(account_key)
+                   for row in expected_rows)
+            or not required_replacement_ids.issubset(durable_replacement_ids)
+        )
+        if res.get("ok") is False or replacement_shortfall:
+            # On a partial or identity-less receipt, reconcile every deterministic
+            # operation-owned expected id. A count-only success can have committed
+            # rows even though it proves no identities; rolling back without checking
+            # those ids would leave active replacements tied to the old event revision.
+            cleanup_rows = (res.get("_attempted_rows") or expected_rows
+                            or inserted_rows)
+            compensated = ec.compensate_staged_rows(
+                _store, account_key, cleanup_rows)
+            reconciled = ec.confirm_staged_rows_inactive(
+                _store, account_key, cleanup_rows)
+            rolled_back = None
+            cleanup_ok = (compensated.get("ok") is not False
+                          and reconciled.get("ok") is not False)
+            if cleanup_ok:
+                try:
+                    rolled_back = _estore.update_event_if_status(
+                        account_key, event_id, current_status, saved, cur)
+                except Exception:  # noqa: BLE001 - response remains retryable
+                    rolled_back = None
+            if not cleanup_ok:
+                return 502, {"error": "calendar staging and cleanup failed",
+                             "reason": (stage_reason or
+                                        "replacement coverage incomplete"),
+                             "compensated": compensated.get("denied", 0),
+                             "active": reconciled.get("active", 0),
+                             "rolled_back": False}
+            return 502, {"error": "calendar staging failed",
+                         "reason": (stage_reason or
+                                    "replacement coverage incomplete"),
+                         "compensated": compensated.get("denied", 0),
+                         "rolled_back": bool(rolled_back)}
+
+    # The event CAS and calendar insert are separate PostgREST requests. A cancel or
+    # nightly terminal transition can therefore win after the CAS but before/during
+    # stage_arc. Re-read after the durable insert and compensate before returning:
+    # terminal state owns every pending event row; another same-status edit invalidates
+    # only the exact rows this call inserted. The counterpart cancel/status paths sweep
+    # after their status write, so every possible ordering ends with zero active rows
+    # for a terminal event. A pre-insert read alone cannot provide that guarantee.
+    try:
+        after_stage = _estore.get_event(account_key, event_id)
+    except Exception as exc:  # noqa: BLE001
+        compensated = (ec.compensate_staged_rows(
+            _store, account_key, inserted_rows) if _store is not None else
+            {"denied": 0})
+        return 502, {"error": f"post-stage verification failed: {type(exc).__name__}",
+                     "compensated": compensated.get("denied", 0)}
+    after_status = (after_stage or {}).get("status")
+    same_revision = _same_event_edit_revision(saved, after_stage)
+    if (not same_revision
+            or after_status not in ge.EDITABLE_EVENT_STATUSES):
+        terminal = after_status
+        if _store is not None and terminal in ("cancelled", "ended"):
+            compensated = ec.cancel_event(
+                _store, account_key, event_id, ended=terminal == "ended")
+        elif _store is not None:
+            compensated = ec.compensate_staged_rows(
+                _store, account_key, inserted_rows)
+        else:
+            compensated = {"denied": 0}
+        if compensated.get("ok") is False:
+            return 502, {"error": "event edit cleanup failed",
+                         "compensated": compensated.get("denied", 0)}
+        return 409, {"error": "this promotion changed while it was being edited",
+                     "compensated": compensated.get("denied", 0)}
+
+    # Only after the saved event revision is still confirmed current may this edit
+    # retire its old machine-owned rows. Exact ids plus the server-side wipeable CAS
+    # preserve any row concurrently approved, published, denied, or otherwise claimed.
+    removed = 0
+    if _store is not None and superseded_rows:
+        superseded = ec.compensate_staged_rows(
+            _store, account_key, superseded_rows,
+            reason=ec.REJECT_EDIT_SUPERSEDED)
+        removed = superseded.get("denied", 0)
+        if superseded.get("ok") is False:
+            return 502, {"error": "superseded event row cleanup failed",
+                         "removed": removed}
+    response_event = _event_row(new_event)
+    response_event["status"] = after_status
+    return 200, {"event": response_event, "restaged": staged,
                  "held_media": held_media, "reason": stage_reason,
-                 "kept": len(keep), "removed": len(remove_keys)}
+                 "kept": len(keep), "removed": removed}
 
 
 # ---- cancel -------------------------------------------------------------------
@@ -230,6 +388,9 @@ def handle_cancel_event(account_key, event_id, body=None, *, store=None,
     if _store is not None:
         res = ec.cancel_event(_store, account_key, event_id, ended=False)
         denied = res.get("denied", 0)
+        if res.get("ok") is False:
+            return 502, {"error": "event cancelled but calendar sweep failed",
+                         "cancelled": True, "denied": denied}
     return 200, {"cancelled": True, "denied": denied}
 
 
@@ -271,6 +432,45 @@ def _event_row(event: ge.GymEvent):
         "brief": event.brief, "media_ids": list(event.media_ids),
         "status": event.status, "created_by": event.created_by,
     }
+
+
+_EDIT_REVISION_FIELDS = (
+    "id", "gym_id", "name", "type", "starts_on", "ends_on", "tz",
+    "offer_text", "link", "brief", "media_ids", "created_by",
+)
+
+
+def _same_event_edit_revision(expected, current):
+    """Compare only fields whose drift invalidates this edit's staged arc.
+
+    Status is deliberately checked separately: scheduled -> live is a benign,
+    editable lifecycle transition, while terminal/non-editable states still own
+    the race. Audit/timestamps are metadata and do not change arc content.
+    """
+    if not isinstance(expected, dict) or not isinstance(current, dict):
+        return False
+    for field in _EDIT_REVISION_FIELDS:
+        left = expected.get(field)
+        right = current.get(field)
+        if field == "media_ids":
+            left = tuple(str(value) for value in (left or []))
+            right = tuple(str(value) for value in (right or []))
+        if left != right:
+            return False
+    return (_latest_edit_revision(expected) is not None
+            and _latest_edit_revision(expected) == _latest_edit_revision(current))
+
+
+def _latest_edit_revision(row):
+    """The newest durable edit token, ignoring lifecycle-only status changes."""
+    audit = row.get("audit") if isinstance(row, dict) else None
+    if not isinstance(audit, list):
+        return None
+    for entry in reversed(audit):
+        if isinstance(entry, dict) and entry.get("action") == "edit":
+            revision = entry.get("revision")
+            return str(revision) if revision else None
+    return None
 
 
 def _preview(row):
