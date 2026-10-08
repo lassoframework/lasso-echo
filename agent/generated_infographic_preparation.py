@@ -66,6 +66,40 @@ def validated_binding(request):
     return result
 
 
+
+def authority_binding(value, base):
+    """Strict delegated witness binding; this grants no DB authority."""
+    if 'authority_pins' not in value and 'copy_derivation_receipt' not in value:
+        return {}
+    try:
+        from .generated_infographic_runtime import validate_authority_pins
+        pins = validate_authority_pins(value['authority_pins'], base)
+        receipt = value['copy_derivation_receipt']
+        if (not isinstance(receipt, dict) or set(receipt) != {'policy', 'caption', 'copy_digest', 'fact_witness'}
+                or receipt['policy'] != 'verbatim_selected_fact_v1'
+                or not isinstance(receipt['caption'], str) or not receipt['caption'].strip()
+                or not isinstance(receipt['fact_witness'], dict)
+                or set(receipt['fact_witness']) != {'key','capture_id','bytes_sha256','source_locator','byte_offset','byte_length','text'}
+                or receipt['fact_witness']['text'] != receipt['caption']
+                or receipt['copy_digest'] != value['copy_digest']
+                or digest(receipt) != pins['derivation_sha256']):
+            raise ValueError()
+        fact = receipt['fact_witness']
+        if (type(fact['byte_offset']) is not int or fact['byte_offset'] < 0
+                or type(fact['byte_length']) is not int or not 1 <= fact['byte_length'] <= 2000
+                or len(fact['text'].encode()) != fact['byte_length']
+                or not re.fullmatch(r'[0-9a-f]{64}', fact['bytes_sha256'])
+                or str(uuid.UUID(fact['capture_id'])) != fact['capture_id']
+                or not isinstance(fact['key'], str) or not 1 <= len(fact['key']) <= 100
+                or not isinstance(fact['source_locator'], str) or not fact['source_locator'].startswith('https://')):
+            raise ValueError()
+        copy = dict(headline=receipt['caption'], facts=[receipt['caption']], cta='', footer='')
+        if digest(copy) != receipt['copy_digest'] or ('copy' in value and value['copy'] != copy):
+            raise ValueError()
+    except Exception:
+        raise PreparationHold('generated_bundle_derivation_invalid') from None
+    return dict(authority_pins=pins, copy_derivation_receipt=receipt)
+
 def checked_snapshot(request, snapshot):
     if (not isinstance(snapshot, dict)
             or any(snapshot.get(k) != request[k] for k in BINDING_FIELDS)):
@@ -78,7 +112,11 @@ def checked_snapshot(request, snapshot):
         raise PreparationHold("generated_photo_available")
     if snapshot.get("history_complete") is not True:
         raise PreparationHold("generated_history_uncertain")
-    if snapshot.get("copy_approved") is not True:
+    if 'authority_pins' in snapshot:
+        authority_binding(snapshot, request['gym_id'])
+        if snapshot.get('copy_approved') is not False or snapshot.get('copy_verified') is not True:
+            raise PreparationHold('generated_bundle_policy_invalid')
+    elif snapshot.get("copy_approved") is not True:
         raise PreparationHold("generated_copy_unapproved")
     copy = snapshot.get("copy")
     if (not isinstance(copy, dict) or set(copy) != {"headline", "facts", "cta", "footer"}
@@ -263,7 +301,7 @@ def prepare_candidate(request, snapshot, *, jobs, provider, reviewer, storage=No
         snapshot = json.loads(canonical(snapshot))
         copy, palette, brief = checked_snapshot(request, snapshot)
         binding = {**request, "copy_digest": digest(copy), "palette_digest": digest(palette),
-                   "review_policy_id": POLICY}
+                   "review_policy_id": POLICY, **authority_binding(snapshot, request["gym_id"])}
         job_id = str(uuid.uuid5(uuid.NAMESPACE_URL, "echo-astra:" + canonical(binding)))
         job = jobs.start(job_id, binding)
         if job["state"] == "generating":
@@ -311,7 +349,7 @@ def prepare_candidate(request, snapshot, *, jobs, provider, reviewer, storage=No
         receipt = host_generated_original(data, request["gym_id"], client=storage)
         if not receipt:
             raise PreparationHold("generated_storage_readback_failed")
-        candidate = {"schema_version": 1, "source_type": "generated_astra_infographic",
+        candidate = {"schema_version": 2 if "authority_pins" in binding else 1, "source_type": "generated_astra_infographic",
                      **binding, "job_id": job_id, "provider": "astra", "model": "gpt-6-astra",
                      "provider_response_id": response["id"], "provider_output_id": output_id,
                      "original_sha256": hashlib.sha256(data).hexdigest(),
@@ -337,10 +375,13 @@ def validate_candidate(candidate, data=None):
               "original_phash", "width", "height", "review_response_id", "storage_key",
               "original_url", "storage_readback_sha256"}
     try:
+        delegated = isinstance(candidate, dict) and candidate.get('schema_version') == 2
+        if delegated:
+            fields |= {'authority_pins', 'copy_derivation_receipt'}
         if not isinstance(candidate, dict) or set(candidate) != fields:
             raise ValueError()
         request = validated_binding({k: candidate[k] for k in BINDING_FIELDS})
-        if (type(candidate["schema_version"]) is not int or candidate["schema_version"] != 1
+        if (type(candidate["schema_version"]) is not int or candidate["schema_version"] != (2 if delegated else 1)
                 or candidate["source_type"] != "generated_astra_infographic"
                 or candidate["provider"] != "astra" or candidate["model"] != "gpt-6-astra"
                 or candidate["review_policy_id"] != POLICY):
@@ -359,7 +400,8 @@ def validate_candidate(candidate, data=None):
                for k in ("provider_response_id", "provider_output_id", "review_response_id")):
             raise ValueError()
         binding = {**request, "copy_digest": candidate["copy_digest"],
-                   "palette_digest": candidate["palette_digest"], "review_policy_id": POLICY}
+                   "palette_digest": candidate["palette_digest"], "review_policy_id": POLICY,
+                   **authority_binding(candidate, request["gym_id"])}
         if candidate["job_id"] != str(uuid.uuid5(uuid.NAMESPACE_URL, "echo-astra:" + canonical(binding))):
             raise ValueError()
         if (type(candidate["original_length"]) is not int

@@ -10,6 +10,7 @@ from agent import generated_infographic_gap_owner as gap
 from agent import client_infographic_fill as fill
 from test_generated_infographic_runtime import system, run, Conn
 from test_generated_infographic_preparation import case
+from test_generated_canonical_owner import active, derive
 
 NOW = '2026-10-07T12:00:00+00:00'
 
@@ -84,7 +85,7 @@ class Transport:
         self.events.append('discover');return [self.request]
     def bind(self,request,**refs):
         self.events.append('bind')
-        assert refs['source_revision'].startswith('client-source:sha256:')
+        assert refs['source_revision'].startswith('source-brand:sha256:')
         assert refs['caption']==self.s.source.text and refs['palette']==self.s.palette
         return dict(bound=True,calendar_row_id=self.s.row_id)
     def record(self,request,rid,result):
@@ -93,8 +94,7 @@ class Transport:
 
 def execute(s,transport,**kwargs):
     return gap.run_pending(persistence=s.persistence,jobs=s.case.jobs,transport=transport,
-        sources=lambda key:[s.source],accounts=lambda key:s.account,
-        palette_loader=lambda base,key:(s.palette,'palette-v1'),now=NOW,
+        bundle_reader=lambda base:s.active,accounts=lambda key:s.account,now=NOW,
         row_runner=lambda *a,**kw:run(s),**kwargs)
 
 
@@ -125,12 +125,12 @@ def test_discovery_binding_mismatch_before_provider(system,change,reason):
 
 
 def test_no_approved_copy_does_not_bind(system):
-    system.source.status='pending'
+    system.active['fact_validation']='pending_collector_validation'
     request=dict(request_id=str(uuid.uuid4()),gym_id='same-gym',local_date=system.case.request['local_date'],
                  account='instagram',format='feed')
     transport=Transport(request,system)
     result=execute(system,transport)
-    assert result['rows'][0]['reason']=='generated_approved_copy_receipt_missing'
+    assert result['rows'][0]['reason']=='generated_bundle_fact_validation_required'
     assert transport.events==['discover']
 
 
@@ -139,10 +139,10 @@ def test_copy_revoked_after_bind_prevents_provider(system):
                  account='instagram',format='feed')
     transport=Transport(request,system);bind=transport.bind
     def revoke(*a,**kw):
-        value=bind(*a,**kw);system.source.status='pending';return value
+        value=bind(*a,**kw);system.active['fact_validation']='pending_collector_validation';return value
     transport.bind=revoke
     result=execute(system,transport)
-    assert result['rows'][0]['reason']=='generated_approved_copy_receipt_missing'
+    assert result['rows'][0]['reason']=='generated_bundle_fact_validation_required'
     assert system.case.provider.calls==0
 
 
@@ -160,8 +160,8 @@ def test_bind_commit_uncertainty_quarantines_request(system,monkeypatch):
     for _ in range(2):
         with pytest.raises(runtime.RuntimeHold,match='generated_gap_commit_uncertain'):
             transport.bind(request,caption=system.source.text,source_revision='ref',
-                           palette=system.palette,palette_revision='palette-v1')
-    assert calls==['bind'] and system.case.provider.calls==0
+                           palette=system.palette,palette_revision='palette-v1',authority=derive(system.active))
+    assert calls==['bind_bundle'] and system.case.provider.calls==0
 
 
 def test_acknowledged_bind_rollback_allows_same_exact_refs_retry(system,monkeypatch):
@@ -171,11 +171,11 @@ def test_acknowledged_bind_rollback_allows_same_exact_refs_retry(system,monkeypa
     monkeypatch.setattr(transport,'rpc',lambda *a: (_ for _ in ()).throw(ValueError()))
     with pytest.raises(runtime.RuntimeHold,match='generated_gap_binding_unavailable'):
         transport.bind(request,caption=system.source.text,source_revision='ref',
-                       palette=system.palette,palette_revision='palette-v1')
+                       palette=system.palette,palette_revision='palette-v1',authority=derive(system.active))
     assert transport.phase(request['request_id'])=='ready'
     with pytest.raises(runtime.RuntimeHold,match='generated_gap_binding_changed'):
         transport.bind(request,caption='Different caption',source_revision='ref',
-                       palette=system.palette,palette_revision='palette-v1')
+                       palette=system.palette,palette_revision='palette-v1',authority=derive(system.active))
 
 
 def test_discovery_supplies_each_gym_timezone_window_before_limit(system,monkeypatch):

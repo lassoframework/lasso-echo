@@ -249,7 +249,7 @@ def reserve_generated(persistence, calendar_row_id, candidate, trusted_snapshot,
         raise ForwardMediaVerificationHold('generated remote preparation requires idle owner connection')
     persistence._assert_owner_identity()
     if (not isinstance(candidate, dict) or not isinstance(trusted_snapshot, dict)
-            or candidate.get('schema_version') != 1
+            or candidate.get('schema_version') not in (1, 2)
             or candidate.get('source_type') != 'generated_astra_infographic'
             or candidate.get('provider') != 'astra'
             or candidate.get('model') != 'gpt-6-astra'
@@ -260,8 +260,25 @@ def reserve_generated(persistence, calendar_row_id, candidate, trusted_snapshot,
             or trusted_snapshot.get('copy_verified') is not True):
         raise ForwardMediaVerificationHold('fresh verified generated owner facts required')
     import re
+    delegated = candidate['schema_version'] == 2
     approved_source_revision = trusted_snapshot.get('approved_source_revision')
-    if (not isinstance(approved_source_revision, str) or not re.fullmatch(
+    if delegated:
+        from . import generated_infographic_preparation as prep, generated_infographic_runtime as runtime
+        prep.validate_candidate(candidate)
+        if (candidate['authority_pins'] != trusted_snapshot.get('authority_pins')
+                or candidate['copy_derivation_receipt'] != trusted_snapshot.get('copy_derivation_receipt')
+                or trusted_snapshot.get('copy_approved') is not False):
+            raise ForwardMediaVerificationHold('generated canonical bundle pins changed')
+        active = runtime._owner_bundle_readback(persistence, candidate['gym_id'])
+        authority = runtime.delegated_copy(active, candidate['gym_id'],
+            caption=candidate['copy_derivation_receipt']['caption'])
+        if (authority['authority_pins'] != candidate['authority_pins']
+                or authority['source_revision'] != approved_source_revision
+                or candidate['copy_digest'] != prep.digest(authority['copy'])
+                or candidate['palette_digest'] != prep.digest(authority['palette'])
+                or candidate['palette_revision'] != authority['palette_revision']):
+            raise ForwardMediaVerificationHold('generated canonical bundle changed')
+    elif (not isinstance(approved_source_revision, str) or not re.fullmatch(
             r'client-source:sha256:[0-9a-f]{64}', approved_source_revision)):
         raise ForwardMediaVerificationHold('verified approved source revision required')
     for key in ('gym_id', 'local_date', 'logical_post_id', 'copy_revision',
@@ -360,7 +377,8 @@ def reserve_generated(persistence, calendar_row_id, candidate, trusted_snapshot,
         'same_object', 'generated-astra:' + candidate['job_id'])
     persistence._assert_owner_identity()
     with persistence._conn.cursor() as cur:
-        cur.execute('select public.fixer_reserve_generated_20261007(%s,%s::jsonb,%s::jsonb,%s::jsonb,%s::text)',
+        operation = 'fixer_reserve_generated_bundle_20261007' if delegated else 'fixer_reserve_generated_20261007'
+        cur.execute('select public.' + operation + '(%s,%s::jsonb,%s::jsonb,%s::jsonb,%s::text)',
                     (_uuid(calendar_row_id), json.dumps(candidate),
                      json.dumps(checked_visuals), json.dumps(manifest.row()), approved_source_revision))
         result = cur.fetchone()[0]

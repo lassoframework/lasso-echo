@@ -39,43 +39,6 @@ def journal_path():
     return path
 
 
-def verified_palette(base, account_key):
-    """Read the existing controlled gym palette file with its evidence revision.
-
-    Source notes plus a first-party source URL (or recorded owner approval) are
-    required. A bare URL/list cannot supply owner verified-palette authority.
-    Revision covers the full evidence file, so edits invalidate prepared art.
-    """
-    from . import astra_prompt as ap
-    if account_key not in (base + '_ig', base + '_fb') or ap._account_base(account_key) != base:
-        raise RuntimeHold('generated_account_gym_mismatch')
-    loaded = ap.load_gym_brand_palette(account_key)
-    if not loaded:
-        raise RuntimeHold('generated_palette_unverified')
-    try:
-        with open(loaded['path'], 'rb') as stream:
-            data = stream.read(65537)
-        if len(data) > 65536:
-            raise ValueError()
-        raw = json.loads(data)
-        if (not isinstance(raw, dict) or not
-                (raw.get('owner_approved') is True or
-                 (isinstance(raw.get('source_url'), str) and raw['source_url'].startswith('https://')
-                  and isinstance(raw.get('source_note'), str) and raw['source_note'].strip()))):
-            raise ValueError()
-        # Load again from the identical source to detect a concurrent file edit.
-        if ap.load_gym_brand_palette(account_key) != loaded:
-            raise ValueError()
-        with open(loaded['path'], 'rb') as stream:
-            if stream.read(65537) != data:
-                raise ValueError()
-    except (OSError, ValueError, TypeError, KeyError):
-        raise RuntimeHold('generated_palette_unverified') from None
-    evidence = 'brand-colors:sha256:' + hashlib.sha256(data).hexdigest()
-    palette = dict(gym_id=base, verified=True, colors=loaded['colors'], evidence_ref=evidence)
-    return palette, 'sha256:' + prep.digest(palette)
-
-
 def _account_binding(base, account):
     key = getattr(account, 'key', None)
     if (key not in (base + '_ig', base + '_fb') or
@@ -85,33 +48,260 @@ def _account_binding(base, account):
     return key
 
 
-def approved_copy(base, caption, sources):
-    """Exact currently approved source and immutable metadata revision."""
-    source = next((item for item in sources(base + '_ig')
-                   if getattr(item, 'account_key', None) in (base, base + '_ig')
-                   and getattr(item, 'status', None) == 'approved'
-                   and getattr(item, 'text', None) == caption), None)
-    if source is None or not isinstance(getattr(source, 'id', None), int) or source.id <= 0:
-        raise RuntimeHold('generated_approved_copy_receipt_missing')
-    fields = ('id', 'account_key', 'category', 'text', 'citation', 'status', 'created_at')
-    revision = 'client-source:sha256:' + prep.digest({k: getattr(source, k, None) for k in fields})
-    copy = dict(headline=' '.join(caption.split()[:8]), facts=[caption], cta='', footer='')
-    return copy, revision
+# This is a distinct delegated policy contract. Configuration approval never
+# sets copy_approved. The SQL adapter must authenticate the current mapping,
+# actor authority and latest observation before returning this payload.
+BUNDLE_CONTRACT = 'echo-source-brand-delegated-v1'
+AUTHORITY_PIN_FIELDS = frozenset(('mode', 'gym_id', 'echo_account_key', 'bundle_id',
+    'bundle_version', 'configuration_sha256', 'configuration_receipt_sha256',
+    'observation_id', 'observation_sha256', 'validator_revision', 'derivation_sha256'))
 
+
+def _stamp(value):
+    from datetime import datetime, timezone
+    stamp = datetime.fromisoformat(value.replace('Z', '+00:00'))
+    if stamp.tzinfo is None:
+        raise ValueError()
+    return stamp.astimezone(timezone.utc)
+
+
+def _uuid_text(value):
+    if not isinstance(value, str) or str(uuid.UUID(value)) != value:
+        raise ValueError()
+    return value
+
+
+def _json_exact(raw, sha):
+    def unique(items):
+        result = {}
+        for key, value in items:
+            if key in result:
+                raise ValueError()
+            result[key] = value
+        return result
+    if (not isinstance(raw, str) or not 0 < len(raw.encode()) <= 40_000_000
+            or hashlib.sha256(raw.encode()).hexdigest() != sha):
+        raise ValueError()
+    return json.loads(raw, object_pairs_hook=unique)
+
+
+def _bundle_snapshot(raw, sha, gym, base, *, fresh, now):
+    import base64
+    from datetime import timedelta
+    snapshot = _json_exact(raw, sha)
+    if (not isinstance(snapshot, dict) or set(snapshot) != {'schema_version', 'gym_id',
+            'echo_account_key', 'captures', 'palette', 'fact_policy', 'selected_facts'}
+            or type(snapshot['schema_version']) is not int or snapshot['schema_version'] != 1
+            or snapshot['gym_id'] != gym or snapshot['echo_account_key'] != base
+            or snapshot['fact_policy'] != 'delegated_supported_facts'
+            or not isinstance(snapshot['captures'], list)
+            or not 2 <= len(snapshot['captures']) <= 12):
+        raise ValueError()
+    captures, seen, kinds = {}, set(), set()
+    for capture in snapshot['captures']:
+        identity = _uuid_text(capture['id'])
+        if identity in seen or capture['gym_id'] != gym or capture['echo_account_key'] != base:
+            raise ValueError()
+        seen.add(identity)
+        kinds.add(capture['source_kind'])
+        data = base64.b64decode(capture['bytes_base64'], validate=True)
+        if not 0 < len(data) <= 2_000_000 or hashlib.sha256(data).hexdigest() != capture['bytes_sha256']:
+            raise ValueError()
+        fetched = _stamp(capture['fetched_at'])
+        if fetched > now or (fresh and fetched < now - timedelta(days=7)):
+            raise ValueError()
+        for field in ('source_url', 'source_revision', 'mapping_revision'):
+            if not isinstance(capture[field], str) or not capture[field].strip():
+                raise ValueError()
+        if not isinstance(capture['mapping_evidence'], dict) or not capture['mapping_evidence']:
+            raise ValueError()
+        from urllib.parse import urlsplit
+        url = urlsplit(capture['source_url'])
+        if url.scheme != 'https' or not url.hostname or url.username or url.password or url.query or url.fragment:
+            raise ValueError()
+        if capture['source_kind'] in ('website', 'website_asset'):
+            if capture['capture_provider'] != 'direct' or any(capture[k] is not None for k in
+                    ('source_locator', 'provider_response_id', 'provider_account_id')):
+                raise ValueError()
+        elif capture['source_kind'] == 'social':
+            locator = urlsplit(capture['source_locator'])
+            if (capture['capture_provider'] != 'apify' or url.hostname != 'api.apify.com'
+                    or not url.path.startswith('/v2/') or locator.scheme != 'https'
+                    or locator.hostname not in ('instagram.com', 'www.instagram.com')
+                    or any(not isinstance(capture[k], str) or not capture[k].strip()
+                           for k in ('provider_response_id', 'provider_account_id'))):
+                raise ValueError()
+        else:
+            raise ValueError()
+        captures[identity] = (capture, data)
+    if 'website' not in kinds or 'social' not in kinds:
+        raise ValueError()
+    palette = snapshot['palette']
+    capture, data = captures[palette['capture_id']]
+    if capture['source_kind'] not in ('website', 'website_asset') or palette['bytes_sha256'] != capture['bytes_sha256']:
+        raise ValueError()
+    import re
+    for name in ('primary', 'secondary'):
+        offset = palette[name + '_byte_offset']
+        if (type(offset) is not int or offset < 0 or not isinstance(palette[name], str)
+                or not re.fullmatch(r'#[0-9A-Fa-f]{6}', palette[name])
+                or data[offset:offset+7].decode('utf-8') != palette[name]):
+            raise ValueError()
+    facts, keys = snapshot['selected_facts'], set()
+    if not isinstance(facts, list) or not 1 <= len(facts) <= 30:
+        raise ValueError()
+    for fact in facts:
+        if (set(fact) != {'key', 'capture_id', 'bytes_sha256', 'source_locator',
+                'byte_offset', 'byte_length', 'text'} or not isinstance(fact['key'], str)
+                or not 1 <= len(fact['key']) <= 100 or fact['key'] in keys):
+            raise ValueError()
+        keys.add(fact['key'])
+        capture, data = captures[fact['capture_id']]
+        start, length = fact['byte_offset'], fact['byte_length']
+        if (type(start) is not int or start < 0 or type(length) is not int
+                or not 1 <= length <= 2000 or start + length > len(data)
+                or fact['bytes_sha256'] != capture['bytes_sha256']
+                or fact['source_locator'] != (capture['source_locator'] or capture['source_url'])
+                or data[start:start+length].decode('utf-8') != fact['text']
+                or not fact['text'].strip()):
+            raise ValueError()
+    return snapshot
+
+
+def validate_authority_pins(pins, base):
+    try:
+        import re
+        if (not isinstance(pins, dict) or set(pins) != AUTHORITY_PIN_FIELDS
+                or pins['mode'] != 'delegated_policy' or pins['echo_account_key'] != base
+                or type(pins['bundle_version']) is not int or pins['bundle_version'] < 1
+                or type(pins['observation_id']) is not int or pins['observation_id'] < 1
+                or not isinstance(pins['validator_revision'], str) or not pins['validator_revision'].strip()):
+            raise ValueError()
+        _uuid_text(pins['gym_id'])
+        _uuid_text(pins['bundle_id'])
+        for field in ('configuration_sha256', 'configuration_receipt_sha256',
+                      'observation_sha256', 'derivation_sha256'):
+            if not isinstance(pins[field], str) or not re.fullmatch(r'[0-9a-f]{64}', pins[field]):
+                raise ValueError()
+    except (ValueError, KeyError, TypeError, AttributeError):
+        raise RuntimeHold('generated_bundle_pins_invalid') from None
+    return dict(pins)
+
+
+def delegated_copy(active, base, *, caption=None, local_date=None, now=None):
+    """Exact byte witnesses plus deterministic verbatim derivation, no approval.
+
+    Only consume an authenticated CURRENT active readback. Hashes alone cannot
+    establish actor authority, semantic validation or current locator identity.
+    The trusted SQL bridge must recheck those under its existing tenant locks.
+    """
+    from datetime import datetime, timezone, date
+    now = _stamp(now) if isinstance(now, str) else now or datetime.now(timezone.utc)
+    try:
+        if (not isinstance(active, dict) or active.get('fact_approval_mode') != 'delegated_policy'
+                or active.get('fact_validation') != 'supported_uncontradicted'):
+            raise RuntimeHold('generated_bundle_fact_validation_required')
+        bundle, receipt, observation = (active[k] for k in ('bundle', 'approval_receipt', 'observation'))
+        if not isinstance(observation, dict):
+            raise RuntimeHold('generated_bundle_fact_validation_required')
+        gym = _uuid_text(bundle['gym_id'])
+        bundle_id = _uuid_text(bundle['id'])
+        if (bundle['echo_account_key'] != base or type(bundle['schema_version']) is not int
+                or bundle['schema_version'] != 1 or type(bundle['version']) is not int or bundle['version'] < 1
+                or any(receipt.get(k) != v for k, v in dict(gym_id=gym, bundle_id=bundle_id,
+                    bundle_version=bundle['version'], content_sha256=bundle['content_sha256'],
+                    purpose='echo_source_brand_configuration', action='approve').items())
+                or receipt['actor_authority'] not in ('blake', 'source_brand_approver')
+                or not isinstance(receipt['actor_clerk_user_id'], str) or not receipt['actor_clerk_user_id'].strip()
+                or type(receipt['id']) is not int or receipt['id'] < 1):
+            raise ValueError()
+        _uuid_text(receipt['request_id'])
+        if not _stamp(bundle['created_at']) <= _stamp(receipt['created_at']) <= now:
+            raise ValueError()
+        if (observation['gym_id'] != gym or observation['bundle_id'] != bundle_id
+                or observation['configuration_sha256'] != bundle['content_sha256']
+                or observation['validation_report'].get('selected_facts_status') != 'supported_uncontradicted'
+                or observation['validation_report'].get('identity_status') != 'verified'
+                or not _stamp(receipt['created_at']) <= _stamp(observation['created_at']) <= now):
+            raise ValueError()
+        configuration = _bundle_snapshot(bundle['snapshot_bytes'], bundle['content_sha256'], gym, base, fresh=False, now=now)
+        ids = bundle['capture_ids']
+        if (not isinstance(ids, list) or len(set(ids)) != len(ids)
+                or set(ids) != {capture['id'] for capture in configuration['captures']}):
+            raise ValueError()
+        current = _bundle_snapshot(observation['snapshot_bytes'], observation['content_sha256'], gym, base, fresh=True, now=now)
+        def fact_identity(snap):
+            return sorted((f['key'], f['text'], f['source_locator']) for f in snap['selected_facts'])
+        if (fact_identity(configuration) != fact_identity(current)
+                or any(configuration['palette'][k] != current['palette'][k] for k in ('primary', 'secondary'))):
+            raise ValueError()
+        def identities(snap):
+            return sorted((c['source_kind'], c['source_locator'] or c['source_url'], c['capture_provider'],
+                c['provider_account_id'], c['mapping_revision'], prep.canonical(c['mapping_evidence'])) for c in snap['captures'])
+        if identities(configuration) != identities(current):
+            raise ValueError()
+        facts = sorted(current['selected_facts'], key=lambda f: f['key'])
+        if caption is None:
+            selected = facts[date.fromisoformat(local_date).toordinal() % len(facts)]
+            caption = selected['text']
+            # Repeated identical supported text uses one deterministic witness.
+            selected = next(f for f in facts if f['text'] == caption)
+        else:
+            selected = next((f for f in facts if f['text'] == caption), None)
+            if selected is None:
+                raise RuntimeHold('generated_bundle_caption_unsupported')
+        copy = dict(headline=caption, facts=[caption], cta='', footer='')
+        if any(mark in caption for mark in ('-', '–', '—', ':', ';')):
+            raise RuntimeHold('generated_copy_style_invalid')
+        derivation = dict(policy='verbatim_selected_fact_v1', caption=caption,
+                         copy_digest=prep.digest(copy), fact_witness=selected)
+        pins = dict(mode='delegated_policy', gym_id=gym, echo_account_key=base,
+            bundle_id=bundle_id, bundle_version=bundle['version'],
+            configuration_sha256=bundle['content_sha256'], configuration_receipt_sha256=prep.digest(receipt),
+            observation_id=observation['id'], observation_sha256=observation['content_sha256'],
+            validator_revision=observation['validator_revision'], derivation_sha256=prep.digest(derivation))
+        validate_authority_pins(pins, base)
+        palette = dict(gym_id=base, verified=True, colors=[current['palette'][k] for k in ('primary','secondary')],
+                       evidence_ref='source-brand-observation:sha256:' + observation['content_sha256'])
+        return dict(copy=copy, caption=caption, palette=palette, authority_pins=pins,
+                    copy_derivation_receipt=derivation, copy_approved=False, copy_verified=True,
+                    source_revision='source-brand:sha256:' + prep.digest(pins),
+                    palette_revision='source-brand-palette:sha256:' + prep.digest(current['palette']))
+    except RuntimeHold:
+        raise
+    except (ValueError, KeyError, TypeError, AttributeError, UnicodeError):
+        raise RuntimeHold('generated_bundle_evidence_invalid') from None
+
+
+def _owner_bundle_readback(persistence, base):
+    """Dedicated role wrapper only; never import collector/service credentials."""
+    try:
+        persistence._assert_owner_identity()
+        with persistence._conn.cursor() as cur:
+            cur.execute('select public.fixer_generated_source_brand_active_20261007(%s)', (base,))
+            result = cur.fetchone()[0]
+        if (not isinstance(result, dict) or result.get('consumer_contract') != BUNDLE_CONTRACT
+                or result.get('echo_account_key') != base or not isinstance(result.get('active'), dict)
+                or result.get('gym_id') != result['active'].get('bundle', {}).get('gym_id')):
+            raise RuntimeHold('generated_bundle_owner_bridge_unavailable')
+        return result['active']
+    except RuntimeHold:
+        raise
+    except Exception:
+        raise RuntimeHold('generated_bundle_owner_bridge_unavailable') from None
+    finally:
+        persistence._conn.rollback()
 
 class OwnerSnapshotLoader:
-    """Compose DB owner facts with exact approved copy and controlled palette.
+    """Compose DB facts with current authenticated delegated bundle evidence.
 
-    This minimal route accepts a caption that exactly equals a currently approved
-    same-gym source. Rephrased captions require a persisted approved copy receipt;
-    no producer flag or successful figure-only check manufactures that receipt.
-    Reads finish before provider/storage work; the final owner rechecks DB facts.
+    Verbatim facts and palette tokens are checked against retained exact bytes.
+    Configuration receipt is never per-caption approval. Reads finish before
+    provider/storage work; final SQL must recheck authority under tenant locks.
     """
-    def __init__(self, persistence, *, sources=None, palette_loader=None, reader=None):
-        from . import client_sources
+    def __init__(self, persistence, *, bundle_reader=None, reader=None):
         self.persistence = persistence
-        self.sources = sources or client_sources.approved_sources
-        self.palette_loader = palette_loader or verified_palette
+        self.bundle_reader = bundle_reader or (lambda base: _owner_bundle_readback(persistence, base))
         self.reader = reader or persistence._reader.read
 
     def load(self, row_id, base, account, *, observe_history=True):
@@ -131,12 +321,15 @@ class OwnerSnapshotLoader:
                 or not isinstance(copy.get('caption'), str) or not copy['caption'].strip()):
             raise RuntimeHold('generated_copy_binding_changed')
         caption = copy['caption']
-        graphic_copy, source_revision = approved_copy(base, caption, self.sources)
-        palette, palette_revision = self.palette_loader(base, key)
-        snap = {**snap, 'copy': graphic_copy, 'copy_approved': True, 'copy_verified': True,
+        authority = delegated_copy(self.bundle_reader(base), base, caption=caption)
+        graphic_copy, palette = authority['copy'], authority['palette']
+        snap = {**snap, 'copy': graphic_copy, 'copy_approved': False, 'copy_verified': True,
                 'copy_digest': prep.digest(graphic_copy), 'palette': palette,
                 'palette_verified': True, 'palette_digest': prep.digest(palette),
-                'palette_revision': palette_revision, 'approved_source_revision': source_revision}
+                'palette_revision': authority['palette_revision'],
+                'approved_source_revision': authority['source_revision'],
+                'authority_pins': authority['authority_pins'],
+                'copy_derivation_receipt': authority['copy_derivation_receipt']}
         binding = {k: snap.get(k) for k in prep.BINDING_FIELDS}
         prep.validated_binding(binding)
         prep.checked_snapshot(binding, snap)
@@ -187,7 +380,8 @@ class OwnerSnapshotLoader:
 
 def _generation_binding(request, snapshot):
     binding = {**request, 'copy_digest': prep.digest(snapshot['copy']),
-               'palette_digest': prep.digest(snapshot['palette']), 'review_policy_id': prep.POLICY}
+               'palette_digest': prep.digest(snapshot['palette']), 'review_policy_id': prep.POLICY,
+               **prep.authority_binding(snapshot, request['gym_id'])}
     job_id = str(uuid.uuid5(uuid.NAMESPACE_URL, 'echo-astra:' + prep.canonical(binding)))
     return job_id, binding
 
@@ -332,7 +526,7 @@ def run_calendar_row(base, account, row_id, *, persistence, loader=None, jobs=No
         # never regenerate because this row's reservation changed the spine.
         bindings = tuple(k for k in prep.BINDING_FIELDS if existing['candidate'] is None or k != 'history_revision')
         if any(current.get(k) != candidate.get(k) for k in
-               (*bindings, 'copy_digest', 'palette_digest')):
+               (*bindings, 'copy_digest', 'palette_digest', 'authority_pins', 'copy_derivation_receipt')):
             raise RuntimeHold('generated_snapshot_binding_changed')
         if current['approved_source_revision'] != existing['source_revision']:
             raise RuntimeHold('generated_approved_source_changed')
@@ -429,15 +623,32 @@ def _sql_publish_readback(store, row_id):
         raise RuntimeHold('generated_publish_binding_unavailable') from None
 
 
-def validate_publish_palette(row, *, store=None, readback=None, palette_loader=None, sources=None):
+
+def _publisher_bundle_readback(store, base):
+    try:
+        if store is None:
+            raise ValueError()
+        response = store._client().post(store._rest('rpc/fixer_generated_source_brand_active_20261007'),
+            headers=store._headers({'Content-Type': 'application/json'}), json={'p_base': base}, timeout=30)
+        result = response.json()
+        if (not 200 <= response.status_code < 300 or not isinstance(result, dict)
+                or result.get('consumer_contract') != BUNDLE_CONTRACT
+                or result.get('echo_account_key') != base or not isinstance(result.get('active'), dict)
+                or result.get('gym_id') != result['active'].get('bundle', {}).get('gym_id')):
+            raise ValueError()
+        return result['active']
+    except Exception:
+        raise RuntimeHold('generated_bundle_publish_bridge_unavailable') from None
+
+def validate_publish_palette(row, *, store=None, readback=None, bundle_reader=None):
     """Check the persisted SQL publish binding and current palette at every
     generated provider boundary.
 
     The immutable generated reservation readback is the sole publisher
     authority for job/row/gym/account/date/logical/group/original/manifest and
-    the owner-approved source/copy/palette refs; the local owner journal grants
+    the configuration and observation pins plus delegated copy derivation; the local owner journal grants
     no publish authority and is not read at this boundary. Missing SQL
-    readback, identity drift, or a CURRENT approved source/palette mismatch
+    readback, identity drift, or a current bundle/observation/copy mismatch
     fails closed. DB lineage and owned-claim checks remain mandatory.
     """
     asset = str(row.get('source_media_asset_id') or '')
@@ -454,8 +665,10 @@ def validate_publish_palette(row, *, store=None, readback=None, palette_loader=N
             raise ValueError()
         row_id = str(uuid.UUID(str(row.get('id'))))
         binding = readback(row_id) if readback is not None else _sql_publish_readback(store, row_id)
-        suffix = {'instagram': '_ig', 'facebook': '_fb'}[row['account']]
+        if row['account'] not in ('instagram', 'facebook'):
+            raise ValueError()
         if (not isinstance(binding, dict)
+                or type(binding.get('schema_version')) is not int or binding['schema_version'] != 2
                 or binding.get('job_id') != job_id
                 or binding.get('calendar_row_id') != row_id
                 or binding.get('gym_id') != row.get('gym_id')
@@ -471,15 +684,18 @@ def validate_publish_palette(row, *, store=None, readback=None, palette_loader=N
                        for key in ('source_revision', 'copy_digest',
                                    'palette_revision', 'palette_digest', 'receipt_ref'))):
             raise ValueError()
-        from . import client_sources
-        copy, source_revision = approved_copy(row['gym_id'], row.get('caption'),
-                                              sources or client_sources.approved_sources)
-        if (binding['source_revision'] != source_revision
-                or binding['copy_digest'] != prep.digest(copy)):
-            raise RuntimeHold('generated_approved_source_changed')
-        palette, revision = (palette_loader or verified_palette)(row['gym_id'], row['gym_id'] + suffix)
-        if binding['palette_revision'] != revision or binding['palette_digest'] != prep.digest(palette):
-            raise RuntimeHold('generated_palette_changed')
+        if bundle_reader is None:
+            active = _publisher_bundle_readback(store, row['gym_id'])
+        else:
+            active = bundle_reader(row['gym_id'])
+        authority = delegated_copy(active, row['gym_id'], caption=row.get('caption'))
+        if (binding.get('authority_pins') != authority['authority_pins']
+                or binding.get('copy_derivation_receipt') != authority['copy_derivation_receipt']
+                or binding['source_revision'] != authority['source_revision']
+                or binding['copy_digest'] != prep.digest(authority['copy'])
+                or binding['palette_revision'] != authority['palette_revision']
+                or binding['palette_digest'] != prep.digest(authority['palette'])):
+            raise RuntimeHold('generated_bundle_publish_binding_changed')
     except RuntimeHold:
         raise
     except Exception:

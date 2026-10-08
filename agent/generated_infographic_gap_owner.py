@@ -1,7 +1,7 @@
 """DRAFT bounded discovery/binding in the existing isolated owner execution.
 
-Publisher dispatch only enqueues dates; this owner selects current approved copy,
-verified palette and exact local accounts before atomic row binding. No source
+Publisher dispatch only enqueues dates; this owner selects supported verbatim
+facts and witnessed palette tokens and exact local accounts before atomic row binding. No source
 observation bridge, calendar store insert, provider send or approval is used.
 """
 from __future__ import annotations
@@ -22,7 +22,7 @@ class GapOwnerTransport:
         self.persistence, self.jobs = persistence, jobs
 
     def rpc(self, operation, args):
-        if operation not in ('pending', 'bind', 'record'):
+        if operation not in ('pending', 'bind_bundle', 'record'):
             raise runtime.RuntimeHold('generated_gap_operation_invalid')
         conn = self.persistence._conn
         info = getattr(conn, 'info', None)
@@ -64,14 +64,16 @@ class GapOwnerTransport:
                 row = (value, row[1])
             return row[0] if row else None
 
-    def bind(self, request, *, caption, source_revision, palette, palette_revision):
+    def bind(self, request, *, caption, source_revision, palette, palette_revision, authority):
         request_id = request['request_id']
         row_id = str(uuid.uuid5(uuid.NAMESPACE_URL, 'echo-generated-gap-row:' + request_id))
         logical = str(uuid.uuid5(uuid.NAMESPACE_URL,
                                 'echo-generated-gap-post:' + request['gym_id'] + ':' + request['local_date']))
         group = 'vg_generated_' + uuid.UUID(logical).hex
+        runtime.validate_authority_pins(authority['authority_pins'], request['gym_id'])
         args = (request_id, row_id, logical, group, caption, source_revision,
-                palette_revision, prep.digest(palette), palette['evidence_ref'])
+                palette_revision, prep.digest(palette), palette['evidence_ref'],
+                json.dumps(authority['authority_pins']), json.dumps(authority['copy_derivation_receipt']))
         phase = self.phase(request_id, binding_digest=prep.digest(args))
         if phase in ('committing', 'binding'):
             raise runtime.RuntimeHold('generated_gap_commit_uncertain')
@@ -80,7 +82,7 @@ class GapOwnerTransport:
             # Durable local quarantine precedes DB binding/commit. A crash
             # cannot redispatch an uncertain owner transaction automatically.
             self.phase(request_id, value='binding')
-            result = self.rpc('bind', args)
+            result = self.rpc('bind_bundle', args)
             if (not isinstance(result, dict) or result.get('bound') is not True
                     or result.get('calendar_row_id') != row_id or result.get('logical_post_id') != logical
                     or any(result.get(k) != request[k] for k in ('gym_id','local_date','account','format'))):
@@ -115,18 +117,18 @@ class GapOwnerTransport:
             raise runtime.RuntimeHold('generated_gap_record_unavailable') from None
 
 
-def run_pending(*, persistence, jobs=None, transport=None, sources=None, accounts=None,
-                palette_loader=None, row_runner=None, now=None):
+def run_pending(*, persistence, jobs=None, transport=None, bundle_reader=None, accounts=None,
+                row_runner=None, now=None):
     """One finite pass in the existing dedicated owner, default OFF.
 
-    All source/account/palette reads are local and complete before bind locks.
+    All bundle/account reads complete before bind locks.
     The row runner reloads these facts and uses normal B reservation authority.
     Missing metadata/API/credentials is a hold, never a service-role fallback.
     """
     if not runtime.enabled():
         return dict(ok=False, held=True, reason='generated_runtime_disabled', rows=[])
     from .forward_media_owner_worker import settings_from_environment
-    from . import forward_media_guard, client_sources, accounts as registry, config
+    from . import forward_media_guard, accounts as registry, config
     report = []
     try:
         if not forward_media_guard.enabled():
@@ -134,9 +136,8 @@ def run_pending(*, persistence, jobs=None, transport=None, sources=None, account
         tenants, limit = settings_from_environment()
         jobs = jobs or prep.SQLiteGenerationJobs(runtime.journal_path())
         transport = transport or GapOwnerTransport(persistence, jobs)
-        sources = sources or client_sources.approved_sources
+        bundle_reader = bundle_reader or (lambda base: runtime._owner_bundle_readback(persistence, base))
         accounts = accounts or registry.get_account
-        palette_loader = palette_loader or runtime.verified_palette
         row_runner = row_runner or runtime.run_calendar_row
         from .calendar_autopublish import _local_now
         from datetime import timedelta
@@ -157,18 +158,11 @@ def run_pending(*, persistence, jobs=None, transport=None, sources=None, account
                     raise runtime.RuntimeHold('generated_gap_date_expired')
                 account = accounts(base + ('_ig' if platform == 'instagram' else '_fb'))
                 runtime._account_binding(base, account)
-                items = [item for item in sources(base+'_ig')
-                         if getattr(item,'account_key',None) in (base,base+'_ig')
-                         and getattr(item,'status',None)=='approved'
-                         and isinstance(getattr(item,'id',None),int) and item.id>0]
-                if not items:
-                    raise runtime.RuntimeHold('generated_approved_copy_receipt_missing')
-                items.sort(key=lambda item:item.id)
-                from datetime import date
-                selected = items[date.fromisoformat(request['local_date']).toordinal()%len(items)]
-                caption = selected.text
-                copy, source_ref = runtime.approved_copy(base, caption, sources)
-                palette, revision = palette_loader(base, account.key)
+                authority = runtime.delegated_copy(bundle_reader(base), base,
+                    local_date=request['local_date'])
+                caption, copy = authority['caption'], authority['copy']
+                source_ref = authority['source_revision']
+                palette, revision = authority['palette'], authority['palette_revision']
                 # Check A's complete copy/palette/style contract before creating
                 # a placeholder, without manufacturing photo/history proof.
                 from .astra_prompt import build_verified_gym_content_brief
@@ -176,11 +170,10 @@ def run_pending(*, persistence, jobs=None, transport=None, sources=None, account
                 if any(mark in text for text in [copy['headline'], *copy['facts']] for mark in ('-','–','—',':',';')):
                     raise runtime.RuntimeHold('generated_copy_style_invalid')
                 bound = transport.bind(request, caption=caption, source_revision=source_ref,
-                                       palette=palette, palette_revision=revision)
+                                       palette=palette, palette_revision=revision, authority=authority)
                 # Trusted refs may change between local load and committed bind.
-                current_copy, current_ref = runtime.approved_copy(base, caption, sources)
-                current_palette, current_revision = palette_loader(base, account.key)
-                if current_ref != source_ref or current_revision != revision or current_palette != palette:
+                current = runtime.delegated_copy(bundle_reader(base), base, caption=caption)
+                if current != authority:
                     raise runtime.RuntimeHold('generated_gap_binding_changed')
                 result = row_runner(base, account, bound['calendar_row_id'],
                                     persistence=persistence, jobs=jobs)

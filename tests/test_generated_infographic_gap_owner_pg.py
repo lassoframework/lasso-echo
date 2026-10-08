@@ -60,7 +60,8 @@ def main():
    sql("insert into fixer_forward_media_photo_baseline_20261007(baseline_id,policy_id,scope_complete,rows_json,historical_manifest_ref,declared_full_fleet_row_count) values(%s,'SYNTHETIC policy',true,'[]','SYNTHETIC empty full fleet',0)",(baseline,))
    sql("update fixer_forward_media_photo_state_20261007 set baseline_id=%s,generation=1,enabled=true,routes_reconciled_ref='SYNTHETIC routes'",(baseline,))
    sql("insert into fixer_forward_media_claim_gate_20261006 values('gym',true),('other',true)")
-   today=sql('select current_date')[0][0];day=today+timedelta(days=1)
+   # The discovery RPC explicitly uses UTC; match that date at UTC/local midnight.
+   today=sql("select (clock_timestamp() at time zone 'UTC')::date")[0][0];day=today+timedelta(days=1)
    service=lane('service_role');conn=lane('generated_owner')
    def windows(tenants,first=day):return {t:[first.isoformat(),(first+timedelta(days=1)).isoformat()] for t in tenants}
    def dispatch(gym='gym',date_=day,account='instagram',request=None):
@@ -70,7 +71,9 @@ def main():
     service.commit();return result
    source=SimpleNamespace(id=1,account_key='gym_ig',text='SYNTHETIC approved words',
      status='approved',category='educational',citation='fixture approved source',created_at='2026-10-07')
-   graphic_copy,source_revision=runtime.approved_copy('gym',source.text,lambda key:[source])
+   # Legacy SQL fixture source reference only; production owner no longer reads SQLite.
+   graphic_copy=dict(headline=source.text,facts=[source.text],cta='',footer='')
+   source_revision='client-source:sha256:'+prep.digest({k:getattr(source,k,None) for k in ('id','account_key','category','text','citation','status','created_at')})
    palette=dict(evidence_ref='brand-colors:sha256:'+'c'*64)
    refs=(source.text,source_revision,'sha256:'+'b'*64,prep.digest(palette),palette['evidence_ref'])
    logical=str(uuid.uuid4());group='vg_generated_'+uuid.UUID(logical).hex
@@ -187,7 +190,8 @@ def main():
     # attester and anon roles are denied, reservation rows stay immutable, and
     # no provider response/output/storage internals are exposed.
     binding=service.execute('select fixer_generated_publish_readback_20261007(%s)',(a[1],)).fetchone()[0];service.commit()
-    assert set(binding)=={'job_id','calendar_row_id','gym_id','account','local_date','logical_post_id','group_key','original_url','manifest_digest','source_revision','copy_digest','palette_revision','palette_digest','receipt_ref'}
+    assert set(binding)=={'job_id','calendar_row_id','gym_id','account','local_date','logical_post_id','group_key','original_url','manifest_digest','source_revision','copy_digest','palette_revision','palette_digest','receipt_ref','authority_pins'}
+    assert binding['authority_pins'] is None
     assert binding['job_id']==original['job_id'] and binding['calendar_row_id']==a[1]
     assert binding['gym_id']=='gym' and binding['account']=='instagram'
     assert binding['local_date']==original['local_date'] and binding['logical_post_id']==original['logical_post_id']
@@ -198,8 +202,9 @@ def main():
     # Actual SQL readback must satisfy the Python boundary without the owner's journal.
     leased=sql('select row_to_json(r) from content_calendar r where id=%s',(a[1],))[0][0]
     with patch.object(runtime,'enabled',lambda:True),patch.object(guard,'enabled',lambda:True):
-     assert runtime.validate_publish_palette(leased,readback=lambda rid:binding,
-       sources=lambda key:[source],palette_loader=lambda base,key:(palette,refs[2]))
+     try:runtime.validate_publish_palette(leased,readback=lambda rid:binding)
+     except runtime.RuntimeHold as exc:assert str(exc)=='generated_publish_binding_unavailable'
+     else:raise AssertionError('legacy SQL binding authorized canonical publisher')
     assert binding['palette_revision']==original['palette_revision'] and binding['palette_digest']==original['palette_digest']
     fbind=service.execute('select fixer_generated_publish_readback_20261007(%s)',(fba[1],)).fetchone()[0];service.commit()
     assert fbind['job_id']==original['job_id'] and fbind['account']=='facebook' and fbind['calendar_row_id']==fba[1]
@@ -224,9 +229,22 @@ def main():
    discovered=adapter.pending(('photo-gym',),10,windows(['photo-gym']))
    assert len(discovered)==1 and discovered[0]['request_id']==photoq['request_id']
    palette=dict(evidence_ref=refs[-1])
-   bound=adapter.bind(discovered[0],caption=refs[0],source_revision=refs[1],palette=palette,palette_revision=refs[2])
-   assert bound['bound'] and adapter.phase(photoq['request_id'])=='bound'
-   assert adapter.bind(discovered[0],caption=refs[0],source_revision=refs[1],palette=palette,palette_revision=refs[2])['replayed']
+   # Canonical owner adapter must hold on this legacy-only SQL installation.
+   # The legacy raw SQL contract remains exercised above, while the separate
+   # bundle bridge PG fixture establishes the new adapter's bound phase.
+   pins=dict(mode='delegated_policy',gym_id=str(uuid.uuid4()),echo_account_key='photo-gym',
+    bundle_id=str(uuid.uuid4()),bundle_version=1,configuration_sha256='a'*64,
+    configuration_receipt_sha256='b'*64,observation_id=1,observation_sha256='c'*64,
+    validator_revision='SYNTHETIC validator',derivation_sha256='d'*64)
+   authority=dict(authority_pins=pins,copy_derivation_receipt={})
+   for attempt in range(2):
+    try:adapter.bind(discovered[0],caption=refs[0],source_revision=refs[1],palette=palette,palette_revision=refs[2],authority=authority)
+    except runtime.RuntimeHold as exc:assert str(exc)=='generated_gap_binding_unavailable'
+    else:raise AssertionError('new adapter bound without canonical SQL bridge')
+    assert adapter.phase(photoq['request_id'])=='ready'
+   bound=bind(conn,args(discovered[0]))
+   assert bound['bound']
+   assert bind(conn,args(discovered[0],row=bound['calendar_row_id']))['replayed']
    adapter.record(discovered[0],bound['calendar_row_id'],dict(ok=False,reason='generated_astra_unavailable'))
    # More expired requests than the batch cannot hide a fresh eligible date.
    # Include a bound old job whose uncertain outcome must remain untouched.
@@ -250,7 +268,7 @@ def main():
    lock=lane('generated_owner');lock.execute('select pg_advisory_xact_lock(hashtextextended(%s,0))',('fixer_forward_graph_20261006',))
    denied(lambda:service.execute("insert into content_calendar(id,gym_id,post_date,account,format,status) values(%s,'free',%s,'instagram','feed','pending')",(str(uuid.uuid4()),day)),'authority busy');service.rollback();lock.rollback();lock.close()
    service.close();conn.close();admin.close()
-   print('PASS: PG17 queue-only dispatch, role isolation, bounded gym-local discovery before limit, 26-expired starvation denial with bound-job preservation, atomic/idempotent row bind, concurrency, exact refs, occupied/held slots, late-photo and sealed-history rollback, no coach marker, client approval, B reservation/completion and normal attester/publisher claim')
+   print('PASS: PG17 queue-only dispatch, role isolation, bounded gym-local discovery before limit, 26-expired starvation denial with bound-job preservation, atomic/idempotent row bind, concurrency, exact refs, occupied/held slots, late-photo and sealed-history rollback, no coach marker, client approval, B reservation/completion and normal attester/forward claim, canonical Python legacy-binding rejection')
   finally:
    subprocess.run([str(pg/'pg_ctl'),'-D',str(data),'-m','immediate','-w','stop'],check=True,capture_output=True,timeout=60)
 

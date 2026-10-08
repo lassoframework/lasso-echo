@@ -13,6 +13,7 @@ from agent import generated_infographic_runtime as runtime
 from agent import generated_infographic_preparation as prep
 from agent import forward_media_guard as guard, forward_media_owner as owner
 from test_generated_infographic_preparation import case
+from test_generated_canonical_owner import active, derive, observe
 
 REAL_RESERVE_GENERATED = guard.reserve_generated
 
@@ -27,7 +28,7 @@ class Conn:
 
 
 @pytest.fixture
-def system(case, monkeypatch):
+def system(case, active, monkeypatch):
     monkeypatch.setenv(runtime.FLAG, 'true')
     monkeypatch.setattr(guard, 'enabled', lambda: True)
     monkeypatch.setattr(owner, 'check_environment', lambda: None)
@@ -37,7 +38,8 @@ def system(case, monkeypatch):
     persistence = owner.ForwardMediaOwnerPersistence(conn, 'isolated_owner', None)
     row_id = str(uuid.uuid4())
     caption = case.snapshot['copy']['facts'][0]
-    palette = case.snapshot['palette']
+    authority=derive(active)
+    palette = authority['palette']
     # Loader builds exact approved words and supplies palette from controlled
     # source. Provider/reviewer/storage are the real A path with offline clients.
     case.snapshot['copy'] = dict(headline=caption, facts=[caption], cta='', footer='')
@@ -57,8 +59,7 @@ def system(case, monkeypatch):
         if '/echo-generated-originals/' in url:
             return case.storage.get_bytes(url.split('images.example.test/')[1])
         return case.data
-    loader = runtime.OwnerSnapshotLoader(persistence, sources=lambda key: [source],
-        palette_loader=lambda base, key: (palette, 'palette-v1'), reader=read)
+    loader = runtime.OwnerSnapshotLoader(persistence, bundle_reader=lambda base:copy.deepcopy(active), reader=read)
     reserved = []
     def reserve(p, rid, candidate, current, **kwargs):
         assert p is persistence and rid == row_id
@@ -70,7 +71,7 @@ def system(case, monkeypatch):
         return dict(reserved=True, receipt_ref='offline_owner_receipt')
     monkeypatch.setattr(guard, 'reserve_generated', reserve)
     return SimpleNamespace(case=case, conn=conn, persistence=persistence, row_id=row_id,
-        snap=snap, source=source, account=account, palette=palette, loader=loader, reserved=reserved)
+        snap=snap, source=source, account=account, palette=palette, loader=loader, reserved=reserved, active=active)
 
 
 def run(s):
@@ -91,21 +92,22 @@ def row_for(s):
 def binding_for(s, row, **overrides):
     """Immutable SQL reservation readback for this row; build while approved."""
     c = s.reserved[-1]
-    copy, source_revision = runtime.approved_copy(row['gym_id'], row['caption'],
-                                                  lambda key: [s.source])
-    binding = dict(job_id=c['job_id'], calendar_row_id=str(row['id']), gym_id=c['gym_id'],
+    authority=derive(s.active,caption=row['caption'])
+    copy, source_revision = authority['copy'], authority['source_revision']
+    binding = dict(schema_version=2,job_id=c['job_id'], calendar_row_id=str(row['id']), gym_id=c['gym_id'],
         account=row['account'], local_date=c['local_date'], logical_post_id=c['logical_post_id'],
         group_key=row['visual_group_key'], original_url=c['original_url'],
         manifest_digest=row['render_manifest_digest'], source_revision=source_revision,
-        copy_digest=prep.digest(copy), palette_revision='palette-v1',
-        palette_digest=prep.digest(s.palette), receipt_ref='offline_owner_receipt')
+        copy_digest=prep.digest(copy), palette_revision=authority['palette_revision'],
+        palette_digest=prep.digest(s.palette), receipt_ref='offline_owner_receipt',
+        authority_pins=authority['authority_pins'],copy_derivation_receipt=authority['copy_derivation_receipt'])
     binding.update(overrides)
     return lambda row_id: dict(binding)
 
 
 def publish_args(s, row, **overrides):
     return dict(readback=binding_for(s, row, **overrides),
-        palette_loader=lambda base, key: (s.palette, 'palette-v1'), sources=lambda key: [s.source])
+        bundle_reader=lambda base:copy.deepcopy(s.active))
 
 
 def test_row_to_fresh_candidate_owner_reservation_and_normal_publish_binding(system):
@@ -138,8 +140,8 @@ def test_owner_facts_block_before_paid_generation(system, field, value, reason):
 
 
 def test_copy_needs_exact_current_same_gym_approved_source(system):
-    system.source.account_key = 'other-gym_ig'
-    assert run(system)['reason'] == 'generated_approved_copy_receipt_missing'
+    system.active['bundle']['echo_account_key'] = 'other-gym'
+    assert run(system)['reason'] == 'generated_bundle_evidence_invalid'
     assert system.case.provider.calls == 0
 
 
@@ -150,7 +152,7 @@ def test_caption_changed_after_generation_blocks_reservation(system):
         system.snap['copy']['caption'] = 'Different caption'
         return result
     system.case.provider.create = change
-    assert run(system)['reason'] == 'generated_approved_copy_receipt_missing'
+    assert run(system)['reason'] == 'generated_bundle_caption_unsupported'
     assert len(system.reserved) == 0
 
 
@@ -227,10 +229,10 @@ def test_publish_date_gym_post_and_original_binding(system, field, value):
     ('group_key', 'generated_publish_binding_unavailable'),
     ('original_url', 'generated_publish_binding_unavailable'),
     ('manifest_digest', 'generated_publish_binding_unavailable'),
-    ('source_revision', 'generated_approved_source_changed'),
-    ('copy_digest', 'generated_approved_source_changed'),
-    ('palette_revision', 'generated_palette_changed'),
-    ('palette_digest', 'generated_palette_changed')])
+    ('source_revision', 'generated_bundle_publish_binding_changed'),
+    ('copy_digest', 'generated_bundle_publish_binding_changed'),
+    ('palette_revision', 'generated_bundle_publish_binding_changed'),
+    ('palette_digest', 'generated_bundle_publish_binding_changed')])
 def test_sql_readback_binding_mismatch_fails_closed(system, field, reason):
     assert run(system)['ok']
     row = row_for(system)
@@ -241,9 +243,10 @@ def test_sql_readback_binding_mismatch_fails_closed(system, field, reason):
 def test_current_palette_revision_blocks_before_send(system):
     assert run(system)['ok']
     row = row_for(system)
-    with pytest.raises(runtime.RuntimeHold, match='generated_palette_changed'):
-        runtime.validate_publish_palette(row, readback=binding_for(system, row),
-            palette_loader=lambda base,key: (system.palette,'new-revision'), sources=lambda key:[system.source])
+    binding=binding_for(system,row)
+    system.active['observation']['id']+=1
+    with pytest.raises(runtime.RuntimeHold, match='generated_bundle_publish_binding_changed'):
+        runtime.validate_publish_palette(row,readback=binding,bundle_reader=lambda base:system.active)
 
 
 def test_absent_sql_readback_fail_closed_without_journal_authority(system):
@@ -253,8 +256,7 @@ def test_absent_sql_readback_fail_closed_without_journal_authority(system):
     journal = Path(system.case.jobs.path)
     assert journal.exists()
     row = row_for(system)
-    loaders = dict(palette_loader=lambda base, key: (system.palette, 'palette-v1'),
-                   sources=lambda key: [system.source])
+    loaders = dict(bundle_reader=lambda base:copy.deepcopy(system.active))
     with pytest.raises(runtime.RuntimeHold, match='generated_publish_binding_unavailable'):
         runtime.validate_publish_palette(row, **loaders)
     with pytest.raises(runtime.RuntimeHold, match='generated_publish_binding_unavailable'):
@@ -278,8 +280,7 @@ def test_separate_owner_volume_journal_absent_still_passes_on_sql_readback(syste
 def test_malformed_sql_readback_fail_closed(system):
     assert run(system)['ok']
     row = row_for(system)
-    loaders = dict(palette_loader=lambda base, key: (system.palette, 'palette-v1'),
-                   sources=lambda key: [system.source])
+    loaders = dict(bundle_reader=lambda base:copy.deepcopy(system.active))
     for bad in ([], 'binding', dict(), dict(binding_for(system, row)('x'), receipt_ref='')):
         with pytest.raises(runtime.RuntimeHold, match='generated_publish_binding_unavailable'):
             runtime.validate_publish_palette(row, readback=lambda row_id: bad, **loaders)
@@ -322,21 +323,14 @@ def test_publish_bridge_checks_palette_before_authority_claim(system, monkeypatc
     assert seen['store'] is store, 'provider boundary must receive the publisher store'
 
 
-def test_palette_evidence_file_revision_and_missing_notes(tmp_path, monkeypatch):
-    from agent import astra_prompt as ap
-    path = tmp_path/'brand_colors.json'
-    raw = dict(colors=['#112233'],source_url='https://gym.example.test',source_note='Official site CSS')
-    path.write_text(json.dumps(raw))
-    monkeypatch.setattr(ap, 'load_gym_brand_palette', lambda key: dict(colors=['#112233'],path=str(path)))
-    first, revision = runtime.verified_palette('same-gym','same-gym_ig')
-    assert first['verified'] and first['gym_id'] == 'same-gym'
-    raw['source_note'] = 'Rechecked official site CSS'
-    path.write_text(json.dumps(raw))
-    assert runtime.verified_palette('same-gym','same-gym_ig')[1] != revision
-    raw.pop('source_note')
-    path.write_text(json.dumps(raw))
-    with pytest.raises(runtime.RuntimeHold, match='generated_palette_unverified'):
-        runtime.verified_palette('same-gym','same-gym_ig')
+def test_palette_byte_evidence_revision_and_missing_tokens(system):
+    first=derive(system.active)
+    system.active['observation']['id']+=1
+    second=derive(system.active)
+    assert second['authority_pins']!=first['authority_pins']
+    observe(system.active,lambda snapshot:snapshot['palette'].update(primary_byte_offset=0))
+    with pytest.raises(runtime.RuntimeHold, match='generated_bundle_evidence_invalid'):
+        derive(system.active)
 
 
 def test_own_successful_reservation_history_revision_never_creates_another_job(system):
@@ -461,18 +455,17 @@ def test_no_sources_legacy_seed_suppressed_under_new_on_flag(monkeypatch):
     assert result['reason'] == 'generated_gap_owner_transport_missing'
 
 
-def test_approved_source_revocation_or_metadata_change_blocks_send(system):
+def test_configuration_revocation_or_observation_change_blocks_send(system):
     assert run(system)['ok']
     row = row_for(system)
     readback = binding_for(system, row)
-    loaders = dict(palette_loader=lambda base,key:(system.palette,'palette-v1'),
-                   sources=lambda key:[system.source])
-    system.source.status = 'pending'
-    with pytest.raises(runtime.RuntimeHold, match='generated_approved_copy_receipt_missing'):
+    loaders = dict(bundle_reader=lambda base:copy.deepcopy(system.active))
+    system.active['fact_validation']='pending_collector_validation'
+    with pytest.raises(runtime.RuntimeHold, match='generated_bundle_fact_validation_required'):
         runtime.validate_publish_palette(row, readback=readback, **loaders)
-    system.source.status = 'approved'
-    system.source.citation = 'changed source record'
-    with pytest.raises(runtime.RuntimeHold, match='generated_approved_source_changed'):
+    system.active['fact_validation']='supported_uncontradicted'
+    system.active['observation']['id']+=1
+    with pytest.raises(runtime.RuntimeHold, match='generated_bundle_publish_binding_changed'):
         runtime.validate_publish_palette(row, readback=readback, **loaders)
 
 
@@ -508,7 +501,7 @@ def test_sibling_ambiguous_provider_never_mints_second_job(system):
 
 def test_same_logical_sibling_with_new_copy_receipt_holds_old_job(system):
     assert run(system)['ok']
-    system.source.citation='changed approved metadata'
+    system.active['observation']['id']+=1
     system.snap['account']='facebook'
     result=runtime.run_calendar_row('same-gym',SimpleNamespace(key='same-gym_fb',platform='facebook_page'),
         str(uuid.uuid4()),persistence=system.persistence,loader=system.loader,jobs=system.case.jobs,
@@ -538,7 +531,7 @@ def test_database_copy_digest_cannot_substitute_for_approved_source_revision(sys
     assert run(s)['ok']
     row = row_for(s)
     # Reproduces the old SQL readback source_revision=c.copy_revision mismatch.
-    with pytest.raises(runtime.RuntimeHold, match='generated_approved_source_changed'):
+    with pytest.raises(runtime.RuntimeHold, match='generated_bundle_publish_binding_changed'):
         runtime.validate_publish_palette(row, **publish_args(
             s, row, source_revision=s.reserved[-1]['copy_revision']))
 
