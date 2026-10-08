@@ -341,6 +341,82 @@ def test_null_thumbnail_reuses_trusted_delivered_receipt(lane):
     assert lane[1].inserted[-1][1] == lane[1].snapshot['image_url']
 
 
+def test_aliased_shared_url_fetched_once_with_identical_bytes(lane):
+    """thumbnail_url NULL aliases image_url; a reader that mutates bytes
+    between per-role fetches must not produce inconsistent attestations."""
+    row_id, conn, data = lane
+    conn.snapshot['thumbnail_url'] = None
+    shared = conn.snapshot['image_url']
+    swapped = image_bytes((25, 50, 75))
+    reads = {}
+    def read(url):
+        reads[url] = reads.get(url, 0) + 1
+        # Simulate the object changing between earlier per-role fetches: any
+        # read past the initial fetch and verification reread (which only
+        # happens if aliased roles re-fetch) returns different bytes.
+        if url == shared and reads[url] not in (1, 2):
+            return swapped
+        return data[url]
+    result = index.attest(row_id, REVISION, LINEAGE,
+                          connection_factory=lambda: conn, read_bytes=read)
+    assert set(result['attestation_ids']) == set(index.ROLES)
+    # Exactly one initial read plus one verification reread for the shared URL.
+    assert reads[shared] == 2
+    by_role = {args[2]: args for args in conn.inserted}
+    delivered, thumbnail = by_role['delivered'], by_role['thumbnail']
+    # Both aliased roles attest the identical observed bytes.
+    assert delivered[1] == thumbnail[1] == shared
+    assert delivered[3] == thumbnail[3]
+    assert delivered[4] == thumbnail[4]
+    assert delivered[5] == thumbnail[5]
+    assert delivered[7] == thumbnail[7]
+    # No stale or swapped bytes attested for any role.
+    for role, blob in (('original', ORIGINAL), ('delivered', DELIVERED)):
+        assert by_role[role][3] == hashlib.sha256(blob).hexdigest()
+    assert conn.committed and not conn.negatives
+
+
+def test_aliased_url_mutation_between_old_role_reads_cannot_attest(lane):
+    """Old per-role fetching would accept delivered-old/thumbnail-new bytes
+    because its final reread only compared the latter URL-keyed observation."""
+    row_id, conn, data = lane
+    conn.snapshot['thumbnail_url'] = None
+    shared = conn.snapshot['image_url']
+    changed = image_bytes((9, 19, 29))
+    reads = {}
+    def read(url):
+        reads[url] = reads.get(url, 0) + 1
+        return data[url] if url != shared or reads[url] == 1 else changed
+    with pytest.raises(guard.ForwardMediaVerificationHold, match='changed bytes'):
+        index.attest(row_id, REVISION, LINEAGE,
+                     connection_factory=lambda: conn, read_bytes=read)
+    assert reads[shared] == 2
+    assert not conn.inserted
+
+
+def test_distinct_urls_still_reread_and_hold_on_mutation(lane):
+    """Unshared URLs keep one initial read plus one reread each; a real
+    mutation between fetch and reread still holds."""
+    row_id, conn, data = lane
+    reads = {}
+    def read(url):
+        reads[url] = reads.get(url, 0) + 1
+        return data[url]
+    run_attest = lambda: index.attest(row_id, REVISION, LINEAGE,
+                                      connection_factory=lambda: conn, read_bytes=read)
+    run_attest()
+    assert all(count == 2 for count in reads.values())
+    changed = image_bytes((1, 2, 3))
+    def mutating(url):
+        reads[url] = reads.get(url, 0) + 1
+        return changed if reads[url] % 2 == 0 else data[url]
+    conn.inserted.clear()
+    with pytest.raises(guard.ForwardMediaVerificationHold, match='changed bytes'):
+        index.attest(row_id, REVISION, LINEAGE,
+                     connection_factory=lambda: conn, read_bytes=mutating)
+    assert not conn.inserted
+
+
 # Reuse existing fake-vendor fixtures while invoking the actual Meta,
 # SocialAPI and Zernio publisher wrappers and actual calendar bridge.
 from test_forward_media_lower_publishers import lane as publisher_lane

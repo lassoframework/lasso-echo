@@ -190,12 +190,18 @@ def attest(calendar_row_id, expected_revision, lineage_receipt_id, *,
             raise ForwardMediaVerificationHold('visual index requires original, delivered and thumbnail objects')
         observations = []
         actual_bytes = {}
+        # Fetch each distinct URL exactly once so aliased roles (a NULL
+        # thumbnail_url reuses image_url) observe identical bytes; the final
+        # reread below then validates the same bytes every role attested.
+        def fetch_once(url):
+            if url not in actual_bytes:
+                try:
+                    actual_bytes[url] = _read(url, read_bytes)
+                except ForwardMediaVerificationHold as exc:
+                    raise ForwardMediaVerificationHold('visual index object evidence unavailable') from exc
+            return actual_bytes[url]
         for role, url, receipt in zip(ROLES, urls, receipts):
-            try:
-                data = _read(url, read_bytes)
-            except ForwardMediaVerificationHold as exc:
-                raise ForwardMediaVerificationHold('visual index object evidence unavailable') from exc
-            actual_bytes[url] = data
+            data = fetch_once(url)
             sha = hashlib.sha256(data).hexdigest()
             phash = phash_v1(data)
             if phash is None:
