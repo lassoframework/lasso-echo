@@ -114,7 +114,7 @@ def main():
                 sql((ROOT/'migrations'/name).read_text())
             sql(f'create role {OWNER} login; grant fixer_forward_media_owner_20261006 to {OWNER};')
             for name in list(os.environ):
-                if owner._FORBIDDEN_ENV_NAME.search(name) or name in worker._FORBIDDEN:
+                if name in owner.forbidden_credential_names(os.environ):
                     os.environ.pop(name)
             os.environ.update(FORWARD_MEDIA_OWNER_DSN=dsn(),FORWARD_MEDIA_OWNER_ROLE=OWNER,
                               AGENT_FORWARD_MEDIA_OWNER_WORKER='true',AGENT_FORWARD_MEDIA_OWNER_TENANTS='gym')

@@ -61,7 +61,7 @@ def main():
             sql(f'create role {OWNER} login; grant fixer_forward_media_owner_20261006 to {OWNER};'
                 f'create role {AUDITOR} login; grant fixer_forward_media_photo_auditor_20261007 to {AUDITOR};')
             for name in list(os.environ):
-                if owner._FORBIDDEN_ENV_NAME.search(name): os.environ.pop(name)
+                if name in owner.forbidden_credential_names(os.environ): os.environ.pop(name)
             os.environ.update(FORWARD_MEDIA_OWNER_DSN=dsn(OWNER),FORWARD_MEDIA_OWNER_ROLE=OWNER)
             rid,history_id=str(uuid.uuid4()),str(uuid.uuid4())
             sql('insert into media_source values(%s,%s,%s,%s,true)',('source','gym','gym_drive',FOLDER))
