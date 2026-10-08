@@ -179,6 +179,11 @@ def test_connection_closed_when_role_query_fails(monkeypatch, failure):
     (503, {}, guard.ForwardMediaVerificationHold),
     (400, {'code': '23514', 'message': 'original source and delivered bytes must be owner attested'}, guard.ForwardMediaVerificationHold),
     (400, {'code': '23514', 'message': 'source or rendition already consumed by another tenant/date/group'}, guard.ForwardMediaDuplicateHold),
+    (400, {'code': '23514', 'message': 'visual byte ancestry already consumed by another tenant/date/group'}, guard.ForwardMediaDuplicateHold),
+    (400, {'code': '23514', 'message': 'visual similarity held for review'}, guard.ForwardMediaDuplicateHold),
+    (400, {'code': '23514', 'message': 'visual negative evidence blocks claim'}, guard.ForwardMediaVerificationHold),
+    (400, {'code': '23514', 'message': 'visual attestation evidence invalid'}, guard.ForwardMediaVerificationHold),
+    (400, {'code': 'XX000', 'message': 'visual similarity held for review'}, guard.ForwardMediaVerificationHold),
 ])
 def test_claim_only_literal_true_and_distinct_duplicate(status, payload, error):
     response=SimpleNamespace(status_code=status,json=lambda:payload)
@@ -186,7 +191,8 @@ def test_claim_only_literal_true_and_distinct_duplicate(status, payload, error):
                           _rest=lambda url:url, _headers=lambda headers:headers)
     args=(store,*[str(uuid.uuid4()) for _ in range(3)], 'outgoing-revision')
     if error:
-        with pytest.raises(error): guard.claim(*args)
+        with pytest.raises(error) as caught: guard.claim(*args)
+        assert type(caught.value) is error
     else:
         assert guard.claim(*args) is True
 
@@ -222,6 +228,36 @@ def test_remote_reads_follow_read_transaction_end(lane):
                  read_bytes=read, original_verifier=lambda *_: True)
     assert conn.committed and conn.closed
 
+
+def test_claim_runs_visual_index_before_claim_rpc_when_armed(monkeypatch):
+    from agent import forward_media_visual_index as visual_index
+    monkeypatch.setenv('AGENT_FORWARD_MEDIA_VISUAL_INDEX', '1')
+    monkeypatch.setenv('AGENT_FORWARD_MEDIA_GUARD', '1')
+    order = []
+    def deny(row_id, revision, evidence_id, **kwargs):
+        order.append('visual_index')
+        raise guard.ForwardMediaVerificationHold('visual index held')
+    monkeypatch.setattr(visual_index, 'before_claim', deny)
+    posts = []
+    store = SimpleNamespace(
+        _client=lambda: SimpleNamespace(post=lambda *a, **k: posts.append((a, k))),
+        _rest=lambda url: url, _headers=lambda headers: headers)
+    with pytest.raises(guard.ForwardMediaVerificationHold, match='visual index held'):
+        guard.claim(store, str(uuid.uuid4()), str(uuid.uuid4()), str(uuid.uuid4()), 'rev')
+    assert order == ['visual_index'] and posts == []
+
+
+def test_claim_skips_visual_index_when_off(monkeypatch):
+    from agent import forward_media_visual_index as visual_index
+    monkeypatch.delenv('AGENT_FORWARD_MEDIA_VISUAL_INDEX', raising=False)
+    monkeypatch.setattr(visual_index, 'attest',
+                        lambda *a, **k: pytest.fail('visual index must stay off'))
+    response = SimpleNamespace(status_code=200, json=lambda: True)
+    store = SimpleNamespace(
+        _client=lambda: SimpleNamespace(post=lambda *a, **k: response),
+        _rest=lambda url: url, _headers=lambda headers: headers)
+    assert guard.claim(store, str(uuid.uuid4()), str(uuid.uuid4()),
+                       str(uuid.uuid4()), 'rev') is True
 
 @pytest.fixture(autouse=True)
 def isolated_process_environment(monkeypatch):
