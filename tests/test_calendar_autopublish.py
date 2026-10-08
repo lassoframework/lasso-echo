@@ -3208,3 +3208,57 @@ def test_legacy_bool_claim_store_skips_the_lease_gate(armed, monkeypatch):
                              now="2026-10-05T23:59:00-04:00", catch_all=True)
 
     assert result["published"] == ["legacy-feed"]
+
+
+@pytest.mark.parametrize("kind", ["verification", "duplicate"])
+def test_forward_media_hold_prevents_provider_and_releases_owned_lease(armed, monkeypatch, kind):
+    from agent import forward_media_guard as guard, forward_media_publish as bridge
+    monkeypatch.setenv("AGENT_FORWARD_MEDIA_GUARD", "true")
+    row = _row("guarded")
+    store = _FakeStore([row], claim_returns={"guarded": "owned-token"})
+    pub = _FakePublisher()
+    monkeypatch.setattr(cap.meta_publisher, "publish", pub)
+    released = []
+    def release(store_arg, row_id, **kwargs):
+        released.append(kwargs)
+        return True
+    def refuse(*args):
+        exc = guard.ForwardMediaDuplicateHold if kind == "duplicate" else guard.ForwardMediaVerificationHold
+        raise exc("persisted evidence unavailable")
+    monkeypatch.setattr(bridge, "authorize", refuse)
+    monkeypatch.setattr(cap, "_revert_to_pending", release)
+    monkeypatch.setattr(cap, "_alert_publish_blocked", lambda *a, **kw: None)
+    out = cap.publish_due(RUN_DATE, store=store, publisher=pub, now=LATE_NOW)
+    assert pub.calls == [] and out["published"] == []
+    assert released[0]["expected_claim_token"] == "owned-token"
+    assert released[0]["reject_reason"] == "forward_media_" + kind
+
+
+def test_forward_media_missing_owned_token_never_calls_provider(armed, monkeypatch):
+    monkeypatch.setenv("AGENT_FORWARD_MEDIA_GUARD", "true")
+    store = _FakeStore([_row("no-token")])
+    pub = _FakePublisher()
+    monkeypatch.setattr(cap.meta_publisher, "publish", pub)
+    monkeypatch.setattr(cap, "_alert_publish_blocked", lambda *a, **kw: None)
+    out = cap.publish_due(RUN_DATE, store=store, publisher=pub, now=LATE_NOW)
+    assert pub.calls == [] and out["published"] == []
+    assert out["forward_media_holds"] == {"no-token": "forward_media_verification"}
+    assert store.failed_calls == []  # no unscoped rollback of an unknown lease
+
+
+def test_forward_media_actual_draft_mismatch_never_claims_or_sends(armed, monkeypatch):
+    from agent import forward_media_publish as bridge
+    monkeypatch.setenv("AGENT_FORWARD_MEDIA_GUARD", "true")
+    original = cap._draft_for
+    def changed(row):
+        draft = original(row)
+        draft.creative_public_url = "https://changed/media"
+        return draft
+    monkeypatch.setattr(cap, "_draft_for", changed)
+    monkeypatch.setattr(bridge, "authorize", lambda *a: pytest.fail("changed draft reached authority"))
+    monkeypatch.setattr(cap, "_alert_publish_blocked", lambda *a, **kw: None)
+    store = _FakeStore([_row("changed")], claim_returns={"changed": "owned-token"})
+    pub = _FakePublisher()
+    monkeypatch.setattr(cap.meta_publisher, "publish", pub)
+    out = cap.publish_due(RUN_DATE, store=store, publisher=pub, now=LATE_NOW)
+    assert pub.calls == [] and out["forward_media_holds"] == {"changed": "forward_media_verification"}

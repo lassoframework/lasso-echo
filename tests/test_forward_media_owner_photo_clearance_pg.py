@@ -500,24 +500,28 @@ def main():
    class RenditionHosted(Hosted):
     def read(self,url):return rendered_objects[url]
    rendition_hosted=RenditionHosted()
-   def signed_rendition(name,tag,day='2026-10-10',group='group',tenant='gym'):
-    recipe_now=attester.make_still_recipe(name,caption='SYNTHETIC distinct story',gym_name='SYNTHETIC gym')
-    image_bytes=attester.replay_still_recipe(source_bytes,recipe_now)['image_bytes']
+   def signed_rendition(name,tag,day='2026-10-10',group='group',tenant='gym',thumbnail_name=None):
+    recipe_now=attester.make_still_recipe(name,caption='SYNTHETIC distinct story '+(tag if thumbnail_name else ''),gym_name='SYNTHETIC gym',thumbnail_name=thumbnail_name)
+    replay_now=attester.replay_still_recipe(source_bytes,recipe_now,has_thumbnail=thumbnail_name is not None)
+    image_bytes=replay_now['image_bytes']
+    thumbnail_url=('https://media.example.test/thumbnail-'+tag+'.png' if thumbnail_name else None)
+    if thumbnail_name=='delivered_image':thumbnail_url='https://media.example.test/signed-'+tag+'.png'
+    if thumbnail_url:rendered_objects[thumbnail_url]=replay_now['thumbnail_bytes']
     image_url='https://media.example.test/signed-'+tag+'.png'
     rendered_objects[image_url]=image_bytes
     row_id=new_row(day=day,fmt='story' if name=='story_photo' else 'feed')
     asset_id,source_url,drive_now=FILE,URL,drive
     if tenant!='gym':
-     asset_id=FILE+'OtherTenant';source_url=URL+'&tenant=other';rendered_objects[source_url]=source_bytes
-     sql('insert into media_source values(%s,%s,%s,%s,true)',('other-source',tenant,'gym_drive',FOLDER))
-     sql('insert into media_asset(id,source_id,gym_id) values(%s,%s,%s)',(asset_id,'other-source',tenant))
+     asset_id=FILE+'OtherTenant'+tag;source_url=URL+'&tenant='+tag;rendered_objects[source_url]=source_bytes
+     sql('insert into media_source values(%s,%s,%s,%s,true)',('other-source-'+tag,tenant,'gym_drive',FOLDER))
+     sql('insert into media_asset(id,source_id,gym_id) values(%s,%s,%s)',(asset_id,'other-source-'+tag,tenant))
      approved_asset(asset_id,source_bytes,tenant)
      class TenantDrive(Drive):
       def original_bytes(self,file_id):assert file_id==asset_id;return source_bytes
      drive_now=TenantDrive();drive_now.data=source_bytes
      drive_now.meta.update(id=asset_id,size=str(len(source_bytes)),md5Checksum=hashlib.md5(source_bytes).hexdigest())
-    sql('update content_calendar set gym_id=%s,visual_group_key=%s,source_media_asset_id=%s,source_media_url=%s,image_url=%s where id=%s',
-        (tenant,group,asset_id,source_url,image_url,row_id))
+    sql('update content_calendar set gym_id=%s,visual_group_key=%s,source_media_asset_id=%s,source_media_url=%s,image_url=%s,thumbnail_url=%s where id=%s',
+        (tenant,group,asset_id,source_url,image_url,thumbnail_url,row_id))
     revision_now=sql('select md5(to_jsonb(r)::text) from content_calendar r where id=%s',(row_id,))[0][0]
     current_now=store.snapshot(row_id,revision_now)
     source_now=verify_source(current_now,drive_now,rendition_hosted)
@@ -528,6 +532,9 @@ def main():
      'image_sha256':'sha256:'+hashlib.sha256(image_bytes).hexdigest(),'image_length':len(image_bytes),
      'render_recipe_digest':digest(recipe_now),
      'content_digest':sql("select 'sha256:'||encode(sha256(convert_to(fixer_forward_media_photo_content_20261007(%s)::text,'UTF8')),'hex')",(row_id,))[0][0]}
+    if thumbnail_url:
+     candidate_now.update(thumbnail_url=thumbnail_url,thumbnail_sha256='sha256:'+hashlib.sha256(replay_now['thumbnail_bytes']).hexdigest(),
+      thumbnail_fingerprint='md5:'+hashlib.md5(replay_now['thumbnail_bytes']).hexdigest(),thumbnail_length=len(replay_now['thumbnail_bytes']))
     cert_now,_,_,_=fixtures(candidate=candidate_now,snapshot=sql('select fixer_forward_media_photo_snapshot_20261007()')[0][0],private=private)
     IndependentPhotoAuditor(auditor_conn,'photo_auditor').submit(cert_now);auditor_conn.commit()
     prepared_now=prepare_remote_photo(current_now,drive_reader=drive_now,hosted_reader=rendition_hosted,
@@ -576,9 +583,155 @@ def main():
     before=sql('select (select count(*) from fixer_owner_photo_reservation_20261007),(select count(*) from fixer_forward_media_render_manifest_20261006)')[0]
     denied(lambda:stage_prepared_photo(p,prepared_now),'already used cleared or reserved');conn.rollback()
     assert sql('select (select count(*) from fixer_owner_photo_reservation_20261007),(select count(*) from fixer_forward_media_render_manifest_20261006)')[0]==before
+   # Real transformed thumbnail, reused same-day rendered bytes, and image
+   # alias traverse signed preparation -> immutable persistence -> attester ->
+   # claim/send replay. The image remains a distinct signed sibling rendition.
+   thumbnail_bindings=[]
+   for thumbnail_name,tag in (('feed_autofit_4x5','thumb-transformed'),('delivered_image','thumb-alias')):
+    row_id,thumb_prepared,thumb_cert=signed_rendition('story_photo',tag,thumbnail_name=thumbnail_name)
+    assert thumb_prepared.thumbnail_bytes==rendered_objects[thumb_prepared.manifest.thumbnail_url]
+    counts=sql('select (select count(*) from fixer_owner_photo_reservation_20261007),(select count(*) from fixer_forward_media_render_manifest_20261006)')[0]
+    # Wrong frozen bytes cannot persist even after SQL stages the reservation;
+    # caller rollback restores the exact before-counts.
+    from dataclasses import replace
+    try:
+     stage_prepared_photo(p,replace(thumb_prepared,thumbnail_bytes=png('white')))
+     raise AssertionError('wrong retained thumbnail persisted')
+    except owner.OwnerPersistenceError:conn.rollback()
+    except PhotoCertificateHold:conn.rollback()
+    assert sql('select (select count(*) from fixer_owner_photo_reservation_20261007),(select count(*) from fixer_forward_media_render_manifest_20261006)')[0]==counts
+    bad_manifest=thumb_prepared.manifest.row();bad_manifest['thumbnail_fingerprint']='md5:'+'e'*32
+    denied(lambda:conn.execute('select fixer_prepare_owner_photo_20261007(%s,%s::jsonb,%s::jsonb)',
+     (thumb_cert['payload']['audit_id'],json.dumps(thumb_prepared.source.original.row()),json.dumps(bad_manifest))),'exact certified');conn.rollback()
+    bad_recipe=thumb_prepared.manifest.row();bad_recipe['render_recipe']={**bad_recipe['render_recipe'],'thumbnail':None}
+    denied(lambda:conn.execute('select fixer_prepare_owner_photo_20261007(%s,%s::jsonb,%s::jsonb)',
+     (thumb_cert['payload']['audit_id'],json.dumps(thumb_prepared.source.original.row()),json.dumps(bad_recipe))),'exact certified');conn.rollback()
+    revision_thumb=sql('select md5(to_jsonb(r)::text) from content_calendar r where id=%s',(row_id,))[0][0]
+    sql('insert into fixer_forward_media_observation_20261007(calendar_row_id,row_revision,observation_digest,tenant_id,gym_id,source_asset_id,source_exact_url,delivered_exact_url,calendar_snapshot,observation_json,digest_input) values(%s,%s,%s,\'gym\',\'gym\',%s,%s,%s,\'{}\'::jsonb,%s,\'SYNTHETIC thumbnail recipe\')',(row_id,revision_thumb,'a'*64,FILE,URL,thumb_prepared.manifest.image_url,json.dumps({'recipe':thumb_prepared.manifest.render_recipe})))
+    class IdleRenditions(RenditionHosted):
+     def read(self,url):
+      assert conn.info.transaction_status==psycopg.pq.TransactionStatus.IDLE,'thumbnail remote read held a DB transaction'
+      return super().read(url)
+    conn.rollback()
+    runtime_thumb=run_photo_pass(persistence=p,reader=IdleRenditions(),drive_reader=drive,tenants=('gym',),limit=25)
+    assert runtime_thumb['status']=='complete' and len(runtime_thumb['rows'])==1,runtime_thumb
+    assert runtime_thumb['rows'][0]['audit_id']==thumb_cert['payload']['audit_id']
+    assert sql("select state from fixer_owner_photo_progress_20261007 where audit_id=%s",(thumb_cert['payload']['audit_id'],))[0][0]=='final'
+    snap_thumb=sql('select fixer_forward_media_photo_snapshot_20261007()')[0][0]
+    assert any(h['history_key']=='owner-reserved-thumbnail:'+thumb_cert['payload']['audit_id']
+      and h['visual_sha256']==thumb_cert['payload']['candidate']['thumbnail_sha256'] for h in snap_thumb['rows'])
+    assert reconcile_owner_photo(p,thumb_cert['payload']['audit_id'])['manifest']==thumb_prepared.manifest.row();conn.rollback()
+    binding_thumb=rendition_claim(row_id)
+    assert claim(binding_thumb) is True and claim(binding_thumb) is True
+    # Hosted bytes change after owner preparation: final actual attester refuses
+    # a new attestation; existing immutable claim remains the tested safe tuple.
+    saved=rendered_objects[thumb_prepared.manifest.thumbnail_url]
+    rendered_objects[thumb_prepared.manifest.thumbnail_url]=png('white')
+    try:
+     with lane(guard.ROLE) as verifier:
+      original_check,renderer=attester.production_callbacks(verifier,row_id,expected_revision=binding_thumb[3])
+     guard.attest(row_id,binding_thumb[3],connection_factory=lambda:lane(guard.ROLE),read_bytes=rendition_hosted.read,
+      original_verifier=original_check,controlled_renderer=renderer)
+     raise AssertionError('changed hosted thumbnail attested')
+    except guard.ForwardMediaVerificationHold:pass
+    rendered_objects[thumb_prepared.manifest.thumbnail_url]=saved
+    assert claim(binding_thumb) is True
+    thumbnail_bindings.append((thumb_prepared,thumb_cert,binding_thumb))
+   # New signed candidates containing those thumbnail bytes across date/tenant
+   # cannot create any authority. Existing source collision also remains held.
+   for tag,day,tenant in (('thumb-other-day','2026-10-11','gym'),('thumb-other-tenant','2026-10-10','thumb-other-gym')):
+    row_id,thumb_prepared,thumb_cert=signed_rendition('story_photo',tag,day=day,tenant=tenant,thumbnail_name='feed_autofit_4x5')
+    before=sql('select (select count(*) from fixer_owner_photo_reservation_20261007),(select count(*) from fixer_forward_media_render_manifest_20261006)')[0]
+    denied(lambda:stage_prepared_photo(p,thumb_prepared),'already used cleared or reserved');conn.rollback()
+    assert sql('select (select count(*) from fixer_owner_photo_reservation_20261007),(select count(*) from fixer_forward_media_render_manifest_20261006)')[0]==before
+   # Isolate the THUMBNAIL collision: originals and delivered images differ
+   # byte-for-byte (valid PNG trailing data), while deterministic crops agree.
+   # Synthetic real signatures cannot claim nonmatch for these known bytes.
+   def independent_thumbnail(tag,day='2026-10-11',tenant='gym',color='blue',thumbnail_name='feed_autofit_4x5',image_source_alias=True):
+    data_bytes=png(color)+tag.encode();asset_id=FILE+tag;source_id='source-'+tag
+    source_url='https://media.example.test/original-'+tag+'.png';row_id=new_row(day=day)
+    sql('insert into media_source values(%s,%s,%s,%s,true)',(source_id,tenant,'gym_drive',FOLDER))
+    sql('insert into media_asset(id,source_id,gym_id) values(%s,%s,%s)',(asset_id,source_id,tenant))
+    approved_asset(asset_id,data_bytes,tenant)
+    recipe_now=attester.make_still_recipe('identity',thumbnail_name=thumbnail_name)
+    replay_now=attester.replay_still_recipe(data_bytes,recipe_now,has_thumbnail=True)
+    thumb_url='https://media.example.test/thumb-independent-'+tag+'.png'
+    image_url=source_url if image_source_alias else 'https://media.example.test/image-independent-'+tag+'.png'
+    rendered_objects[source_url]=data_bytes;rendered_objects[image_url]=data_bytes;rendered_objects[thumb_url]=replay_now['thumbnail_bytes']
+    sql('update content_calendar set gym_id=%s,source_media_asset_id=%s,source_media_url=%s,image_url=%s,thumbnail_url=%s where id=%s',
+     (tenant,asset_id,source_url,image_url,thumb_url,row_id))
+    class FreshDrive(Drive):
+     def original_bytes(self,file_id):assert file_id==asset_id;return data_bytes
+    fresh_drive=FreshDrive();fresh_drive.data=data_bytes
+    fresh_drive.meta.update(id=asset_id,size=str(len(data_bytes)),md5Checksum=hashlib.md5(data_bytes).hexdigest())
+    revision_now=sql('select md5(to_jsonb(r)::text) from content_calendar r where id=%s',(row_id,))[0][0]
+    current_now=store.snapshot(row_id,revision_now);source_now=verify_source(current_now,fresh_drive,rendition_hosted)
+    store.stage_source(source_now);conn.commit()
+    candidate_now={**candidate,'calendar_row_id':row_id,'tenant_id':tenant,'post_date':day,'source_asset_id':asset_id,
+     'source_url':source_url,'image_url':image_url,'source_receipt_ref':source_now.receipt_ref,
+     'source_fingerprint':source_now.original.source_fingerprint,'image_fingerprint':source_now.original.source_fingerprint,
+     'source_sha256':source_now.evidence['source_sha256'],'image_sha256':source_now.evidence['source_sha256'],
+     'source_length':len(data_bytes),'image_length':len(data_bytes),'render_recipe_digest':digest(recipe_now),
+     'thumbnail_url':thumb_url,'thumbnail_sha256':'sha256:'+hashlib.sha256(replay_now['thumbnail_bytes']).hexdigest(),
+     'thumbnail_fingerprint':'md5:'+hashlib.md5(replay_now['thumbnail_bytes']).hexdigest(),'thumbnail_length':len(replay_now['thumbnail_bytes']),
+     'content_digest':sql("select 'sha256:'||encode(sha256(convert_to(fixer_forward_media_photo_content_20261007(%s)::text,'UTF8')),'hex')",(row_id,))[0][0]}
+    cert_now,_,_,_=fixtures(candidate=candidate_now,snapshot=sql('select fixer_forward_media_photo_snapshot_20261007()')[0][0],private=private)
+    IndependentPhotoAuditor(auditor_conn,'photo_auditor').submit(cert_now);auditor_conn.commit()
+    prepared_now=prepare_remote_photo(current_now,drive_reader=fresh_drive,hosted_reader=rendition_hosted,recipe=recipe_now,auditor=owner_auditor,audit_id=cert_now['payload']['audit_id']);conn.rollback()
+    return prepared_now,cert_now
+   # Identity images also traverse the actual owner -> attester -> claim.
+   # Operation comes from all URLs and bytes, including a separately hosted
+   # identical thumbnail (rehost) and transformed thumbnail (render).
+   for thumbnail_name,tag,image_source_alias,operation,color in (
+       ('feed_autofit_4x5','identity-source-transformed-thumb',True,'render','purple'),
+       ('feed_autofit_4x5','identity-rehost-transformed-thumb',False,'render','orange'),
+       ('identity','identity-source-separate-thumb',True,'rehost','pink')):
+    identity_prepared,identity_cert=independent_thumbnail(tag,day='2026-10-10',color=color,
+       thumbnail_name=thumbnail_name,image_source_alias=image_source_alias)
+    row_id=identity_cert['payload']['candidate']['calendar_row_id']
+    identity_source=identity_prepared.source.source_bytes
+    assert identity_prepared.image_bytes==identity_source
+    assert identity_prepared.manifest.operation==operation
+    assert identity_prepared.manifest.thumbnail_url not in (identity_prepared.source.original.source_url,identity_prepared.manifest.image_url)
+    assert (identity_prepared.thumbnail_bytes==identity_source)==(operation=='rehost')
+    stage_prepared_photo(p,identity_prepared);conn.commit()
+    binding_identity=rendition_claim(row_id)
+    assert sql('select operation from fixer_forward_media_lineage_20261006 where calendar_row_id=%s',(row_id,))[0][0]==operation
+    assert claim(binding_identity) is True and claim(binding_identity) is True
+   for tag,day,tenant in (('thumb-only-date','2026-10-11','gym'),('thumb-only-tenant','2026-10-10','thumb-only-other-gym')):
+    thumb_prepared,thumb_cert=independent_thumbnail(tag,day,tenant)
+    assert thumb_cert['payload']['candidate']['source_sha256']!=candidate['source_sha256']
+    assert thumb_cert['payload']['candidate']['image_sha256']!=candidate['image_sha256']
+    assert thumb_cert['payload']['candidate']['thumbnail_sha256']==thumbnail_bindings[0][1]['payload']['candidate']['thumbnail_sha256']
+    before=sql('select (select count(*) from fixer_owner_photo_reservation_20261007),(select count(*) from fixer_forward_media_render_manifest_20261006)')[0]
+    denied(lambda:stage_prepared_photo(p,thumb_prepared),'already used cleared or reserved');conn.rollback()
+    assert sql('select (select count(*) from fixer_owner_photo_reservation_20261007),(select count(*) from fixer_forward_media_render_manifest_20261006)')[0]==before
+   concurrent_a,concurrent_cert_a=independent_thumbnail('thumb-concurrent-a',color='cyan')
+   concurrent_b,concurrent_cert_b=independent_thumbnail('thumb-concurrent-b',tenant='concurrent-other-gym',color='cyan')
+   assert concurrent_cert_a['payload']['candidate']['source_sha256']!=concurrent_cert_b['payload']['candidate']['source_sha256']
+   assert concurrent_cert_a['payload']['candidate']['thumbnail_sha256']==concurrent_cert_b['payload']['candidate']['thumbnail_sha256']
+   stage_prepared_photo(p,concurrent_a)
+   def competing_thumbnail():
+    with psycopg.connect(dsn('photo_owner')) as competing_conn:
+     competing_conn.execute("set statement_timeout='6s'")
+     competing_p=owner.ForwardMediaOwnerPersistence(competing_conn,'photo_owner',rendition_hosted)
+     try:stage_prepared_photo(competing_p,concurrent_b);return 'unsafe thumbnail grant'
+     except psycopg.errors.CheckViolation as exc:
+      assert 'complete current independently reviewed' in str(exc),str(exc)
+      competing_conn.rollback();return 'concurrent thumbnail stale held'
+   with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+    waiting=pool.submit(competing_thumbnail)
+    deadline=time.monotonic()+5
+    while time.monotonic()<deadline:
+     if sql("select count(*) from pg_stat_activity where wait_event_type='Lock' and query like 'select public.fixer_prepare_owner_photo%' ")[0][0]:break
+     time.sleep(.02)
+    else:raise AssertionError('thumbnail contender did not serialize at graph')
+    conn.commit();assert waiting.result(timeout=8)=='concurrent thumbnail stale held'
+   assert sql('select count(*) from fixer_owner_photo_reservation_20261007 where audit_id=%s',(concurrent_cert_b['payload']['audit_id'],))[0][0]==0
    unknown_crop=str(uuid.uuid4())
    sql("insert into content_calendar(id,gym_id,status,image_url) values(%s,'other','published','https://media.example.test/unknown-crop-history.png')",(unknown_crop,))
    denied(lambda:claim(signed_crops[0][2]),'unknown historical')
+   denied(lambda:claim(thumbnail_bindings[0][2]),'unknown historical')
    denied(lambda:reconcile_owner_photo(p,signed_crops[0][1]['payload']['audit_id']),'complete known current history');conn.rollback()
    sql('delete from content_calendar where id=%s',(unknown_crop,))
    # Rendition revocation blocks only that exact signed rendition. The original
@@ -586,9 +739,13 @@ def main():
    sql('insert into fixer_owner_photo_revocation_20261007 values(%s,%s)',(signed_crops[1][1]['payload']['audit_id'],'SYNTHETIC story revoke'))
    denied(lambda:claim(signed_crops[1][2]),'revoked')
    assert claim(signed_crops[0][2]) is True and claim(first) is True
+   sql('insert into fixer_owner_photo_revocation_20261007 values(%s,%s)',(thumbnail_bindings[0][1]['payload']['audit_id'],'SYNTHETIC thumbnail rendition revoke'))
+   denied(lambda:claim(thumbnail_bindings[0][2]),'revoked')
+   assert claim(thumbnail_bindings[1][2]) is True
    # Explicit monotonic epoch invalidation holds both fresh sends and replay.
    sql('update fixer_forward_media_photo_state_20261007 set generation=1')
    denied(lambda:claim(first),'retired epoch')
+   denied(lambda:claim(thumbnail_bindings[1][2]),'retired epoch')
    denied(lambda:sql('update fixer_forward_media_photo_state_20261007 set generation=0'),'cannot regress')
    sql('insert into fixer_owner_photo_revocation_20261007 values(%s,%s)',(packet['payload']['audit_id'],'SYNTHETIC revoke'))
    denied(lambda:claim(first),'revoked')

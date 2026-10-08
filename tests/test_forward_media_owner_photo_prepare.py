@@ -24,6 +24,7 @@ class Cursor:
 
 class Connection:
     def cursor(self):return Cursor()
+    def rollback(self):pass
 
 
 class OwnerPhotoTests(unittest.TestCase):
@@ -58,6 +59,36 @@ class OwnerPhotoTests(unittest.TestCase):
         self.assertEqual(result.manifest.render_evidence_ref,result.certificate.receipt_ref)
         self.assertEqual(result.manifest.render_recipe,recipe)
 
+    def test_signed_transformed_thumbnail_and_image_alias_prepare_exact_retained_bytes(self):
+        from agent.forward_media_attester import replay_still_recipe
+        for stage in ('feed_autofit_4x5','delivered_image','identity'):
+            snap,drive,data,_,packet,auditor,_=self.setup_candidate()
+            recipe=make_still_recipe('identity',thumbnail_name=stage)
+            thumb=replay_still_recipe(data,recipe,has_thumbnail=True)['thumbnail_bytes']
+            url=URL if stage=='delivered_image' else 'https://media.example.test/thumb.png'
+            snap['calendar']['thumbnail_url']=url
+            candidate={**packet['payload']['candidate'],'render_recipe_digest':digest(recipe),
+                'thumbnail_url':url,'thumbnail_sha256':'sha256:'+hashlib.sha256(thumb).hexdigest(),
+                'thumbnail_fingerprint':'md5:'+hashlib.md5(thumb).hexdigest(),'thumbnail_length':len(thumb)}
+            packet,key,corpus,_=fixtures(candidate=candidate)
+            def rpc(name,values):
+                return {'packet':packet,'approved_key':key} if name=='certificate' else corpus
+            class Reader(Hosted):
+                def read(self,url_now):
+                    self.urls.append(url_now)
+                    return thumb if url_now==url else data
+            reader=Reader()
+            with patch.object(auditor,'_rpc',side_effect=rpc),patch('agent.visual_writer_prepare._own_media_url',return_value=True):
+                prepared=prepare_remote_photo(snap,drive_reader=drive,hosted_reader=reader,recipe=recipe,
+                    auditor=auditor,audit_id=packet['payload']['audit_id'])
+            self.assertEqual(prepared.thumbnail_bytes,thumb)
+            self.assertEqual(prepared.manifest.thumbnail_url,url)
+            self.assertEqual(prepared.manifest.thumbnail_fingerprint,candidate['thumbnail_fingerprint'])
+            self.assertEqual(prepared.manifest.operation,
+                'render' if stage=='feed_autofit_4x5' else 'same_object' if stage=='delivered_image' else 'rehost')
+            # Alias consumes the already read delivered image; no third read.
+            self.assertEqual(reader.urls.count(url),2 if stage=='delivered_image' else 1)
+
     def test_tampered_signature_is_not_a_positive_owner_decision(self):
         snap,drive,data,recipe,packet,auditor,rpc=self.setup_candidate();packet['signature_hex']='00'*64
         with patch.object(auditor,'_rpc',side_effect=rpc),self.assertRaisesRegex(PhotoCertificateHold,'signature_invalid'):
@@ -71,11 +102,11 @@ class OwnerPhotoTests(unittest.TestCase):
             prepare_remote_photo(snap,drive_reader=drive,hosted_reader=Hosted(data),recipe=recipe,
                 auditor=auditor,audit_id=packet['payload']['audit_id'])
 
-    def test_thumbnail_and_sent_candidates_remain_held(self):
+    def test_unsigned_thumbnail_and_sent_candidates_remain_held(self):
         snap,drive,data,recipe,packet,auditor,rpc=self.setup_candidate()
         snap['calendar']['thumbnail_url']='https://media.example.test/thumb.png'
-        with self.assertRaisesRegex(PhotoCertificateHold,'thumbnail_candidate_contract_missing'):
-            prepare_remote_photo(snap,drive_reader=drive,hosted_reader=Hosted(data),recipe=recipe,auditor=auditor,audit_id='unused')
+        with self.assertRaisesRegex(Exception,'thumbnail recipe binding unavailable'):
+            prepare_remote_photo(snap,drive_reader=drive,hosted_reader=Hosted(data),recipe=recipe,auditor=auditor,audit_id=packet['payload']['audit_id'])
         snap['calendar']['thumbnail_url']=None;snap['calendar']['status']='published'
         with self.assertRaisesRegex(PhotoCertificateHold,'not_unsent'):
             prepare_remote_photo(snap,drive_reader=drive,hosted_reader=Hosted(data),recipe=recipe,auditor=auditor,audit_id='unused')

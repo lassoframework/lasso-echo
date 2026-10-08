@@ -98,6 +98,34 @@ class CertificateTests(unittest.TestCase):
         with self.assertRaisesRegex(PhotoCertificateHold,'certificate_dispositions_incomplete'):
             verify(packet,key,snapshot)
 
+    def test_signed_nullable_thumbnail_tuple_and_tamper(self):
+        packet,key,snapshot,private=fixtures()
+        candidate=packet['payload']['candidate']
+        candidate.update(thumbnail_url='https://media.example.test/thumb.png',
+            thumbnail_sha256=digest('thumbnail'),thumbnail_fingerprint='md5:'+hashlib.md5(b'thumbnail').hexdigest(),
+            thumbnail_length=len(b'thumbnail'))
+        packet['signature_hex']=private.sign(canonical(packet['payload']).encode()).hex()
+        self.assertEqual(verify(packet,key,snapshot).payload['candidate'],candidate)
+        candidate['thumbnail_sha256']=digest('swapped thumbnail')
+        with self.assertRaisesRegex(PhotoCertificateHold,'certificate_signature_invalid'):
+            verify(packet,key,snapshot)
+
+    def test_partial_or_malformed_thumbnail_tuple_holds(self):
+        for fields in ({'thumbnail_url':'https://media.example.test/thumb.png'},
+                {'thumbnail_url':'https://media.example.test/thumb.png','thumbnail_sha256':None,
+                 'thumbnail_fingerprint':None,'thumbnail_length':None},
+                {'thumbnail_url':None,'thumbnail_sha256':None,'thumbnail_fingerprint':None,'thumbnail_length':1}):
+            packet,key,snapshot,private=fixtures()
+            packet['payload']['candidate'].update(fields)
+            packet['signature_hex']=private.sign(canonical(packet['payload']).encode()).hex()
+            with self.assertRaisesRegex(PhotoCertificateHold,'certificate_candidate_invalid'):
+                verify(packet,key,snapshot)
+        packet,key,snapshot,private=fixtures()
+        packet['payload']['candidate'].update(thumbnail_url=None,thumbnail_sha256=None,
+            thumbnail_fingerprint=None,thumbnail_length=None)
+        packet['signature_hex']=private.sign(canonical(packet['payload']).encode()).hex()
+        self.assertIsNone(verify(packet,key,snapshot).payload['candidate']['thumbnail_url'])
+
     def test_candidate_date_group_tenant_or_output_changes_reject(self):
         packet,key,snapshot,_=fixtures()
         for field,value in [('tenant_id','other'),('group_key','other'),('post_date','2026-10-11'),

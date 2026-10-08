@@ -18,11 +18,17 @@ thin wrappers over these pure functions.
 
 import json
 import uuid
+from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 
 from . import config, gbp
 
 RECONCILE_HOURS = 48          # §7.2: poll hourly for the first 48h after publish
+_GBP_SEND_CREATIVE = ('id', 'gym_id', 'account', 'format', 'post_date', 'caption',
+                     'image_url', 'source_media_url', 'thumbnail_url', 'visual_group_key',
+                     'source_media_asset_id', 'render_manifest_digest', 'gbp_topic_type',
+                     'gbp_cta_type', 'gbp_cta_url', 'gbp_event', 'gbp_offer',
+                     'gbp_location_id', 'pillar')
 
 
 def _alert_manual_approval_changed(gym_id, row_id, alert):
@@ -163,8 +169,111 @@ def _media_reuse_hold(row, *, now=None, history_store=None, media_store=None):
                                media_store=media_store)
 
 
+def _current_gbp_destination(store, bound_row, bound_connection):
+    """Fresh trusted lookup; missing or changed native destination is never safe."""
+    try:
+        location = bound_row.get("gbp_location_id")
+        gym = bound_row.get("gym_id")
+        if (store is None or bound_row.get("account") != "googlebusiness"
+                or not gym or not location
+                or bound_connection.get("gbp_location_id") != location):
+            raise ValueError("unbound GBP destination")
+        lookup = getattr(store, "connections_for", None)
+        if not callable(lookup):
+            from .gbp_store import GbpStore
+            lookup = GbpStore(base=getattr(store, "_s", store)).connections_for
+        connections = lookup(gym)
+        matches = [c for c in connections
+                   if c.get("gbp_location_id") == location]
+        if (len(matches) != 1 or matches[0].get("status") != "connected"
+                or matches[0].get("portal_gym_key") != gym
+                or not bound_connection.get("zernio_account_id")
+                or matches[0].get("zernio_account_id") !=
+                bound_connection.get("zernio_account_id")):
+            return False
+        return True
+    except Exception:
+        return False
+
+
+def _atomic_gbp_send_hold(store, row, connection, token, send_kind):
+    """Last DB call before create: one committed exact row/media/destination check."""
+    from . import forward_media_guard as guard
+    reason = "atomic GBP send authority unavailable or changed"
+    kind = "forward_media_verification"
+    try:
+        store = getattr(store, "_s", store)
+        response = store._client().post(
+            store._rest('rpc/fixer_authorize_gbp_forward_send_20261008'),
+            headers=store._headers({'Content-Type': 'application/json'}),
+            json={'p_calendar_row_id': guard._uuid(row.get('id')),
+                  'p_claim_token': guard._uuid(token),
+                  'p_expected_creative': {key: row.get(key) for key in _GBP_SEND_CREATIVE},
+                  'p_native_account_id': connection.get('zernio_account_id'),
+                  'p_expected_location_id': connection.get('gbp_location_id'),
+                  'p_send_kind': send_kind},
+            timeout=30)
+        result = response.json()
+        if 200 <= response.status_code < 300 and result is True:
+            return None
+        if (isinstance(result, dict) and result.get('code') == '23514'
+                and result.get('message') ==
+                'source or rendition already consumed by another tenant/date/group'):
+            kind = "forward_media_duplicate"
+            reason = "media bytes were already consumed"
+    except Exception:
+        pass
+    return {"ok": False, "status": "approved", "late_post_id": "",
+            "reject_reason": reason, "held": kind, "mode": ""}
+
+
+def _reauthorize_gbp_send(store, row, connection, token, snapshot, payload=None):
+    """Recheck current authority immediately before this single provider mutation.
+
+    The snapshot pins the exact local arguments from the initial check, including
+    nested event/offer fields and the resolved native account. Reauthorization
+    checks the persisted token, creative and attestation revision again. Refusals
+    occur outside the provider exception handler: no create has been attempted.
+    """
+    from . import forward_media_guard as guard
+    from .forward_media_publish import hold_result
+    if snapshot is None and not guard.enabled():
+        return None
+    def changed():
+        return (snapshot is None or row != snapshot[0] or
+                connection != snapshot[1] or payload != snapshot[2])
+    def drift_hold():
+        return {"ok": False, "status": "approved", "late_post_id": "",
+                "reject_reason": "outgoing GBP arguments changed before create",
+                "held": "forward_media_verification", "mode": ""}
+    def destination_hold():
+        return {"ok": False, "status": "approved", "late_post_id": "",
+                "reject_reason": "current same-gym GBP destination unavailable or changed",
+                "held": "forward_media_verification", "mode": ""}
+    if changed():
+        return drift_hold()
+    # Gallery uploads carry only the native account; the media claim cannot
+    # authorize an arbitrary caller-supplied destination.
+    if not _current_gbp_destination(store, *snapshot[:2]):
+        return destination_hold()
+    hold = hold_result(store, deepcopy(snapshot[0]), token)
+    if hold:
+        return hold
+    # Reject even local mutation during the authority read; never send newer
+    # arguments using authority obtained for the pinned arguments.
+    if changed():
+        return drift_hold()
+    if payload is not None and payload != build_gbp_payload_for_row(*snapshot[:2]):
+        return drift_hold()
+    # No alternating row/destination reads after this RPC. It validates both
+    # current bindings under one DB transaction; create uses the pinned bytes.
+    return _atomic_gbp_send_hold(store, snapshot[0], snapshot[1], token,
+                                 'gallery' if payload is None else 'post')
+
+
 def publish_gbp_row(row, connection, *, client, draft=True, now=None,
-                    history_store=None, media_store=None, idempotency_key=None):
+                    history_store=None, media_store=None, idempotency_key=None,
+                    authority_store=None):
     """Send one approved GBP row through Zernio. Re-validates the hard rails at send
     time (belt-and-suspenders over the planner) and refuses to ship a violation.
 
@@ -231,6 +340,18 @@ def publish_gbp_row(row, connection, *, client, draft=True, now=None,
         if hold:
             return {"ok": False, "status": "approved", "late_post_id": "",
                     "reject_reason": hold, "held": "media_reuse", "mode": ""}
+    from .forward_media_publish import hold_result
+    from . import forward_media_guard as _fmg
+    if (_fmg.enabled() and payload.get("mediaItems") !=
+            [{"type": "image", "url": row.get("image_url")}]):
+        return {"ok": False, "status": "approved", "late_post_id": "",
+                "reject_reason": "outgoing GBP payload media differs from row",
+                "held": "forward_media_verification", "mode": ""}
+    send_snapshot = (deepcopy((row, connection, payload))
+                     if _fmg.enabled() else None)
+    media_hold = hold_result(authority_store, row, idempotency_key)
+    if media_hold:
+        return media_hold
     # A transport exception does not prove that Zernio rejected the create. It may
     # have accepted the post before the response was lost. Never issue a second
     # create or release the claimed row until provider readback resolves it.
@@ -257,6 +378,12 @@ def publish_gbp_row(row, connection, *, client, draft=True, now=None,
                 "reject_reason": "", "mode": "draft" if draft else "live",
                 "dedup": True}
 
+    media_hold = _reauthorize_gbp_send(authority_store, row, connection,
+                                     idempotency_key, send_snapshot, payload)
+    if media_hold:
+        return media_hold
+    if send_snapshot is not None:
+        payload = send_snapshot[2]
     try:
         # The persisted claim token (live lane only) is the logical-attempt
         # Idempotency-Key; without a verified token no key is sent. Legacy fake
@@ -383,7 +510,8 @@ def resolve_connection(connections, gbp_location_id=None):
 
 
 def publish_photo_drop(row, connection, *, client, draft=True, alert=None,
-                       now=None, history_store=None, media_store=None):
+                       now=None, history_store=None, media_store=None,
+                       idempotency_key=None, authority_store=None):
     """§6.4 photo drop: add the image to the GBP gallery via Zernio gmb-media. This
     endpoint is SYNCHRONOUS with NO webhook and no caption — 2xx -> published now,
     error -> failed + reason + alert. No caption gate (a gallery photo has no text). In
@@ -413,9 +541,22 @@ def publish_photo_drop(row, connection, *, client, draft=True, alert=None,
     if hold:
         return {"ok": False, "status": "approved", "late_post_id": "",
                 "reject_reason": hold, "held": "media_reuse", "mode": ""}
+    from .forward_media_publish import hold_result
+    from . import forward_media_guard as _fmg
+    send_snapshot = (deepcopy((row, connection, None))
+                     if _fmg.enabled() else None)
+    media_hold = hold_result(authority_store, row, idempotency_key)
+    if media_hold:
+        return media_hold
+    media_hold = _reauthorize_gbp_send(authority_store, row, connection,
+                                     idempotency_key, send_snapshot)
+    if media_hold:
+        return media_hold
+    send_row, send_connection = (send_snapshot[:2] if send_snapshot is not None
+                                 else (row, connection))
     try:
-        resp = client.create_gmb_media(connection["zernio_account_id"],
-                                       row["image_url"])
+        resp = client.create_gmb_media(send_connection["zernio_account_id"],
+                                       send_row["image_url"])
     except Exception as e:  # noqa: BLE001 - an error here is NOT always the outcome
         # CARRY THE MESSAGE, not just the class (2026-09-03). This recorded only
         # type(e).__name__, so the live failure on crossfitnine7f7dadc read "photo
@@ -516,7 +657,8 @@ def in_publish_window(now, tz_str):
 
 
 def publish_one(row, connections, *, client, draft=True, alert=None, now=None,
-                history_store=None, media_store=None, idempotency_key=None):
+                history_store=None, media_store=None, idempotency_key=None,
+                authority_store=None):
     """Publish one approved GBP row: connection precheck (§7.1) + routing + send. Returns
     the status transition dict {status, late_post_id, reject_reason}. A needs_reconnect
     gym HOLDS silently (status stays 'approved'); a routing failure or rail violation
@@ -548,12 +690,14 @@ def publish_one(row, connections, *, client, draft=True, alert=None, now=None,
     is_photo = str(row.get("format") or "").lower() == "photo"
     res = (publish_photo_drop(row, conn, client=client, draft=draft, alert=alert,
                              now=now, history_store=history_store,
-                             media_store=media_store)
+                             media_store=media_store, idempotency_key=idempotency_key,
+                             authority_store=authority_store)
            if is_photo
            else publish_gbp_row(row, conn, client=client, draft=draft, now=now,
                                 history_store=history_store,
                                 media_store=media_store,
-                                idempotency_key=idempotency_key))
+                                idempotency_key=idempotency_key,
+                                authority_store=authority_store))
     if not res["ok"] and not res.get("held") and alert and not is_photo:
         alert(f"GBP send failed for {row.get('gym_id')} row {row.get('id')}: "
               f"{res['reject_reason']}")
@@ -660,7 +804,7 @@ def publish_due_gbp(store, client, *, run_date, draft=True, alert=None, now=None
                                   now=(now or _utcnow()),
                                   history_store=history_store,
                                   media_store=media_store,
-                                  idempotency_key=claim_token)
+                                  idempotency_key=claim_token, authority_store=store)
             except Exception as e:  # noqa: BLE001
                 # An exception escaping publish_one is NOT proof of a definite
                 # no-post: it may come AFTER a provider call (a post-send alert
@@ -697,6 +841,10 @@ def publish_due_gbp(store, client, *, run_date, draft=True, alert=None, now=None
                                   f"{res.get('reject_reason') or ''}")
                         except Exception:  # noqa: BLE001 - alerts never decide outcomes
                             pass
+                    continue
+                if (str(res.get("held") or "").startswith("forward_media_")
+                        and not claim_token):
+                    # Ownership is unavailable: never use an unscoped rollback.
                     continue
                 if claim_won:
                     # release the claim: a held row (needs_reconnect etc.) must go back

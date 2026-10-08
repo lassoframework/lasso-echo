@@ -232,6 +232,10 @@ def _autonomous_publish(draft, store, poster):
       - A MediaNotReady / unauthorized-actor / unknown-account outcome returns False so
         the draft is stored PENDING and can still be approved manually (never lost).
     """
+    from . import forward_media_guard as _fmg
+    if _fmg.enabled():
+        print("[autonomy] HELD: forward_media_verification; legacy draft has no persisted calendar authority")
+        return False
     from . import db as _db
     account_key = getattr(draft, "account_key", "") or ""
     if not _db.is_autonomous(account_key):
@@ -387,6 +391,10 @@ def _claimed_meta_publish(draft, acct):
     Returns ('published', result) on a fresh publish/would_publish,
     ('already', None) when a prior attempt already landed, ('held', None) when
     the claim is unverifiable and the draft must wait for a human."""
+    from . import forward_media_guard as _fmg
+    if _fmg.enabled():
+        print("[claim] HELD: forward_media_verification; legacy draft has no persisted calendar authority")
+        return ("held", None)
     from . import db, ops_alerts
     from .meta_publisher import (MediaNotReady, MissingToken, NotSupported,
                                  publish)

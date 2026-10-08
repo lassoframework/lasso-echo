@@ -209,6 +209,17 @@ begin
    or nullif(btrim(d->>'review_evidence_ref'),'') is null then
    raise exception 'unresolved or matching historical visual' using errcode='23514'; end if;
  end loop;
+ -- Nullable thumbnail bindings are atomic and signed. Legacy null candidates
+ -- remain valid; any hosted thumbnail requires exact SHA, MD5 and bounded size.
+ if ((c->>'thumbnail_url' is null and c->>'thumbnail_sha256' is null
+     and c->>'thumbnail_fingerprint' is null and c->>'thumbnail_length' is null)
+   or (c->>'thumbnail_url' ~ '^https://[^[:space:]]+$'
+     and c->>'thumbnail_sha256' ~ '^sha256:[0-9a-f]{64}$'
+     and c->>'thumbnail_fingerprint' ~ '^md5:[0-9a-f]{32}$'
+     and jsonb_typeof(c->'thumbnail_length')='number'
+     and c->>'thumbnail_length' ~ '^[0-9]+$'
+     and (c->>'thumbnail_length')::bigint between 1 and 134217728)) is distinct from true then
+  raise exception 'complete exact thumbnail candidate required' using errcode='23514'; end if;
  select * into s from public.fixer_forward_media_source_receipt_20261007
   where receipt_ref=c->>'source_receipt_ref';
  if not found or s.calendar_row_id is distinct from (c->>'calendar_row_id')::uuid
@@ -223,7 +234,7 @@ begin
   or r.source_media_asset_id is distinct from c->>'source_asset_id'
   or r.source_media_url is distinct from c->>'source_url'
   or r.visual_group_key is distinct from c->>'group_key' or r.post_date::text is distinct from c->>'post_date'
-  or r.image_url is distinct from c->>'image_url' or r.thumbnail_url is not null
+  or r.image_url is distinct from c->>'image_url' or r.thumbnail_url is distinct from c->>'thumbnail_url'
   or c->>'content_digest' is distinct from 'sha256:'||encode(sha256(convert_to(public.fixer_forward_media_photo_content_20261007(r.id)::text,'UTF8')),'hex') then
   raise exception 'exact still candidate content required' using errcode='23514'; end if;
  if not exists(select 1 from public.media_asset a join public.media_source source on source.id=a.source_id

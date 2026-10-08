@@ -1448,6 +1448,16 @@ def publish_due(run_date, *, gym_id="lasso", store=None, publisher=None,
     if zernio_publish is None:
         from . import zernio_publisher
         zernio_publish = zernio_publisher.publish
+    from . import forward_media_guard as _forward_media_guard
+    if _forward_media_guard.enabled():
+        from . import zernio_publisher
+        # The trusted send scope is meaningful only when its wrapped lower
+        # publisher is the callable used. Test hooks or future callers may not
+        # substitute an arbitrary callback and ignore that scope when armed.
+        if (publisher is not meta_publisher.publish
+                or zernio_publish is not zernio_publisher.publish):
+            return {"ok": False, "held": True, "date": run_date,
+                    "reason": "unverified provider callback", "published": []}
 
     # A reviewed managed Story unlocks only the exact dated incident feed hold.
     # This CAS never changes captions, visuals, claims or another hold reason.
@@ -1483,6 +1493,7 @@ def publish_due(run_date, *, gym_id="lasso", store=None, publisher=None,
     skipped = []
     failed = []
     waiting = []            # slot not arrived yet: left pending for a later run
+    forward_media_holds = {}
     recovery_required = []  # pre-network block claimed a row, but rollback was unconfirmed
     published_accounts = set()
 
@@ -2109,6 +2120,31 @@ def publish_due(run_date, *, gym_id="lasso", store=None, publisher=None,
             failed.append(row_id)
             continue
 
+        # Default-OFF byte authority: a failed check is a proven pre-network
+        # hold. Only release a lease whose persisted token this run owns.
+        from . import forward_media_guard as _fmg
+        from .forward_media_publish import authorize as _authorize_media
+        if _fmg.enabled():
+            try:
+                if draft.creative_public_url != row.get("image_url"):
+                    raise _fmg.ForwardMediaVerificationHold("outgoing draft media differs from row")
+                _authorize_media(store, row, claim_token)
+            except _fmg.ForwardMediaVerificationHold as exc:
+                reason = ("forward_media_duplicate" if isinstance(
+                    exc, _fmg.ForwardMediaDuplicateHold) else "forward_media_verification")
+                forward_media_holds[row_id] = reason
+                reverted = False
+                if claim_token:
+                    reverted = _revert_to_pending(
+                        store, row_id, reject_reason=reason, gym_id=gym_id,
+                        expected_claim_token=claim_token,
+                        revert_status="approved" if approved_only else "pending")
+                if not reverted:
+                    recovery_required.append(row_id)
+                _alert_publish_blocked(gym_id, row_id, reason, reverted=reverted)
+                failed.append(row_id)
+                continue
+
         # CAPTION TRACE (pure logging, WIRING.md 2026-08-27): stage-by-stage
         # visible-length for the outbound caption, so a caption that goes
         # missing between the row and the API call is grep-able as
@@ -2147,12 +2183,24 @@ def publish_due(run_date, *, gym_id="lasso", store=None, publisher=None,
                 # caller reached here (WHY: a Meta-direct post reads as an external
                 # second publisher in Zernio analytics and taints metrics_sync's
                 # LASSO months for the learning loop).
-                if account.key.startswith("lasso") and \
-                        not config.lasso_via_zernio_enabled():
-                    result = publisher(draft, account)
-                else:
-                    result = zernio_publish(draft, account, scheduled_for=None)
+                # A successful precheck grants no ambient provider permission.
+                # Bind the exact claimed row/token to this one lower invocation;
+                # the scope re-reads authority and closes on every exit.
+                from contextlib import nullcontext
+                from .forward_media_publish import authorized_send as _authorized_send
+                with (_authorized_send(store, row, claim_token)
+                      if _fmg.enabled() else nullcontext()):
+                    if account.key.startswith("lasso") and \
+                            not config.lasso_via_zernio_enabled():
+                        result = publisher(draft, account)
+                    else:
+                        result = zernio_publish(draft, account, scheduled_for=None)
             except Exception as e:
+                if isinstance(e, _fmg.ForwardMediaVerificationHold):
+                    forward_media_holds[row_id] = (
+                        "forward_media_duplicate" if isinstance(
+                            e, _fmg.ForwardMediaDuplicateHold)
+                        else "forward_media_verification")
                 # A deterministic Zernio preflight refusal (missing/expired account,
                 # profile/page/media) happens before create_post is called, so it is
                 # safe to release the owned claim for a later tick after repair. Keep
@@ -2275,7 +2323,8 @@ def publish_due(run_date, *, gym_id="lasso", store=None, publisher=None,
 
     return {"ok": True, "published": published, "skipped": skipped,
             "failed": failed, "waiting": waiting,
-            "held": bool(recovery_required),
+            "held": bool(recovery_required or forward_media_holds),
+            "forward_media_holds": forward_media_holds,
             "recovery_required": recovery_required, "date": run_date}
 
 

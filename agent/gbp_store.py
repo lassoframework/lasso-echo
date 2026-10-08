@@ -375,7 +375,8 @@ class GbpStore:
                     "publish_claim_token": f"eq.{claim_token}"},
             headers=self._s._headers({"Content-Type": "application/json",
                                       "Prefer": "return=representation"}),
-            json={"status": status, "publish_claim_token": None}, timeout=30)
+            json={"status": status, "publish_claim_token": None,
+                  "publish_reservation_day": None}, timeout=30)
         if r.status_code >= 400:
             raise PortalStoreError(r.status_code, _scrub((r.text or "")[:200]))
         rows = r.json() or []
