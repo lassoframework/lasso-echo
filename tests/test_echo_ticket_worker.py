@@ -1334,3 +1334,110 @@ def test_real_outreach_claim_refusal_does_not_double_alert(monkeypatch, reason, 
     assert bus.tickets["t-1"]["status"] == "verification"
     assert bus.tickets["t-1"]["escalated"] is False
     assert log["posted"] == []
+
+
+# ---- completion gate (2026-10-07 live incident): an answer that asks the client for
+# missing facts or an action must NOT resolve on delivery --------------------------------
+
+def _run_answer(bus, answer_body):
+    log, open_dm, post = _calls()
+    _, notice = _notices()
+    marks, mark_message = _marks_capture(bus)
+    W.intake_pass(bus, open_group_dm=open_dm, post_first_message=post,
+                  write_hold_notice=notice,
+                  fetch_state=lambda ticket, who: {"social_status": "connected"},
+                  llm=lambda s, u: answer_body,
+                  mark_message=mark_message, stamp_ticket=bus.stamp_ticket,
+                  **_client_deps())
+    return log, marks
+
+
+@pytest.mark.parametrize("answer_body", [
+    # asks for screenshots
+    "I can't see the error yet. Can you send us a screenshot of the Instagram login screen?",
+    # asks for post links
+    "Which post should I update? Please share the link to the post that looks wrong.",
+    # asks for dates
+    "Could you confirm the date the schedule stopped publishing? "
+    "Would you also tell us the timeframe you expected?",
+    # asks for connection / action details
+    "To check the connection, please provide the account name and grant access, "
+    "or forward the login details.",
+    "Please share the error message you see when connecting.",
+    "Please reply with the URL of the post that failed.",
+    "Please take a screenshot of the error you see.",
+    "Could you capture a screenshot of the page?",
+])
+def test_answer_asking_client_for_details_stays_open_after_delivery(answer_body):
+    """Synthetic reproduction of the 2026-10-07 incident: an answer body that asks
+    the client for screenshots, post links, dates or connection/action details must
+    keep the ticket OPEN after the response is delivered -- never resolve on
+    delivery -- and route to staff follow-up."""
+    bus = FakeBus([_ticket(raw_text="is my instagram connected?", request_version=2)])
+    log, marks = _run_answer(bus, answer_body)
+    # The answer WAS delivered to the client's DM ...
+    assert len(log["posted"]) == 1
+    assert len(marks) == 1 and marks[0]["status"] == "posted"
+    assert marks[0]["meta_update"] is None, "needs-more-info answer is not a completion"
+    assert bus.outbound[0]["attachments"].get("resolve_notice") is None
+    # ... but the ticket stays open and escalated for staff follow-up.
+    assert bus.tickets["t-1"]["status"] == "hold"
+    assert bus.tickets["t-1"]["escalated"] is True
+    hold = (bus.tickets["t-1"].get("verification_after") or {}).get("hold") or {}
+    assert hold.get("reason") == W.CLIENT_DETAILS_MARKER
+    assert hold.get("reason") != A.FOLLOW_UP_MARKER
+    cards = [r for r in bus.outbound if r["kind"] == A.KIND_ESCALATION
+             and r["meta"].get("client_details_requested")]
+    assert len(cards) == 1
+    assert cards[0]["delivery_status"] == "ready"
+    assert "investigate internally; keep ticket open" in cards[0]["body"]
+
+
+def test_answer_matching_both_patterns_is_carded_exactly_once():
+    """An answer that both promises a human follow-up AND asks for details routes
+    through the single shared path -- one card, one stamp, no duplicate outreach."""
+    bus = FakeBus([_ticket(raw_text="is my instagram connected?", request_version=2)])
+    body = ("I will follow up once we know more. Can you send us a screenshot of "
+            "the error screen?")
+    log, marks = _run_answer(bus, body)
+    assert len(log["posted"]) == 1
+    assert marks[0]["meta_update"] is None
+    assert bus.tickets["t-1"]["status"] == "hold"
+    follow_up_rows = [r for r in bus.outbound
+                      if r["kind"] == A.KIND_ESCALATION
+                      and r["body"].startswith("FOLLOW-UP PROMISED")]
+    assert len(follow_up_rows) == 1
+    assert bus.tickets["t-1"]["verification_after"]["hold"]["reason"] == A.FOLLOW_UP_MARKER
+
+
+def test_complete_grounded_answer_still_resolves_on_delivery():
+    """The gate is conservative: a genuinely complete, grounded answer still
+    closes normally after verified delivery."""
+    bus = FakeBus([_ticket(raw_text="is my instagram connected?", request_version=3)])
+    log, marks = _run_answer(
+        bus, "Yes, your Instagram is connected right now. Your last post went out "
+             "on schedule and nothing is queued.")
+    assert bus.tickets["t-1"]["status"] == "resolved"
+    assert len(log["posted"]) == 1
+    assert marks[0]["meta_update"] == {"resolve_notice": True, "request_version": 3}
+    # No staff follow-up card (the delivery RECEIPT shares KIND_ESCALATION).
+    follow_up_rows = [r for r in bus.outbound
+                      if r["kind"] == A.KIND_ESCALATION
+                      and r["body"].startswith("FOLLOW-UP PROMISED")]
+    assert follow_up_rows == []
+
+
+@pytest.mark.parametrize("answer_body", [
+    "Your error message is Instagram's temporary connection warning.",
+    "The account name is LASSO Fitness and the latest post went out today.",
+    "We received the screenshot and link, and confirmed the schedule is active.",
+])
+def test_grounded_answers_mention_requested_objects_still_resolve(answer_body):
+    bus = FakeBus([_ticket(raw_text="is my instagram connected?", request_version=3)])
+    _, marks = _run_answer(bus, answer_body)
+    assert bus.tickets["t-1"]["status"] == "resolved"
+    assert marks[0]["meta_update"] == {"resolve_notice": True, "request_version": 3}
+
+
+def test_common_request_phrasings_are_recognized_without_needing_live_delivery():
+    assert W._needs_more_information("Let me know which account you are using.")
