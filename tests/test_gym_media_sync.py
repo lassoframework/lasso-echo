@@ -726,3 +726,368 @@ def test_sync_source_refuses_a_persisted_inactive_source(monkeypatch):
                            store=store)
     assert res["ok"] is False and res["refused"] == "source_inactive"
     assert store.assets == {}
+
+
+
+# ---- inventory mutation receipt fence (default OFF) -------------------------
+# Mirrors tests/test_intake_web_inventory_guard.py: fully offline — fake
+# mutation authority (no PG), real tmp library/SQLite/journal paths.
+import json  # noqa: E402
+import sqlite3  # noqa: E402
+import uuid  # noqa: E402
+
+from agent import config as _config  # noqa: E402
+from agent import local_inventory_mutation as _mutation  # noqa: E402
+
+
+class _FakeAuthority:
+    """Fake mutation authority; fail='begin'/'complete' simulates a lost ack."""
+
+    def __init__(self, fail=None):
+        self.fail = fail
+
+    def begin(self, request):
+        self.pending = dict(request, state="pending", generation=3,
+                            result_digest=None,
+                            begun_at="2026-10-08T00:00:00+00:00",
+                            completed_at=None)
+        if self.fail == "begin":
+            raise _mutation.MutationHold("ack_lost")
+        return dict(self.pending)
+
+    def complete(self, request, result_digest):
+        if self.fail == "complete":
+            raise _mutation.MutationHold("ack_lost")
+        self.pending.update(state="complete", result_digest=result_digest,
+                            completed_at="2026-10-08T00:00:01+00:00")
+        return dict(self.pending)
+
+    def close(self):
+        pass
+
+
+@pytest.fixture
+def fenced(tmp_path, monkeypatch):
+    """Mutation fence armed with real tmp durable paths for gym 'pierce'."""
+    root = tmp_path.resolve()
+    monkeypatch.setenv("AGENT_LOCAL_INVENTORY_MUTATIONS_ENABLED", "true")
+    monkeypatch.setenv("LOCAL_INVENTORY_MUTATION_EPOCH", str(uuid.uuid4()))
+    database = root / "echo.db"
+    sqlite3.connect(database).close()
+    monkeypatch.setenv("AGENT_DB_PATH", str(database))
+    monkeypatch.setattr(_config, "LIBRARY_PATH", str(root))
+    (root / "pierce").mkdir()
+    monkeypatch.setattr("agent.jobs.sync_gym_media._post_digest",
+                        lambda *a, **k: None)
+    return root
+
+
+def _journals(root):
+    directory = root / "inventory-mutation-receipts"
+    return [json.loads(p.read_text()) for p in directory.glob("*.json")] \
+        if directory.exists() else []
+
+
+def _install_authority(monkeypatch, authority):
+    monkeypatch.setattr(_mutation.MutationAuthority, "from_environment",
+                        staticmethod(lambda: authority))
+
+
+def test_fence_off_by_default_leaves_no_journal(tmp_path, monkeypatch):
+    """DEFAULT OFF: with the flag unset, sync behaves exactly as legacy — no
+    receipt, no journal directory, no library requirement."""
+    monkeypatch.delenv("AGENT_LOCAL_INVENTORY_MUTATIONS_ENABLED", raising=False)
+    monkeypatch.setattr("agent.jobs.sync_gym_media._post_digest",
+                        lambda *a, **k: None)
+    store = FakeMediaStore()
+    res = sync.sync_source(_src(store), drive=FakeDrive(files=[photo("p1")]),
+                           store=store)
+    assert res["ok"] is True and res["inserted"] == 1
+    assert not (tmp_path / "inventory-mutation-receipts").exists()
+
+
+def test_fenced_sync_completes_with_receipt_and_verified_effects(fenced,
+                                                                 monkeypatch):
+    _install_authority(monkeypatch, _FakeAuthority())
+    store = FakeMediaStore()
+    res = sync.sync_source(_src(store), drive=FakeDrive(files=[photo("p1")]),
+                           store=store)
+    assert res["ok"] is True and res["inserted"] == 1
+    assert store.assets["p1"]["gym_id"] == "pierce"
+    (record,) = _journals(fenced)
+    assert record["local_state"] == "complete"
+    assert record["gym_id"] == "pierce" and record["kind"] == "gym_media_sync"
+    assert record["complete_receipt"]["state"] == "complete"
+    assert record["complete_receipt"]["result_digest"] == record["result_digest"]
+
+
+def test_fenced_sync_holds_on_readback_mismatch(fenced, monkeypatch):
+    """An index effect that does not re-read clean holds the receipt: held
+    summary, no digest, never COMPLETE."""
+
+    class CorruptingStore(FakeMediaStore):
+        def insert_assets_ignore_conflicts(self, rows):
+            rows = [dict(r, title="tampered") for r in rows]
+            return super().insert_assets_ignore_conflicts(rows)
+
+    digests = []
+    monkeypatch.setattr("agent.jobs.sync_gym_media._post_digest",
+                        lambda *a, **k: digests.append(a))
+    _install_authority(monkeypatch, _FakeAuthority())
+    store = CorruptingStore()
+    res = sync.sync_source(_src(store), drive=FakeDrive(files=[photo("p1")]),
+                           store=store)
+    assert res["ok"] is False and res["held"] is True
+    assert digests == []                       # no certified-success digest
+    (record,) = _journals(fenced)
+    # The local effect committed but completion never happened: pending forever.
+    assert record["local_state"] != "complete"
+    assert record.get("complete_receipt") is None
+
+
+def test_fenced_sync_holds_before_any_write_when_authority_unavailable(fenced):
+    """Fail closed: no dedicated mutator login configured -> nothing indexed."""
+    store = FakeMediaStore()
+    res = sync.sync_source(_src(store), drive=FakeDrive(files=[photo("p1")]),
+                           store=store)
+    assert res["ok"] is False and res["held"] is True
+    assert store.assets == {}
+
+
+def test_fenced_sync_uncertain_begin_writes_nothing(fenced, monkeypatch):
+    _install_authority(monkeypatch, _FakeAuthority(fail="begin"))
+    store = FakeMediaStore()
+    res = sync.sync_source(_src(store), drive=FakeDrive(files=[photo("p1")]),
+                           store=store)
+    assert res["ok"] is False and res["held"] is True
+    assert store.assets == {}                  # begin never settled: no effect
+    (record,) = _journals(fenced)
+    assert record["local_state"] == "prepared"  # exact identity retained pending
+
+
+def test_fenced_sync_uncertain_complete_stays_pending(fenced, monkeypatch):
+    _install_authority(monkeypatch, _FakeAuthority(fail="complete"))
+    store = FakeMediaStore()
+    res = sync.sync_source(_src(store), drive=FakeDrive(files=[photo("p1")]),
+                           store=store)
+    assert res["ok"] is False and res["held"] is True
+    (record,) = _journals(fenced)
+    # Local effects happened but PG completion is uncertain: pending, never
+    # certified complete; a retry is blocked by assert_settled.
+    assert record["local_state"] == "local_committed"
+    with pytest.raises(_mutation.MutationHold):
+        _mutation.assert_settled(
+            _mutation.configured("pierce", (fenced / "pierce").absolute()))
+
+
+def test_fenced_sync_holds_not_raises_on_cross_gym_collision(fenced,
+                                                             monkeypatch):
+    """A duplicate/collision is a HOLD in armed mode, not a raw exception."""
+    _install_authority(monkeypatch, _FakeAuthority())
+    store = FakeMediaStore(assets=[make_asset("shared", gym_id="other",
+                                              source_id="other-src")])
+    res = sync.sync_source(_src(store), drive=FakeDrive(files=[photo("shared")]),
+                           store=store)
+    assert res["ok"] is False and res["held"] is True
+    assert store.assets["shared"]["gym_id"] == "other"   # other gym untouched
+    (record,) = _journals(fenced)
+    assert record["local_state"] != "complete"
+
+
+def test_fenced_revoked_mark_settles_under_its_own_receipt(fenced, monkeypatch):
+    _install_authority(monkeypatch, _FakeAuthority())
+    store = FakeMediaStore(sources=[_src()])
+    res = sync.sync_source(_src(store), drive=FakeDrive(walk_raises=_Resp(403)),
+                           store=store)
+    assert res.get("revoked") is True
+    assert store.sources["src1"]["revoked_externally"] is True
+    (record,) = _journals(fenced)
+    assert record["kind"] == "gym_media_source_revoke"
+    assert record["local_state"] == "complete"
+
+
+@pytest.mark.parametrize("outcome", ["rejected", "exception", "still_pending", "bad_readback"])
+def test_fenced_calendar_flip_uncertainty_holds(fenced, monkeypatch, outcome):
+    import requests
+    _install_authority(monkeypatch, _FakeAuthority())
+    monkeypatch.setattr(_config, "supabase_url", lambda: "https://example.invalid")
+    monkeypatch.setattr(_config, "supabase_service_key", lambda: "test-key")
+
+    class Response:
+        status_code = 500 if outcome == "rejected" else 200
+        text = "rejected"
+        def json(self):
+            return [{"id": "pending"}] if outcome == "still_pending" else {}
+
+    def patch(*args, **kwargs):
+        if outcome == "exception":
+            raise RuntimeError("transport down")
+        return Response()
+
+    monkeypatch.setattr(requests, "patch", patch)
+    monkeypatch.setattr(requests, "get", lambda *a, **k: Response())
+    store = FakeMediaStore(assets=[make_asset("gone", source_id="src1")])
+    res = sync.sync_source(_src(store), drive=FakeDrive(files=[]), store=store)
+    assert res["held"] and res["hold_reason"] == "local_mutation_pending_reconciliation"
+    assert _journals(fenced)[0]["local_state"] != "complete"
+
+
+@pytest.mark.parametrize("revoked", [True, False])
+@pytest.mark.parametrize("write_error", [False, True])
+def test_fenced_source_flag_requires_persisted_readback(fenced, monkeypatch,
+                                                       revoked, write_error):
+    _install_authority(monkeypatch, _FakeAuthority())
+    class NoWriteStore(FakeMediaStore):
+        def update_source(self, identifier, fields):
+            if write_error:
+                raise RuntimeError("source write failed")
+            return True
+    store = NoWriteStore()
+    source = _src(store)
+    source["revoked_externally"] = not revoked
+    store.sources["src1"] = dict(source)
+    drive = FakeDrive(walk_raises=_Resp(403)) if revoked else FakeDrive(files=[])
+    res = sync.sync_source(source, drive=drive, store=store)
+    assert res["ok"] is False and res["held"] is True
+    assert _journals(fenced)[0]["local_state"] != "complete"
+
+
+@pytest.mark.parametrize("field", ["width", "height", "aspect", "eligible", "reject_reason"])
+def test_fenced_probe_requires_all_written_fields(fenced, monkeypatch, field):
+    _install_authority(monkeypatch, _FakeAuthority())
+    monkeypatch.setattr(_config, "story_classifier_enabled", lambda: False)
+    class PartialStore(FakeMediaStore):
+        def update_asset(self, identifier, fields):
+            fields = dict(fields)
+            if "duration_sec" in fields:
+                fields.pop(field, None)
+            return super().update_asset(identifier, fields)
+    store = PartialStore()
+    # Landscape, long video gives distinct eligibility/rejection values.
+    probe = lambda p: {"duration_sec": 180., "width": 1920, "height": 1080, "codec": "h264"}
+    res = sync.sync_source(_src(store), drive=FakeDrive(files=[video("v1")]),
+                           store=store, probe_fn=probe, render_budget=0)
+    assert res["held"] and _journals(fenced)[0]["local_state"] != "complete"
+
+
+@pytest.mark.parametrize("write_error", [False, True])
+def test_fenced_rendition_noop_or_swallowed_error_holds(fenced, monkeypatch, write_error):
+    _install_authority(monkeypatch, _FakeAuthority())
+    monkeypatch.setattr(_config, "story_classifier_enabled", lambda: False)
+    class NoRenditionStore(FakeMediaStore):
+        def update_asset(self, identifier, fields):
+            if "rendition_url" in fields:
+                if write_error:
+                    raise RuntimeError("rendition write failed")
+                return True
+            return super().update_asset(identifier, fields)
+    store = NoRenditionStore()
+    probe = lambda p: {"duration_sec": 30., "width": 1080, "height": 1920, "codec": "h264"}
+    res = sync.sync_source(_src(store), drive=FakeDrive(files=[video("v1")]),
+                           store=store, probe_fn=probe, render_budget=1,
+                           host_fn=lambda *a: "https://example.invalid/clip.mp4")
+    assert res["held"] and _journals(fenced)[0]["local_state"] != "complete"
+
+
+def test_fenced_classifier_quarantine_noop_holds(fenced, monkeypatch):
+    from types import SimpleNamespace
+    from agent import story_classifier as sc
+    _install_authority(monkeypatch, _FakeAuthority())
+    monkeypatch.setattr(_config, "story_classifier_enabled", lambda: True)
+    monkeypatch.setattr(sc, "classify", lambda sig: SimpleNamespace(
+        verdict=sc.FINISHED, reasons=["finished"]))
+    class NoQuarantineStore(FakeMediaStore):
+        def update_asset(self, identifier, fields):
+            if fields.get("reject_reason") == sync._idx.REJECT_FINISHED_CONTENT:
+                return True
+            return super().update_asset(identifier, fields)
+    store = NoQuarantineStore()
+    res = sync.sync_source(_src(store), drive=FakeDrive(files=[photo("p1")]), store=store)
+    assert res["held"] and _journals(fenced)[0]["local_state"] != "complete"
+
+
+@pytest.mark.parametrize("field", ["consent_status", "review_status", "review_content_hash",
+                                    "release_ref", "moderation_status"])
+def test_fenced_changed_bytes_requires_consent_review_invalidation(fenced, monkeypatch, field):
+    _install_authority(monkeypatch, _FakeAuthority())
+    class PartialResetStore(FakeMediaStore):
+        def update_indexed_asset_if_hash(self, gym_id, identifier, old_hash, fields):
+            fields = dict(fields)
+            fields.pop(field, None)
+            return super().update_indexed_asset_if_hash(gym_id, identifier, old_hash, fields)
+    asset = make_asset("p1", source_id="src1", content_hash="old")
+    asset.update(consent_status="granted", review_status="approved",
+                 review_content_hash="old", release_ref="old-release",
+                 moderation_status="passed")
+    store = PartialResetStore(assets=[asset])
+    res = sync.sync_source(_src(store), drive=FakeDrive(files=[photo("p1")]),
+                           store=store, render_budget=0)
+    assert res["held"] and _journals(fenced)[0]["local_state"] != "complete"
+
+
+def test_fenced_probe_and_rendition_persisted_effects_complete(fenced, monkeypatch):
+    _install_authority(monkeypatch, _FakeAuthority())
+    monkeypatch.setattr(_config, "story_classifier_enabled", lambda: False)
+    store = FakeMediaStore()
+    probe = lambda p: {"duration_sec": 30., "width": 1080, "height": 1920, "codec": "h264"}
+    res = sync.sync_source(_src(store), drive=FakeDrive(files=[video("v1")]),
+                           store=store, probe_fn=probe, render_budget=1,
+                           host_fn=lambda *a: "https://example.invalid/clip.mp4")
+    assert res["ok"] and res["probed"] == 1 and res["prehosted"] == 1
+    assert _journals(fenced)[0]["local_state"] == "complete"
+
+
+def test_fence_off_preserves_best_effort_calendar_failure(monkeypatch):
+    import requests
+    monkeypatch.delenv("AGENT_LOCAL_INVENTORY_MUTATIONS_ENABLED", raising=False)
+    monkeypatch.setattr(_config, "supabase_url", lambda: "https://example.invalid")
+    monkeypatch.setattr(_config, "supabase_service_key", lambda: "test-key")
+    monkeypatch.setattr(sync, "_post_digest", lambda *a, **k: None)
+    class Response:
+        status_code = 500
+        text = "rejected"
+    monkeypatch.setattr(requests, "patch", lambda *a, **k: Response())
+    monkeypatch.setattr(requests, "get", lambda *a, **k: pytest.fail("legacy readback"))
+    store = FakeMediaStore(assets=[make_asset("gone", source_id="src1")])
+    res = sync.sync_source(_src(store), drive=FakeDrive(files=[]), store=store, emit_digest=False)
+    assert res["ok"] and res["removed"] == 1
+
+
+@pytest.mark.parametrize("corruption", [
+    {"eligible": True, "reject_reason": None, "width": 9999},
+    {"eligible": True}, {"reject_reason": None}, {"width": 9999},
+    {"height": 9999}, {"used_count": 4},
+])
+def test_fenced_insert_requires_all_initial_fields(fenced, monkeypatch, corruption):
+    _install_authority(monkeypatch, _FakeAuthority())
+    monkeypatch.setattr(_config, "story_classifier_enabled", lambda: False)
+    class CorruptInsertStore(FakeMediaStore):
+        def insert_assets_ignore_conflicts(self, rows):
+            inserted = super().insert_assets_ignore_conflicts(rows)
+            for identifier in inserted:
+                self.assets[identifier].update(corruption)
+            return inserted
+    store = CorruptInsertStore()
+    res = sync.sync_source(_src(store), drive=FakeDrive(files=[photo("tiny", w=100, h=100)]),
+                           store=store, render_budget=0)
+    assert res["ok"] is False and res["held"] is True
+    assert _journals(fenced)[0]["local_state"] != "complete"
+
+
+def test_fenced_insert_conflict_preserves_existing_effect_fields(fenced, monkeypatch):
+    _install_authority(monkeypatch, _FakeAuthority())
+    monkeypatch.setattr(_config, "story_classifier_enabled", lambda: False)
+    class SameSourceRaceStore(FakeMediaStore):
+        def insert_assets_ignore_conflicts(self, rows):
+            # Another pass already inserted the same source-owned bytes and
+            # inspected them. Ignoring conflict must not demand insertion defaults.
+            for row in rows:
+                self.assets[row["id"]] = dict(row, eligible=False,
+                                               reject_reason="operator_hold", used_count=5)
+            return set()
+    store = SameSourceRaceStore()
+    res = sync.sync_source(_src(store), drive=FakeDrive(files=[photo("p1")]),
+                           store=store, render_budget=0)
+    assert res["ok"] is True and res["inserted"] == 0
+    assert store.assets["p1"]["reject_reason"] == "operator_hold"
+    assert _journals(fenced)[0]["local_state"] == "complete"
