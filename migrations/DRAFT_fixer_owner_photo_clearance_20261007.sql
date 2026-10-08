@@ -137,7 +137,7 @@ returns text language plpgsql immutable set search_path=pg_catalog,public as $$
 declare result text;
 begin
  case jsonb_typeof(v)
- when 'object' then select '{'||coalesce(string_agg(to_jsonb(key)::text||':'||public.fixer_owner_photo_canonical_20261007(value),',' order by key),'')||'}' into result from jsonb_each(v);
+ when 'object' then select '{'||coalesce(string_agg(to_jsonb(key)::text||':'||public.fixer_owner_photo_canonical_20261007(value),',' order by key collate "C"),'')||'}' into result from jsonb_each(v);
  when 'array' then select '['||coalesce(string_agg(public.fixer_owner_photo_canonical_20261007(value),',' order by n),'')||']' into result from jsonb_array_elements(v) with ordinality e(value,n);
  else result:=v::text;
  end case;

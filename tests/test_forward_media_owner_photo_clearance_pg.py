@@ -548,6 +548,10 @@ def main():
    for name in ('feed_autofit_4x5','story_photo'):
     row_id,prepared_now,cert_now=signed_rendition(name,name)
     counts=sql('select (select count(*) from fixer_owner_photo_reservation_20261007),(select count(*) from fixer_forward_media_render_manifest_20261006)')[0]
+    # Story runtime filenames mix case and underscores. The signed Python
+    # codepoint order must match SQL even on an en_US database locale.
+    canonical_sql=sql('select fixer_owner_photo_canonical_20261007(%s::jsonb)',(json.dumps(prepared_now.manifest.render_recipe),))[0][0]
+    assert canonical_sql==json.dumps(prepared_now.manifest.render_recipe,sort_keys=True,separators=(',',':'),ensure_ascii=False)
     staged=stage_prepared_photo(p,prepared_now)
     assert staged['registry']==verified_source.original.row(),staged
     assert staged['clearance']==result['clearance'],staged
