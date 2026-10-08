@@ -10,16 +10,35 @@ begin
  if current_user in ('service_role','anon','authenticated') then
   raise exception 'trusted existing migration owner required' using errcode='42501'; end if;
  if to_regprocedure('public.echo_source_brand_active(uuid)') is null
-  or to_regclass('public.tenant_alias') is null
   or to_regclass('public.echo_intake_tokens') is null
   or to_regprocedure('public.fixer_owner_photo_canonical_20261007(jsonb)') is null then
   raise exception 'assembled same-database source-brand dependencies unavailable' using errcode='55000'; end if;
  if not has_function_privilege(current_user,'public.echo_source_brand_active(uuid)','EXECUTE')
   or not has_table_privilege(current_user,'public.echo_source_captures','SELECT')
-  or not has_table_privilege(current_user,'public.echo_intake_tokens','SELECT')
-  or not has_table_privilege(current_user,'public.tenant_alias','SELECT') then
+  or not has_table_privilege(current_user,'public.echo_intake_tokens','SELECT') then
   raise exception 'trusted migration owner lacks bounded portal read privileges' using errcode='42501'; end if;
 end $$;
+
+-- This registry belongs only to the generated portal bridge. It does not
+-- depend on visual-group tenant_alias or treat shared intake tokens as Echo
+-- enrollment. EMPTY BY DEFAULT: an authorized release must independently review
+-- and explicitly populate each exact calendar gym text <-> portal gym UUID pair,
+-- with its approval evidence and actor. No backfill from echo_intake_tokens.
+create table public.fixer_generated_portal_tenant_map_20261008 (
+ echo_account_key text primary key check(length(echo_account_key) between 1 and 200
+  and echo_account_key=btrim(echo_account_key)),
+ gym_id uuid not null unique references public.gyms(id),
+ approval_evidence_ref text not null check(length(btrim(approval_evidence_ref))>0),
+ approved_by text not null check(length(btrim(approved_by))>0),
+ approved_at timestamptz not null default clock_timestamp()
+);
+alter table public.fixer_generated_portal_tenant_map_20261008 enable row level security;
+-- Only the trusted migration/table owner can populate or inspect the registry.
+-- Runtime service and isolated owner roles consume bounded SECURITY DEFINER RPCs.
+revoke all on table public.fixer_generated_portal_tenant_map_20261008
+ from public,anon,authenticated,service_role,fixer_forward_media_owner_20261006,
+ fixer_forward_media_attester_20261006,generated_authority_owner_20261007,
+ generated_authority_publisher_20261007,generated_send_reconciler_20261007;
 
 -- Retain historical local-source rows unchanged; v2 rows carry a distinct
 -- configuration/observation derivation reference and cannot use legacy refs.
@@ -52,7 +71,7 @@ begin
  hex:=encode(bytes,'hex'); return hex::uuid;
 end $$;
 
--- Resolve both independent tenant registries before returning the explicit B
+-- Resolve the approved bridge registry and independent intake registry before returning B
 -- consumer contract. No public-active call grants a collector/producer role.
 create function public.fixer_generated_source_brand_active_20261007(p_base text)
 returns jsonb language plpgsql security definer set search_path=pg_catalog,public set timezone='UTC' as $$
@@ -60,12 +79,16 @@ declare gym uuid; active jsonb;
 begin
  if current_setting('transaction_isolation')<>'read committed' then
   raise exception 'bundle bridge requires read committed' using errcode='25000'; end if;
- select tenant_id into gym from public.tenant_alias where alias_key=p_base;
- if gym is null then raise exception 'canonical tenant alias missing' using errcode='23514'; end if;
+ perform pg_advisory_xact_lock(hashtext('generated-authority-20261007'),hashtext(p_base));
+ select gym_id into gym from public.fixer_generated_portal_tenant_map_20261008 where echo_account_key=p_base;
+ if gym is null then raise exception 'approved generated portal tenant mapping missing' using errcode='23514'; end if;
  perform pg_advisory_xact_lock(hashtextextended(gym::text,0));
  if (select count(*) from public.echo_intake_tokens where gym_id=gym and echo_account_key=p_base)<>1
   or (select count(*) from public.echo_intake_tokens where gym_id=gym or echo_account_key=p_base)<>1
-  or not exists(select 1 from public.tenant_alias where alias_key=p_base and tenant_id=gym) then
+  or (select count(*) from public.fixer_generated_portal_tenant_map_20261008
+    where gym_id=gym or echo_account_key=p_base)<>1
+  or not exists(select 1 from public.fixer_generated_portal_tenant_map_20261008
+    where echo_account_key=p_base and gym_id=gym) then
   raise exception 'exact source-brand tenant bijection required' using errcode='23514'; end if;
  active:=public.echo_source_brand_active(gym);
  if active is null or active->'bundle'->>'gym_id' is distinct from gym::text
@@ -629,12 +652,16 @@ declare gym uuid; old_gym uuid; alias text; old_alias text;
 begin
  if current_setting('transaction_isolation')<>'read committed' then
   raise exception 'generated bundle mutation requires read committed' using errcode='25000'; end if;
- if tg_table_name='tenant_alias' then
-  gym:=case when tg_op='DELETE' then old.tenant_id else new.tenant_id end;
-  if tg_op='UPDATE' then old_gym:=old.tenant_id; end if;
- else
-  gym:=case when tg_op='DELETE' then old.gym_id else new.gym_id end;
-  if tg_op='UPDATE' then old_gym:=old.gym_id; end if;
+ gym:=case when tg_op='DELETE' then old.gym_id else new.gym_id end;
+ if tg_op='UPDATE' then old_gym:=old.gym_id; end if;
+ if tg_table_name in ('fixer_generated_portal_tenant_map_20261008','echo_intake_tokens') then
+  alias:=case when tg_op='DELETE' then old.echo_account_key else new.echo_account_key end;
+  if tg_op='UPDATE' then old_alias:=old.echo_account_key; end if;
+  -- Mapping writers already hold row locks. Never wait in reverse order:
+  -- canonical account precedes portal UUID, including both old and new pairs.
+  if not pg_try_advisory_xact_lock(hashtext('generated-authority-20261007'),hashtext(alias))
+   or (old_alias is not null and not pg_try_advisory_xact_lock(hashtext('generated-authority-20261007'),hashtext(old_alias))) then
+   raise exception 'generated bundle send decision busy; account mapping blocked' using errcode='55000'; end if;
  end if;
  if not pg_try_advisory_xact_lock(hashtextextended(gym::text,0))
   or (old_gym is not null and not pg_try_advisory_xact_lock(hashtextextended(old_gym::text,0))) then
@@ -642,13 +669,6 @@ begin
  if exists(select 1 from public.generated_send_lease_20261007 where state in ('reserved','inflight','unknown')
   and authority_pins->>'mode'='delegated_policy' and authority_pins->>'gym_id'=any(array[gym::text,old_gym::text])) then
   raise exception 'outstanding generated attempt freezes portal authority' using errcode='55000'; end if;
- if tg_table_name='tenant_alias' then
-  alias:=case when tg_op='DELETE' then old.alias_key else new.alias_key end;
-  if tg_op='UPDATE' then old_alias:=old.alias_key; end if;
- elsif tg_table_name='echo_intake_tokens' then
-  alias:=case when tg_op='DELETE' then old.echo_account_key else new.echo_account_key end;
-  if tg_op='UPDATE' then old_alias:=old.echo_account_key; end if;
- end if;
  if alias is not null and exists(select 1 from public.generated_send_lease_20261007
   where state in ('reserved','inflight','unknown') and tenant_id=any(array[alias,old_alias])) then
   raise exception 'outstanding generated attempt freezes account mapping' using errcode='55000'; end if;
@@ -676,12 +696,12 @@ begin
  return null;
 end $$;
 do $$ declare t text; begin
- foreach t in array array['echo_source_captures','echo_source_brand_receipts','echo_source_brand_observations',
-  'echo_source_brand_capability_events','echo_intake_tokens','tenant_alias'] loop
+ foreach t in array array['echo_source_captures','echo_source_brand_provider_status','echo_source_brand_receipts','echo_source_brand_observations',
+  'echo_source_brand_capability_events','echo_intake_tokens','fixer_generated_portal_tenant_map_20261008'] loop
   execute format('create trigger generated_bundle_send_fence before insert or update or delete on public.%I for each row execute function public.generated_bundle_portal_fence_20261007()',t);
  end loop;
- foreach t in array array['echo_source_captures','echo_source_brand_bundles','echo_source_brand_receipts','echo_source_brand_observations',
-  'echo_source_brand_capability_events','echo_intake_tokens','tenant_alias','app_users'] loop
+ foreach t in array array['echo_source_captures','echo_source_brand_provider_status','echo_source_brand_bundles','echo_source_brand_receipts','echo_source_brand_observations',
+  'echo_source_brand_capability_events','echo_intake_tokens','fixer_generated_portal_tenant_map_20261008','app_users'] loop
   execute format('create trigger generated_bundle_truncate_fence before truncate on public.%I for each statement execute function public.generated_bundle_truncate_fence_20261007()',t);
  end loop;
 end $$;

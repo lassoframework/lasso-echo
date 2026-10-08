@@ -24,7 +24,7 @@ PG=Path('/opt/homebrew/opt/postgresql@17/bin')
 PORTAL=ROOT.parent/'portal-brand-source-bundle-20261008/supabase/migrations/DRAFT_echo_source_brand_bundle.sql'
 
 
-def main():
+def main(source_mode=None):
  import psycopg
  assert shutil.disk_usage('/tmp').free>5*1024**3
  with tempfile.TemporaryDirectory(prefix='generated_bundle_pg_',dir='/tmp') as tmp:
@@ -54,7 +54,6 @@ def main():
     create table gyms(id uuid primary key);
     create table app_users(id uuid primary key,clerk_user_id text unique,role text,email text);
     create table echo_intake_tokens(gym_id uuid primary key,echo_account_key text unique);
-    create table tenant_alias(alias_key text primary key,tenant_id uuid);
    ''')
    for name in ('DRAFT_fixer_forward_media_claim_20261006.sql','DRAFT_fixer_forward_media_observation_bridge_20261007.sql','DRAFT_fixer_forward_media_source_history_20261007.sql','DRAFT_fixer_forward_media_photo_certificate_20261007.sql','DRAFT_fixer_owner_photo_clearance_20261007.sql','DRAFT_fixer_generated_owner_20261007.sql','DRAFT_fixer_generated_gap_dispatch_20261007.sql','DRAFT_generated_source_palette_authority_20261007.sql','DRAFT_generated_send_lease_20261007.sql'):
     sql((ROOT/'migrations'/name).read_text())
@@ -72,23 +71,77 @@ def main():
    sql('insert into gyms values(%s)',(gym,))
    sql("insert into app_users values(%s,'SYNTHETIC Blake identity','owner','blake@lassoframework.com')",(uuid.uuid4(),))
    sql("insert into echo_intake_tokens values(%s,'gym')",(gym,))
-   sql("insert into tenant_alias values('gym',%s)",(gym,))
+   mapping='fixer_generated_portal_tenant_map_20261008'
+   assert sql("select to_regclass('public.tenant_alias')")[0][0] is None
+   assert sql('select count(*) from '+mapping)[0][0]==0
+   # Shared intake plumbing never enrolls or approves a generated bridge tenant.
+   denied(lambda:rpc(owner,'fixer_generated_source_brand_active_20261007','gym'),'mapping missing')
+   other_gym=uuid.uuid4()
+   sql('insert into gyms values(%s)',(other_gym,))
+   put_mapping=lambda mapped_gym=gym:sql('insert into '+mapping+'(echo_account_key,gym_id,approval_evidence_ref,approved_by) values(%s,%s,%s,%s)',('gym',mapped_gym,'SYNTHETIC independently approved tenant pair','SYNTHETIC release owner'))
+   denied(lambda:sql('insert into '+mapping+'(echo_account_key,gym_id,approval_evidence_ref,approved_by) values(%s,%s,%s,%s)',('gym',gym,'','SYNTHETIC release owner')),'approval_evidence_ref')
+   # Even BYPASSRLS service_role and isolated generation roles have no direct ACL.
+   for role in ('anon','authenticated','service_role','fixer_forward_media_owner_20261006',
+     'fixer_forward_media_attester_20261006','generated_authority_owner_20261007',
+     'generated_authority_publisher_20261007','generated_send_reconciler_20261007'):
+    role_conn=connect();role_conn.execute('set role '+role)
+    for statement in ('select * from '+mapping,
+      "insert into "+mapping+"(echo_account_key,gym_id,approval_evidence_ref,approved_by) values('unsafe','"+str(gym)+"','unsafe','unsafe')",
+      "update "+mapping+" set approval_evidence_ref='unsafe'",
+      'delete from '+mapping,'truncate '+mapping):
+     denied(lambda statement=statement:role_conn.execute(statement),'permission denied')
+   put_mapping()
+
    text='SYNTHETIC training fact';raw=(text+' #112233 #aabbcc').encode()
    for ident,kind,url,locator,data in ((web,'website','https://synthetic.test/',None,raw),(social,'social','https://api.apify.com/v2/synthetic','https://www.instagram.com/synthetic/','SYNTHETIC social bytes'.encode())):
     sql('''insert into echo_source_captures(id,gym_id,echo_account_key,source_kind,source_url,provider_account_id,source_locator,capture_provider,provider_response_id,source_revision,mapping_revision,mapping_evidence,fetched_at,raw_bytes)
      values(%s,%s,'gym',%s,%s,%s,%s,%s,%s,'SYNTHETIC source revision','SYNTHETIC mapping revision','{"synthetic":true}',clock_timestamp(),%s)''',
-     (ident,gym,kind,url,'SYNTHETIC social account' if kind=='social' else None,locator,'apify' if kind=='social' else 'direct','SYNTHETIC provider response' if kind=='social' else None,data))
+     (ident,gym,kind,url,'12345' if kind=='social' else None,locator,'apify' if kind=='social' else 'direct','SYNTHETIC provider response' if kind=='social' else None,data))
    spans=json.dumps([dict(key='training',capture_id=str(web),byte_offset=0,byte_length=len(text.encode()))])
    primary,secondary=raw.index(b'#112233'),raw.index(b'#aabbcc')
-   b=rpc(service,'echo_source_brand_prepare',gym,'SYNTHETIC Blake identity',[web,social],web,primary,secondary,None,spans)
+   capture_ids=[web] if source_mode=='website_only_no_connected_instagram_v2' else [web,social]
+   def attest_provider(**changes):
+    status=dict(gym_id=str(gym),echo_account_key='gym',provider='zernio',source='zernio_authenticated_accounts',
+     mapping_revision='SYNTHETIC provider map',lookup_status='complete',authenticated=True,
+     observed_at=sql('select clock_timestamp()')[0][0].isoformat(),profile_id='SYNTHETIC profile',
+     response_sha256='a'*64,instagram=dict(connected=source_mode=='website_and_social_v2',
+      account_id='SYNTHETIC account' if source_mode=='website_and_social_v2' else None,
+      platform_user_id='12345' if source_mode=='website_and_social_v2' else None,
+      handle='synthetic' if source_mode=='website_and_social_v2' else None))
+    status.update(changes)
+    return rpc(service,'echo_source_brand_attest_provider',gym,'gym',json.dumps(status),uuid.uuid4())
+   prepare_args=(gym,'SYNTHETIC Blake identity',capture_ids,web,primary,secondary,None,spans)
+   if source_mode:
+    attest_provider()
+    prepare_args+= (source_mode,)
+   b=rpc(service,'echo_source_brand_prepare',*prepare_args)
    # Composite function returns a tuple; read its exact canonical JSON instead.
    b=sql('select to_jsonb(b) from echo_source_brand_bundles b')[0][0]
+   assert b['schema_version']==(2 if source_mode else 1)
+   if source_mode:assert json.loads(b['snapshot_bytes'])['source_policy']['mode']==source_mode
    rpc(service,'echo_source_brand_decide',gym,'SYNTHETIC Blake identity',b['id'],b['content_sha256'],b['version'],uuid.uuid4(),'approve')
    denied(lambda:rpc(owner,'fixer_generated_source_brand_active_20261007','gym'),'observation required')
    def observe(report=None):
-    return rpc(service,'echo_source_brand_revalidate',gym,b['id'],b['content_sha256'],[web,social],web,primary,secondary,spans,'SYNTHETIC validator v1',json.dumps(report or dict(selected_facts_status='supported_uncontradicted',identity_status='verified')))
+    return rpc(service,'echo_source_brand_revalidate',gym,b['id'],b['content_sha256'],capture_ids,web,primary,secondary,spans,'SYNTHETIC validator v1',json.dumps(report or dict(selected_facts_status='supported_uncontradicted',identity_status='verified')))
    observe()
+   sql('delete from '+mapping)
+   denied(lambda:rpc(owner,'fixer_generated_source_brand_active_20261007','gym'),'mapping missing')
+   put_mapping(other_gym)
+   denied(lambda:rpc(owner,'fixer_generated_source_brand_active_20261007','gym'),'tenant bijection')
+   sql('update '+mapping+' set gym_id=%s where echo_account_key=%s',(gym,'gym'))
    active=rpc(owner,'fixer_generated_source_brand_active_20261007','gym')
+   assert active['gym_id']==str(gym) and active['echo_account_key']=='gym'
+   # A source read holds both canonical account and portal UUID locks until COMMIT.
+   # Both remap directions and the independent intake registry fail fast.
+   reader=connect();reader.execute('begin')
+   rpc(reader,'fixer_generated_source_brand_active_20261007','gym')
+   for statement,parameters in (
+      ('update '+mapping+' set gym_id=%s where echo_account_key=%s',(other_gym,'gym')),
+      ('update '+mapping+' set echo_account_key=%s where gym_id=%s',('other',gym)),
+      ('delete from '+mapping+' where gym_id=%s',(gym,)),
+      ('update echo_intake_tokens set echo_account_key=%s where gym_id=%s',('other',gym))):
+    denied(lambda statement=statement,parameters=parameters:sql(statement,parameters),'send decision busy')
+   reader.execute('rollback')
    authority=runtime.delegated_copy(active['active'],'gym',caption=text)
    pins,derivation=authority['authority_pins'],authority['copy_derivation_receipt']
    validate=lambda p=pins,d=derivation:rpc(admin,'fixer_generated_bundle_validate_20261007','gym',json.dumps(p),json.dumps(d),text,prep.digest(authority['copy']),prep.digest(authority['palette']),authority['palette_revision'])
@@ -104,6 +157,17 @@ def main():
    q=rpc(service,'fixer_generated_gap_dispatch_20261007',uuid.uuid4(),'gym',day,'instagram','feed')
    rid,logical=uuid.uuid4(),uuid.uuid4();group='vg_generated_'+logical.hex
    args=(q['request_id'],rid,logical,group,text,authority['source_revision'],authority['palette_revision'],prep.digest(authority['palette']),authority['palette']['evidence_ref'],json.dumps(pins),json.dumps(derivation))
+   if source_mode:
+    # Latest failed/changed provider evidence holds the entire bridge despite
+    # immutable approved configuration and a previously valid observation.
+    for change in (dict(lookup_status='unavailable',authenticated=False),
+      dict(instagram=dict(connected=True,account_id='SYNTHETIC changed account',platform_user_id='67890',handle='changed'))):
+     attest_provider(**change)
+     denied(lambda:rpc(owner,'fixer_generated_source_brand_active_20261007','gym'),'observation required')
+     denied(lambda:rpc(owner,'fixer_generated_gap_bind_bundle_20261007',*args),'observation required')
+     assert sql('select count(*) from content_calendar')[0][0]==0
+     attest_provider()
+     assert rpc(owner,'fixer_generated_source_brand_active_20261007','gym')['gym_id']==str(gym)
    # Photo-first failure is checked against the real snapshot (unknown source).
    sql("insert into media_source values('SYNTHETIC source','gym','gym_drive','folder',false,'ready',clock_timestamp())")
    denied(lambda:rpc(owner,'fixer_generated_gap_bind_bundle_20261007',*args),'depletion or sealed')
@@ -147,11 +211,24 @@ def main():
    denied(lambda:reserve({**c,'schema_version':1}),'generated original authority')
    denied(lambda:reserve({**c,'job_id':str(uuid.uuid4())}),'job identity')
    assert reserve()['reserved']
+   if source_mode:
+    for change in (dict(lookup_status='unavailable',authenticated=False),
+      dict(instagram=dict(connected=True,account_id='SYNTHETIC changed account',platform_user_id='67890',handle='changed'))):
+     attest_provider(**change)
+     denied(lambda:reserve(),'observation required')
+     denied(lambda:sql("update content_calendar set status='approved' where id=%s",(rid,)),'observation required')
+     assert sql('select status,generated_authority_pins from content_calendar where id=%s',(rid,))[0]==('pending',None)
+     attest_provider()
    fresh_snap=rpc(owner,'fixer_generated_snapshot_20261007',rid)
    rpc(owner,'fixer_still_inventory_record_20261007',uuid.uuid4(),rid,fresh_snap['inventory_revision'],True,0,'SYNTHETIC zero local inventory')
    assert reserve()['replayed']
    readback=rpc(service,'fixer_generated_publish_readback_20261007',rid)
    assert readback['copy_derivation_receipt']==derivation and readback['authority_pins']==pins
+   sql('delete from '+mapping)
+   denied(lambda:sql("update content_calendar set status='approved' where id=%s",(rid,)),'mapping missing')
+   put_mapping(other_gym)
+   denied(lambda:sql("update content_calendar set status='approved' where id=%s",(rid,)),'tenant bijection')
+   sql('update '+mapping+' set gym_id=%s where echo_account_key=%s',(gym,'gym'))
    sql("update content_calendar set status='approved' where id=%s",(rid,))
    assert sql('select generated_authority_pins from content_calendar where id=%s',(rid,))[0][0]==pins
    # Advancing the observation leaves immutable reservation pins stale; no send.
@@ -198,6 +275,18 @@ def main():
    attempt=uuid.uuid4()
    assert rpc(service,'generated_send_acquire_20261007',attempt,'gym',row,claim,job,json.dumps(p))['state']=='reserved'
    denied(lambda:observe(),'freezes portal')
+   if source_mode:
+    denied(lambda:attest_provider(lookup_status='unavailable',authenticated=False),'freezes portal')
+    denied(lambda:sql('truncate echo_source_brand_provider_status'),'freezes portal')
+   for statement,parameters in (
+      ('update '+mapping+' set gym_id=%s where echo_account_key=%s',(other_gym,'gym')),
+      ('update '+mapping+' set echo_account_key=%s where gym_id=%s',('other',gym)),
+      ('update '+mapping+' set approval_evidence_ref=%s where gym_id=%s',('changed',gym)),
+      ('delete from '+mapping+' where gym_id=%s',(gym,)),
+      ('update echo_intake_tokens set echo_account_key=%s where gym_id=%s',('other',gym)),
+      ('delete from echo_intake_tokens where gym_id=%s',(gym,)),
+      ('truncate '+mapping,None)):
+    denied(lambda statement=statement,parameters=parameters:sql(statement,parameters),'freezes portal')
    denied(lambda:sql("update app_users set role='executive' where clerk_user_id='SYNTHETIC Blake identity'"),'freezes actor')
    denied(lambda:sql('truncate echo_source_captures'),'freezes portal')
    assert rpc(service,'generated_send_begin_20261007',attempt)['authorize_send']
@@ -206,10 +295,14 @@ def main():
    evidence=json.dumps(dict(actor='SYNTHETIC test publisher',receipt_ref='SYNTHETIC unknown transport'))
    assert rpc(service,'generated_send_outcome_20261007',attempt,'unknown',evidence,False)['state']=='unknown'
    denied(lambda:observe(),'freezes portal')
+   denied(lambda:sql('delete from '+mapping+' where gym_id=%s',(gym,)),'freezes portal')
+   denied(lambda:sql('truncate '+mapping),'freezes portal')
    assert not rpc(service,'generated_send_validate_20261007',attempt)['authorize_send']
-   print('PASS assembled portal + B/gap + delegated approval/acquire/begin/validate + stale evidence + durable unknown fences; synthetic local only')
+   print('PASS '+str(source_mode or 'legacy_v1')+' assembled portal + B/gap + delegated approval/acquire/begin/validate + empty/missing/cross-tenant mapping holds + exact approved UUID bijection + mapping/ACL/concurrency fences + failed/changed v2 provider holds + stale evidence + durable unknown fences; synthetic local only')
   finally:
    for c in connections:c.close()
    subprocess.run([str(PG/'pg_ctl'),'-D',str(root/'data'),'-m','immediate','-w','stop'],check=True,capture_output=True,timeout=60)
 
-if __name__=='__main__':main()
+if __name__=='__main__':
+ for source_mode in (None,'website_only_no_connected_instagram_v2','website_and_social_v2'):
+  main(source_mode)
