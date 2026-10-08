@@ -75,3 +75,53 @@ Gap package selection: 223 focused offline tests passed using the existing Echo 
 Discovery starvation repair: owner discovery now supplies each configured gym's exact local tomorrow/+2 window to the owner-only pending RPC. SQL validates a bounded window for every allowlisted gym and filters those dates before the batch limit. It never deletes, expires, rebinds or resets old bound/uncertain jobs. The PG17 regression inserts 26 expired requests plus one fresh date, proves the fresh request is returned with limit 25, and proves the old bound row and queue states are unchanged.
 
 Starvation repair evidence: 59 focused runtime/gap tests passed; the disposable PG17 script passed the 26-expired-plus-fresh regression, bound-job preservation and invalid-window holds, alongside its existing authority checks. The discovery RPC's date-window bounds use UTC independently of session timezone. Intermediate B dependency and final accepted B rerun hold are unchanged.
+
+## Canonical approval and durable send boundary intermediate (2026-10-07)
+
+This default-OFF intermediate adds `generated_authority_pins` to the unapplied
+lease draft. The approval trigger copies exact tenant/epoch/source ID/revision/
+palette key/revision from the immutable owner reservation, validates current
+canonical authority and verbatim caption under its tenant lock, and clears the
+pins when a row returns to pending. It never creates source approval, infers a
+human identity, imports a local file, or upgrades a legacy reservation. Pending
+revocation and stale canonical revisions hold approval. The normal human proof
+and claim gates remain required.
+
+The SQL reservation readback exposes these owner pins. The lower Meta,
+SocialAPI and Zernio scopes acquire a durable attempt bound to the exact calendar
+claim and require those same approval pins. The first provider mutation commits
+`begin`; later mutations inside that invocation retain the same lease. Actual
+outgoing captions must equal the canonical caption, so appended hashtags or
+mentions hold before the first mutation. Settlement occurs before calendar
+publication recording. A published adapter result with a post ID records `sent`
+(provider acceptance as reported by that adapter, not independent platform
+publication). Ambiguous exceptions, unidentifiable success and lost terminal
+responses retain the fence for independent reconciliation. A lost begin response
+is never replayed or cancelled by this runtime. Cached prior publication cannot
+certify a new canonical attempt. There is no automatic expiry or reconciliation.
+A reservation left before a lower call begins also requires explicit cancellation
+through the guarded outcome workflow.
+
+**Activation blocker:** the current generation route still selects local
+`client_sources.approved_sources` and verified palette files. Its strict candidate
+schema rejects `authority_pins`, and the existing owner reservation expects the
+legacy `client-source:sha256` reference. No current runtime candidate can reach
+this new approval/send boundary successfully. A separate accepted owner change
+must ingest original verified bytes/explicit receipts into canonical authority,
+select canonical source/palette revisions before generation, bind those revisions
+into job identity and the strict candidate schema, validate them under canonical
+locks at reservation, and preserve exact palette/copy rendering provenance. It
+must not bootstrap authority from local approved labels or reconstructed bytes.
+Current local source/palette rechecks remain an additional hold; their removal or
+migration is part of that owner integration. No migration, flag, production write,
+deploy, real generation or provider send occurred here.
+
+Evidence: 136 focused Python tests passed (including real lower adapters with
+synthetic vendors). The disposable PostgreSQL 17 lease script passed exact
+approval-pin persistence, missing/changed/stale approval holds, durable lease
+identity, one begin, pending revocation, explicit unknown reconciliation, immutable
+calendar fencing/ACLs and both overlapping lock-order races. The PG script uses
+real canonical/lease/readback SQL with synthetic prerequisite claim/reservation
+rows; it does not prove the entire assembled claim/approval stack or production.
+Existing compatible dependencies were reused; disk measured 19 GiB free before
+these checks. No new worktree or dependency installation was created.

@@ -76,13 +76,17 @@ def main():
                 candidate = dict(gym_id=tenant, local_date='2026-10-08', logical_post_id=str(logical), original_url='https://synthetic.test/original', copy_digest='copy', palette_revision='palette',palette_digest='palette-digest')
                 if pins: candidate['authority_pins'] = identity
                 manifest = dict(manifest_digest='manifest',tenant_id=tenant,source_asset_id='generated-astra:'+str(job),image_url=candidate['original_url'])
-                admin.execute('insert into public.content_calendar values(%s,%s,%s,%s,null,null,%s,%s,%s,%s,%s,%s,%s,%s,null,%s,%s,%s)',
+                admin.execute('insert into public.content_calendar(id,gym_id,publish_claim_token,status,published_at,late_post_id,account,format,source_media_asset_id,post_date,logical_post_id,visual_group_key,image_url,source_media_url,thumbnail_url,render_manifest_digest,publish_reservation_day,caption) values(%s,%s,%s,%s,null,null,%s,%s,%s,%s,%s,%s,%s,%s,null,%s,%s,%s)',
                     (row,tenant,claim,'publishing','instagram','feed','generated-astra:'+str(job),'2026-10-08',logical,'group',candidate['original_url'],candidate['original_url'],'manifest','2026-10-08','exact source text'))
                 admin.execute('insert into public.fixer_generated_reservation_20261007(job_id,calendar_row_id,group_key,candidate_json,manifest_json,receipt_ref,history_epoch,approved_source_revision) values(%s,%s,%s,%s,%s,%s,%s,%s)',
                     (job,row,'group',json.dumps(candidate),json.dumps(manifest),'synthetic:reservation:'+tenant,'{}','client-source:sha256:'+'a'*64))
                 admin.execute('insert into public.fixer_forward_media_lineage_20261006 values(%s)',(eid,))
                 admin.execute('insert into public.fixer_forward_media_claim_receipt_20261006(claim_token,calendar_row_id,tenant_id,post_date,reservation_day,group_key,evidence_id,fingerprints,source_url,image_url) values(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)',
                     (claim,row,tenant,'2026-10-08','2026-10-08','group',eid,['md5:'+'a'*32],candidate['original_url'],candidate['original_url']))
+                if pins:
+                    admin.execute("update public.content_calendar set status='approved' where id=%s", (row,))
+                    assert admin.execute('select generated_authority_pins from public.content_calendar where id=%s',(row,)).fetchone()[0] == identity
+                    admin.execute("update public.content_calendar set status='publishing' where id=%s", (row,))
                 return dict(tenant=tenant,row=row,claim=claim,job=job,pins=identity,token=uuid.uuid4())
             def acquire(s,c=service):
                 return rpc(c,'generated_send_acquire',s['token'],s['tenant'],s['row'],s['claim'],s['job'],json.dumps(s['pins']))
@@ -94,7 +98,20 @@ def main():
 
             # Required canonical pins and exact row/claim identity; no bootstrap
             # from the legacy local-source hash in an old reservation.
-            denied(lambda: acquire(seed('missing-pins',False)), 'pins missing')
+            missing = seed('missing-pins',False)
+            denied(lambda: acquire(missing), 'pins missing')
+            denied(lambda: admin.execute("update public.content_calendar set status='approved' where id=%s",(missing['row'],)), 'owner canonical pins')
+            approval = seed('approval-pins')
+            denied(lambda: admin.execute("update public.content_calendar set generated_authority_pins='{}' where id=%s",(approval['row'],)), 'cannot change')
+            admin.execute("update public.content_calendar set status='pending' where id=%s",(approval['row'],))
+            assert admin.execute('select generated_authority_pins from public.content_calendar where id=%s',(approval['row'],)).fetchone()[0] is None
+            denied(lambda: acquire(approval))
+            admin.execute("update public.content_calendar set caption='altered' where id=%s",(approval['row'],))
+            denied(lambda: admin.execute("update public.content_calendar set status='approved' where id=%s",(approval['row'],)), 'approved caption')
+            stale=seed('approval-stale')
+            admin.execute("update public.content_calendar set status='pending' where id=%s",(stale['row'],))
+            rpc(service,'generated_authority_write',stale['tenant'],1,json.dumps([source_op('src')]))
+            denied(lambda: admin.execute("update public.content_calendar set status='approved' where id=%s",(stale['row'],)), 'stale epoch')
             s=seed('identity')
             for field,value in [('tenant','other'),('row',uuid.uuid4()),('claim',uuid.uuid4()),('job',uuid.uuid4())]:
                 denied(lambda field=field,value=value: acquire({**s,field:value}))

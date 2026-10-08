@@ -888,7 +888,7 @@ begin
   'group_key',g.group_key,'original_url',c->>'original_url','manifest_digest',m->>'manifest_digest',
   'source_revision',g.approved_source_revision,'copy_digest',c->>'copy_digest',
   'palette_revision',c->>'palette_revision','palette_digest',c->>'palette_digest',
-  'receipt_ref',g.receipt_ref);
+  'receipt_ref',g.receipt_ref,'authority_pins',c->'authority_pins');
 end; $$;
 revoke all on function public.fixer_generated_publish_readback_20261007(uuid)
  from public,anon,authenticated,service_role,fixer_forward_media_owner_20261006,

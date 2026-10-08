@@ -46,6 +46,53 @@ create trigger immutable_update before update on public.generated_send_audit_202
  for each row execute function public.generated_authority_immutable_20261007();
 revoke all on sequence public.generated_send_audit_20261007_audit_id_seq from public,anon,authenticated,service_role,generated_authority_owner_20261007,generated_authority_publisher_20261007,generated_send_reconciler_20261007;
 
+-- Approval captures only pins already persisted by the trusted generation owner.
+-- This is an additional gate, never a new source approval or human identity API.
+-- Legacy reservations and local hashes cannot bootstrap canonical authority.
+alter table public.content_calendar add column generated_authority_pins jsonb;
+create function public.generated_approval_pins_20261007()
+returns trigger language plpgsql security definer set search_path=pg_catalog,public as $$
+declare p jsonb;
+begin
+ if new.source_media_asset_id not like 'generated-astra:%' or new.source_media_asset_id is null then
+  new.generated_authority_pins:=null; return new; end if;
+ if tg_op='UPDATE' and old.source_media_asset_id like 'generated-astra:%'
+  and new.status in ('publishing','published') then
+  if new.generated_authority_pins is distinct from old.generated_authority_pins then
+   raise exception 'generated approval pins cannot change during send' using errcode='23514'; end if;
+  return new;
+ end if;
+ if new.status is distinct from 'approved' then
+  new.generated_authority_pins:=null; return new; end if;
+ if current_setting('transaction_isolation')<>'read committed' then
+  raise exception 'generated approval requires read committed' using errcode='25000'; end if;
+ -- A row trigger already owns a row lock. Never wait in reverse lock order.
+ if not pg_try_advisory_xact_lock(hashtext('generated-authority-20261007'),hashtext(new.gym_id)) then
+  raise exception 'generated approval authority busy' using errcode='55000'; end if;
+ if exists(select 1 from public.generated_revocation_request_20261007 where tenant_id=new.gym_id and state='pending') then
+  raise exception 'generated revocation pending' using errcode='55000'; end if;
+ select candidate_json->'authority_pins' into p from public.fixer_generated_reservation_20261007
+  where 'generated-astra:'||job_id::text=new.source_media_asset_id;
+ if jsonb_typeof(p) is distinct from 'object' or p->>'tenant_id' is distinct from new.gym_id
+  or jsonb_typeof(p->'epoch') is distinct from 'number'
+  or jsonb_typeof(p->'source_revision') is distinct from 'number'
+  or jsonb_typeof(p->'palette_revision') is distinct from 'number'
+  or coalesce(p->>'epoch','') !~ '^[1-9][0-9]*$'
+  or coalesce(p->>'source_revision','') !~ '^[1-9][0-9]*$'
+  or coalesce(p->>'palette_revision','') !~ '^[1-9][0-9]*$' then
+  raise exception 'owner canonical pins required at approval' using errcode='23514'; end if;
+ perform public.generated_authority_validate_publish_20261007(new.gym_id,(p->>'epoch')::bigint,
+  array[p->>'source_id'],array[(p->>'source_revision')::bigint],p->>'palette_key',(p->>'palette_revision')::bigint);
+ if not exists(select 1 from public.generated_source_authority_20261007
+  where tenant_id=new.gym_id and source_id=p->>'source_id' and exact_text=new.caption) then
+  raise exception 'canonical source differs from approved caption' using errcode='23514'; end if;
+ new.generated_authority_pins:=p;
+ return new;
+end; $$;
+revoke all on function public.generated_approval_pins_20261007() from public,anon,authenticated,service_role;
+create trigger generated_approval_pins before insert or update on public.content_calendar
+ for each row execute function public.generated_approval_pins_20261007();
+
 -- One lock shared by every lease transition and canonical authority mutation.
 -- Frozen authority cannot change while any reserved/inflight/unknown attempt
 -- exists. Revocation requests stay visible and block new decisions immediately.
@@ -107,6 +154,8 @@ begin
  select * into g from public.fixer_generated_reservation_20261007 where job_id=p_job;
  if not found or g.candidate_json->'authority_pins' is distinct from p_pins then
   raise exception 'canonical pins missing from immutable generated reservation' using errcode='23514'; end if;
+ if r.generated_authority_pins is distinct from p_pins then
+  raise exception 'exact canonical approval pins required' using errcode='23514'; end if;
  binding:=public.fixer_generated_publish_readback_20261007(p_row);
  if binding is null or binding->>'job_id' is distinct from p_job::text or binding->>'gym_id' is distinct from p_tenant then
   raise exception 'generated reservation readback unavailable' using errcode='23514'; end if;
