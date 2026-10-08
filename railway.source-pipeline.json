@@ -1,0 +1,16 @@
+{
+  "$schema": "https://railway.app/railway.schema.json",
+  "_comment": "TEMPLATE ONLY — NOT DEPLOYED. Single-service sequential capture->observation cron lane (agent.source_brand_pipeline_job). This is the SUPPORTED topology: both phases run in ONE process on ONE service, sharing ONE private durable journal volume via ECHO_SOURCE_CAPTURE_JOURNAL_DIR — unlike the separate capture/observation services, which would each get their own empty local SQLite journal (two independent Railway volumes never share data). Everything defaults OFF: before any use an operator must explicitly set ECHO_SOURCE_PIPELINE_JOB_ENABLED, ECHO_SOURCE_CAPTURE_JOB_ENABLED and ECHO_SOURCE_OBSERVATION_JOB_ENABLED to 'true', provide EXACTLY MATCHING ECHO_SOURCE_CAPTURE_JOB_ALLOWLIST and ECHO_SOURCE_OBSERVATION_JOB_ALLOWLIST (exact canonical gym UUIDs), set ECHO_SOURCE_OBSERVATION_ENABLED, mount the private journal volume at ECHO_SOURCE_CAPTURE_JOURNAL_DIR on THIS service, and provision all startup gates (see agent/source_brand_startup.py). Observation never runs after a capture hold/error; any hold/error exits nonzero. No production values are provisioned here.",
+  "build": { "builder": "NIXPACKS" },
+  "deploy": {
+    "startCommand": "/opt/venv/bin/python -m agent.source_brand_pipeline_job",
+    "cronSchedule": "0 6 * * *",
+    "restartPolicyType": "ON_FAILURE"
+  },
+  "variables": {
+    "ECHO_SOURCE_PIPELINE_JOB_ENABLED": "false",
+    "ECHO_SOURCE_CAPTURE_JOB_ENABLED": "false",
+    "ECHO_SOURCE_OBSERVATION_JOB_ENABLED": "false",
+    "ECHO_SOURCE_OBSERVATION_ENABLED": "false"
+  }
+}
