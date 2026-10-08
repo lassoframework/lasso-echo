@@ -45,6 +45,9 @@ begin
       or to_regprocedure('public.fixer_bind_forward_media_manifest_20261006(uuid)') is null then
     raise exception 'forward media owner/photo/binder drafts are required' using errcode='23514';
   end if;
+  if to_regprocedure('public.fixer_forward_media_provenance_lookup_20261006(uuid)') is null then
+    raise exception 'forward media provenance chain is required' using errcode='23514';
+  end if;
 end;
 $$;
 
@@ -465,9 +468,19 @@ revoke all on function public.fixer_bind_forward_schedule_staged_manifest_202610
 grant execute on function public.fixer_bind_forward_schedule_staged_manifest_20261008(uuid) to service_role;
 
 -- ---------------------------------------------------------------------------
--- Staged alias provenance handoff (create-or-replace of the attester-facing
--- provenance lookup; the frozen claim-migration original and the photo
--- clearance wrapper chain beneath it are UNCHANGED).
+-- Staged alias provenance handoff (rename-and-wrap of the attester-facing
+-- provenance lookup; the frozen claim-migration original and every wrapper
+-- above it — photo clearance, generated runtime check, still negative/final
+-- checks — stay intact beneath this draft and keep running for every row).
+--
+-- The current chain top (whatever wrappers are installed) is renamed to
+-- fixer_pre_staged_provenance_20261008 and revoked from every role, so the
+-- replacement below calls the FULL inherited chain instead of jumping
+-- directly to the frozen photo base. Installing this draft after the
+-- generated/still wrapper migration therefore keeps
+-- fixer_generated_runtime_check_20261007, fixer_still_negative_check_20261007
+-- and fixer_still_final_check_20261007 in force for all rows the base lookup
+-- resolves, exactly as before.
 --
 -- For a genuine staged member row whose gym key is a registered ALIAS, the
 -- owner/photo/binder authority rows (original registry, history clearance,
@@ -487,7 +500,12 @@ grant execute on function public.fixer_bind_forward_schedule_staged_manifest_202
 -- receipt and active reservation/revision binding for readback only; terminal
 -- batches remain closed to staged preparation. Ordinary active rows, ACLs and
 -- every signed-source guard retain the inherited behavior.
-create or replace function public.fixer_forward_media_provenance_lookup_20261006(p_calendar_row_id uuid)
+alter function public.fixer_forward_media_provenance_lookup_20261006(uuid)
+  rename to fixer_pre_staged_provenance_20261008;
+revoke all on function public.fixer_pre_staged_provenance_20261008(uuid)
+  from public,anon,authenticated,service_role,fixer_forward_media_owner_20261006,
+  fixer_forward_media_attester_20261006,fixer_forward_media_photo_auditor_20261007;
+create function public.fixer_forward_media_provenance_lookup_20261006(p_calendar_row_id uuid)
 returns jsonb language plpgsql security definer set search_path=pg_catalog,public as $$
 declare provenance jsonb; grant_row public.fixer_owner_photo_reservation_20261007%rowtype;
  snap jsonb; content jsonb; anchor_audit uuid; required_audit uuid;
@@ -499,6 +517,7 @@ declare provenance jsonb; grant_row public.fixer_owner_photo_reservation_2026100
  staged_clearance public.fixer_forward_media_history_clearance_20261006%rowtype;
  staged_manifest public.fixer_forward_media_render_manifest_20261006%rowtype;
  raw_tenant text; predicate jsonb;
+ still_reservation record;
 begin
  -- Production callbacks read provenance before later appending attestation in
  -- this SAME transaction. The attester must take its final exclusive graph
@@ -513,7 +532,7 @@ begin
  end if;
  perform pg_advisory_xact_lock(hashtextextended('fixer_forward_photo_census_20261007',0));
  begin
-  provenance:=public.fixer_photo_base_provenance_20261007(p_calendar_row_id);
+  provenance:=public.fixer_pre_staged_provenance_20261008(p_calendar_row_id);
  exception when check_violation then
   if sqlerrm is distinct from 'authoritative original registry binding unavailable' then
    raise; end if;
@@ -634,6 +653,32 @@ begin
     -- tenancy remains unchanged. Every check below must pass before return.
     'staged_alias_binding',jsonb_build_object('authority_tenant_id',raw_tenant,
       'snapshot',staged_snapshot));
+  -- The fallback runs only because the frozen base raised before the
+  -- generated/still wrapper tails could run, so those post-checks never saw
+  -- this row. Re-apply exactly those tails on the fallback result when the
+  -- generated/still stack is installed; without that stack the draft
+  -- degrades exactly as before. Exceptions raised here propagate (this
+  -- handler does not re-catch them), so a late denial still fails closed.
+  if to_regprocedure('public.fixer_generated_runtime_check_20261007(uuid)') is not null then
+   perform public.fixer_generated_runtime_check_20261007(p_calendar_row_id);
+  end if;
+  if to_regprocedure('public.fixer_still_negative_check_20261007(jsonb)') is not null then
+   perform public.fixer_still_negative_check_20261007(jsonb_build_object(
+    'gym_id',staged_original.tenant_id,'source_asset_id',staged_original.source_asset_id,
+    'source_url',staged_original.source_url,'md5',staged_original.source_fingerprint));
+   select * into still_reservation from public.fixer_still_reservation_20261007
+    where gym_id=staged_original.tenant_id
+     and original->>'source_asset_id'=staged_original.source_asset_id
+    order by reserved_at limit 1;
+   if found then
+    if still_reservation.original->>'source_url' is distinct from staged_original.source_url
+     or still_reservation.original->>'md5' is distinct from staged_original.source_fingerprint
+     or still_reservation.original->>'source_url' is distinct from staged_manifest.image_url
+     or staged_manifest.thumbnail_url is not null then
+     raise exception 'still reservation requires exact original delivery' using errcode='23514'; end if;
+    perform public.fixer_still_final_check_20261007(p_calendar_row_id,still_reservation.receipt_id);
+   end if;
+  end if;
  end;
  select r.* into grant_row from public.fixer_owner_photo_reservation_20261007 r
  where r.receipt_ref=provenance#>>'{clearance,history_evidence_ref}';
@@ -690,7 +735,7 @@ begin
  return provenance;
 end; $$;
 revoke all on function public.fixer_forward_media_provenance_lookup_20261006(uuid)
-  from public,anon,authenticated,service_role;
+  from public,anon,authenticated,service_role,fixer_forward_media_photo_auditor_20261007;
 grant execute on function public.fixer_forward_media_provenance_lookup_20261006(uuid)
   to fixer_forward_media_attester_20261006;
 commit;

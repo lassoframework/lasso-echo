@@ -11,8 +11,11 @@ All bytes, Drive metadata, signing keys, corpus judgments and roles SYNTHETIC.
 Proves: genuine positive staged preparation (owner evidence-only hold, then
 signed-photo grant, then pre-finalization manifest bind), alias success with
 canonical tenant agreement between discovery and the owner-locked transport
-while raw source/asset ownership is still checked, wrong tenant/asset
-rejection, stale row, unknown commit, and absence of unauthorized mutation.
+while raw source/asset ownership is still checked, staged+generated provenance
+composition (the public wrapper must keep the PR #345 generated/still wrapper
+chain beneath the staged alias handoff; a direct photo-base delegation that
+skips it is detected by a late still denial), wrong tenant/asset rejection,
+stale row, unknown commit, and absence of unauthorized mutation.
 """
 import copy
 import hashlib
@@ -182,6 +185,7 @@ def main():
                          'DRAFT_fixer_forward_media_owner_transport_20261007.sql',
                          'DRAFT_fixer_forward_media_photo_certificate_20261007.sql',
                          'DRAFT_fixer_owner_photo_clearance_20261007.sql',
+                         'DRAFT_fixer_generated_owner_20261007.sql',
                          'DRAFT_fixer_forward_schedule_reservation_20261008.sql'):
                 sql((ROOT / 'migrations' / name).read_text())
             sql(STAGE_SQL.read_text())
@@ -513,6 +517,11 @@ def main():
             assert prov['original']['source_asset_id'] == a_asset
             assert prov['manifest']['manifest_digest'] == a_digest
             assert prov['clearance']['decision'] == 'cleared_unused'
+            # The staged alias handoff bridges this canonical snapshot to its
+            # verified RAW authority explicitly.
+            assert prov['staged_alias_binding']['authority_tenant_id'] == alias_gym
+            assert prov['staged_alias_binding']['snapshot']['tenant_id'] == canonical
+            assert prov['staged_alias_binding']['snapshot']['gym_id'] == alias_gym
             # Provenance ACLs still fail closed for non-attester roles.
             for role in ('anon', 'authenticated', 'service_role', 'staged_owner'):
                 denied('select public.fixer_forward_media_provenance_lookup_20261006(%s)',
@@ -943,6 +952,74 @@ def main():
             assert sql('select count(*) from forward_schedule_reservation where tenant_id=%s',
                        (canonical,))[0][0] == 1
 
+            # ============ F. staged+generated provenance composition ============
+            # The staged draft replaces the PUBLIC provenance lookup installed
+            # by the generated/still stack (PR #345). The safe contract: the
+            # replacement must keep that wrapper chain beneath the staged alias
+            # handoff, never delegate straight to the raw photo base. Probe
+            # both a staged-alias finalized row and an ordinary canonical row:
+            # a late still denial recorded by the isolated owner MUST hold
+            # provenance through the still wrapper's negative check. A direct
+            # fixer_photo_base_provenance_20261007 delegation skips the still
+            # and generated wrappers entirely and this probe would succeed.
+            def still_deny(raw_gym, raw_asset):
+                sql('select public.fixer_still_known_record_20261007(%s,%s,%s::jsonb,%s)',
+                    (str(uuid.uuid4()), 'deny',
+                     json.dumps({'gym_id': raw_gym, 'source_asset_id': raw_asset}),
+                     'SYNTHETIC late known historical denial'), role='staged_owner')
+
+            keep = sql('select public.fixer_forward_media_provenance_lookup_20261006(%s)',
+                       (a_rid,), role='staged_attester')[0][0]
+            assert keep['original']['tenant_id'] == alias_gym
+            assert keep['original']['source_asset_id'] == a_asset
+            keep = sql('select public.fixer_forward_media_provenance_lookup_20261006(%s)',
+                       (rid,), role='staged_attester')[0][0]
+            assert keep['original']['tenant_id'] == tenant
+            assert keep['original']['source_asset_id'] == asset
+            # A matching permanent still reservation also governs alias
+            # fallback. This synthetic fixture binds the raw gym/asset and
+            # exact original, but the alias delivers a rendered image, so the
+            # inherited still wrapper must reject it before final freshness.
+            still_receipt, still_inventory, still_clearance, still_epoch = (
+                str(uuid.uuid4()) for _ in range(4))
+            sql('insert into fixer_still_inventory_20261007 values '
+                '(%s,%s,%s,%s,true,1,%s,clock_timestamp())',
+                (still_inventory, still_epoch, alias_gym, 'SYNTHETIC revision',
+                 'SYNTHETIC matching reservation inventory'))
+            sql('insert into fixer_still_known_20261007 '
+                '(receipt_id,epoch_id,decision,original,evidence_ref) '
+                "values(%s,%s,'cleared_fresh',%s::jsonb,%s)",
+                (still_clearance, still_epoch,
+                 json.dumps({'gym_id': alias_gym, 'source_asset_id': a_asset}),
+                 'SYNTHETIC matching reservation clearance'))
+            sql('insert into fixer_still_reservation_20261007 '
+                '(receipt_id,epoch_id,calendar_row_id,gym_id,local_date,'
+                'logical_post_id,group_key,media_kind,original,inventory_receipt,clearance_receipt) '
+                "select %s,%s,id,gym_id,post_date,logical_post_id,visual_group_key,'photo',"
+                '%s::jsonb,%s,%s from content_calendar where id=%s',
+                (still_receipt, still_epoch,
+                 json.dumps({'source_asset_id': a_asset, 'source_url': a_url,
+                             'md5': prov['original']['source_fingerprint']}),
+                 still_inventory, still_clearance, a_rid))
+            denied('select public.fixer_forward_media_provenance_lookup_20261006(%s)',
+                   (a_rid,), role='staged_attester',
+                   fragment='still reservation requires exact original delivery')
+            # Keep immutable synthetic authority in this disposable database.
+            # Deny the alias pair: the staged-alias row is held while the
+            # unrelated ordinary row keeps genuine provenance (scoped denial).
+            still_deny(alias_gym, a_asset)
+            denied('select public.fixer_forward_media_provenance_lookup_20261006(%s)',
+                   (a_rid,), role='staged_attester',
+                   fragment='known still history denied or quarantined')
+            keep = sql('select public.fixer_forward_media_provenance_lookup_20261006(%s)',
+                       (rid,), role='staged_attester')[0][0]
+            assert keep['original']['source_asset_id'] == asset
+            # Deny the ordinary pair as well: same wrapper obligation.
+            still_deny(tenant, asset)
+            denied('select public.fixer_forward_media_provenance_lookup_20261006(%s)',
+                   (rid,), role='staged_attester',
+                   fragment='known still history denied or quarantined')
+
             print('PASS: PG17 staged preparation; owner staged pass stages exact provenance with '
                   'durable uncertain hold and no invented authority; signed staged photo grant '
                   'creates exactly one positive reservation/registry/clearance/manifest through '
@@ -955,7 +1032,10 @@ def main():
                   'unapproved source holds; active canonical regression; wrong tenant/asset rejection; stale revision '
                   'hold; lost COMMIT never retried and resolved only by durable progress readback; '
                   'prior used/uncertain history stays held; run_once wiring; role ACLs fail closed; '
-                  'active-only RPCs refuse staged rows')
+                  'active-only RPCs refuse staged rows; staged+generated provenance composition: '
+                  'the public wrapper still applies the generated/still (PR #345) negative checks '
+                  'across the staged alias handoff and ordinary rows, so a direct photo-base '
+                  'delegation bypass is detected')
         finally:
             subprocess.run([_pg('pg_ctl'), '-D', str(data), '-m', 'immediate', '-w', 'stop'],
                            capture_output=True, timeout=60)
