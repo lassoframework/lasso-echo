@@ -5,7 +5,7 @@ import unittest
 import uuid
 from unittest.mock import patch
 
-from agent.forward_media_owner_photo_prepare import prepare_remote_photo,stage_prepared_photo,reconcile_owner_photo
+from agent.forward_media_owner_photo_prepare import prepare_remote_photo,stage_prepared_photo,stage_prepared_staged_photo,reconcile_owner_photo,staged_photo_candidates
 from agent.forward_media_owner import ForwardMediaOwnerPersistence
 from agent.forward_media_photo_certificate import IndependentPhotoAuditor,PhotoCertificateHold,digest
 from agent.forward_media_source_verifier import verify_source
@@ -170,3 +170,132 @@ class OwnerPhotoTests(unittest.TestCase):
                 reconcile_owner_photo(persistence,packet['payload']['audit_id'])
 
 if __name__=='__main__':unittest.main()
+
+
+class StagedPhotoDiscoveryTests(unittest.TestCase):
+    """Staged photo discovery admits only predicate-authorized candidates."""
+
+    def make_persistence(self, pending, states):
+        calls = []
+
+        class Cursor:
+            def __enter__(self): return self
+            def __exit__(self, *a): pass
+            def execute(self, query, args):
+                calls.append(query)
+                self._result = (pending,) if 'staged_photo_pending' in query else (states.get(str(args[0])),)
+            def fetchone(self): return self._result
+
+        class Conn:
+            def __init__(self): self.rolled_back = False
+            def cursor(self): return Cursor()
+            def rollback(self): self.rolled_back = True
+
+        conn = Conn()
+        persistence = ForwardMediaOwnerPersistence(conn, 'isolated_owner', None)
+        persistence._assert_owner_identity = lambda: None
+        return persistence, conn, calls
+
+    def candidate(self, row_id):
+        return {'calendar_row_id': row_id, 'audit_id': str(uuid.uuid4()),
+                'revision': 'a' * 32, 'tenant_id': 'gym', 'batch_id': str(uuid.uuid4())}
+
+    def test_only_predicate_authorized_staged_candidates_are_admitted(self):
+        ok, forged, active, foreign = (str(uuid.uuid4()) for _ in range(4))
+        batch = str(uuid.uuid4())
+        states = {
+            ok: {'eligible': True, 'mode': 'staged', 'tenant_id': 'gym', 'batch_id': batch, 'reason': None},
+            forged: {'eligible': False, 'mode': None, 'tenant_id': 'gym', 'batch_id': None,
+                     'reason': 'unregistered staged row'},
+            active: {'eligible': True, 'mode': 'active', 'tenant_id': 'gym', 'batch_id': None, 'reason': None},
+            foreign: {'eligible': True, 'mode': 'staged', 'tenant_id': 'other', 'batch_id': batch, 'reason': None},
+        }
+        pending = [self.candidate(r) for r in (ok, forged, active, foreign)]
+        persistence, conn, calls = self.make_persistence(pending, states)
+        admitted = staged_photo_candidates(persistence, tenants=('gym',), limit=25)
+        self.assertEqual([c['calendar_row_id'] for c in admitted], [ok])
+        self.assertTrue(conn.rolled_back)
+        self.assertTrue(any('forward_schedule_preparation_eligible_20261008' in q for q in calls))
+
+    def test_non_dedicated_persistence_and_bad_bounds_hold(self):
+        with self.assertRaises(PhotoCertificateHold):
+            staged_photo_candidates(object(), tenants=('gym',), limit=25)
+        persistence, _, _ = self.make_persistence([], {})
+        with self.assertRaises(PhotoCertificateHold):
+            staged_photo_candidates(persistence, tenants=(), limit=25)
+        with self.assertRaises(PhotoCertificateHold):
+            staged_photo_candidates(persistence, tenants=('gym',), limit=0)
+
+    def test_malformed_pending_payload_holds(self):
+        persistence, _, _ = self.make_persistence({'not': 'a list'}, {})
+        with self.assertRaises(PhotoCertificateHold):
+            staged_photo_candidates(persistence, tenants=('gym',), limit=25)
+
+
+class StagedPhotoPassTests(unittest.TestCase):
+    """Staged photo pass/guard rails without a database."""
+
+    def test_staged_mode_requires_candidate_marker_state(self):
+        snapshot, drive, data, recipe, packet, auditor, rpc = OwnerPhotoTests().setup_candidate()
+        with patch.object(auditor, '_rpc', side_effect=rpc):
+            with self.assertRaisesRegex(PhotoCertificateHold, 'certified_owner_candidate_not_unsent'):
+                prepare_remote_photo(snapshot, drive_reader=drive, hosted_reader=Hosted(data),
+                                     recipe=recipe, auditor=auditor,
+                                     audit_id=packet['payload']['audit_id'], mode='staged')
+        # A staged row under the exact marker passes the state check offline.
+        staged_snapshot = copy.deepcopy(snapshot)
+        staged_snapshot['calendar'].update(status='pending', variant_status='candidate',
+                                           media_not_ready_reason='forward_reservation_staged')
+        with patch.object(auditor, '_rpc', side_effect=rpc):
+            prepared = prepare_remote_photo(staged_snapshot, drive_reader=drive,
+                                            hosted_reader=Hosted(data), recipe=recipe,
+                                            auditor=auditor,
+                                            audit_id=packet['payload']['audit_id'], mode='staged')
+        self.assertEqual(prepared.image_bytes, data)
+        # The same staged row is refused by the active-only check.
+        with patch.object(auditor, '_rpc', side_effect=rpc):
+            with self.assertRaisesRegex(PhotoCertificateHold, 'certified_owner_candidate_not_unsent'):
+                prepare_remote_photo(staged_snapshot, drive_reader=drive, hosted_reader=Hosted(data),
+                                     recipe=recipe, auditor=auditor,
+                                     audit_id=packet['payload']['audit_id'])
+
+    def test_staged_grant_uses_only_the_staged_rpc(self):
+        queries = []
+        snapshot, drive, data, recipe, packet, auditor, rpc = OwnerPhotoTests().setup_candidate()
+        source = verify_source(snapshot, drive, Hosted(data))
+        original_row = source.original.row()
+
+        class StageCursor(Cursor):
+            def execute(self, query, args):
+                queries.append(query)
+                self._row = (dict(original_row, decision='cleared_unused',
+                                  history_evidence_ref='owner-photo-reservation:ref'),)
+            def fetchone(self):
+                return self._row
+
+        class StageConnection(Connection):
+            def cursor(self):
+                return StageCursor()
+
+        with patch.object(auditor, '_rpc', side_effect=rpc):
+            prepared = prepare_remote_photo(snapshot, drive_reader=drive, hosted_reader=Hosted(data),
+                                            recipe=recipe, auditor=auditor,
+                                            audit_id=packet['payload']['audit_id'])
+        persistence = ForwardMediaOwnerPersistence(StageConnection(), 'offline_owner', Hosted(data))
+        with self.assertRaisesRegex(PhotoCertificateHold, 'dedicated_prepared_owner_photo_required'):
+            stage_prepared_staged_photo(object(), prepared)
+        with self.assertRaisesRegex(PhotoCertificateHold, 'dedicated_prepared_owner_photo_required'):
+            stage_prepared_staged_photo(persistence, object())
+        with patch.object(persistence, '_assert_owner_identity'), \
+                patch.object(ForwardMediaOwnerPersistence, 'persist_in_transaction',
+                             return_value={'manifest': {'manifest_digest': 'sha256:' + 'b' * 64}}):
+            stage_prepared_staged_photo(persistence, prepared)
+        assert any('fixer_prepare_owner_staged_photo_20261008' in q for q in queries)
+        assert not any('fixer_prepare_owner_photo_20261007' in q for q in queries)
+
+    def test_staged_pass_requires_idle_dedicated_persistence(self):
+        from agent.forward_media_owner_photo_prepare import run_staged_photo_pass
+        report = run_staged_photo_pass(persistence=object(), reader=None, drive_reader=None,
+                                       tenants=('gym',), limit=25)
+        self.assertEqual(report, {'status': 'hold', 'reason': 'owner_transaction_contract_required',
+                                  'rows': []})

@@ -23,6 +23,15 @@ from . import forward_media_owner as owner
 from .forward_media_owner_worker import OwnerTransport, OwnerWorkerHold, _identity
 
 PREFIX = 'fixer_forward_media_owner_'
+STAGED_PENDING_RPC = 'fixer_forward_schedule_staged_owner_pending_20261008'
+ELIGIBILITY_RPC = 'forward_schedule_preparation_eligible_20261008'
+STAGED_SNAPSHOT_RPC = 'fixer_forward_schedule_staged_owner_snapshot_20261008'
+STAGED_LOCKED_RPC = 'fixer_forward_schedule_staged_owner_locked_20261008'
+
+
+def _staged_lane(candidate):
+    """Staged discovery candidates carry tenant_id/batch_id; active never do."""
+    return isinstance(candidate, dict) and candidate.get('batch_id') is not None
 
 
 @dataclass(frozen=True)
@@ -72,15 +81,18 @@ class DedicatedOwnerTransport(OwnerTransport):
         if self._conn.info.transaction_status != TransactionStatus.IDLE:
             raise OwnerWorkerHold('owner_transaction_contract_required')
 
-    def _rpc(self, operation, args):
+    def _call(self, name, args):
         # Names are internal constants; never interpolate caller-controlled SQL.
         placeholders = ','.join(['%s'] * len(args))
         with self._conn.cursor() as cur:
-            cur.execute(f'select public.{PREFIX}{operation}_20261007({placeholders})', args)
+            cur.execute(f'select public.{name}({placeholders})', args)
             result = cur.fetchone()
         if not result:
             raise OwnerWorkerHold('owner_transport_unavailable')
         return result[0]
+
+    def _rpc(self, operation, args):
+        return self._call(f'{PREFIX}{operation}_20261007', args)
 
     def _commit(self):
         try:
@@ -97,6 +109,36 @@ class DedicatedOwnerTransport(OwnerTransport):
         self.persistence._assert_owner_identity()
         result = self._rpc('pending', (list(tenants), limit))
         self._conn.rollback()  # End read-only identity/discovery transaction.
+        return result
+
+    def pending_staged(self, tenants, limit):
+        """Staged-lane discovery. The SQL function joins registered nonterminal
+        batch membership and requires the eligibility predicate; this client
+        never authorizes from the marker alone."""
+        if self._broken or self._active is not None:
+            raise OwnerWorkerHold('owner_manual_reconciliation_required')
+        self._require_idle()
+        owner.check_environment()
+        self.persistence._assert_owner_identity()
+        result = self._call(STAGED_PENDING_RPC, (list(tenants), limit))
+        self._conn.rollback()  # End read-only identity/discovery transaction.
+        return result
+
+    def preparation_eligible(self, row_id):
+        """Fresh predicate readback on the owner connection; never cached.
+
+        Only an exact {eligible:true, mode:'staged'} result with matching
+        tenant/batch may admit a staged candidate; anything else holds.
+        """
+        if self._broken or self._active is not None:
+            raise OwnerWorkerHold('owner_manual_reconciliation_required')
+        self._require_idle()
+        owner.check_environment()
+        self.persistence._assert_owner_identity()
+        result = self._call(ELIGIBILITY_RPC, (str(row_id),))
+        self._conn.rollback()  # Read-only; end before any further I/O.
+        if not isinstance(result, dict):
+            raise OwnerWorkerHold('owner_transport_unavailable')
         return result
 
     @contextmanager
@@ -120,7 +162,12 @@ class DedicatedOwnerTransport(OwnerTransport):
                 raise OwnerWorkerHold('owner_manual_reconciliation_required')
             self._active = (*key, token)
             self._recorded = False
-            current = self._rpc('snapshot', self._active)
+            if _staged_lane(candidate):
+                # Staged snapshot RPC resolves the canonical tenant for the
+                # observation binding; raw source/asset ownership is unchanged.
+                current = self._call(STAGED_SNAPSHOT_RPC, self._active)
+            else:
+                current = self._rpc('snapshot', self._active)
             self._conn.rollback()  # End read tx BEFORE any remote byte I/O.
             yield current
             if not self._recorded:
@@ -164,7 +211,10 @@ class DedicatedOwnerTransport(OwnerTransport):
             with self._conn.cursor() as cur:
                 cur.execute("set local lock_timeout='5s'; set local statement_timeout='15s'")
             self._final_phase = True
-            current = self._rpc('locked', self._active)
+            if _staged_lane(candidate):
+                current = self._call(STAGED_LOCKED_RPC, self._active)
+            else:
+                current = self._rpc('locked', self._active)
             yield current
             if not self._recorded:
                 raise OwnerWorkerHold('durable_progress_commit_unverified')
