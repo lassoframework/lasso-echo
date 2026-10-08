@@ -855,12 +855,16 @@ class _Img:
         self.media_type = "image"
 
 
-def _stub_local_pick(monkeypatch, tmp_path, raw_bytes=b"raw-source-bytes",
-                     crop_bytes=b"cropped-delivered-bytes"):
+def _stub_local_pick(monkeypatch, tmp_path):
     raw = tmp_path / "photo.jpg"
-    raw.write_bytes(raw_bytes)
+    from PIL import Image
+    from agent import visual_writer_prepare
+    Image.new("RGB", (1200, 400), "blue").save(raw, "JPEG")
     crop = tmp_path / "photo_gbp.jpg"
-    crop.write_bytes(crop_bytes)
+    gp.gbp.crop_4x3(str(raw), str(crop))
+    objects = {"https://r2/gbp/raw.jpg": raw.read_bytes(),
+               "https://r2/gbp/crop.jpg": crop.read_bytes()}
+    monkeypatch.setattr(visual_writer_prepare, "_bytes_for_url", objects.__getitem__)
     monkeypatch.setattr(gp.client_content, "pick_image",
                         lambda *a, **k: _Img(raw))
     monkeypatch.setattr(gp, "_cropped_image",
@@ -894,24 +898,29 @@ def test_cropped_transform_carries_raw_source_and_byte_bound_evidence(monkeypatc
         assert "render_evidence" not in row
     ev = store.evidence_by_url["https://r2/gbp/crop.jpg"]
     assert ev["operation"] == "render"
+    candidate = ev["materialization_observation"]
+    assert candidate["provenance_status"] == "unverified"
+    assert candidate["recipe"]["image"]["name"] == "gbp_crop_4x3"
+    assert "authoritative_render_manifest_receipt_required" in candidate["hold_reasons"]
+    assert "render_manifest_digest" not in candidate
     assert ev["source_exact_url"] == "https://r2/gbp/raw.jpg"
     assert ev["delivered_exact_url"] == "https://r2/gbp/crop.jpg"
-    assert ev["source_fingerprint"] == "md5:" + hashlib.md5(b"raw-source-bytes").hexdigest()
-    assert ev["delivered_fingerprint"] == "md5:" + hashlib.md5(b"cropped-delivered-bytes").hexdigest()
-    assert ev["source_byte_length"] == len(b"raw-source-bytes")
-    assert ev["delivered_byte_length"] == len(b"cropped-delivered-bytes")
+    assert ev["source_fingerprint"] == "md5:" + hashlib.md5(raw.read_bytes()).hexdigest()
+    assert ev["delivered_fingerprint"] == "md5:" + hashlib.md5(crop.read_bytes()).hexdigest()
+    assert ev["source_byte_length"] == len(raw.read_bytes())
+    assert ev["delivered_byte_length"] == len(crop.read_bytes())
     # Exercise the production owner-receipt contract, which validates provenance
     # fields as well as the byte-bound lineage values above.
     monkeypatch.setattr(gp.config, "S3_PUBLIC_BASE_URL", "https://r2")
     receipt_identity = owner._validate(
         "11111111-1111-4111-8111-111111111111", "vg_gbp_crop",
-        b"raw-source-bytes", b"cropped-delivered-bytes", ev, None)
+        raw.read_bytes(), crop.read_bytes(), ev, None)
     assert receipt_identity[6:10] == (
         "render", ev["evidence_ref"], "gbp_planner", "gbp_planner")
     assert ev["evidence_ref"].startswith(
         "gbp_planner:render:"
-        + hashlib.md5(b"raw-source-bytes").hexdigest()
-        + ":" + hashlib.md5(b"cropped-delivered-bytes").hexdigest() + ":")
+        + hashlib.md5(raw.read_bytes()).hexdigest()
+        + ":" + hashlib.md5(crop.read_bytes()).hexdigest() + ":")
 
 
 def test_cropped_transform_holds_when_raw_source_cannot_be_hosted(monkeypatch,

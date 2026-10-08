@@ -409,3 +409,106 @@ def test_prepared_mirror_does_not_retry_typeerror_without_poster_proof(monkeypat
     assert len(calls) == 1
     assert calls[0][("https://cdn/vid.mp4", "https://cdn/poster.jpg")][
         "operation"] == "render"
+
+
+def _observed_draft(day="2026-10-10"):
+    from agent.gym_media_index import materialization_observation
+    draft = _draft("observed_" + day, day_key=day,
+                   url="https://cdn/source.jpg")
+    draft.source_media_asset_id = "asset"
+    draft.source_media_url = "https://cdn/source.jpg"
+    draft.media_materialization_observations = [materialization_observation(
+        b"synthetic", b"synthetic", draft.creative_public_url,
+        tenant=draft.account_key, source_asset_id="asset",
+        source_url=draft.source_media_url,
+        recipe={"image": {"name": "identity"}, "runtime_verified": False},
+        bytes_fn=lambda _: b"synthetic")]
+    return draft
+
+
+def test_cached_rendition_mirror_preserves_existing_month(monkeypatch):
+    from agent import forward_media_observation_bridge as bridge
+    from agent.gym_media_index import ensure_rendition
+    monkeypatch.setenv(bridge.ENV, "true")
+    draft = _observed_draft()
+    observations = []
+    url, converted = ensure_rendition(
+        {"rendition_url": "https://cdn/cached.jpg"}, "unused", store=object(),
+        observation_sink=observations)
+    assert converted is False
+    draft.creative_public_url = url
+    draft.media_materialization_observations = observations
+    existing = [{"id": "retained", "gym_id": "northside_ig",
+                 "post_date": "2026-10-09", "status": "pending"}]
+    sb = _FakeSB(existing)
+    before = dict(sb._rows)
+
+    result = rcm.mirror_to_supabase("northside_ig", _FakeStore([draft]), sb)
+
+    assert result["ok"] is False
+    assert result["deleted"] == result["upserted"] == 0
+    assert sb._rows == before
+    assert sb.deletes == sb.inserts == []
+    # The hold-only cache packet never becomes a trusted observation.
+    with pytest.raises(bridge.ObservationBridgeHold, match="exact_edge"):
+        bridge.prepare(dict(rcm._real_row("northside_ig", draft),
+                            id=str(_uuid.uuid4())), observations)
+
+
+@pytest.mark.parametrize("failure", ["batch", "digest", "schema"])
+def test_observation_mirror_preflights_all_months_before_delete(monkeypatch, failure):
+    from agent import forward_media_observation_bridge as bridge
+    monkeypatch.setenv(bridge.ENV, "true")
+    first, second = _observed_draft(), _observed_draft("2026-11-10")
+    if failure == "batch":
+        second.media_materialization_observations = []
+    elif failure == "digest":
+        second.media_materialization_observations[0]["observation_digest"] = "0" * 64
+
+    def ready(store):
+        if failure == "schema":
+            raise bridge.ObservationBridgeHold("observation_bridge_schema_unavailable")
+
+    monkeypatch.setattr(bridge, "preflight", ready)
+    sb = _FakeSB([{"id": "old-" + month, "gym_id": "northside_ig",
+                   "post_date": month + "-09", "status": "pending"}
+                  for month in ("2026-10", "2026-11")])
+    before = dict(sb._rows)
+
+    result = rcm.mirror_to_supabase("northside_ig", _FakeStore([first, second]), sb)
+
+    assert result["ok"] is False
+    assert result["deleted"] == result["upserted"] == 0
+    assert sb._rows == before
+    assert sb.deletes == sb.inserts == []
+
+
+def test_valid_observation_mirror_preflight_keeps_writer_metadata(monkeypatch):
+    from agent import forward_media_observation_bridge as bridge
+    monkeypatch.setenv(bridge.ENV, "true")
+    draft = _observed_draft()
+    calls = []
+    sb = _FakeSB()
+    monkeypatch.setattr(bridge, "preflight", lambda store: calls.append(store))
+
+    result = rcm.mirror_to_supabase("northside_ig", _FakeStore([draft]), sb)
+
+    assert result["ok"] is True
+    assert calls == [sb]
+    inserted = sb.inserts[0][1]
+    assert inserted[bridge.METADATA] == draft.media_materialization_observations
+    assert "id" not in rcm._real_row("northside_ig", draft)
+
+
+def test_bridge_disabled_mirror_retains_plain_writer_path(monkeypatch):
+    from agent import forward_media_observation_bridge as bridge
+    monkeypatch.delenv(bridge.ENV, raising=False)
+    draft = _observed_draft()
+    draft.media_materialization_observations = [{"hold_reasons": ["cached"]}]
+    monkeypatch.setattr(bridge, "preflight", lambda store: pytest.fail("bridge off"))
+    sb = _FakeSB()
+
+    result = rcm.mirror_to_supabase("northside_ig", _FakeStore([draft]), sb)
+
+    assert result["ok"] is True
+    assert bridge.METADATA not in sb.inserts[0][1]

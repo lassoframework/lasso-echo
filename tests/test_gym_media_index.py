@@ -191,3 +191,77 @@ def test_ensure_rendition_noop_for_plain_jpeg(tmp_path):
     url, converted = idx.ensure_rendition(asset, str(src), store=store,
                                           host_fn=lambda p, g: "u")
     assert url is None and converted is False       # plain asset: use the original
+
+
+def test_materialization_observation_binds_exact_bytes_without_certifying_original():
+    import hashlib
+    source, output = b"drive-source", b"render-output"
+    source_url = "https://media.example/echo/pierce/raw/source.jpg"
+    output_url = "https://media.example/echo/pierce/render/output.jpg"
+    record = idx.materialization_observation(
+        source, output, output_url, tenant="pierce", source_asset_id="drive1",
+        source_url=source_url,
+        recipe={"name": "test", "version": 1, "runtime_verified": False},
+        bytes_fn=lambda url: {source_url: source, output_url: output}.get(url))
+    assert record["source_sha256"] == hashlib.sha256(source).hexdigest()
+    assert record["delivered_sha256"] == hashlib.sha256(output).hexdigest()
+    assert record["provenance_status"] == "unverified"
+    assert "authoritative_original_registry_receipt_required" in record["hold_reasons"]
+    assert "renderer_runtime_or_recipe_unverified" in record["hold_reasons"]
+    assert "render_manifest_digest" not in record
+    assert len(record["observation_digest"]) == 64
+
+
+def test_materialization_observation_rejects_mismatched_hosted_source_or_output():
+    import pytest
+    src_url = "https://media.example/raw.jpg"
+    out_url = "https://media.example/out.jpg"
+    with pytest.raises(ValueError, match="hosted readback"):
+        idx.materialization_observation(b"source", b"output", out_url,
+                                        tenant="pierce", bytes_fn=lambda _: b"changed")
+    with pytest.raises(ValueError, match="hosted source"):
+        idx.materialization_observation(b"source", b"output", out_url, tenant="pierce",
+                                        source_url=src_url,
+                                        bytes_fn=lambda u: b"output" if u == out_url else b"changed")
+
+
+def test_cached_rendition_reports_missing_manifest_without_reencoding(tmp_path):
+    observations = []
+    asset = {"id": "drive1", "gym_id": "pierce", "rendition_url": "https://media.example/old.mp4"}
+    assert idx.ensure_rendition(asset, tmp_path / "missing", store=FakeMediaStore(),
+                                observation_sink=observations) == (asset["rendition_url"], False)
+    assert observations == [{"provenance_status": "unverified",
+                              "hold_reasons": ["cached_rendition_manifest_unavailable"]}]
+
+
+def test_new_rendition_observes_output_readback_and_keeps_runtime_hold(tmp_path):
+    src = tmp_path / "source.heic"
+    src.write_bytes(b"source")
+    asset = {"id": "h1", "gym_id": "pierce", "kind": "photo", "title": "source.heic"}
+    observations = []
+    def convert(_src, out):
+        out.write_bytes(b"converted")
+    url, made = idx.ensure_rendition(
+        asset, src, store=FakeMediaStore(), heic_fn=convert,
+        host_fn=lambda *_: "https://media.example/converted.jpg",
+        observation_sink=observations, bytes_fn=lambda _: b"converted")
+    assert made and url
+    assert observations[0]["recipe"]["quality"] == 90
+    assert observations[0]["provenance_status"] == "unverified"
+    assert "hosted_original_url_unobserved" in observations[0]["hold_reasons"]
+
+
+def test_new_rendition_readback_mismatch_is_unverified(tmp_path):
+    src = tmp_path / "source.heic"
+    src.write_bytes(b"source")
+    asset = {"id": "h1", "gym_id": "pierce", "kind": "photo", "title": "source.heic"}
+    observations = []
+    def convert(_src, out):
+        out.write_bytes(b"converted")
+    url, made = idx.ensure_rendition(
+        asset, src, store=FakeMediaStore(), heic_fn=convert,
+        host_fn=lambda *_: "https://media.example/converted.jpg",
+        observation_sink=observations, bytes_fn=lambda _: b"different")
+    assert made and url  # legacy return shape is unchanged; authority remains held
+    assert observations[0]["hold_reasons"] == ["rendition_readback_unverified"]
+    assert "observation_digest" not in observations[0]

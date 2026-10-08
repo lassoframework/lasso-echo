@@ -384,3 +384,60 @@ def test_vision_still_called_for_a_gym_on_the_allowlist(monkeypatch, tmp_path):
     assert calls == ["pierce"], "an armed gym must still get vision, exactly as before"
     assert draft is not None
     assert draft.status == DraftStatus.PENDING
+
+
+def test_drive_original_observation_uses_fresh_checksum_and_stays_unverified(monkeypatch, tmp_path):
+    from tests.gym_media_fakes import bound_review_fields
+    _wire(monkeypatch)
+    monkeypatch.setenv("AGENT_DB_PATH", str(tmp_path / "echo.db"))
+    monkeypatch.setattr(builder, "writer_prep_enabled", lambda: True)
+    image = BytesIO()
+    Image.new("RGB", (640, 480), "blue").save(image, "JPEG")
+    raw = image.getvalue()
+    digest = hashlib.md5(raw).hexdigest()
+    asset = make_asset("p-observed", gym_id="pierce", kind="photo")
+    asset.update(bound_review_fields("p-observed", "pierce", digest))
+    store = FakeMediaStore(assets=[asset])
+    monkeypatch.setattr("agent.visual_writer_prepare._bytes_for_url", lambda _: raw)
+    draft = builder.build_gym_media_draft(
+        _Acct(), "2026-08-27", "faces", voice=object(), source=object(),
+        store=store, drive=FakeDrive(blobs={"p-observed": raw}), library_dir=str(tmp_path))
+    assert draft is not None
+    observation = draft.media_materialization_observations[0]
+    assert observation["source_asset_id"] == "p-observed"
+    assert observation["source_sha256"] == hashlib.sha256(raw).hexdigest()
+    assert observation["recipe"]["name"] == "echo_still_image"
+    assert observation["recipe"]["image"]["name"] == "identity"
+    assert "runtime_verified" not in observation["recipe"]
+    assert draft.media_provenance_status == "unverified"
+    assert "authoritative_original_registry_receipt_required" in observation["hold_reasons"]
+    assert not hasattr(draft, "render_manifest_digest")
+
+
+def test_drive_original_checksum_mismatch_cannot_emit_bound_observation(monkeypatch, tmp_path):
+    _wire(monkeypatch)
+    monkeypatch.setenv("AGENT_DB_PATH", str(tmp_path / "echo.db"))
+    monkeypatch.setattr(builder, "writer_prep_enabled", lambda: True)
+    store = FakeMediaStore(assets=[make_asset("p-held", gym_id="pierce", kind="photo")])
+    monkeypatch.setattr("agent.visual_writer_prepare._bytes_for_url",
+                        lambda _: (_ for _ in ()).throw(AssertionError("must not attest wrong bytes")))
+    draft = builder.build_gym_media_draft(
+        _Acct(), "2026-08-27", "faces", voice=object(), source=object(),
+        store=store, drive=FakeDrive(blobs={"p-held": b"changed"}), library_dir=str(tmp_path))
+    assert draft is not None
+    assert draft.media_materialization_observations == [
+        {"provenance_status": "unverified", "hold_reasons": ["drive_identity_or_checksum_unverified"]}]
+
+
+def test_drive_observations_are_absent_when_writer_flag_off(monkeypatch, tmp_path):
+    _wire(monkeypatch)
+    monkeypatch.setenv("AGENT_DB_PATH", str(tmp_path / "echo.db"))
+    monkeypatch.setattr(builder, "writer_prep_enabled", lambda: False)
+    monkeypatch.setattr("agent.gym_media_index.bounded_materialization_bytes",
+                        lambda _: (_ for _ in ()).throw(AssertionError("flag off must not observe")))
+    store = FakeMediaStore(assets=[make_asset("p-legacy", gym_id="pierce", kind="photo")])
+    draft = builder.build_gym_media_draft(
+        _Acct(), "2026-08-27", "faces", voice=object(), source=object(),
+        store=store, drive=FakeDrive(blobs={"p-legacy": b"jpgbytes"}), library_dir=str(tmp_path))
+    assert draft is not None
+    assert not hasattr(draft, "media_materialization_observations")
