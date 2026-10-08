@@ -103,42 +103,55 @@ def _replacement_grade(existing, target, caption):
     return grade_month(view, profile="B2B").total >= A_THRESHOLD
 
 
-def _candidate(target, existing, account_key, regen):
+def _candidate(target, existing, account_key, regen, *, store=None, author_summary=None):
     avoid = [str(r.get("caption") or "") for r in existing]
-    result = regen(target, avoid) if regen else None
-    if result is None:
-        drafts = real_month_run.plan_and_build(account_key, target["post_date"], 1,
-            source_only=True, slot_selector=lambda s: s.fmt == "feed"
-            and s.post_date == target["post_date"] and s.cadence_slot == target["slot_index"])
-        rows = [r for r in real_month_planner.to_calendar_rows(drafts, "lasso")
-                if r.get("account") == target["account"] and r.get("format") == "feed"
-                and r.get("post_date") == target["post_date"] and r.get("slot_index") == target["slot_index"]]
-        if (len(drafts) != 1 or len(rows) != 1 or not getattr(drafts[0], "source_fragments", None)
-                or rows[0].get("pillar") != target["pillar"]):
+    def valid(result):
+        if result is None:
             return None
-        # Source-only fallback cannot infer a different topic for custom copy.
-        # An exact approved source fragment in the old caption proves continuity.
+        caption, pillar = result
+        if (pillar != target["pillar"] or not isinstance(caption, str)
+                or copy_gate.lasso_violations(caption)
+                or not grade_fix._clears_craft(caption, allow_no_ask=True)
+                or caption_ledger.caption_hash(caption) in {caption_ledger.caption_hash(c) for c in avoid if c}
+                or caption_ledger.is_blocked_strict("lasso", caption, target["post_date"])):
+            return None
+        return caption
+    result = valid(regen(target, avoid) if regen else None)
+    if result is not None:
+        return result
+    drafts = real_month_run.plan_and_build(account_key, target["post_date"], 1,
+        source_only=True, slot_selector=lambda s: s.fmt == "feed"
+        and s.post_date == target["post_date"] and s.cadence_slot == target["slot_index"])
+    rows = [r for r in real_month_planner.to_calendar_rows(drafts, "lasso")
+            if r.get("account") == target["account"] and r.get("format") == "feed"
+            and r.get("post_date") == target["post_date"] and r.get("slot_index") == target["slot_index"]]
+    if (len(drafts) == 1 and len(rows) == 1 and getattr(drafts[0], "source_fragments", None)
+            and rows[0].get("pillar") == target["pillar"]):
         fragments = getattr(drafts[0], "source_fragments", [])
-        if not any(str(f).strip() and str(f) in target["caption"] for f in fragments):
-            return None
-        result = rows[0]["caption"], rows[0]["pillar"]
-    caption, pillar = result
-    if (pillar != target["pillar"] or not isinstance(caption, str)
-            or copy_gate.lasso_violations(caption)
-            or not grade_fix._clears_craft(caption, allow_no_ask=True)
-            or caption_ledger.caption_hash(caption) in {caption_ledger.caption_hash(c) for c in avoid if c}
-            or caption_ledger.is_blocked_strict("lasso", caption, target["post_date"])):
-        return None
-    return caption
+        if any(str(f).strip() and str(f) in target["caption"] for f in fragments):
+            result = valid((rows[0]["caption"], rows[0]["pillar"]))
+            if result is not None:
+                return result
+    # Author only after both finite approved-source routes are exhausted.
+    # Source review does not replace the later full book grade or exact repair.
+    from agent import lasso_caption_authoring
+    authored = lasso_caption_authoring.author(target, avoid,
+        gate_fn=(lambda: _gates(store, account_key)) if store is not None else None)
+    if author_summary is not None:
+        author_summary.update({k: authored[k] for k in
+            ("ok", "writer_calls", "reviewer_calls", "reused", "receipt_key", "receipt_sha256", "reason")
+            if k in authored})
+    return valid((authored["caption"], target["pillar"])) if authored.get("ok") is True else None
 
 
 class _ExactContextStore:
     """Revalidate the patch helper's own read and every write, without bypasses."""
-    def __init__(self, store, target, day_rows, source_snapshot, account_key, book, caption):
+    def __init__(self, store, target, day_rows, source_snapshot, account_key, book, caption, author_receipt=None):
         self.store, self.target, self.day_rows = store, target, day_rows
         self.source_snapshot, self.account_key = source_snapshot, account_key
         self.book, self.caption = book, caption
         self.context_validated = False
+        self.author_receipt = author_receipt
 
     def __getattr__(self, name):
         return getattr(self.store, name)
@@ -146,6 +159,12 @@ class _ExactContextStore:
     def _fresh(self):
         if not _gates(self.store, self.account_key) or runway._source_snapshot() != self.source_snapshot:
             raise _Refused("fresh caption source gate closed")
+        if self.author_receipt:
+            from agent import lasso_caption_authoring
+            if not lasso_caption_authoring.current_receipt_valid(self.target,
+                    [r.get("caption") or "" for r in self.book], self.author_receipt,
+                    expected_caption=self.caption, gate_fn=lambda: _gates(self.store, self.account_key)):
+                raise _Refused("fresh authored source receipt unavailable")
         if not _replacement_grade(self.book, self.target, self.caption):
             raise _Refused("fresh replacement book below A")
 
@@ -206,7 +225,11 @@ def run(*, account_key, now=None, store=None):
         source = runway._source_snapshot()
         context = store.active_rows_on_day_complete("lasso", target["post_date"])
         _siblings(store, target, context)
-        caption = _candidate(target, existing, account_key, grade_fix._lasso_caption_regen(lambda m: None))
+        author_summary = {}
+        caption = _candidate(target, existing, account_key, grade_fix._lasso_caption_regen(lambda m: None),
+                             store=store, author_summary=author_summary)
+        if author_summary:
+            out["authoring"] = author_summary
         if caption is None:
             return dict(out, blocked=1, reason="approved same-topic source exhausted")
         fresh = store.rows_in_range_complete("lasso", first, grade_last, all_statuses=True)
@@ -216,7 +239,8 @@ def run(*, account_key, now=None, store=None):
             return dict(out, blocked=1, reason="fresh caption gate closed")
         if not _replacement_grade(fresh, target, caption):
             return dict(out, blocked=1, reason="replacement book below A")
-        proxy = _ExactContextStore(store, target, context, source, account_key, fresh, caption)
+        proxy = _ExactContextStore(store, target, context, source, account_key, fresh, caption,
+                                  author_receipt=author_summary.get("receipt_key") if author_summary.get("ok") else None)
         repair_target = deepcopy(target)
         if not grade_fix._patch_date_rows("lasso", [repair_target], proxy, caption, target["pillar"], lambda m: None):
             return dict(out, blocked=1, reason="exact caption repair refused")
