@@ -44,6 +44,9 @@ def read_sidecar(creative_path):
 
 def write_sidecar(creative_path, updates):
     """Merge-write: existing fields (note, public_url, archetype...) survive."""
+    from . import local_inventory_mutation
+    if local_inventory_mutation.enabled():
+        return local_inventory_mutation.write_sidecar(creative_path, updates)
     data = read_sidecar(creative_path)
     data.update(updates)
     with open(sidecar_path(creative_path), "w", encoding="utf-8") as fh:

@@ -8,6 +8,7 @@ token does not authenticate a media reviewer.
 
 import argparse
 import fcntl
+import hashlib
 import json
 import os
 import sys
@@ -51,7 +52,7 @@ def _media_path(base, asset_name, account):
     return path
 
 
-def _audit_approval(base, asset_name, actor_id, reviewed_at, note):
+def _audit_approval(base, asset_name, actor_id, reviewed_at, note, *, transaction=None):
     """Commit approval provenance before changing the eligibility sidecar.
 
     db.audit intentionally swallows failures, so the approval gate must write
@@ -60,6 +61,11 @@ def _audit_approval(base, asset_name, actor_id, reviewed_at, note):
     reason = ops_alerts.scrub(
         f"local operator review; actor={actor_id}; consent=granted; "
         f"moderation=clean; at={reviewed_at}; note={note or ''}")[:500]
+    if transaction is not None:
+        return transaction.execute(
+            "INSERT INTO audit (day, account_key, kind, subject, reason) VALUES (?,?,?,?,?)",
+            (reviewed_at[:10], base, "media_approval", asset_name[:200], reason),
+        ).lastrowid
     conn = db.connect()
     try:
         conn.execute("BEGIN IMMEDIATE")
@@ -77,6 +83,14 @@ def _audit_approval(base, asset_name, actor_id, reviewed_at, note):
 
 def approve(account_key, asset_name, actor_id, *, moderation="", note=""):
     """Serialize local approval decisions across operator processes."""
+    from . import local_inventory_mutation
+    if local_inventory_mutation.enabled():
+        if not isinstance(account_key, str) or account_key != account_key.strip():
+            return 400, {"ok": False, "error": "canonical account key required"}
+        # PG begin/complete may not run while any local approval flock is held.
+        # The new operation owns its canonical gym flock only around local effects.
+        return _approve_locked(account_key, asset_name, actor_id,
+                               moderation=moderation, note=note)
     lock_path = db.db_path() + ".media-approval.lock"
     try:
         with open(lock_path, "a+b") as lock:
@@ -102,6 +116,56 @@ def _write_approval_sidecar(path, updates):
     finally:
         if os.path.exists(temporary):
             os.unlink(temporary)
+
+
+def _reviewed_source_identity(path):
+    """Bind validity to one stable file identity and exact byte digest."""
+    from pathlib import Path
+    from .client_media_sync import _valid_media_file
+    from .local_inventory_mutation import MutationHold
+    source = Path(path)
+    if source.is_symlink() or source.resolve() != source:
+        raise MutationHold('local_mutation_review_bytes_changed')
+    def identity():
+        stat = source.stat()
+        return {'device': stat.st_dev, 'inode': stat.st_ino, 'length': stat.st_size,
+                'mtime_ns': stat.st_mtime_ns, 'ctime_ns': stat.st_ctime_ns,
+                'source_digest': 'sha256:' + hashlib.sha256(source.read_bytes()).hexdigest()}
+    before = identity()
+    if not _valid_media_file(path) or identity() != before:
+        raise MutationHold('local_mutation_review_bytes_changed')
+    return before
+
+
+def _fenced_approval(base, path, actor_id, reviewed_at, note, updates, source_identity):
+    from pathlib import Path
+    from . import local_inventory_mutation as mutation
+    cfg = mutation.configured(base, os.path.dirname(path))
+    cfg.asset_path(Path(path))
+    source_digest = source_identity['source_digest']
+    side_path = Path(dam.sidecar_path(path))
+    def apply(conn):
+        # The review is bound to the exact bytes that were validated before begin.
+        if _reviewed_source_identity(path) != source_identity:
+            raise mutation.MutationHold('local_mutation_review_bytes_changed')
+        current = json.loads(side_path.read_text()) if side_path.exists() else {}
+        if not isinstance(current, dict):
+            raise mutation.MutationHold('local_mutation_sidecar_invalid')
+        audit_id = _audit_approval(base, Path(path).name, actor_id, reviewed_at, note,
+                                   transaction=conn)
+        current.update(updates)
+        mutation.atomic_write_json(side_path, current)
+        return {'asset': Path(path).name, 'source_digest': source_digest,
+                'source_identity': source_identity,
+                'sidecar_digest': mutation.digest(current), 'audit_id': audit_id}
+    authority = mutation.MutationAuthority.from_environment()
+    try:
+        mutation.run(cfg, authority, 'upload_approval',
+                     {'asset': Path(path).name, 'source_digest': source_digest,
+                      'source_identity': source_identity,
+                      'updates': updates, 'note_digest': mutation.digest(note)}, apply)
+    finally:
+        authority.close()
 
 
 def _approved_asset_is_currently_usable(path, account_key):
@@ -149,9 +213,14 @@ def _approve_locked(account_key, asset_name, actor_id, *, moderation="", note=""
     if path is None or not os.path.isfile(path):
         # Same response for malformed/missing paths: never confirm another file.
         return 404, {"ok": False, "error": "unknown media"}
+    from . import local_inventory_mutation as mutation
+    fenced = mutation.enabled()
+    source_identity = None
     try:
         from .client_media_sync import _valid_media_file
-        if not _valid_media_file(path):
+        if fenced:
+            source_identity = _reviewed_source_identity(path)
+        elif not _valid_media_file(path):
             return 409, {"ok": False, "error": "media is not valid for approval"}
     except Exception:
         return 409, {"ok": False, "error": "media is not valid for approval"}
@@ -160,8 +229,20 @@ def _approve_locked(account_key, asset_name, actor_id, *, moderation="", note=""
     if str(moderation or "").strip().lower() != "clean":
         return 400, {"ok": False, "error": "explicit clean moderation review is required"}
 
+    if fenced:
+        try:
+            mutation.assert_settled(mutation.configured(base, os.path.dirname(path)))
+        except Exception:
+            return 503, {"ok": False, "error": "inventory mutation requires reconciliation"}
+
     if (side.get("approved") is True and side.get("review") is False
             and str(side.get("moderation") or "").lower() == "clean"):
+        if fenced:
+            # A settled-journal observation is not a lease: another mutation
+            # can begin immediately afterward. This retry must not delete a
+            # bridge episode outside a mutation fence. Hold without mutation
+            # until the bridge reconciliation writer adopts the protocol.
+            return 503, {"ok": False, "error": "approval recorded; fenced bridge reconciliation required"}
         # A previous attempt may have approved the sidecar but failed while
         # closing the media bridge episode. Retry that repair on idempotent calls.
         try:
@@ -172,12 +253,7 @@ def _approve_locked(account_key, asset_name, actor_id, *, moderation="", note=""
         return 200, {"ok": True, "asset": asset_name, "already_approved": True}
 
     reviewed_at = datetime.now(timezone.utc).isoformat()
-    try:
-        _audit_approval(base, asset_name, actor_id, reviewed_at, note)
-    except Exception:
-        return 503, {"ok": False, "error": "approval audit unavailable"}
-    try:
-        _write_approval_sidecar(path, {
+    updates = {
             "approved": True,
             "review": False,
             "moderation": "clean",
@@ -185,9 +261,28 @@ def _approve_locked(account_key, asset_name, actor_id, *, moderation="", note=""
             "approved_at": reviewed_at,
             "moderation_reviewed_by": str(actor_id or "")[:200],
             "moderation_reviewed_at": reviewed_at,
-        })
-    except Exception:
-        return 503, {"ok": False, "error": "approval sidecar write failed"}
+        }
+    if fenced:
+        try:
+            _fenced_approval(base, path, actor_id, reviewed_at, note, updates, source_identity)
+        except Exception:
+            return 503, {"ok": False, "error": "inventory mutation pending or unavailable"}
+        # Sidecar and audit are committed, and the exact mutation receipt is
+        # complete. That receipt does not fence a later bridge deletion: another
+        # writer may already have begun. Keep the episode until its reconciliation
+        # writer participates in the mutation protocol.
+        return 503, {"ok": False, "approval_recorded": True,
+                     "inventory_mutation_complete": True,
+                     "error": "approval recorded; fenced bridge reconciliation required"}
+    else:
+        try:
+            _audit_approval(base, asset_name, actor_id, reviewed_at, note)
+        except Exception:
+            return 503, {"ok": False, "error": "approval audit unavailable"}
+        try:
+            _write_approval_sidecar(path, updates)
+        except Exception:
+            return 503, {"ok": False, "error": "approval sidecar write failed"}
 
     # This is intentionally after the durable approval write.  A raw upload, a
     # A raw upload or sync pass can never close a media-bridge episode.
