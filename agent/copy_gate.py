@@ -28,7 +28,15 @@ _DASH_RE = re.compile("[" + _BANNED_DASHES + "]")
 _ZERO_WIDTH = "​⁠﻿­"
 _ZERO_WIDTH_RE = re.compile("[" + _ZERO_WIDTH + "]")
 _INTRAWORD_HYPHEN_RE = re.compile(r"(?<=[A-Za-z])-(?=[A-Za-z])")
+# CONSUMER COPY LAW (Blake, 2026-10-07): client captions carry NO hyphen of any kind
+# (letter-letter, digit-letter like "30-minute", list bullets), no colon and no
+# semicolon. URLs, emails' domains, @handles and #tags are protected spans.
+_ANY_HYPHEN_RE = re.compile(r"-")
+_CLOCK_RE = re.compile(r"\b(\d{1,2}):(\d{2})\b")
+_COLON_RE = re.compile(r"\s*:\s*")
+_BULLET_RE = re.compile(r"(?m)^[ \t]*-+[ \t]*")
 # protect URLs and @handles/#tags: hyphens inside them are load-bearing
+_HYPHEN_AS_DASH_RE = re.compile(r"[ \t]+-+[ \t]+|-{2,}")
 _PROTECTED_RE = re.compile(r"(?:https?://\S+|\b[\w.-]+\.(?:com|net|org|io|co|fit|gym)\S*|[@#][\w.]+)", re.I)
 
 # A real email address, anywhere in the text. HARD violation (2026-09-08, Zanshin Fitness /
@@ -63,15 +71,83 @@ ASK_RE = re.compile(
     r"comment \"?\w+\"?|sign up|get started|claim your|reserve your|try a (free )?class|"
     r"schedule (a|your)|start (here|today|your))", re.I)
 
-def scrub(text: str) -> str:
+# MODEL META REPLY (Bolton Club, 2026-10-07): an SB7 caption for a photo whose only
+# "description" was the camera filename prefix "DSC" came back as the model talking
+# TO US instead of writing a post: 'You said the photo shows "DSC" but didn't describe
+# what that image contains... Can you tell me what the image shows?' Nothing on the
+# caption path read for that shape (the gates looked for figures, dashes, scaffold
+# headers and hint blocks), so it was staged onto three pending rows. A caption that
+# asks the operator a question, or comments on the request / the image it was given /
+# itself as an AI, is not copy. Patterns are deliberately narrow (each names the
+# request, the image, or the model) so a real hook like "You don't have to do it
+# alone" or a member quote "I don't have time" never trips them.
+_MEDIA = r"(?:image|photo|picture|pic|video|clip|visual|shot|attachment|file)"
+META_REPLY_RE = re.compile(
+    r"\bas an ai\b"
+    r"|\b(?:i am|i'm) (?:an ai|a language model|unable to (?:see|view|open|access))\b"
+    r"|\bi (?:can't|cannot|can not|am unable to|'m unable to|don't|do not) "
+    r"(?:see|view|open|access|make out) (?:the|this|that|your|any|an|a) (?:\w+ )?" + _MEDIA + r"s?\b"
+    r"|\bi (?:don't|do not) have (?:access|enough (?:information|context|detail)|"
+    r"(?:any |the |a )?(?:details?|description|context|information)\b|"
+    r"(?:the |that |this |your |a |an |any )?" + _MEDIA + r")"
+    r"|\b(?:can|could|would) you (?:please )?(?:tell me|describe|share|provide|clarify|"
+    r"confirm|let me know|explain)\b[^.?!\n]{0,60}\b(?:" + _MEDIA + r"s?|shows?|contains?|"
+    r"caption|scene|details?)\b"
+    r"|\bcould you (?:please )?describe\b"
+    r"|\byou (?:said|mentioned|noted|wrote) (?:that )?(?:the|this) (?:post's )?" + _MEDIA + r"\b"
+    r"|\bi need (?:some |more )?(?:clarification|clarity)\b"
+    r"|\bwhat (?:the|this|that|your) " + _MEDIA + r" (?:shows|contains|depicts|is of)\b"
+    r"|\bwhat'?s (?:actually )?in the " + _MEDIA + r"\b"
+    r"|\bonce you (?:describe|share|tell me|provide|send)\b"
+    r"|\bi (?:need|would need|'d need) (?:(?:to see|to know) what(?:'s| is)? (?:actually )?in\b|"
+    r"more (?:info|information|context|details?) (?:about|on) the " + _MEDIA + r"|a description\b)"
+    r"|\b(?:i'll|i will|i can|let me) (?:write|draft|create|craft)\b[^.?!\n]{0,60}\bcaption\b"
+    r"|\bhere(?:'s| is) (?:a|the|your) (?:\w+ ){0,3}caption\b"
+    r"|\bthe " + _MEDIA + r" (?:you (?:sent|shared|provided|uploaded|attached|described))\b",
+    re.I)
+
+
+def meta_reply_defects(text: str) -> list[str]:
+    """The model talked to the operator instead of writing a caption. Returns
+    ["meta_reply"] or []. Read on the raw text with typographic apostrophes folded."""
+    t = str(text or "").replace("\u2019", "'").replace("\u2018", "'")
+    return ["meta_reply"] if META_REPLY_RE.search(t) else []
+
+
+def is_meta_reply(text: str) -> bool:
+    """True when `text` is a clarification request / model meta comment, never copy."""
+    return bool(meta_reply_defects(text))
+
+
+def scrub_caption(text: str) -> str:
+    """CONSUMER COPY LAW scrub for client captions (Blake, 2026-10-07): everything
+    scrub does PLUS every hyphen (letter or digit: "30-minute" -> "30 minute"; list
+    bullets dropped), every colon ("6:00" -> "6", "6:30" -> "6.30", otherwise ", ")
+    and every semicolon. URLs, @handles and #tags stay protected."""
+    return scrub(text, strict=True)
+
+
+def caption_violations(text: str) -> list[str]:
+    """violations() plus the consumer copy law: any hyphen and any colon outside a
+    protected URL/handle/tag span. Used by the client caption validator."""
+    v = violations(text)
+    plain = _PROTECTED_RE.sub("", str(text))
+    if "-" in plain and "intraword_hyphen" not in v:
+        v.append("hyphen")
+    if ":" in plain:
+        v.append("colon")
+    return v
+
+
+def scrub(text: str, strict: bool = False) -> str:
     """Rewrite, never reject. Long dashes become ', '; intraword hyphens become a
     space; zero-width/invisible characters are removed; URLs, @handles and #tags
     pass through untouched."""
     out, last = [], 0
     s = _ZERO_WIDTH_RE.sub("", str(text))
     for m in _PROTECTED_RE.finditer(s):
-        out.append(_scrub_plain(s[last:m.start()])); out.append(m.group(0)); last = m.end()
-    out.append(_scrub_plain(s[last:]))
+        out.append(_scrub_plain(s[last:m.start()], strict)); out.append(m.group(0)); last = m.end()
+    out.append(_scrub_plain(s[last:], strict))
     return "".join(out).strip()
 
 def scrub_prompt(text: str) -> str:
@@ -86,9 +162,29 @@ def scrub_prompt(text: str) -> str:
     cleaned = _DASH_RE.sub(" ", s)
     return re.sub(r"[ \t]{2,}", " ", cleaned).strip()
 
-def _scrub_plain(t: str) -> str:
+def _clock(m):
+    hh, mm = m.group(1), m.group(2)
+    return hh if mm == "00" else f"{hh}.{mm}"
+
+
+def _scrub_plain(t: str, strict: bool = False) -> str:
     t = _DASH_RE.sub(", ", t)
-    t = _INTRAWORD_HYPHEN_RE.sub(" ", t)
+    if strict:
+        t = _BULLET_RE.sub("", t)
+        # Meaning-preserving numeric rewrites FIRST (review on #340): a range
+        # "8-12" reads "8 to 12", a ratio "1:1" reads "1 to 1", a leading minus
+        # "-5" reads "negative 5". Only then are the remaining hyphens/colons cut.
+        t = re.sub(r"(\d)\s*-\s*(?=\d)", r"\1 to ", t)
+        t = re.sub(r"(?<![\w.])-(?=\d)", "negative ", t)
+        t = re.sub(r"\b(\d{1,2}):(\d)\b", r"\1 to \2", t)
+        t = _HYPHEN_AS_DASH_RE.sub(", ", t)
+        t = _ANY_HYPHEN_RE.sub(" ", t)
+        t = _CLOCK_RE.sub(_clock, t)
+        t = _COLON_RE.sub(", ", t)
+        t = re.sub(r",\s*,", ",", t)
+        t = re.sub(r"^\s*,\s*", "", t)
+    else:
+        t = _INTRAWORD_HYPHEN_RE.sub(" ", t)
     t = t.replace(";", ",")
     t = re.sub(r"\s+,", ",", t)
     t = re.sub(r"[ \t]{2,}", " ", t)
@@ -158,6 +254,7 @@ def violations(text: str) -> list[str]:
     # (zanshin.fit) is exactly the shape _PROTECTED_RE exists to protect (real URLs/domains), so
     # stripping it first would hide the email behind its own protection.
     if _EMAIL_RE.search(s): v.append("email_address")
+    v.extend(meta_reply_defects(s))
     return v
 
 

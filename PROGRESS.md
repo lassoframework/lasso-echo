@@ -1,3 +1,28 @@
+## FIXER current notice release repairs (2026-10-07, PR #317)
+
+- [~] Reserved ready first-contact notices abandoned before claim now expire through
+  exact ready/status/receipt/attachment CAS suppression with staff escalation. They
+  never requeue or send from the outbox; active and competing owners are preserved.
+- [~] First-contact identity changes use claimed pre-intent CAS suppression and
+  escalation instead of a legacy unconditional status write.
+- [~] A shared stable-UUID staff alert survives failed/lost INSERT responses and
+  concurrent reconcilers. A scoped keyset scan retries missing alerts from at most
+  20 definitely unsent suppressed notices per sweep, without modifying the notice
+  or rearming an existing alert. Earlier queued/posted escalation rows are preserved.
+- [~] Generic designated-notice suppression now uses the same exact pre-intent
+  CAS and stable staff alert. Earlier generic staff bodies are matched exactly
+  against their source suppression reason. A fresh source/alert/ticket match lets
+  only this internal informational alert retain its original dispatcher after a
+  ticket owner change; no customer route, action buttons or closeout are granted.
+- [~] `SLACK_CONVO_ECHO_CURRENT_NOTICE_ENABLED` defaults OFF. New reservations,
+  tokenized inserts/dispatch, route binds and current-notice resolution require it.
+  Ordinary Echo website-tab answers still cannot certify a fix or close a ticket.
+- [~] Targeted local caller, worker, wiring and Slack adapter suites: 804 passed.
+  The paired portal disposable PG17 harness passed 0382/0383/0605 verification,
+  including suppressed-row immutability and suppression refusal after Slack intent.
+- [ ] Independent acceptance, paired portal migration 0605 live verification, and
+  release/activation remain with the integration owner. No deployment or flag change.
+
 ## Four production bugs (2026-10-06)
 
 - [~] Caption formatter presentation (whitespace/line breaks) no longer demotes an
