@@ -511,7 +511,14 @@ def _zernio_health_candidate(client, key, profile, clock):
     Instagram), so selection filters the exact profile, then requires exactly
     one Instagram row; sibling platform rows are not ambiguity. Duplicate or
     conflicting Instagram identities/IDs, conflicting profile/status data,
-    partial or malformed data fails closed. Returns (health_row_or_None,
+    partial or malformed data fails closed. Strict field validation applies
+    only to rows whose readable profile identity equals the requested profile;
+    rows for other profiles cannot hold this gym, while a row with absent or
+    unreadable profile identity could still refer to it and fails closed.
+    Reuse of this profile's candidate account ID by any row with a different
+    readable profile identity is conflicting ownership evidence and fails
+    closed.
+    Returns (health_row_or_None,
     observed_at, raw_bytes): None means this profile has no Instagram
     candidate (missing or disconnected — never proof of disconnection).
     Handle is never used to infer ownership.
@@ -527,10 +534,19 @@ def _zernio_health_candidate(client, key, profile, clock):
     if (not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows)
             or any(name in data for name in ('pagination', 'nextCursor', 'hasMore', 'next'))):
         _fail('authenticated_social_status_incomplete')
-    seen_ids = set()
+    # Strict validation is scoped to rows for the requested profile. A row
+    # whose readable profile identity differs can hold unrelated malformed
+    # non-identity fields without holding this gym; a row whose profile
+    # identity is absent or unreadable could refer to this profile and holds.
+    candidates = []
     for row in rows:
+        if (not isinstance(row.get('profileId'), str) or not row['profileId']):
+            _fail('authenticated_social_status_incomplete')
+        if row['profileId'] == profile:
+            candidates.append(row)
+    seen_ids = set()
+    for row in candidates:
         if (not isinstance(row.get('accountId'), str) or not row['accountId']
-                or not isinstance(row.get('profileId'), str) or not row['profileId']
                 or not isinstance(row.get('platform'), str)
                 or not re.fullmatch(r'[a-z][a-z0-9_]*', row['platform'])
                 or not isinstance(row.get('username'), str) or not row['username']
@@ -541,7 +557,17 @@ def _zernio_health_candidate(client, key, profile, clock):
                 or row['accountId'] in seen_ids):
             _fail('authenticated_social_status_incomplete')
         seen_ids.add(row['accountId'])
-    candidates = [row for row in rows if row['profileId'] == profile]
+    # Cross-profile reuse of a candidate's account ID is conflicting ownership
+    # evidence: the same target account cannot be owned by this profile and
+    # another readable profile at once. Fail closed even if the other row's
+    # non-identity fields are malformed; a non-string accountId on another
+    # profile's row cannot equal a validated candidate ID.
+    candidate_ids = {row['accountId'] for row in candidates}
+    for row in rows:
+        if (row['profileId'] != profile
+                and isinstance(row.get('accountId'), str)
+                and row['accountId'] in candidate_ids):
+            _fail('authenticated_social_identity_ambiguous_or_missing')
     instagram = [row for row in candidates if row['platform'] == 'instagram']
     if len(instagram) > 1:
         # Duplicate or conflicting Instagram rows for this exact profile hold.

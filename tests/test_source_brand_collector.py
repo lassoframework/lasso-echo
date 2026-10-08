@@ -401,6 +401,73 @@ def test_identity_reader_duplicate_populated_profile_keys_hold():
     assert rows.attestations[0][0]['instagram'] is None
 
 
+def test_identity_reader_unrelated_malformed_rows_do_not_hold_requested_profile():
+    # A row for another exact profile may carry malformed non-identity fields;
+    # it cannot hold this gym's ownership decision.
+    rows = IdentityReadRows(None)
+    unrelated = {'accountId': '', 'profileId': 'other-exact-profile',
+                 'platform': '!!!not-a-platform', 'username': 123, 'status': None,
+                 'tokenValid': 'yes', 'needsReconnect': 1, 'canPost': {}}
+    http = IdentityHttp([unrelated, zhealth()], [zaccount()])
+    result = zreader(http, rows)(GYM, KEY)
+    assert result['connected'] is True and result['account_id'] == ZACCOUNT
+    assert rows.attestations[0][0]['lookup_status'] == 'complete'
+
+
+@pytest.mark.parametrize('unrelated_account_id', [[], {}])
+def test_identity_reader_unrelated_unhashable_account_id_is_ignored(unrelated_account_id):
+    rows = IdentityReadRows(None)
+    unrelated = zhealth(profileId='other-exact-profile', accountId=unrelated_account_id)
+    result = zreader(IdentityHttp([unrelated, zhealth()], [zaccount()]), rows)(GYM, KEY)
+    assert result['connected'] is True and result['account_id'] == ZACCOUNT
+    assert rows.attestations[0][0]['lookup_status'] == 'complete'
+
+
+def test_identity_reader_matched_malformed_row_holds():
+    rows = IdentityReadRows(None)
+    http = IdentityHttp([zhealth(tokenValid='yes')], [zaccount()])
+    with pytest.raises(CaptureIngestError,
+                       match='authenticated_social_status_unavailable_or_incomplete'):
+        zreader(http, rows)(GYM, KEY)
+    assert len(rows.attestations) == 1
+
+
+@pytest.mark.parametrize('profile_id', [None, 123, ''])
+def test_identity_reader_unreadable_profile_identity_holds(profile_id):
+    # Absent or non-string profileId could refer to the requested profile, so
+    # it fails closed at the profile-identity check even when every other
+    # field looks well-formed (including the account ID).
+    rows = IdentityReadRows(None)
+    http = IdentityHttp([zhealth(profileId=profile_id)], [zaccount()])
+    with pytest.raises(CaptureIngestError,
+                       match='authenticated_social_status_unavailable_or_incomplete'):
+        zreader(http, rows)(GYM, KEY)
+    assert len(rows.attestations) == 1
+
+
+def test_identity_reader_cross_profile_reuse_of_target_account_holds():
+    # The target account ID appearing on another profile's row is conflicting
+    # ownership evidence and fails closed, even when that row is otherwise
+    # well-formed.
+    rows = IdentityReadRows(None)
+    http = IdentityHttp(
+        [zhealth(), zhealth(profileId='other-exact-profile')], [zaccount()])
+    with pytest.raises(CaptureIngestError,
+                       match='authenticated_social_status_unavailable_or_incomplete'):
+        zreader(http, rows)(GYM, KEY)
+    assert len(rows.attestations) == 1
+
+
+def test_identity_reader_duplicate_matched_instagram_rows_hold():
+    rows = IdentityReadRows(None)
+    health = [zhealth(), zhealth(accountId='second-ig-account')]
+    http = IdentityHttp(health, [zaccount()])
+    with pytest.raises(CaptureIngestError,
+                       match='authenticated_social_status_unavailable_or_incomplete'):
+        zreader(http, rows)(GYM, KEY)
+    assert len(rows.attestations) == 1
+
+
 def test_identity_reader_duplicate_instagram_rows_still_hold():
     rows = IdentityReadRows(None)
     health = [zhealth(accountId='facebook-account', platform='facebook'),

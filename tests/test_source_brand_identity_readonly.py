@@ -208,8 +208,8 @@ def test_tenant_or_profile_mismatch_fails_before_zernio_request():
     ([health_row(accountId='facebook-account', platform='facebook'),
       health_row(), health_row(accountId='second-ig-account')],
      [account()], 'authenticated_social_identity_ambiguous_or_missing'),
-    # Duplicate accountId anywhere in the health list.
-    (other_health_rows() + [health_row(), health_row(accountId='other-account-0')],
+    # Duplicate accountId involving the requested profile's rows.
+    (other_health_rows() + [health_row(), health_row(platform='facebook')],
      [account()], 'authenticated_social_status_incomplete'),
     # Malformed health row (missing boolean flag).
     (other_health_rows() + [health_row(canPost='yes')], [account()],
@@ -244,6 +244,36 @@ def test_missing_ambiguous_conflicting_or_stale_identity_fails_closed(health, ac
     zernio = ZernioGetOnly(accounts, health)
     with pytest.raises(CaptureIngestError, match=code):
         lookup(zernio)
+
+
+def test_cross_profile_reuse_of_target_account_id_fails_closed():
+    # The requested profile's account ID also appearing on a row whose
+    # readable profile identity is a different profile is conflicting
+    # ownership evidence and must fail closed.
+    zernio = ZernioGetOnly([account()],
+        other_health_rows() + [health_row(),
+        health_row(accountId=ACCOUNT_ID, profileId='other-profile-0')])
+    with pytest.raises(CaptureIngestError,
+                       match='authenticated_social_identity_ambiguous_or_missing'):
+        lookup(zernio)
+
+
+def test_duplicate_account_id_only_among_unrelated_health_rows_holds_nothing():
+    # Unrelated rows may reuse account IDs; only duplicates that could refer
+    # to the requested profile fail closed.
+    zernio = ZernioGetOnly([account()],
+        other_health_rows() + [health_row(),
+        health_row(accountId='other-account-0', profileId='other-profile-0')])
+    result = lookup(zernio)
+    assert result['account_id'] == ACCOUNT_ID
+
+
+@pytest.mark.parametrize('unrelated_account_id', [[], {}])
+def test_unrelated_unhashable_account_id_does_not_hold_target(unrelated_account_id):
+    unrelated = other_health_rows(1)
+    unrelated[0]['accountId'] = unrelated_account_id
+    result = lookup(ZernioGetOnly([account()], unrelated + [health_row()]))
+    assert result['account_id'] == ACCOUNT_ID
 
 
 @pytest.mark.parametrize('paged', [

@@ -24,12 +24,35 @@ PG=Path('/opt/homebrew/opt/postgresql@17/bin')
 PORTAL_MIGRATIONS=ROOT.parent/'portal-brand-source-bundle-20261008/supabase/migrations'
 PORTAL=PORTAL_MIGRATIONS/'0611_echo_source_brand_bundle.sql'
 PORTAL_VERIFY=PORTAL_MIGRATIONS/'0611_echo_source_brand_bundle.verify.sql'
-assert PORTAL.exists(),PORTAL
-assert PORTAL_VERIFY.exists(),PORTAL_VERIFY
+
+
+def _portal_evidence_present():
+ return PORTAL.exists() and PORTAL_VERIFY.exists()
+
+
+def test_generated_bundle_bridge_pg_integration():
+ # Ordinary repo pytest collection must succeed without the sibling portal
+ # checkout or the shared PG runtime; the integration check itself is never
+ # declared passed when its required evidence or runtime is absent.
+ missing=[]
+ if not _portal_evidence_present():
+  missing.append('sibling portal checkout')
+ if not PG.is_dir():
+  missing.append('postgresql@17 binaries')
+ try:
+  import psycopg
+ except ImportError:
+  missing.append('psycopg test runtime')
+ if missing:
+  import pytest
+  pytest.skip('PG bridge integration requires: '+', '.join(missing))
+ main()
 
 
 def main(source_mode=None):
  import psycopg
+ assert PORTAL.exists(),PORTAL
+ assert PORTAL_VERIFY.exists(),PORTAL_VERIFY
  assert shutil.disk_usage('/tmp').free>5*1024**3
  with tempfile.TemporaryDirectory(prefix='generated_bundle_pg_',dir='/tmp') as tmp:
   root=Path(tmp);sock=root/'sock';sock.mkdir();port=random.randint(41000,59000)

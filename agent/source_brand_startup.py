@@ -6,7 +6,6 @@ File permissions establish provenance of installation, not truth of approval.
 """
 from __future__ import annotations
 
-import json
 import os
 import stat
 from dataclasses import fields
@@ -43,14 +42,10 @@ def load_approved_mappings(path):
             raw = source.read(262145)
             if not 1 <= len(raw) <= 262144:
                 _fail('private_mapping_authority_required')
-        def unique(pairs):
-            value = {}
-            for key, item in pairs:
-                if key in value:
-                    raise ValueError()
-                value[key] = item
-            return value
-        data = json.loads(raw, object_pairs_hook=unique)
+        from .source_brand_collector import _strict_json
+        # Shared strict parser: rejects duplicate keys and NaN/Infinity so a
+        # private authority file cannot smuggle non-finite or shadowed values.
+        data = _strict_json(raw)
     except CaptureIngestError:
         raise
     except Exception:

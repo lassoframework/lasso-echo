@@ -82,10 +82,15 @@ def test_slow_provider_status_never_ingests(tmp_path):
     runner, storage, _, apify, websites = setup(tmp_path)
     identity = runner.collector._resolve._social_identity
     now = datetime.now(timezone.utc)
-    values = iter([now, now, now + timedelta(minutes=16)])
+    # Exactly four reads: unavailable report, profile report, health observed
+    # time and the staleness comparison. The fourth value is 16 minutes after
+    # the profile report time, so the intended >15-minute stale branch runs;
+    # exhausting the iterator proves StopIteration is not the pass reason.
+    values = iter([now, now, now, now + timedelta(minutes=16)])
     identity._now = lambda: next(values)
     with pytest.raises(CaptureIngestError, match='authenticated_social_status_unavailable_or_incomplete'):
         runner.capture(GYM, 'slow-provider')
+    assert list(values) == []
     assert not storage.rows and not websites and not apify.calls
     assert storage.attestations[-1]['attestation']['lookup_status'] == 'partial'
 
@@ -104,3 +109,19 @@ def test_wrong_live_tenant_key_holds_without_source_bytes(tmp_path):
         runner.capture(GYM, 'wrong-live-key')
     assert not storage.rows and not storage.posts and not zernio.calls
     assert not websites and not apify.calls
+
+
+def test_nonfinite_authority_json_rejected_without_ingestion(tmp_path):
+    original, storage, zernio, apify, _ = setup(tmp_path)
+    row = asdict(next(iter(original.collector._resolve._approved.values())))
+    os.chmod(tmp_path, 0o700)
+    path = tmp_path / 'approved.json'
+    text = json.dumps({'schema_version': 1, 'approved_mappings': [row]})
+    path.write_text(text.replace('"schema_version": 1', '"schema_version": NaN'))
+    os.chmod(path, 0o600)
+    with pytest.raises(CaptureIngestError, match='private_mapping_authority_required'):
+        load_approved_mappings(path)
+    path.write_text(text.replace('"schema_version": 1', '"schema_version": Infinity'))
+    with pytest.raises(CaptureIngestError, match='private_mapping_authority_required'):
+        load_approved_mappings(path)
+    assert not storage.posts and not zernio.calls and not apify.calls
