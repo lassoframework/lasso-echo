@@ -39,6 +39,8 @@ select artifact(candidate('facebook',0,'22222222-2222-4222-8222-222222222222'));
 select artifact(candidate('facebook',1,'33333333-3333-4333-8333-333333333333'));
 select artifact(candidate('facebook',1,'44444444-4444-4444-8444-444444444444'));
 select artifact(candidate('facebook',2,'55555555-5555-4555-8555-555555555555'));
+select artifact(candidate('instagram',1,'66666666-6666-4666-8666-666666666666'));
+select artifact(candidate('instagram',2,'77777777-7777-4777-8777-777777777777'));
 do $$ declare result jsonb; before_ig jsonb; begin
  result:=stage_lasso_runway_feed(candidate('instagram',0,'11111111-1111-4111-8111-111111111111'),'current','{"brain":"hash"}');
  assert result->>'result'='inserted',result::text;
@@ -46,6 +48,18 @@ do $$ declare result jsonb; before_ig jsonb; begin
  result:=stage_lasso_runway_feed(candidate('facebook',0,'22222222-2222-4222-8222-222222222222'),'current','{"brain":"hash"}');
  assert result->>'result'='inserted',result::text;
  assert before_ig=(select to_jsonb(c) from content_calendar c where account='instagram');
+ result:=stage_lasso_runway_feed(candidate('instagram',1,'66666666-6666-4666-8666-666666666666')||'{"logical_post_id":null}','current','{"brain":"hash"}');
+ assert result->>'result'='inserted',result::text;
+ assert (select logical_post_id is null from content_calendar where id='66666666-6666-4666-8666-666666666666');
+ result:=stage_lasso_runway_feed(candidate('instagram',1,'66666666-6666-4666-8666-666666666666')||'{"logical_post_id":null}','current','{"brain":"hash"}');
+ assert result->>'result'='idempotent',result::text;
+ result:=stage_lasso_runway_feed(candidate('instagram',2,'77777777-7777-4777-8777-777777777777')-'logical_post_id','current','{"brain":"hash"}');
+ assert result->>'result'='conflict';
+ result:=stage_lasso_runway_feed(candidate('instagram',2,'77777777-7777-4777-8777-777777777777')||'{"logical_post_id":"malformed"}','current','{"brain":"hash"}');
+ assert result->>'result'='conflict';
+ result:=stage_lasso_runway_feed(candidate('instagram',2,'77777777-7777-4777-8777-777777777777')||'{"logical_post_id":7}','current','{"brain":"hash"}');
+ assert result->>'result'='conflict';
+
  result:=stage_lasso_runway_feed(candidate('facebook',0,'22222222-2222-4222-8222-222222222222'),'current','{"brain":"hash"}');
  assert result->>'result'='idempotent';
  result:=stage_lasso_runway_feed(candidate('facebook',0,'22222222-2222-4222-8222-222222222222')||'{"caption":"changed"}','current','{"brain":"hash"}');
@@ -68,7 +82,7 @@ do $$ declare result jsonb; before_ig jsonb; begin
  values(gen_random_uuid(),'lasso','facebook',(now() at time zone 'America/New_York')::date,2,'story',null,'active');
  result:=stage_lasso_runway_feed(candidate('facebook',2,'55555555-5555-4555-8555-555555555555'),'current','{"brain":"hash"}');
  assert result->>'result'='occupied';
- assert (select count(*) from content_calendar where format='feed')=2;
+ assert (select count(*) from content_calendar where format='feed')=3;
 end $$;
 SQL
 # Two distinct source candidates race for the same exact empty platform/slot.

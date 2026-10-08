@@ -201,14 +201,15 @@ def test_fresh_insert_autonomy_gate_closes_after_review(armed, monkeypatch):
 
 
 @pytest.mark.parametrize("account_key,platform", [("lasso_ig", "instagram"), ("lasso_fb", "facebook")])
-def test_real_selected_summit_source_path_preserves_target_account(monkeypatch, account_key, platform):
+@pytest.mark.parametrize("logical_enabled", [False, True])
+def test_real_selected_summit_source_path_preserves_target_account(monkeypatch, account_key, platform, logical_enabled):
     from agent import cadence
     monkeypatch.setenv("AGENT_REAL_MONTH_PLAN", "true")
     monkeypatch.setenv("AGENT_LASSO_3X_ENABLED", "true")
     monkeypatch.setenv("AGENT_LASSO_SUMMIT_DAILY_ENABLED", "true")
     monkeypatch.setenv("AGENT_LASSO_EDITORIAL_CALENDAR", "true")
     monkeypatch.setattr(config, "lasso_editorial_calendar_enabled", lambda: True)
-    monkeypatch.setattr(config, "logical_post_id_enabled", lambda: True)
+    monkeypatch.setattr(config, "logical_post_id_enabled", lambda: logical_enabled)
     monkeypatch.setattr(cadence, "resolve_posts_per_day_live", lambda _: 3)
     account = SimpleNamespace(key=account_key, platform=platform)
     drafts = real_month_run.plan_and_build(account_key, DAY, 1, account=account,
@@ -220,6 +221,8 @@ def test_real_selected_summit_source_path_preserves_target_account(monkeypatch, 
     selected = [r for r in rows if r["account"] == platform]
     assert len(selected) == 1 and selected[0]["slot_index"] == 2
     assert selected[0]["pillar"] == "summit" and selected[0]["caption"]
+
+    assert ("logical_post_id" in selected[0]) is logical_enabled
 
 
 def test_unreadable_strict_caption_reservation_stops_before_render_or_write(armed, monkeypatch):
@@ -293,3 +296,38 @@ def test_normal_account_target_cooldown_scope_remains_unchanged(monkeypatch):
     assert real_month_planner._cooldown_checked(draft, lambda *a: draft,
         SimpleNamespace(key="lasso_ig"), DAY, "book", lambda m: None) is draft
     assert calls == ["lasso_ig"]
+
+
+@pytest.mark.parametrize("logical_enabled", [False, True])
+def test_runway_identity_mode_keeps_global_flag_and_exact_feed_story_source(armed, monkeypatch, logical_enabled):
+    from agent.jobs import lasso_paired_story_backfill as pairs, lasso_daily_paired_stories as stories
+    monkeypatch.setattr(config, "logical_post_id_enabled", lambda: logical_enabled)
+    store = Store([])
+    out = job.run(account_key="lasso_fb", now=NOW, store=store,
+                  artifact_store=Artifacts(), horizon_days=2, planner=planner)
+    assert out["ok"] and len(store.staged) == 1
+    staged = store.staged[0]
+    expected_feed = str(uuid.uuid5(job.NAMESPACE, f"lasso_fb|{DAY}|0"))
+    assert staged["id"] == expected_feed and config.logical_post_id_enabled() is logical_enabled
+    logical = staged["logical_post_id"]
+    assert logical == (str(uuid.uuid5(job.NAMESPACE, f"logical|lasso_fb|{DAY}|0")) if logical_enabled else None)
+    identity = pairs.source_identity(staged)
+    assert identity["source_feed_id"] == staged["id"]
+    assert identity["source_feed_caption"] == staged["caption"]
+    assert identity["source_logical_post_id"] == (logical or "")
+    # Exercise the real managed Story readback contract, including legacy NULL.
+    story_id = str(uuid.uuid4())
+    story_schedule = pairs._scheduled_after_feed(staged, DAY)
+    story = dict(staged, id=story_id, format="story", caption="", image_url="https://cdn.test/story.png",
+                 source_media_url="https://cdn.test/story.png", scheduled_at=story_schedule,
+                 media_not_ready_reason=None)
+    action = dict(story_id=story_id, feed_id=staged["id"], account="facebook", date=DAY,
+                  slot_index=0, story_scheduled_at=story_schedule, story_image_url=story["image_url"],
+                  feed_pillar=staged["pillar"], feed_logical_post_id=logical)
+    link = {"story_id": story_id, "feed_id": staged["id"]}
+    monkeypatch.setattr(stories.stage, "_one", lambda store, table, params:
+                        story if table == "content_calendar" else link)
+    stories._verify_staged_pair(store, action)
+    link["feed_id"] = str(uuid.uuid4())
+    with pytest.raises(RuntimeError, match="source-link"):
+        stories._verify_staged_pair(store, action)

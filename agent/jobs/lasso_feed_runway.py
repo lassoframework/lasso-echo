@@ -24,7 +24,7 @@ def enabled():
 
 def _gates(account_key, store, artifacts):
     return (enabled() and config.real_month_plan_enabled()
-            and config.lasso_three_feed_enabled() and config.logical_post_id_enabled()
+            and config.lasso_three_feed_enabled()
             and config.lasso_infographic_quality_enabled(account_key)
             and config.POSTING_TIMEZONE == "America/New_York"
             and config.cadence_slot_times() == ("07:30", "18:30")
@@ -93,7 +93,6 @@ def run(*, account_key, now=None, store=None, artifact_store=None,
             or not 2 <= horizon_days <= 30):
         return dict(out, reason="invalid account or horizon")
     if not (config.real_month_plan_enabled() and config.lasso_three_feed_enabled()
-            and config.logical_post_id_enabled()
             and config.lasso_infographic_quality_enabled(account_key) and variant_regen.enabled()):
         return dict(out, reason="runway source or review gates off")
     store = store or SupabaseCalendarStore()
@@ -165,7 +164,9 @@ def run(*, account_key, now=None, store=None, artifact_store=None,
             return dict(out, blocked=out["blocked"] + 1, reason="fresh source gate closed")
         caption_ledger.record_staged_strict("lasso", caption, day)
         row["id"] = str(uuid.uuid5(NAMESPACE, f"{account_key}|{day}|{slot}"))
-        row["logical_post_id"] = str(uuid.uuid5(NAMESPACE, f"logical|{account_key}|{day}|{slot}"))
+        row["logical_post_id"] = (
+            str(uuid.uuid5(NAMESPACE, f"logical|{account_key}|{day}|{slot}"))
+            if config.logical_post_id_enabled() else None)
         row["variant_status"] = "active"
         row["status"] = "pending"
         source_id = f"content_calendar:{row['id']}:caption"

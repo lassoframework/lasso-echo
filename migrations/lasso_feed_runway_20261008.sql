@@ -29,6 +29,8 @@ begin
    or p_row->>'format' is distinct from 'feed'
    or p_row->>'status' is distinct from 'pending'
    or p_row->>'variant_status' is distinct from 'active'
+   or not (p_row ? 'logical_post_id')
+   or jsonb_typeof(p_row->'logical_post_id') not in ('null','string')
    or jsonb_typeof(p_row->'slot_index') is distinct from 'number'
    or p_row->>'slot_index' not in ('0','1','2')
    or nullif(btrim(p_row->>'caption'),'') is null
@@ -44,7 +46,7 @@ begin
  exception when others then
   return jsonb_build_object('result','conflict','reason','invalid_row_types');
  end;
- if v.id is null or v.logical_post_id is null or v.scheduled_at is null
+ if v.id is null or v.scheduled_at is null
     or v.post_date is null or v.post_date not between
       (now() at time zone 'America/New_York')::date and
       (now() at time zone 'America/New_York')::date+29 then
@@ -83,7 +85,7 @@ begin
   if prior.gym_id=v.gym_id and prior.account=v.account and prior.post_date=v.post_date
     and prior.slot_index=v.slot_index and prior.format='feed'
     and prior.caption=v.caption and prior.image_url=v.image_url
-    and prior.logical_post_id=v.logical_post_id and prior.scheduled_at=v.scheduled_at
+    and prior.logical_post_id is not distinct from v.logical_post_id and prior.scheduled_at=v.scheduled_at
     and prior.variant_status='active' and prior.status in ('pending','approved','publishing','published') then
    return jsonb_build_object('result','idempotent','id',prior.id);
   end if;
