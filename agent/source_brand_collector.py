@@ -489,13 +489,165 @@ class CollectorPortalReader:
             _fail('provider_attestation_unconfirmed')
 
 
+def _strict_json(raw):
+    """Bounded strict JSON: no duplicate keys, no non-finite constants."""
+    def unique(pairs):
+        result = {}
+        for name, value in pairs:
+            if name in result:
+                raise ValueError()
+            result[name] = value
+        return result
+    return json.loads(raw, object_pairs_hook=unique,
+        parse_constant=lambda _: (_ for _ in ()).throw(ValueError()))
+
+
+def _zernio_health_candidate(client, key, profile, clock):
+    """Independent profile ownership/status authority: GET /v1/accounts/health.
+
+    The account list rows omit profileId, so ownership of an account for this
+    exact stored profile can only come from the health endpoint. A real
+    profile owns one row per platform (e.g. Facebook, Google Business,
+    Instagram), so selection filters the exact profile, then requires exactly
+    one Instagram row; sibling platform rows are not ambiguity. Duplicate or
+    conflicting Instagram identities/IDs, conflicting profile/status data,
+    partial or malformed data fails closed. Returns (health_row_or_None,
+    observed_at, raw_bytes): None means this profile has no Instagram
+    candidate (missing or disconnected — never proof of disconnection).
+    Handle is never used to infer ownership.
+    """
+    response = client.get('https://api.zernio.com/v1/accounts/health',
+        headers={'Authorization': 'Bearer ' + key}, timeout=30, allow_redirects=False)
+    observed_at = clock().astimezone(timezone.utc).isoformat()
+    raw = response.content
+    if response.status_code != 200 or type(raw) is not bytes or not 1 <= len(raw) <= 2_000_000:
+        _fail('authenticated_social_status_unavailable')
+    data = _strict_json(raw)
+    rows = data.get('accounts') if isinstance(data, dict) else None
+    if (not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows)
+            or any(name in data for name in ('pagination', 'nextCursor', 'hasMore', 'next'))):
+        _fail('authenticated_social_status_incomplete')
+    seen_ids = set()
+    for row in rows:
+        if (not isinstance(row.get('accountId'), str) or not row['accountId']
+                or not isinstance(row.get('profileId'), str) or not row['profileId']
+                or not isinstance(row.get('platform'), str)
+                or not re.fullmatch(r'[a-z][a-z0-9_]*', row['platform'])
+                or not isinstance(row.get('username'), str) or not row['username']
+                or not isinstance(row.get('status'), str)
+                or type(row.get('tokenValid')) is not bool
+                or type(row.get('needsReconnect')) is not bool
+                or type(row.get('canPost')) is not bool
+                or row['accountId'] in seen_ids):
+            _fail('authenticated_social_status_incomplete')
+        seen_ids.add(row['accountId'])
+    candidates = [row for row in rows if row['profileId'] == profile]
+    instagram = [row for row in candidates if row['platform'] == 'instagram']
+    if len(instagram) > 1:
+        # Duplicate or conflicting Instagram rows for this exact profile hold.
+        _fail('authenticated_social_identity_ambiguous_or_missing')
+    if not instagram:
+        return None, observed_at, raw
+    row = instagram[0]
+    if not re.fullmatch(r'[a-z0-9._]{1,30}', row['username']):
+        _fail('authenticated_social_status_incomplete')
+    if (row['status'] != 'healthy'
+            or row['tokenValid'] is not True or row['needsReconnect'] is not False
+            or row['canPost'] is not True):
+        return None, observed_at, raw
+    return row, observed_at, raw
+
+
+def _zernio_account_match(client, key, profile, health, clock):
+    """Pair the health authority row with the profile-scoped account list.
+
+    Matches exactly one account row by stable provider account ID
+    (health.accountId -> account _id), never by handle alone, then verifies
+    platform, handle and the numeric platform owner ID. Returns
+    (platform_user_id, raw_bytes). Ownership is never inferred from the handle.
+    """
+    response = client.get('https://api.zernio.com/v1/accounts',
+        params={'profileId': profile}, headers={'Authorization': 'Bearer ' + key},
+        timeout=30, allow_redirects=False)
+    raw = response.content
+    if response.status_code != 200 or type(raw) is not bytes or not 1 <= len(raw) <= 2_000_000:
+        _fail('authenticated_social_status_unavailable')
+    data = _strict_json(raw)
+    accounts = data.get('accounts') if isinstance(data, dict) else None
+    if (not isinstance(accounts, list) or any(not isinstance(a, dict) for a in accounts)
+            or any(name in data for name in ('pagination', 'nextCursor', 'hasMore', 'next'))):
+        _fail('authenticated_social_status_incomplete')
+    seen = set()
+    for a in accounts:
+        if (not isinstance(a.get('platform'), str)
+                or not re.fullmatch(r'[a-z][a-z0-9_]*', a['platform'])
+                or not isinstance(a.get('_id'), str) or not a['_id']):
+            _fail('authenticated_social_status_incomplete')
+        if a['_id'] in seen:
+            _fail('authenticated_social_identity_ambiguous_or_missing')
+        seen.add(a['_id'])
+        # Account lists can omit profileId or populate it with a profile
+        # object. A present scalar or populated _id must exactly match the
+        # stored profile; the display name is never ownership evidence.
+        if 'profileId' in a:
+            account_profile = a['profileId']
+            if isinstance(account_profile, dict):
+                account_profile = account_profile.get('_id')
+            if not isinstance(account_profile, str) or account_profile != profile:
+                _fail('authenticated_social_profile_mismatch')
+    matches = [a for a in accounts if a['_id'] == health['accountId']]
+    if len(matches) != 1 or matches[0].get('platform') != 'instagram':
+        _fail('authenticated_social_profile_mismatch')
+    row = matches[0]
+    metadata = row.get('metadata', {})
+    if not isinstance(metadata, dict):
+        _fail('independent_social_id_evidence_missing')
+    profile_data = metadata.get('profileData', {})
+    if not isinstance(profile_data, dict):
+        _fail('independent_social_id_evidence_missing')
+    ids = [value for value in (row.get('platformUserId'), metadata.get('platformUserId'))
+           if value is not None]
+    handles = [value for value in (row.get('username'), profile_data.get('username'))
+               if value is not None]
+    if (not ids or any(type(value) is not str or not re.fullmatch(r'[0-9]+', value) for value in ids)
+            or len(set(ids)) != 1 or row['_id'] == ids[0]
+            or not handles or any(type(value) is not str
+                                  or not re.fullmatch(r'[a-z0-9._]{1,30}', value) for value in handles)
+            or len(set(handles)) != 1 or handles[0] != health['username']):
+        _fail('independent_social_id_evidence_missing')
+    return ids[0], raw
+
+
+def _zernio_identity_response_sha256(health_raw, accounts_raw):
+    """Bind both exact responses in a versioned, domain-separated receipt.
+
+    SHA256 input is the ASCII domain below (including its terminating NUL),
+    then, in order, each fixed endpoint label plus NUL, an unsigned 8-byte
+    big-endian response length, and the original response bytes. Labels bind
+    response roles; lengths prevent ambiguous concatenation. JSON is never
+    reserialized. Only complete paired identity evidence uses this composite;
+    a partial runtime receipt retains its single health-response digest.
+    """
+    digest = hashlib.sha256(b'echo:zernio:identity-responses:v1\0')
+    for endpoint, raw in ((b'/v1/accounts/health', health_raw),
+                          (b'/v1/accounts', accounts_raw)):
+        digest.update(endpoint + b'\0')
+        digest.update(len(raw).to_bytes(8, 'big'))
+        digest.update(raw)
+    return digest.hexdigest()
+
+
 class AuthenticatedZernioIdentityReader:
-    """Exact UUID→stored profile→authenticated complete account list→receipt.
+    """Exact UUID→stored profile→health authority→paired account list→receipt.
 
     Uses existing ZERNIO_API_KEY and the dedicated capture service credential.
     Never searches profile names, creates a profile or uses a scraped item ID.
-    A missing profile/key, partial account list, unavailable transport, duplicate
-    connected IG, missing numeric platformUserId or mismatched handle holds.
+    GET /v1/accounts/health is the independent profile ownership/status
+    authority; the profile-scoped account list only supplies the numeric
+    platform owner ID and metadata for the exact health-matched account ID.
+    A missing profile/key, partial or malformed list, unavailable transport,
+    ambiguous or conflicting health rows, missing numeric platformUserId or a
+    mismatched handle holds.
     Every call writes/readbacks a fresh default-off service RPC attestation.
     """
     def __init__(self, *, read_rows, environ=None, http=None, now=None):
@@ -540,59 +692,28 @@ class AuthenticatedZernioIdentityReader:
             if client is None:
                 import requests
                 client = requests
-            response = client.get('https://api.zernio.com/v1/accounts',
-                params={'profileId': profile}, headers={'Authorization': 'Bearer ' + key},
-                timeout=30, allow_redirects=False)
-            raw = response.content
-            if response.status_code != 200 or type(raw) is not bytes or not 1 <= len(raw) <= 2_000_000:
-                _fail('authenticated_social_status_unavailable')
-            status.update(authenticated=True, response_sha256=hashlib.sha256(raw).hexdigest(),
+            # The health endpoint is the independent profile ownership/status
+            # authority; the account list only supplies the numeric owner ID
+            # and metadata for the exact health-matched account.
+            health, observed_at, health_raw = _zernio_health_candidate(
+                client, key, profile, self._now)
+            status.update(authenticated=True,
+                          response_sha256=hashlib.sha256(health_raw).hexdigest(),
                           lookup_status='partial')
-            def unique(pairs):
-                result = {}
-                for name, value in pairs:
-                    if name in result:
-                        raise ValueError()
-                    result[name] = value
-                return result
-            data = json.loads(raw, object_pairs_hook=unique,
-                parse_constant=lambda _: (_ for _ in ()).throw(ValueError()))
-            accounts = data.get('accounts') if isinstance(data, dict) else None
-            if not isinstance(accounts, list) or any(not isinstance(a, dict) for a in accounts):
-                _fail('authenticated_social_status_incomplete')
-            # list_accounts is a complete-list contract. An unfamiliar paging
-            # envelope is held rather than assumed to be a complete negative.
-            if any(k in data for k in ('pagination', 'nextCursor', 'hasMore', 'next')):
-                _fail('authenticated_social_status_incomplete')
-            from .zernio import account_state
-            if any(not isinstance(a.get('platform'), str) or not re.fullmatch(r'[a-z][a-z0-9_]*', a['platform'])
-                   or not isinstance(a.get('_id'), str) or not a['_id']
-                   or a.get('profileId') != profile for a in accounts):
-                _fail('authenticated_social_status_incomplete')
-            instagram = [a for a in accounts if a.get('platform') == 'instagram']
-            if any(a.get('profileId') != profile for a in instagram):
-                _fail('authenticated_social_profile_mismatch')
-            connected = [a for a in instagram if account_state(a, now=self._now()) == 'connected']
-            if len(connected) > 1:
-                _fail('authenticated_social_identity_ambiguous')
-            identity = dict(connected=False, account_id=None, platform_user_id=None, handle=None)
-            if connected:
-                a = connected[0]
-                md = a.get('metadata') or {}
-                pd = md.get('profileData') or {}
-                values = [v for v in (a.get('platformUserId'), md.get('platformUserId')) if v is not None]
-                handles = [v for v in (a.get('username'), pd.get('username')) if v is not None]
-                if (not values or any(type(v) is not str or not re.fullmatch(r'[0-9]+', v) for v in values)
-                        or len(set(values)) != 1 or not isinstance(a.get('_id'), str)
-                        or not a['_id'] or a['_id'] == values[0]
-                        or not handles or any(type(v) is not str or not re.fullmatch(r'[a-z0-9._]{1,30}', v) for v in handles)
-                        or len(set(handles)) != 1):
-                    _fail('independent_social_id_evidence_missing')
-                identity = dict(connected=True, account_id=a['_id'],
-                                platform_user_id=values[0], handle=handles[0])
+            if health is None:
+                # Missing or unhealthy evidence cannot establish a complete
+                # negative identity that would permit website-only capture.
+                _fail('authenticated_social_identity_ambiguous_or_missing')
+            platform_user_id, accounts_raw = _zernio_account_match(
+                client, key, profile, health, self._now)
+            identity = dict(connected=True, account_id=health['accountId'],
+                            platform_user_id=platform_user_id,
+                            handle=health['username'])
             if self._now() - _timestamp(status['observed_at']) > timedelta(minutes=15):
                 _fail('authenticated_social_status_expired')
-            status.update(lookup_status='complete', instagram=identity)
+            status.update(lookup_status='complete', instagram=identity,
+                          response_sha256=_zernio_identity_response_sha256(
+                              health_raw, accounts_raw))
         except Exception:
             # Persist the negative/partial lookup as a hold, never as proof of
             # disconnection. Provider exceptions are never propagated or logged.
@@ -610,8 +731,11 @@ def read_zernio_identity_readonly(gym_id, echo_account_key, *, read_rows,
 
     This operator diagnostic deliberately does not use
     ``AuthenticatedZernioIdentityReader``: that runtime reader persists a portal
-    attestation. This function only performs gym-scoped portal GETs and one fixed
-    profile-scoped Zernio GET, and returns a minimal identity receipt.
+    attestation. This function only performs gym-scoped portal GETs and two fixed
+    Zernio GETs: the health endpoint is the independent profile
+    ownership/status authority, and the profile-scoped account list supplies
+    the numeric platform owner ID and metadata for the exact health-matched
+    account. It returns a minimal identity receipt.
     """
     _canonical_gym(gym_id)
     if (not isinstance(echo_account_key, str)
@@ -641,55 +765,16 @@ def read_zernio_identity_readonly(gym_id, echo_account_key, *, read_rows,
         import requests
         client = requests
     try:
-        response = client.get('https://api.zernio.com/v1/accounts',
-            params={'profileId': profile}, headers={'Authorization': 'Bearer ' + key},
-            timeout=30, allow_redirects=False)
-        observed_at = clock().astimezone(timezone.utc).isoformat()
-        raw = response.content
-        if response.status_code != 200 or type(raw) is not bytes or not 1 <= len(raw) <= 2_000_000:
-            _fail('authenticated_social_status_unavailable')
-        def unique(pairs):
-            result = {}
-            for name, value in pairs:
-                if name in result:
-                    raise ValueError()
-                result[name] = value
-            return result
-        data = json.loads(raw, object_pairs_hook=unique,
-            parse_constant=lambda _: (_ for _ in ()).throw(ValueError()))
-        accounts = data.get('accounts') if isinstance(data, dict) else None
-        if (not isinstance(accounts, list) or any(not isinstance(row, dict) for row in accounts)
-                or any(name in data for name in ('pagination', 'nextCursor', 'hasMore', 'next'))):
-            _fail('authenticated_social_status_incomplete')
-        from .zernio import account_state
-        if any(not isinstance(row.get('platform'), str)
-                or not re.fullmatch(r'[a-z][a-z0-9_]*', row['platform'])
-                or not isinstance(row.get('_id'), str) or not row['_id']
-                or row.get('profileId') != profile for row in accounts):
-            _fail('authenticated_social_profile_mismatch')
-        connected = [row for row in accounts if row.get('platform') == 'instagram'
-                     and account_state(row, now=clock()) == 'connected']
-        if len(connected) != 1:
+        health, observed_at, health_raw = _zernio_health_candidate(client, key, profile, clock)
+        if health is None:
+            # Missing or non-healthy profile candidate: fail closed. This is a
+            # hold, never proof of disconnection.
             _fail('authenticated_social_identity_ambiguous_or_missing')
-        row = connected[0]
-        metadata = row.get('metadata', {})
-        if not isinstance(metadata, dict):
-            _fail('independent_social_id_evidence_missing')
-        profile_data = metadata.get('profileData', {})
-        if not isinstance(profile_data, dict):
-            _fail('independent_social_id_evidence_missing')
-        ids = [value for value in (row.get('platformUserId'), metadata.get('platformUserId'))
-               if value is not None]
-        handles = [value for value in (row.get('username'), profile_data.get('username'))
-                   if value is not None]
-        if (not ids or any(type(value) is not str or not re.fullmatch(r'[0-9]+', value) for value in ids)
-                or len(set(ids)) != 1 or row['_id'] == ids[0]
-                or not handles or any(type(value) is not str
-                                      or not re.fullmatch(r'[a-z0-9._]{1,30}', value) for value in handles)
-                or len(set(handles)) != 1):
-            _fail('independent_social_id_evidence_missing')
-        return {'profile_id': profile, 'platform_user_id': ids[0], 'handle': handles[0],
-                'observed_at': observed_at, 'response_sha256': hashlib.sha256(raw).hexdigest()}
+        platform_user_id, accounts_raw = _zernio_account_match(client, key, profile, health, clock)
+        return {'profile_id': profile, 'account_id': health['accountId'],
+                'platform_user_id': platform_user_id, 'handle': health['username'],
+                'observed_at': observed_at,
+                'response_sha256': _zernio_identity_response_sha256(health_raw, accounts_raw)}
     except CaptureIngestError:
         raise
     except Exception:
