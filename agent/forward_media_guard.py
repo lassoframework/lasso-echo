@@ -24,8 +24,15 @@ class ForwardMediaDuplicateHold(ForwardMediaVerificationHold):
     """Verified bytes were consumed by another tenant/content date/group."""
 
 
-def enabled():
+def _base_enabled():
     return os.getenv('AGENT_FORWARD_MEDIA_GUARD', '').lower() in ('1', 'true', 'yes', 'on')
+
+
+def enabled():
+    # Every existing publisher/transport fence consults this effective switch.
+    # An independently armed visual flag must never fall through their OFF path.
+    return (_base_enabled() or os.getenv('AGENT_FORWARD_MEDIA_VISUAL_INDEX', '').lower()
+            in ('1', 'true', 'yes', 'on'))
 
 
 def _uuid(value):
@@ -184,9 +191,25 @@ def claim(store, calendar_row_id, claim_token, evidence_id, expected_revision):
     if not isinstance(expected_revision, str) or not expected_revision:
         raise ForwardMediaVerificationHold('expected outgoing media revision required')
     arguments['p_expected_revision'] = expected_revision
+    from . import forward_media_visual_index as visual_index
+    rpc = 'rpc/fixer_claim_forward_media_20261006'
+    if visual_index.enabled():
+        if not _base_enabled():
+            raise ForwardMediaVerificationHold('visual index requires forward media guard configuration')
+        proof = visual_index.before_claim(arguments['p_calendar_row_id'], expected_revision,
+                                          arguments['p_evidence_id'], store=store,
+                                          claim_token=arguments['p_claim_token'])
+        try:
+            ids = proof['attestation_ids']
+            if not isinstance(ids, list) or len(ids) != 3:
+                raise ForwardMediaVerificationHold('visual claim proof unavailable')
+            arguments['p_attestation_ids'] = [_uuid(ident) for ident in ids]
+        except (KeyError, TypeError) as exc:
+            raise ForwardMediaVerificationHold('visual claim proof unavailable') from exc
+        rpc = 'rpc/fixer_forward_visual_index_claim_20261008'
     try:
         response = store._client().post(
-            store._rest('rpc/fixer_claim_forward_media_20261006'),
+            store._rest(rpc),
             headers=store._headers({'Content-Type': 'application/json'}),
             json=arguments, timeout=30)
         payload = response.json()

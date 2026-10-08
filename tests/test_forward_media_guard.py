@@ -175,3 +175,34 @@ def test_remote_reads_follow_read_transaction_end(lane):
     guard.attest(row_id, 'revision', connection_factory=lambda: conn,
                  read_bytes=read, original_verifier=lambda *_: True)
     assert conn.committed and conn.closed
+
+
+def test_claim_runs_visual_index_before_claim_rpc_when_armed(monkeypatch):
+    from agent import forward_media_visual_index as visual_index
+    monkeypatch.setenv('AGENT_FORWARD_MEDIA_VISUAL_INDEX', '1')
+    monkeypatch.setenv('AGENT_FORWARD_MEDIA_GUARD', '1')
+    order = []
+    def deny(row_id, revision, evidence_id, **kwargs):
+        order.append('visual_index')
+        raise guard.ForwardMediaVerificationHold('visual index held')
+    monkeypatch.setattr(visual_index, 'before_claim', deny)
+    posts = []
+    store = SimpleNamespace(
+        _client=lambda: SimpleNamespace(post=lambda *a, **k: posts.append((a, k))),
+        _rest=lambda url: url, _headers=lambda headers: headers)
+    with pytest.raises(guard.ForwardMediaVerificationHold, match='visual index held'):
+        guard.claim(store, str(uuid.uuid4()), str(uuid.uuid4()), str(uuid.uuid4()), 'rev')
+    assert order == ['visual_index'] and posts == []
+
+
+def test_claim_skips_visual_index_when_off(monkeypatch):
+    from agent import forward_media_visual_index as visual_index
+    monkeypatch.delenv('AGENT_FORWARD_MEDIA_VISUAL_INDEX', raising=False)
+    monkeypatch.setattr(visual_index, 'attest',
+                        lambda *a, **k: pytest.fail('visual index must stay off'))
+    response = SimpleNamespace(status_code=200, json=lambda: True)
+    store = SimpleNamespace(
+        _client=lambda: SimpleNamespace(post=lambda *a, **k: response),
+        _rest=lambda url: url, _headers=lambda headers: headers)
+    assert guard.claim(store, str(uuid.uuid4()), str(uuid.uuid4()),
+                       str(uuid.uuid4()), 'rev') is True
