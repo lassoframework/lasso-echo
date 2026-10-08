@@ -33,6 +33,10 @@ create trigger remote_drive_version before insert or update on public.media_asse
  for each row execute function public.fixer_remote_drive_version_private_20261008();
 create trigger remote_drive_version before insert or update on public.media_source
  for each row execute function public.fixer_remote_drive_version_private_20261008();
+-- Existing rows receive sequence versions at installation. New-row defaults
+-- must not require runtime sequence privileges before the definer trigger runs.
+alter table public.media_asset alter column drive_use_version set default 0;
+alter table public.media_source alter column drive_use_version set default 0;
 create table public.fixer_remote_drive_use_control_20261008 (
  singleton boolean primary key default true check(singleton),
  enabled boolean not null default false,
@@ -49,6 +53,15 @@ create table public.fixer_remote_drive_use_20261008 (
  receipt jsonb not null,
  applied_at timestamptz not null default clock_timestamp()
 );
+-- Immutable even for the table owner through ordinary DML; no destructive
+-- receipt operation is part of the runtime or operator reconciliation contract.
+create function public.fixer_remote_drive_use_immutable_20261008()
+returns trigger language plpgsql set search_path=pg_catalog,public as $$
+begin
+ raise exception 'remote drive receipts are immutable' using errcode='23514';
+end $$;
+create trigger remote_drive_use_immutable before update or delete or truncate on public.fixer_remote_drive_use_20261008
+ for each statement execute function public.fixer_remote_drive_use_immutable_20261008();
 -- No runtime direct DML. Receipts stay permanent across denial, hide and swap.
 alter table public.fixer_remote_drive_use_20261008 enable row level security;
 alter table public.fixer_remote_drive_use_control_20261008 enable row level security;
@@ -105,11 +118,51 @@ begin
  insert into public.fixer_remote_drive_use_20261008(use_id,request,receipt) values(uid,p_request,result);
  return result;
 end $$;
-revoke all on table public.fixer_remote_drive_use_20261008,public.fixer_remote_drive_use_control_20261008 from public,anon,authenticated,service_role;
-revoke all on sequence public.fixer_remote_drive_version_20261008 from public,anon,authenticated,service_role;
-revoke all on function public.fixer_remote_drive_version_private_20261008(),
- public.fixer_remote_drive_use_apply_20261008(jsonb),public.fixer_remote_drive_use_receipt_20261008(jsonb)
- from public,anon,authenticated,service_role;
+-- Default ACLs may grant mutator or arbitrarily inherited roles raw access.
+-- Scrub every non-owner grantee on these new objects, not just known roles.
+do $$ declare obj record; grantee record; target text; begin
+ for obj in select oid,relname,relowner,relkind,relacl from pg_class
+  where oid=any(array['public.fixer_remote_drive_use_20261008'::regclass,
+   'public.fixer_remote_drive_use_control_20261008'::regclass,
+   'public.fixer_remote_drive_version_20261008'::regclass]) loop
+  target:=case when obj.relkind='S' then 'sequence' else 'table' end;
+  for grantee in select distinct a.grantee from aclexplode(coalesce(obj.relacl,
+   acldefault(case when obj.relkind='S' then 'S'::"char" else 'r'::"char" end,obj.relowner))) a
+   where a.grantee<>obj.relowner loop
+   execute format('revoke all on %s public.%I from %s cascade',target,obj.relname,
+    case when grantee.grantee=0 then 'public' else quote_ident(pg_get_userbyid(grantee.grantee)) end);
+  end loop;
+ end loop;
+ -- Functions can inherit default EXECUTE grants too, including private helpers.
+ for obj in select oid,proowner,proacl from pg_proc where oid=any(array[
+  'public.fixer_remote_drive_version_private_20261008()'::regprocedure,
+  'public.fixer_remote_drive_use_immutable_20261008()'::regprocedure,
+  'public.fixer_remote_drive_use_apply_20261008(jsonb)'::regprocedure,
+  'public.fixer_remote_drive_use_receipt_20261008(jsonb)'::regprocedure]) loop
+  for grantee in select distinct a.grantee from aclexplode(coalesce(obj.proacl,acldefault('f',obj.proowner))) a
+   where a.grantee<>obj.proowner loop
+   execute format('revoke all on function %s from %s cascade',obj.oid::regprocedure,
+    case when grantee.grantee=0 then 'public' else quote_ident(pg_get_userbyid(grantee.grantee)) end);
+  end loop;
+ end loop;
+end $$;
 grant execute on function public.fixer_remote_drive_use_apply_20261008(jsonb),public.fixer_remote_drive_use_receipt_20261008(jsonb)
  to fixer_inventory_mutator_20261008;
+-- Owner-role inheritance cannot be repaired by REVOKE. Refuse installation
+-- if any non-superuser mutator member retains effective raw access.
+do $$ declare principal record; target text; begin
+ for principal in select oid,rolname from pg_roles where not rolsuper
+  and pg_has_role(oid,'fixer_inventory_mutator_20261008','member') loop
+  foreach target in array array['public.fixer_remote_drive_use_20261008',
+   'public.fixer_remote_drive_use_control_20261008'] loop
+   if has_table_privilege(principal.oid,target,'SELECT,INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER')
+    or has_any_column_privilege(principal.oid,target,'SELECT,INSERT,UPDATE,REFERENCES') then
+    raise exception 'remote drive runtime retains raw table authority' using errcode='42501'; end if;
+  end loop;
+  if has_sequence_privilege(principal.oid,'public.fixer_remote_drive_version_20261008','USAGE,SELECT,UPDATE')
+   or has_function_privilege(principal.oid,'public.fixer_remote_drive_version_private_20261008()','EXECUTE')
+   or has_function_privilege(principal.oid,'public.fixer_remote_drive_use_immutable_20261008()','EXECUTE') then
+   raise exception 'remote drive runtime retains private authority' using errcode='42501'; end if;
+ end loop;
+end $$;
 commit;

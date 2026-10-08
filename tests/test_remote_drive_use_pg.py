@@ -26,7 +26,7 @@ def function(filename,name):
 
 
 @pytest.fixture
-def pg():
+def pg(request):
     psycopg=pytest.importorskip('psycopg')
     if not PG.is_dir(): pytest.skip('PG17 unavailable')
     assert shutil.disk_usage('/tmp').free>5*1024**3
@@ -68,6 +68,24 @@ def pg():
                 admin.execute(f'create trigger inventory_generation_20261008 after insert or update or delete on {table} for each row execute function fixer_inventory_database_write_20261008()')
             # Snapshot unrelated predecessor function bodies and ACLs before install.
             before=admin.execute("select oid,prosrc,proacl::text from pg_proc where proname like 'fixer_inventory_%' order by oid").fetchall()
+            # Reproduce hostile creator default ACLs, including transitive
+            # privileges inherited by the mutator through another group role.
+            admin.execute('''create role inherited_acl nologin;
+             grant inherited_acl to fixer_inventory_mutator_20261008;
+             alter default privileges grant all on tables to fixer_inventory_mutator_20261008,inherited_acl,writer,service_role;
+             alter default privileges grant all on sequences to fixer_inventory_mutator_20261008,inherited_acl,writer,service_role;
+             alter default privileges grant all on functions to fixer_inventory_mutator_20261008,inherited_acl,writer,service_role;''')
+            if getattr(request,'param',None)=='owner_inherited':
+                admin.execute('grant postgres to fixer_inventory_mutator_20261008')
+                with pytest.raises(psycopg.Error,match='retains raw table authority'):
+                    admin.execute(MIGRATION.read_text())
+                admin.execute('rollback')
+                assert admin.execute(
+                 "select to_regclass('public.fixer_remote_drive_use_20261008')").fetchone()==(None,)
+                assert admin.execute(
+                 "select to_regclass('public.fixer_remote_drive_version_20261008')").fetchone()==(None,)
+                yield None
+                return
             admin.execute(MIGRATION.read_text())
             assert before==admin.execute("select oid,prosrc,proacl::text from pg_proc where proname like 'fixer_inventory_%' order by oid").fetchall()
             epoch=uuid.uuid4()
@@ -205,3 +223,56 @@ def test_concurrent_distinct_attempts_consume_once(pg):
         assert sorted(pool.map(consume,zip(connections,(first,second))))==['applied','held']
     assert admin.execute('select used_count from media_asset').fetchone()==(1,)
     assert admin.execute('select count(*) from fixer_remote_drive_use_20261008').fetchone()==(1,)
+
+
+def test_default_and_inherited_acl_scrub_and_immutable_owner_dml(pg):
+    admin,connect,request,rpc,psycopg=pg
+    writer=connect('writer')
+    for role in ('writer','fixer_inventory_mutator_20261008','inherited_acl','service_role'):
+        for table in ('fixer_remote_drive_use_20261008','fixer_remote_drive_use_control_20261008'):
+            assert admin.execute('select has_table_privilege(%s,%s,%s)',
+             (role,table,'SELECT,INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER')).fetchone()==(False,)
+            assert admin.execute('select has_any_column_privilege(%s,%s,%s)',
+             (role,table,'SELECT,INSERT,UPDATE,REFERENCES')).fetchone()==(False,)
+        assert admin.execute('select has_sequence_privilege(%s,%s,%s)',
+         (role,'fixer_remote_drive_version_20261008','USAGE,SELECT,UPDATE')).fetchone()==(False,)
+        for function_name in ('fixer_remote_drive_version_private_20261008()',
+                              'fixer_remote_drive_use_immutable_20261008()'):
+            assert admin.execute('select has_function_privilege(%s,%s,%s)',
+             (role,function_name,'EXECUTE')).fetchone()==(False,)
+    admin.execute("update fixer_remote_drive_use_control_20261008 set enabled=true,writers_verified_ref='SYNTHETIC disposable fixture'")
+    r=request()
+    receipt=rpc(writer,'fixer_remote_drive_use_apply_20261008',r)
+    version=admin.execute('select last_value from fixer_remote_drive_version_20261008').fetchone()
+    for statement in (
+        'truncate fixer_remote_drive_use_20261008',
+        'delete from fixer_remote_drive_use_20261008',
+        "update fixer_remote_drive_use_20261008 set receipt='{}'",
+        "select setval('fixer_remote_drive_version_20261008',1)",
+        "select nextval('fixer_remote_drive_version_20261008')"):
+        with pytest.raises(psycopg.Error) as denied:
+            writer.execute(statement)
+        assert denied.value.sqlstate=='42501'
+    # Owner ordinarily bypasses RLS, so protect destructive DML with a trigger.
+    for statement in ('truncate fixer_remote_drive_use_20261008',
+                      'delete from fixer_remote_drive_use_20261008',
+                      "update fixer_remote_drive_use_20261008 set receipt='{}'"):
+        with pytest.raises(psycopg.Error,match='immutable') as denied:
+            admin.execute(statement)
+        assert denied.value.sqlstate=='23514'
+    assert admin.execute('select count(*) from fixer_remote_drive_use_20261008').fetchone()==(1,)
+    assert admin.execute('select last_value from fixer_remote_drive_version_20261008').fetchone()==version
+    assert rpc(writer,'fixer_remote_drive_use_receipt_20261008',r)==receipt
+    assert rpc(writer,'fixer_remote_drive_use_apply_20261008',r)==receipt
+    assert admin.execute('select used_count from media_asset').fetchone()==(1,)
+    # Ordinary index writers need no sequence privilege for before-trigger defaults.
+    admin.execute('grant insert on media_source,media_asset to writer')
+    writer.execute("insert into media_source(id,gym_id,kind,active,folder_id) values('new','gym','gym_drive',true,'newfolder')")
+    writer.execute("insert into media_asset(id,source_id,gym_id,content_hash,eligible,excluded_by_coach,used_count) values('new','new','gym','newhash',true,false,0)")
+    assert admin.execute("select drive_use_version>0 from media_source where id='new'").fetchone()==(True,)
+    assert admin.execute("select drive_use_version>0 from media_asset where id='new'").fetchone()==(True,)
+
+
+@pytest.mark.parametrize('pg',['owner_inherited'],indirect=True)
+def test_installation_holds_unrevokable_owner_inheritance(pg):
+    assert pg is None
