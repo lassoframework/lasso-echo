@@ -255,3 +255,12 @@ def test_rate_gate_is_keyed_by_host_not_tenant():
     c._rate_gate('gym-one.example')   # same host again: delay owed
     assert slept == [pytest.approx(1.0)]
     assert list(c._rate_last) == ['gym-one.example', 'gym-two.example']
+
+
+def test_disconnected_portal_row_without_approved_handle_is_website_mapping():
+    r, rows = resolver(authority(instagram_handle=None))
+    rows['echo_social_connections'][0].update(state='not_connected', handle=None,
+                                              last_verified_at=None)
+    mapping = r(GYM)
+    assert mapping.website_response_urls == (URL,)
+    assert mapping.social_locators == () and mapping.provider_account_id is None

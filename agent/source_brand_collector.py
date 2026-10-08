@@ -6,9 +6,9 @@ operator with mapping approval evidence. The legacy name-keyed domain registry
 alone is deliberately insufficient. Social bootstrap requires independent
 account ID evidence; an Apify response cannot approve its own owner ID.
 
-The existing social capture adapter has no authenticated run/dataset response
-identity. Social collection therefore remains held even with an approved ID.
-This lane only calls the reviewed original-byte ingest adapter for persistence.
+Social execution uses the reviewed exact run/dataset adapter and never derives
+account authority from scraped items. Durable private receipts authenticate
+retained captures after process restart; no receipt is accepted from a request.
 """
 from __future__ import annotations
 
@@ -55,7 +55,11 @@ SWIFT_RIVER_DRAFT = {
 
 
 def _fail(code):
-    raise CaptureIngestError(code)
+    try:
+        raise CaptureIngestError(code) from None
+    except CaptureIngestError as error:
+        error.__context__ = None
+        raise
 
 
 def _json(value):
@@ -100,10 +104,12 @@ class PortalMappingResolver:
     records here. Exact UUID-scoped uniqueness is checked before any capture.
     A deterministic revision binds both operator authority and live mappings.
     """
-    def __init__(self, *, read_rows, approved_mappings=(), now=None):
+    def __init__(self, *, read_rows, approved_mappings=(), now=None,
+                 social_identity_reader=None):
         if not callable(read_rows):
             _fail('mapping_reader_required')
         self._read = read_rows
+        self._social_identity = social_identity_reader
         self._now = now or (lambda: datetime.now(timezone.utc))
         self._approved = {}
         for entry in approved_mappings:
@@ -144,7 +150,31 @@ class PortalMappingResolver:
             _fail('social_mapping_ambiguous')
         social = ()
         provider_id = None
-        if entry.instagram_handle:
+        provider_evidence = None
+        if self._social_identity is not None:
+            provider_evidence = self._social_identity(gym_id, entry.echo_account_key)
+            if (not isinstance(provider_evidence, dict)
+                    or provider_evidence.get('gym_id') != gym_id
+                    or provider_evidence.get('echo_account_key') != entry.echo_account_key
+                    or provider_evidence.get('source') != 'zernio_authenticated_accounts'
+                    or type(provider_evidence.get('connected')) is not bool):
+                _fail('authenticated_social_status_required')
+            if provider_evidence['connected']:
+                if (not entry.instagram_handle
+                        or provider_evidence['handle'] != entry.instagram_handle
+                        or len(connections) != 1
+                        or connections[0].get('state') != 'connected'
+                        or connections[0].get('handle') != entry.instagram_handle):
+                    _fail('current_social_mapping_mismatch')
+                provider_id = provider_evidence['platform_user_id']
+                if not isinstance(provider_id, str) or not re.fullmatch(r'[0-9]+', provider_id):
+                    _fail('independent_social_id_evidence_missing')
+                if entry.instagram_owner_id and entry.instagram_owner_id != provider_id:
+                    _fail('current_social_owner_mismatch')
+                social = ('https://www.instagram.com/' + entry.instagram_handle + '/',)
+            elif any(row.get('state') == 'connected' for row in connections):
+                _fail('current_social_mapping_mismatch')
+        if entry.instagram_handle and (provider_evidence is None or provider_evidence['connected']):
             if not re.fullmatch(r'[a-z0-9._]{1,30}', entry.instagram_handle):
                 _fail('social_handle_invalid')
             if (len(connections) != 1 or connections[0].get('gym_id') != gym_id
@@ -157,7 +187,7 @@ class PortalMappingResolver:
                 _fail('social_mapping_timestamp_invalid')
             if verified_at < self._now() - timedelta(days=7):
                 _fail('social_mapping_verification_expired')
-            if entry.instagram_owner_id:
+            if entry.instagram_owner_id and provider_evidence is None:
                 if (not re.fullmatch(r'[0-9]+', entry.instagram_owner_id)
                         or not entry.owner_id_evidence
                         or entry.owner_id_evidence_source not in
@@ -165,13 +195,20 @@ class PortalMappingResolver:
                     _fail('independent_social_id_evidence_missing')
                 social = ('https://www.instagram.com/' + entry.instagram_handle + '/',)
                 provider_id = entry.instagram_owner_id
-        elif connections:
+        elif connections and provider_evidence is None and any(
+                row.get('state') == 'connected' for row in connections):
             # An undeclared connected account is a mapping change, never an
             # opportunity to infer a handle from arbitrary response data.
             _fail('unapproved_social_mapping')
         authority = dict(entry.__dict__)
+        if any(row.get('gym_id') != gym_id or row.get('platform') != 'instagram'
+               or row.get('state') not in ('connected', 'not_connected', 'disconnected', 'expired')
+               for row in connections):
+            _fail('current_social_mapping_mismatch')
         evidence = {'authority': authority, 'portal_token': tokens[0],
                     'portal_instagram': connections}
+        if provider_evidence is not None:
+            evidence['provider_instagram'] = provider_evidence
         revision = 'server-mapping:sha256:' + hashlib.sha256(_json(evidence).encode()).hexdigest()
         return VerifiedMapping(gym_id, entry.echo_account_key, revision,
                                json.loads(_json(evidence)), entry.website_urls,
@@ -188,11 +225,15 @@ class TrustedSourceCollector:
     """
     def __init__(self, *, resolver, environ=None, ingest_http=None,
                  website_factory=WebsiteSourceCapture,
-                 clock=None, sleep=None, min_host_delay=1.0):
+                 clock=None, sleep=None, min_host_delay=1.0, receipt_journal=None,
+                 apify_client=None, apify_journal=None):
         self._env = os.environ if environ is None else environ
         self._resolve = resolver
         self._website_factory = website_factory
         self._receipts = {}
+        self._journal = receipt_journal
+        self._apify_client = apify_client
+        self._apify_journal = apify_journal
         # Cross-call per-host rate gate. collect_website builds a fresh
         # capture instance every call, so instance-level state would let
         # repeated calls bypass the per-host minimum delay. This state lives
@@ -228,7 +269,40 @@ class TrustedSourceCollector:
                 and registered[3] == mapping
                 and self._resolve(mapping.gym_id) == mapping)
 
-    def collect_website(self, gym_id, source_url, *, source_kind='website'):
+    def _persist(self, metadata, raw_bytes, mapping, *, request_id=None, proof=None):
+        digest = hashlib.sha256(raw_bytes).hexdigest()
+        if self._journal is not None:
+            if not request_id:
+                _fail('durable_capture_request_required')
+            self._journal.prepare(request_id, metadata, raw_bytes, proof or {})
+        receipt = object()
+        self._receipts[id(receipt)] = (receipt, _json(metadata), raw_bytes, mapping)
+        try:
+            stored = self._ingest.ingest(metadata, raw_bytes, transport_receipt=receipt,
+                expected_length=len(raw_bytes), expected_sha256=digest)
+            if self._journal is not None:
+                self._journal.confirm(request_id, stored)
+            return stored
+        finally:
+            self._receipts.pop(id(receipt), None)
+
+    def authenticate_capture(self, capture, raw_bytes, mapping):
+        try:
+            return (self._journal is not None and self._resolve(mapping.gym_id) == mapping
+                    and self._journal.authenticate_capture(capture, raw_bytes, mapping))
+        except Exception:
+            return False
+
+    def _replay(self, request_id, binding, mapping):
+        if self._journal is None:
+            return None
+        prepared = self._journal.claim(request_id, binding)
+        if prepared is None:
+            return None
+        metadata, raw, proof = prepared
+        return self._persist(metadata, raw, mapping, request_id=request_id, proof=proof)
+
+    def collect_website(self, gym_id, source_url, *, source_kind='website', request_id=None):
         if (self._env.get('ECHO_SOURCE_COLLECTOR_ENABLED') != 'true'
                 or self._env.get('ECHO_SOURCE_CAPTURE_INGEST_ENABLED') != 'true'):
             _fail('source_collector_disabled')
@@ -238,6 +312,10 @@ class TrustedSourceCollector:
         mapping = self._resolve(gym_id)
         if source_url not in mapping.website_response_urls:
             _fail('website_mapping_mismatch')
+        replay = self._replay(request_id, {'mapping': mapping.__dict__,
+            'source_kind': source_kind, 'source_url': source_url}, mapping)
+        if replay is not None:
+            return replay
         entries = [PortalDomainEntry(gym_id, mapping.echo_account_key,
                    _website_url(url).hostname, source_kind,
                    path_prefixes=(_website_url(url).path or '/',),
@@ -262,21 +340,73 @@ class TrustedSourceCollector:
             provider_account_id=None, source_revision='response-sha256:' + result.bytes_sha256,
             mapping_revision=mapping.mapping_revision, mapping_evidence=mapping.mapping_evidence,
             fetched_at=result.fetched_at)
-        receipt = object()
-        self._receipts[id(receipt)] = (receipt, _json(metadata), result.raw_bytes, mapping)
-        try:
-            return self._ingest.ingest(metadata, result.raw_bytes, transport_receipt=receipt,
-                expected_length=len(result.raw_bytes), expected_sha256=result.bytes_sha256)
-        finally:
-            self._receipts.pop(id(receipt), None)
+        return self._persist(metadata, result.raw_bytes, mapping, request_id=request_id,
+            proof={'transport': 'reviewed_website_https', 'status': result.status,
+                   'response_url': result.source_url})
 
-    def collect_social(self, gym_id):
+    def collect_social(self, gym_id, *, request_id=None):
         if self._env.get('ECHO_SOURCE_COLLECTOR_ENABLED') != 'true':
             _fail('source_collector_disabled')
         mapping = self._resolve(gym_id)
         if not mapping.provider_account_id:
             _fail('independent_social_id_evidence_missing')
-        _fail('authenticated_provider_response_identity_missing')
+        if (self._env.get('ECHO_SOURCE_CAPTURE_INGEST_ENABLED') != 'true'
+                or self._env.get('ECHO_SOURCE_SOCIAL_RUN_CAPTURE_ENABLED') != 'true'
+                or self._journal is None or self._apify_journal is None):
+            _fail('authenticated_provider_response_identity_missing')
+        self._ingest._config()
+        if not request_id:
+            _fail('durable_capture_request_required')
+        proof = mapping.mapping_evidence.get('provider_instagram', {})
+        if (proof.get('source') != 'zernio_authenticated_accounts'
+                or proof.get('connected') is not True
+                or proof.get('platform_user_id') != mapping.provider_account_id):
+            _fail('independent_social_id_evidence_missing')
+        actor = self._env.get('ECHO_SOURCE_APIFY_ACTOR_ID', '')
+        try:
+            charge = float(self._env.get('ECHO_SOURCE_APIFY_MAX_CHARGE_USD', ''))
+        except (TypeError, ValueError):
+            _fail('social_capture_limits_missing')
+        binding = {'mapping': mapping.__dict__, 'source_kind': 'social',
+                   'actor': actor, 'max_total_charge_usd': charge,
+                   'lookback_days': 90, 'results_limit': 500}
+        replay = self._replay(request_id, binding, mapping)
+        if replay is not None:
+            return replay
+        from .apify_run_capture import capture_social_source_run
+        result = capture_social_source_run(mapped_handle=proof['handle'],
+            mapped_provider_account_id=mapping.provider_account_id,
+            mapped_source_locator=mapping.social_locators[0], gym_id=gym_id,
+            echo_account_key=mapping.echo_account_key,
+            mapping_revision=mapping.mapping_revision, mapping_evidence=mapping.mapping_evidence,
+            source_revision='mapped-social:' + mapping.mapping_revision,
+            request_id=request_id, expected_actor_id=actor, journal=self._apify_journal,
+            max_total_charge_usd=charge, enabled=True, client=self._apify_client)
+        if not result.ok:
+            _fail('social_run_capture_held')
+        p = result.provenance
+        if (type(result.raw_bytes) is not bytes
+                or result.sha256 != hashlib.sha256(result.raw_bytes).hexdigest()
+                or p.get('gym_id') != gym_id or p.get('echo_account_key') != mapping.echo_account_key
+                or p.get('source_locator') != mapping.social_locators[0]
+                or p.get('provider_run_actor_id') != actor or p.get('run_status') != 'SUCCEEDED'
+                or self._resolve(gym_id) != mapping or p.get('mapping_revision') != mapping.mapping_revision
+                or p.get('provider_account_id') != mapping.provider_account_id
+                or p.get('mapping_evidence') != mapping.mapping_evidence):
+            _fail('transport_capture_binding_mismatch')
+        # Ingest deliberately rejects every URL query. Persist the canonical
+        # endpoint for this exact dataset; the private receipt retains the actual
+        # executed URL and bounded query, never a latest-run or reconstructed body.
+        source_url = 'https://api.apify.com/v2/datasets/' + p['provider_dataset_id'] + '/items'
+        metadata = dict(gym_id=gym_id, echo_account_key=mapping.echo_account_key,
+            source_kind='social', source_url=source_url, source_locator=mapping.social_locators[0],
+            capture_provider='apify', provider_response_id=p['provider_response_id'],
+            provider_account_id=mapping.provider_account_id,
+            source_revision=p['provider_response_id'] + ':sha256:' + result.sha256,
+            mapping_revision=mapping.mapping_revision, mapping_evidence=mapping.mapping_evidence,
+            fetched_at=p['fetched_at'])
+        return self._persist(metadata, result.raw_bytes, mapping, request_id=request_id,
+                             proof=p)
 
 class CollectorPortalReader:
     """Dedicated server credential, read-only transport for resolver lookups.
@@ -289,7 +419,7 @@ class CollectorPortalReader:
         self._http = http
 
     def __call__(self, table, params):
-        if table not in ('echo_intake_tokens', 'echo_social_connections'):
+        if table not in ('echo_intake_tokens', 'echo_social_connections', 'echo_gym_settings'):
             _fail('mapping_table_not_allowed')
         if self._env.get('ECHO_SOURCE_COLLECTOR_ENABLED') != 'true':
             _fail('source_collector_disabled')
@@ -316,12 +446,164 @@ class CollectorPortalReader:
             _fail('mapping_read_unavailable')
 
 
-def build_collector(*, approved_mappings=(), environ=None, http=None):
+    def attest_provider(self, status, request_id):
+        if self._env.get('ECHO_SOURCE_COLLECTOR_ENABLED') != 'true':
+            _fail('source_collector_disabled')
+        base = self._env.get('ECHO_SOURCE_CAPTURE_SUPABASE_URL', '')
+        key = self._env.get('ECHO_SOURCE_CAPTURE_SERVICE_ROLE_KEY', '')
+        parsed = _website_url(base)
+        if parsed.path not in ('', '/') or not key:
+            _fail('collector_service_config_missing')
+        http = self._http
+        if http is None:
+            import requests
+            http = requests
+        try:
+            response = http.post(base.rstrip('/') + '/rest/v1/rpc/echo_source_brand_attest_provider',
+                headers={'apikey': key, 'Authorization': 'Bearer ' + key},
+                json={'p_gym': status['gym_id'], 'p_key': status['echo_account_key'],
+                      'p_status': status, 'p_request': request_id},
+                timeout=15, allow_redirects=False)
+            if response.status_code != 200:
+                _fail('provider_attestation_unconfirmed')
+            row = response.json()
+            if (not isinstance(row, dict) or type(row.get('id')) is not int or row['id'] < 1
+                    or row.get('gym_id') != status['gym_id']
+                    or row.get('echo_account_key') != status['echo_account_key']
+                    or row.get('attestation') != status or row.get('request_id') != request_id
+                    or _timestamp(row.get('created_at')) < _timestamp(status['observed_at'])):
+                _fail('provider_attestation_readback_mismatch')
+            return row
+        except CaptureIngestError:
+            raise
+        except Exception:
+            _fail('provider_attestation_unconfirmed')
+
+
+class AuthenticatedZernioIdentityReader:
+    """Exact UUID→stored profile→authenticated complete account list→receipt.
+
+    Uses existing ZERNIO_API_KEY and the dedicated capture service credential.
+    Never searches profile names, creates a profile or uses a scraped item ID.
+    A missing profile/key, partial account list, unavailable transport, duplicate
+    connected IG, missing numeric platformUserId or mismatched handle holds.
+    Every call writes/readbacks a fresh default-off service RPC attestation.
+    """
+    def __init__(self, *, read_rows, environ=None, http=None, now=None):
+        self._read = read_rows
+        self._env = os.environ if environ is None else environ
+        self._http = http
+        self._now = now or (lambda: datetime.now(timezone.utc))
+
+    def __call__(self, gym_id, echo_account_key):
+        _canonical_gym(gym_id)
+        if self._env.get('ECHO_SOURCE_COLLECTOR_ENABLED') != 'true':
+            _fail('source_collector_disabled')
+        def report(profile):
+            revision = 'zernio-profile:sha256:' + hashlib.sha256(_json({
+                'gym_id': gym_id, 'echo_account_key': echo_account_key,
+                'profile_id': profile}).encode()).hexdigest()
+            return dict(provider='zernio', source='zernio_authenticated_accounts',
+                gym_id=gym_id, echo_account_key=echo_account_key, profile_id=profile,
+                mapping_revision=revision, lookup_status='unavailable', authenticated=False,
+                observed_at=self._now().isoformat(), response_sha256=None, instagram=None)
+        status = report(None)
+        try:
+            rows = self._read('echo_gym_settings', {'gym_id': 'eq.' + gym_id,
+                              'select': 'gym_id,zernio_profile_id'})
+            if (not isinstance(rows, list) or len(rows) != 1 or not isinstance(rows[0], dict)
+                    or rows[0].get('gym_id') != gym_id
+                    or not isinstance(rows[0].get('zernio_profile_id'), str)
+                    or not re.fullmatch(r'[A-Za-z0-9_-]{1,128}', rows[0]['zernio_profile_id'])):
+                _fail('exact_zernio_profile_mapping_required')
+            profile = rows[0]['zernio_profile_id']
+        except Exception:
+            self._read.attest_provider(status, str(uuid.uuid4()))
+            _fail('exact_zernio_profile_mapping_required')
+        status = report(profile)
+        revision = status['mapping_revision']
+        try:
+            key = self._env.get('ZERNIO_API_KEY', '')
+            if not isinstance(key, str) or not key or any(c.isspace() for c in key):
+                _fail('zernio_account_credential_required')
+            # Fixed reviewed endpoint: environment overrides cannot leak the key.
+            client = self._http
+            if client is None:
+                import requests
+                client = requests
+            response = client.get('https://api.zernio.com/v1/accounts',
+                params={'profileId': profile}, headers={'Authorization': 'Bearer ' + key},
+                timeout=30, allow_redirects=False)
+            raw = response.content
+            if response.status_code != 200 or type(raw) is not bytes or not 1 <= len(raw) <= 2_000_000:
+                _fail('authenticated_social_status_unavailable')
+            status.update(authenticated=True, response_sha256=hashlib.sha256(raw).hexdigest(),
+                          lookup_status='partial')
+            def unique(pairs):
+                result = {}
+                for name, value in pairs:
+                    if name in result:
+                        raise ValueError()
+                    result[name] = value
+                return result
+            data = json.loads(raw, object_pairs_hook=unique,
+                parse_constant=lambda _: (_ for _ in ()).throw(ValueError()))
+            accounts = data.get('accounts') if isinstance(data, dict) else None
+            if not isinstance(accounts, list) or any(not isinstance(a, dict) for a in accounts):
+                _fail('authenticated_social_status_incomplete')
+            # list_accounts is a complete-list contract. An unfamiliar paging
+            # envelope is held rather than assumed to be a complete negative.
+            if any(k in data for k in ('pagination', 'nextCursor', 'hasMore', 'next')):
+                _fail('authenticated_social_status_incomplete')
+            from .zernio import account_state
+            if any(not isinstance(a.get('platform'), str) or not re.fullmatch(r'[a-z][a-z0-9_]*', a['platform'])
+                   or not isinstance(a.get('_id'), str) or not a['_id']
+                   or a.get('profileId') != profile for a in accounts):
+                _fail('authenticated_social_status_incomplete')
+            instagram = [a for a in accounts if a.get('platform') == 'instagram']
+            if any(a.get('profileId') != profile for a in instagram):
+                _fail('authenticated_social_profile_mismatch')
+            connected = [a for a in instagram if account_state(a, now=self._now()) == 'connected']
+            if len(connected) > 1:
+                _fail('authenticated_social_identity_ambiguous')
+            identity = dict(connected=False, account_id=None, platform_user_id=None, handle=None)
+            if connected:
+                a = connected[0]
+                md = a.get('metadata') or {}
+                pd = md.get('profileData') or {}
+                values = [v for v in (a.get('platformUserId'), md.get('platformUserId')) if v is not None]
+                handles = [v for v in (a.get('username'), pd.get('username')) if v is not None]
+                if (not values or any(type(v) is not str or not re.fullmatch(r'[0-9]+', v) for v in values)
+                        or len(set(values)) != 1 or not isinstance(a.get('_id'), str)
+                        or not a['_id'] or a['_id'] == values[0]
+                        or not handles or any(type(v) is not str or not re.fullmatch(r'[a-z0-9._]{1,30}', v) for v in handles)
+                        or len(set(handles)) != 1):
+                    _fail('independent_social_id_evidence_missing')
+                identity = dict(connected=True, account_id=a['_id'],
+                                platform_user_id=values[0], handle=handles[0])
+            status.update(lookup_status='complete', instagram=identity)
+        except Exception:
+            # Persist the negative/partial lookup as a hold, never as proof of
+            # disconnection. Provider exceptions are never propagated or logged.
+            self._read.attest_provider(status, str(uuid.uuid4()))
+            _fail('authenticated_social_status_unavailable_or_incomplete')
+        self._read.attest_provider(status, str(uuid.uuid4()))
+        return dict(gym_id=gym_id, echo_account_key=echo_account_key,
+            profile_id=profile, provider_mapping_revision=revision,
+            source='zernio_authenticated_accounts', **identity)
+
+def build_collector(*, approved_mappings=(), environ=None, http=None,
+                    receipt_journal=None, apify_journal=None, apify_client=None,
+                    identity_http=None):
     """Reviewed server composition root. Empty authority/default flags hold.
 
     Only server startup code supplies approved mappings. Never deserialize a
     request body into this argument. No scheduled runner or live activation.
     """
     reader = CollectorPortalReader(environ=environ, http=http)
-    resolver = PortalMappingResolver(read_rows=reader, approved_mappings=approved_mappings)
-    return TrustedSourceCollector(resolver=resolver, environ=environ, ingest_http=http)
+    identity = AuthenticatedZernioIdentityReader(read_rows=reader, environ=environ,
+                                               http=identity_http)
+    resolver = PortalMappingResolver(read_rows=reader, approved_mappings=approved_mappings,
+                                     social_identity_reader=identity)
+    return TrustedSourceCollector(resolver=resolver, environ=environ, ingest_http=http,
+        receipt_journal=receipt_journal, apify_journal=apify_journal, apify_client=apify_client)
