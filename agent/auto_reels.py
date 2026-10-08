@@ -128,6 +128,28 @@ def _is_exhausted(job):
     return int(job.get("attempts") or 0) >= _MAX_ATTEMPTS
 
 
+def _reopen_zero_ask_job(job):
+    """Reopen once when the old CTA matcher caused the terminal failure.
+
+    Earlier builds accepted approved voice CTAs such as ``Save this post`` and
+    ``Tag a gym owner`` in auto_reel_copy, then Story Studio's narrower matcher
+    counted them as zero asks. Those batches exhausted all retries without ever
+    rendering. The matcher is now shared at preparation time; this one-shot marker
+    lets an affected reserved batch try the corrected code without granting an
+    unbounded retry or touching any staged reel.
+    """
+    if not isinstance(job, dict) or job.get("zero_ask_repair_v1"):
+        return False
+    reason = str(job.get("reason") or "").lower()
+    if (not _is_exhausted(job)
+            or "overlay rejected: end-frame carries 0 ask(s)" not in reason):
+        return False
+    job.update(status="held", attempts=0, next_attempt_at=0,
+               reason="Corrected approved call to action check queued",
+               zero_ask_repair_v1=True)
+    return True
+
+
 def _job_snapshot(request_id, job):
     return {
         "request_id": request_id,
@@ -206,6 +228,10 @@ def _claim(gym, candidates, assets, now):
         for request_id, job in jobs.items():
             if job['status'] not in ('staged', 'running', 'uncertain') and _consumed_elsewhere(jobs, request_id, job):
                 job.update(status='superseded', reason='Source footage was staged by another job')
+            # Affected batches keep their UUID and reserved source entries. This
+            # correction is one-shot and still receives the normal three-attempt
+            # ceiling after reopening.
+            _reopen_zero_ask_job(job)
             # Repair pre-minimum-check jobs from earlier builds. They could never
             # satisfy the automatic renderer and must not strand drip uploads.
             if job["status"] not in ("staged", "uncertain", "running") and (
