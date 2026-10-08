@@ -126,6 +126,33 @@ def test_unconfigured_lane_defaults_off(monkeypatch):
     with pytest.raises(guard.ForwardMediaVerificationHold, match='not configured'): guard._connect()
 
 
+@pytest.mark.parametrize('failure', ['cursor', 'execute', 'fetchone'])
+def test_connection_closed_when_role_query_fails(monkeypatch, failure):
+    import sys
+    conn = Connection({})
+    class FailingCursor(Cursor):
+        def execute(self, sql, args=None):
+            if failure == 'execute':
+                raise RuntimeError('role query unavailable')
+            super().execute(sql, args)
+        def fetchone(self):
+            if failure == 'fetchone':
+                raise RuntimeError('role result unavailable')
+            return super().fetchone()
+    def cursor():
+        if failure == 'cursor':
+            raise RuntimeError('cursor unavailable')
+        return FailingCursor(conn)
+    conn.cursor = cursor
+    monkeypatch.setitem(sys.modules, 'psycopg', SimpleNamespace(connect=lambda _: conn))
+    monkeypatch.setenv('AGENT_FORWARD_MEDIA_GUARD', 'true')
+    monkeypatch.setenv('AGENT_FORWARD_MEDIA_ATTESTER_DSN', 'isolated-test-dsn')
+    monkeypatch.setenv('AGENT_FORWARD_MEDIA_ATTESTER_ROLE', guard.ROLE)
+    with pytest.raises(guard.ForwardMediaVerificationHold, match='database unavailable'):
+        guard._connect()
+    assert conn.closed and not conn.committed
+
+
 @pytest.mark.parametrize('status,payload,error', [
     (200, True, None), (200, 'true', guard.ForwardMediaVerificationHold),
     (200, {}, guard.ForwardMediaVerificationHold),

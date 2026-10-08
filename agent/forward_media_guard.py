@@ -43,6 +43,7 @@ def _connect():
     expected = os.getenv('AGENT_FORWARD_MEDIA_ATTESTER_ROLE')
     if not enabled() or not dsn or expected != ROLE:
         raise ForwardMediaVerificationHold('trusted media attester is not configured')
+    conn = None
     try:
         import psycopg
         conn = psycopg.connect(dsn)
@@ -55,6 +56,11 @@ def _connect():
     except ForwardMediaVerificationHold:
         raise
     except Exception as exc:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
         raise ForwardMediaVerificationHold('trusted attester database unavailable') from exc
 
 
