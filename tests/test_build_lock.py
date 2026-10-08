@@ -25,6 +25,7 @@ heartbeat write failure must never crash the build or release the lock early
 """
 
 import os
+import multiprocessing
 import sys
 import threading
 import time
@@ -87,6 +88,60 @@ def test_is_locked_reports_without_acquiring():
     assert build_lock.is_locked("crossfitreverb30b5b2") is True
 
 
+def test_colon_in_holder_is_parsed_and_owner_can_release():
+    gym = "swiftrivercrossfite5c9db"
+    holder = "1:140150691433360"
+    assert build_lock.acquire(gym, holder=holder) is True
+    assert build_lock.is_locked(gym) is True
+    assert build_lock.acquire(gym, holder="other-run") is False
+
+    build_lock.release(gym, holder=holder)
+    assert build_lock.acquire(gym, holder="other-run") is True
+
+
+def test_colon_holder_lock_expires_normally(monkeypatch):
+    gym = "swiftrivercrossfite5c9db"
+    assert build_lock.acquire(gym, holder="1:140150691433360") is True
+    real_time = build_lock.time.time
+    monkeypatch.setattr(
+        build_lock.time, "time",
+        lambda: real_time() + build_lock.STALE_SECONDS + 1,
+    )
+    assert build_lock.is_locked(gym) is False
+    assert build_lock.acquire(gym, holder="replacement") is True
+
+
+@pytest.mark.parametrize("raw", ["ambiguous", "holder:", ":123.0", "holder:nan", "holder:inf"])
+def test_malformed_lock_fails_closed(monkeypatch, raw):
+    from agent import db
+
+    gym = "crossfitreverb30b5b2"
+    key = build_lock._key(gym)
+    db.kv_set(key, raw)
+
+    assert build_lock.is_locked(gym) is True
+    assert build_lock.acquire(gym, holder="replacement") is False
+    build_lock.release(gym, holder="replacement")
+    assert db.kv_get(key, "") == raw
+
+
+def test_null_persisted_lock_fails_closed():
+    from agent import db
+
+    key = build_lock._key("shared-gym")
+    conn = db.connect()
+    try:
+        with conn:
+            conn.execute("INSERT INTO kv (key, value) VALUES (?, NULL)", (key,))
+    finally:
+        conn.close()
+    assert build_lock.is_locked("shared-gym") is True
+    assert build_lock.acquire("shared-gym", holder="replacement") is False
+    assert build_lock.heartbeat("shared-gym", holder="replacement") is False
+    build_lock.release("shared-gym", holder="replacement")
+    assert db.kv_get(key) is None
+
+
 def test_empty_gym_id_never_locks_anything():
     assert build_lock.acquire("", holder="run-a") is False
     assert build_lock.is_locked("") is False
@@ -97,7 +152,7 @@ def test_unreadable_store_fails_closed(monkeypatch):
         raise RuntimeError("kv store down")
 
     from agent import db
-    monkeypatch.setattr(db, "kv_get", _boom)
+    monkeypatch.setattr(db, "connect", _boom)
     assert build_lock.acquire("crossfitreverb30b5b2", holder="run-a") is False
 
 
@@ -165,12 +220,12 @@ def test_heartbeat_write_failure_never_raises_and_never_releases_early(monkeypat
     assert build_lock.acquire(gym, holder="run-a") is True
 
     from agent import db
-    real_kv_set = db.kv_set
+    real_kv_update = db.kv_update
 
     def _boom(*a, **k):
         raise RuntimeError("kv store hiccup")
 
-    monkeypatch.setattr(db, "kv_set", _boom)
+    monkeypatch.setattr(db, "kv_update", _boom)
     # Must not raise, and reports the renewal did not happen.
     assert build_lock.heartbeat(gym, holder="run-a") is False
 
@@ -179,7 +234,7 @@ def test_heartbeat_write_failure_never_raises_and_never_releases_early(monkeypat
     # undo() would also revert that, silently pointing kv reads/writes at a
     # different db). The lock is still held by run-a (the failed heartbeat
     # did not release or corrupt it) and still fresh.
-    monkeypatch.setattr(db, "kv_set", real_kv_set)
+    monkeypatch.setattr(db, "kv_update", real_kv_update)
     assert build_lock.is_locked(gym) is True
     assert build_lock.acquire(gym, holder="run-b") is False
     assert build_lock.acquire(gym, holder="run-a") is True  # still ours
@@ -240,3 +295,111 @@ def test_start_heartbeat_thread_renews_the_lock_while_running(monkeypatch):
     time.sleep(0.2)
     # No further renewals after stop() -- the thread actually exited.
     assert len(calls) == seen_at_stop
+
+
+def _acquire_in_process(path, holder, start, legacy_reads, results):
+    """Expose the old split-read race while exercising real SQLite processes."""
+    from agent import db
+
+    os.environ["AGENT_DB_PATH"] = path
+    original_get = db.kv_get
+    original_update = db.kv_update
+
+    def simultaneous_legacy_read(*args, **kwargs):
+        raw = original_get(*args, **kwargs)
+        # Under the old implementation every contender sees the same free or
+        # stale value before any starts its independent kv_set.
+        legacy_reads.wait(timeout=10)
+        return raw
+
+    def slow_atomic_update(key, update):
+        def slow_callback(raw):
+            time.sleep(0.05)  # widen the read/write window inside the transaction
+            return update(raw)
+        return original_update(key, slow_callback)
+
+    db.kv_get = simultaneous_legacy_read
+    db.kv_update = slow_atomic_update
+    start.wait(timeout=10)
+    results.put((holder, build_lock.acquire("shared-gym", holder=holder)))
+
+
+@pytest.mark.parametrize("stale", [False, True])
+def test_concurrent_processes_have_exactly_one_acquisition_winner(stale):
+    from agent import db
+
+    key = build_lock._key("shared-gym")
+    # Initialize schema before spawning, so this checks lock transitions rather
+    # than the separate first-open schema migration concurrency behavior.
+    initial = f"dead:holder:{time.time() - build_lock.STALE_SECONDS - 1}" if stale else ""
+    db.kv_set(key, initial)
+    ctx = multiprocessing.get_context("spawn")
+    start = ctx.Barrier(4)
+    legacy_reads = ctx.Barrier(4)
+    results = ctx.Queue()
+    workers = [ctx.Process(target=_acquire_in_process,
+                           args=(db.db_path(), f"run:{i}", start, legacy_reads, results))
+               for i in range(4)]
+    try:
+        for worker in workers:
+            worker.start()
+        observed = [results.get(timeout=15) for _ in workers]
+        for worker in workers:
+            worker.join(timeout=5)
+            assert worker.exitcode == 0
+        winners = [holder for holder, acquired in observed if acquired]
+        assert len(winners) == 1
+        assert build_lock._parse_lock(db.kv_get(key))[0] == winners[0]
+    finally:
+        for worker in workers:
+            if worker.is_alive():
+                worker.terminate()
+                worker.join(timeout=5)
+        results.close()
+        results.join_thread()
+
+
+def test_heartbeat_cannot_take_over_a_different_stale_owner():
+    from agent import db
+
+    key = build_lock._key("shared-gym")
+    raw = f"new:owner:{time.time() - build_lock.STALE_SECONDS - 1}"
+    db.kv_set(key, raw)
+    assert build_lock.heartbeat("shared-gym", holder="old:owner") is False
+    assert db.kv_get(key) == raw
+    assert build_lock.acquire("shared-gym", holder="next:owner") is True
+
+
+def test_atomic_update_rolls_back_write_failure(monkeypatch):
+    from agent import db
+
+    key = build_lock._key("shared-gym")
+    assert build_lock.acquire("shared-gym", holder="original")
+    raw = db.kv_get(key)
+    original_connect = db.connect
+
+    class FailingConnection:
+        def __init__(self):
+            self.conn = original_connect()
+
+        def execute(self, sql, *args):
+            result = self.conn.execute(sql, *args)
+            if sql.startswith("INSERT OR REPLACE INTO kv"):
+                raise RuntimeError("failed after write, before commit")
+            return result
+
+        def __enter__(self):
+            self.conn.__enter__()
+            return self
+
+        def __exit__(self, *args):
+            return self.conn.__exit__(*args)
+
+        def close(self):
+            self.conn.close()
+
+    monkeypatch.setattr(db, "connect", FailingConnection)
+    assert build_lock.heartbeat("shared-gym", holder="original") is False
+    build_lock.release("shared-gym", holder="original")
+    monkeypatch.setattr(db, "connect", original_connect)
+    assert db.kv_get(key) == raw

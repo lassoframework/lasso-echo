@@ -322,6 +322,29 @@ def kv_set(key, value):
         conn.commit()
 
 
+def kv_update(key, update):
+    """Atomically transform one kv value, serialized across SQLite processes.
+
+    ``update`` receives the current value (empty when absent) and returns the
+    replacement, or None to refuse the write. Exceptions roll back and propagate.
+    Keep the callback local and short: the SQLite writer lock is held throughout.
+    """
+    with _lock:
+        conn = connect()
+        try:
+            with conn:
+                conn.execute("BEGIN IMMEDIATE")
+                row = conn.execute("SELECT value FROM kv WHERE key=?", (key,)).fetchone()
+                replacement = update(row["value"] if row else "")
+                if replacement is None:
+                    return False
+                conn.execute("INSERT OR REPLACE INTO kv (key, value) VALUES (?,?)",
+                             (key, str(replacement)))
+            return True
+        finally:
+            conn.close()
+
+
 def kv_is_durable():
     """True when the kv store PERSISTS across process runs: an explicit AGENT_DB_PATH
     or the mounted data volume (AGENT_DATA_DIR, default /data). The CWD-fallback
