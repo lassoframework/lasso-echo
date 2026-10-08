@@ -157,13 +157,11 @@ def main():
                 "operation": "same_object",
             }), encoding="utf-8")
             owner_conn = psycopg.connect(dsn(OWNER))
-            forbidden = [k for k in os.environ
-                         if __import__("re").search(
-                             r"(SERVICE[_-]?ROLE|PUBLISH[_-]?(KEY|TOKEN|SECRET)|SUPABASE_.*_(KEY|SECRET))",
-                             k, __import__("re").IGNORECASE)]
-            saved = {k: os.environ.pop(k) for k in forbidden}
-            old_dsn = os.environ.get("FORWARD_MEDIA_OWNER_DSN")
-            os.environ["FORWARD_MEDIA_OWNER_DSN"] = dsn(OWNER)
+            from agent.forward_media_lane import RUNTIME_NAMES
+            saved = dict(os.environ)
+            os.environ.clear()
+            os.environ.update({k:v for k,v in saved.items() if k in RUNTIME_NAMES})
+            os.environ.update(FORWARD_MEDIA_OWNER_DSN=dsn(OWNER),FORWARD_MEDIA_OWNER_ROLE=OWNER)
             out = io.StringIO()
             try:
                 code, result = forward_media_owner_packet.run(
@@ -173,11 +171,8 @@ def main():
                         owner_conn, OWNER, reader),
                     out=out)
             finally:
+                os.environ.clear()
                 os.environ.update(saved)
-                if old_dsn is None:
-                    os.environ.pop("FORWARD_MEDIA_OWNER_DSN", None)
-                else:
-                    os.environ["FORWARD_MEDIA_OWNER_DSN"] = old_dsn
             assert code == 0 and result["ok"] and result["applied"] and not result["replayed"], out.getvalue()
             after = counts()
             # Owner preparation wrote ONLY the three owner authority rows.
@@ -222,15 +217,18 @@ def main():
                 # swapped for the immutable synthetic object map.
                 env_names = ("AGENT_FORWARD_MEDIA_GUARD", "AGENT_FORWARD_MEDIA_ATTESTER_DSN",
                              "AGENT_FORWARD_MEDIA_ATTESTER_ROLE")
-                prior_env = {name: os.environ.get(name) for name in env_names}
-                prior_reader = visual_writer_prepare._bytes_for_url
+                prior_env = dict(os.environ)
+                os.environ.clear()
+                os.environ.update({k:v for k,v in prior_env.items() if k in RUNTIME_NAMES})
+                os.environ['AGENT_S3_PUBLIC_BASE_URL'] = SOURCE_URL.rsplit('/',1)[0]
+                prior_reader = forward_media_guard.read_public_object
                 try:
                     os.environ["AGENT_FORWARD_MEDIA_GUARD"] = "true"
                     os.environ["AGENT_FORWARD_MEDIA_ATTESTER_DSN"] = dsn(
                         "fixer_forward_media_attester_20261006")
                     os.environ["AGENT_FORWARD_MEDIA_ATTESTER_ROLE"] = (
                         "fixer_forward_media_attester_20261006")
-                    visual_writer_prepare._bytes_for_url = reader.read
+                    forward_media_guard.read_public_object = reader.read
                     try:
                         forward_media_guard.attest(rid, revision, read_bytes=reader.read)
                     except forward_media_guard.ForwardMediaVerificationHold as exc:
@@ -239,12 +237,9 @@ def main():
                         raise AssertionError("production attester accepted caller bytes")
                     proof = forward_media_guard.attest(rid, revision)
                 finally:
-                    visual_writer_prepare._bytes_for_url = prior_reader
-                    for name, value in prior_env.items():
-                        if value is None:
-                            os.environ.pop(name, None)
-                        else:
-                            os.environ[name] = value
+                    forward_media_guard.read_public_object = prior_reader
+                    os.environ.clear()
+                    os.environ.update(prior_env)
                 if not claim:
                     return rid, token, revision, proof["evidence_id"]
                 with lane("service_role") as conn:
