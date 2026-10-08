@@ -47,23 +47,50 @@ def capture(kind, raw, id):
         bytes_sha256=sha(raw), raw_bytes='\\x' + raw.hex())
 
 
-def snapshot(rows):
+PROVIDER_IDENTITY = dict(provider='zernio', source='zernio_authenticated_accounts',
+                         profile_id='profile-1', mapping_revision='mapping-1')
+# id is the Zernio internal account id; platform_user_id is the numeric actual
+# Instagram owner identity and must match the social capture provider_account_id.
+CONN = dict(id='zernio-internal-account-1', platform_user_id='123', handle='mapped')
+RECEIPT = dict(id=7, observed_at=NOW.isoformat(), response_sha256='ab' * 32)
+
+
+def policy(mode='website_only_no_connected_instagram_v2', conn=None, identity=None):
+    return dict(version=2, mode=mode, gym_id=GYM, echo_account_key='gym_exact',
+                provider_identity=copy.deepcopy(identity or PROVIDER_IDENTITY),
+                instagram_connection=None if conn is None else dict(conn))
+
+
+def snapshot(rows, policy=None, receipt=None):
     cs = [{**{k: v for k, v in c.items() if k not in ('raw_bytes', 'captured_at')},
            'bytes_base64': base64.b64encode(bytes.fromhex(c['raw_bytes'][2:])).decode()} for c in rows]
     c = rows[0]; raw = bytes.fromhex(c['raw_bytes'][2:])
-    return dict(schema_version=1, gym_id=GYM, echo_account_key='gym_exact',
+    s = dict(schema_version=1, gym_id=GYM, echo_account_key='gym_exact',
         fact_policy='delegated_supported_facts', captures=cs,
         selected_facts=[dict(key='offer', capture_id=c['id'], bytes_sha256=c['bytes_sha256'],
             source_locator=WEB, byte_offset=raw.index(b'Train here'), byte_length=10, text='Train here')],
         palette=dict(capture_id=c['id'], bytes_sha256=c['bytes_sha256'], primary='#112233',
             secondary='#445566', primary_byte_offset=raw.index(b'#112233'), secondary_byte_offset=raw.index(b'#445566')))
+    if policy is not None:
+        s['schema_version'] = 2
+        s['source_policy'] = policy
+        s['provider_status_receipt'] = dict(receipt or RECEIPT)
+    return s
 
 
 class Store:
-    def __init__(self):
-        self.rows = [capture('website', RAW, '051a189e-5f91-44f4-bf89-a1549f7b9442'),
-                     capture('social', b'{"caption":"Our gym is open", "ownerId":"123"}', 'b4d4d171-fd4d-4393-8602-bc99960b05cd')]
-        old = snapshot(self.rows)
+    def __init__(self, pol=None, keep_social=None):
+        self.policy = pol
+        self.current_policy = copy.deepcopy(pol)
+        self.receipt = dict(RECEIPT)
+        self.observation_receipt = dict(RECEIPT)
+        social = keep_social if keep_social is not None else (
+            pol is None or pol['mode'] != 'website_only_no_connected_instagram_v2')
+        self.rows = [capture('website', RAW, '051a189e-5f91-44f4-bf89-a1549f7b9442')]
+        if social:
+            self.rows.append(capture('social', b'{"caption":"Our gym is open", "ownerId":"123"}',
+                                     'b4d4d171-fd4d-4393-8602-bc99960b05cd'))
+        old = snapshot(self.rows, self.policy, self.receipt)
         raw = canonical(old)
         b = dict(id='1bbcd64f-362d-4b6d-8bc5-b34f9b113d41', gym_id=GYM, echo_account_key='gym_exact',
                  version=1, capture_ids=[c['id'] for c in self.rows], snapshot_bytes=raw,
@@ -86,9 +113,11 @@ class Store:
         self.calls.append((name, copy.deepcopy(params)))
         if name == 'echo_source_brand_configuration':
             return copy.deepcopy(self.config)
+        if name == 'echo_source_brand_current_policy':
+            return copy.deepcopy(self.current_policy)
         if name == 'echo_source_brand_revalidate':
             positive = params['p_validation_report']['selected_facts_status'] == 'supported_uncontradicted'
-            raw = canonical(snapshot(self.rows)) if positive else self.config['bundle']['snapshot_bytes']
+            raw = canonical(snapshot(self.rows, self.policy, self.observation_receipt)) if positive else self.config['bundle']['snapshot_bytes']
             self.observation = dict(id=1, gym_id=GYM, bundle_id=self.config['bundle']['id'],
                 configuration_sha256=self.config['bundle']['content_sha256'], snapshot_bytes=raw,
                 content_sha256=sha(raw.encode()), validator_revision=params['p_validator_revision'],
@@ -465,4 +494,165 @@ def test_two_assistant_messages_are_ambiguous_and_held():
     model.response_mutate = mutate
     with pytest.raises(ObservationHold, match='semantic_assessor_unavailable_or_uncertain'):
         producer(store, model).observe(GYM)
+    assert not writes(store)
+
+
+def test_v2_website_only_verified_without_social_evidence():
+    store, model = Store(policy()), Model()
+    assert len(store.rows) == 1
+    result = producer(store, model).observe(GYM)
+    assert result['state'] == 'verified' and result['observation_id'] == 1
+    evidence = json.loads(model.calls[0][2]['input'][1]['content'])
+    assert len(evidence['captures']) == 1
+    assert any(name == 'echo_source_brand_current_policy' for name, _ in store.calls)
+    assert json.loads(store.config['bundle']['snapshot_bytes'])['source_policy'] == policy()
+
+
+def test_v2_website_only_connected_instagram_requires_social():
+    store, model = Store(policy()), Model()
+    store.current_policy = policy('website_and_social_v2', CONN)
+    with pytest.raises(ObservationHold, match='connected_instagram_requires_social'):
+        producer(store, model).observe(GYM)
+    assert not writes(store) and not model.calls
+
+
+def refreeze(store, pol, receipt='keep'):
+    raw = canonical(snapshot(store.rows, pol, store.receipt if receipt == 'keep' else receipt))
+    store.config['bundle']['snapshot_bytes'] = raw
+    store.config['bundle']['content_sha256'] = sha(raw.encode())
+    store.config['approval_receipt']['content_sha256'] = store.config['bundle']['content_sha256']
+
+
+@pytest.mark.parametrize('drift', [
+    lambda p: {**p, 'instagram_connection': dict(CONN, id='zernio-other-account')},
+    lambda p: {**p, 'instagram_connection': dict(CONN, platform_user_id='456')},
+    lambda p: {**p, 'instagram_connection': dict(CONN, handle='other')},
+    lambda p: policy(),  # connection removed: current mode flips to website-only
+    lambda p: policy('website_and_social_v2', CONN, identity=dict(PROVIDER_IDENTITY, profile_id='other')),
+    lambda p: policy('website_and_social_v2', CONN, identity=dict(PROVIDER_IDENTITY, mapping_revision='other')),
+    lambda p: policy('website_and_social_v2', CONN, identity=dict(PROVIDER_IDENTITY, provider='other')),
+    lambda p: policy('website_and_social_v2', CONN, identity=dict(PROVIDER_IDENTITY, source='other')),
+    lambda p: {**policy('website_and_social_v2', CONN), 'echo_account_key': 'changed'},
+    lambda p: {**policy('website_and_social_v2', CONN), 'gym_id': '11111111-2222-4333-8444-555555555555'},
+])
+def test_v2_both_source_stable_identity_drift_holds(drift):
+    store, model = Store(policy('website_and_social_v2', CONN)), Model()
+    store.current_policy = drift(policy('website_and_social_v2', CONN))
+    with pytest.raises(ObservationHold, match='stale_source_policy'):
+        producer(store, model).observe(GYM)
+    assert not writes(store) and not model.calls
+
+
+def test_v2_website_only_provider_identity_drift_holds():
+    store, model = Store(policy()), Model()
+    store.current_policy = policy(identity=dict(PROVIDER_IDENTITY, profile_id='other'))
+    with pytest.raises(ObservationHold, match='stale_source_policy'):
+        producer(store, model).observe(GYM)
+    assert not writes(store) and not model.calls
+
+
+def test_v2_missing_or_unusable_attestation_holds():
+    # The portal returns null for absent, stale (>15 min), partial, unavailable
+    # or unauthenticated provider evidence and for missing tenant mapping.
+    store, model = Store(policy()), Model()
+    store.current_policy = None
+    with pytest.raises(ObservationHold, match='provider_status_unavailable'):
+        producer(store, model).observe(GYM)
+    assert not writes(store) and not model.calls
+
+
+@pytest.mark.parametrize('bad', [
+    {'version': 2},
+    {**policy(), 'provider_identity': dict(PROVIDER_IDENTITY, profile_id='')},
+    policy('website_and_social_v2', dict(CONN, platform_user_id='not-numeric')),
+    policy('website_and_social_v2', None),  # mode inconsistent with connection
+    policy(conn=CONN),  # website-only mode carrying a connection
+])
+def test_v2_malformed_current_policy_holds(bad):
+    store, model = Store(policy('website_and_social_v2', CONN)), Model()
+    store.current_policy = bad
+    with pytest.raises(ObservationHold, match='stale_source_policy'):
+        producer(store, model).observe(GYM)
+    assert not writes(store) and not model.calls
+
+
+def test_v2_website_only_snapshot_with_social_capture_rejected():
+    store, model = Store(policy(), keep_social=True), Model()
+    with pytest.raises(ObservationHold, match='website_only_capture_set_required'):
+        producer(store, model).observe(GYM)
+    assert not writes(store) and not model.calls
+
+
+def test_v2_social_numeric_owner_mismatch_rejected():
+    store, model = Store(policy('website_and_social_v2', CONN)), Model()
+    store.rows[1]['provider_account_id'] = '999'
+    refreeze(store, policy('website_and_social_v2', CONN))
+    with pytest.raises(ObservationHold, match='provider_instagram_identity_mismatch'):
+        producer(store, model).observe(GYM)
+    assert not writes(store) and not model.calls
+
+
+def test_v2_website_only_still_requires_complete_website_mapping():
+    m = mapping()
+    incomplete = VerifiedMapping(m.gym_id, m.echo_account_key, m.mapping_revision,
+        m.mapping_evidence, m.website_response_urls + ('https://gym.example/pricing',),
+        (), None)
+    store, model = Store(policy()), Model()
+    with pytest.raises(ObservationHold, match='complete_mapping_evidence_required'):
+        producer(store, model, resolve=lambda gym: incomplete).observe(GYM)
+    assert not writes(store) and not model.calls
+
+
+def test_v2_both_source_verified_with_stable_connected_identity():
+    store, model = Store(policy('website_and_social_v2', CONN)), Model()
+    assert len(store.rows) == 2
+    result = producer(store, model).observe(GYM)
+    assert result['state'] == 'verified'
+    policy_calls = [p for name, p in store.calls if name == 'echo_source_brand_current_policy']
+    assert len(policy_calls) == 2  # checked before and after assessment
+    frozen = json.loads(store.config['bundle']['snapshot_bytes'])
+    assert frozen['provider_status_receipt'] == RECEIPT
+
+
+def test_v2_observation_binds_newest_provider_receipt():
+    store, model = Store(policy('website_and_social_v2', CONN)), Model()
+    store.observation_receipt = dict(RECEIPT, id=8, response_sha256='cd' * 32,
+        observed_at=(NOW + timedelta(minutes=1)).isoformat())
+    result = producer(store, model).observe(GYM)
+    assert result['state'] == 'verified'
+    observed = json.loads(store.observation['snapshot_bytes'])
+    assert observed['provider_status_receipt']['id'] == 8
+    assert observed['source_policy'] == json.loads(store.config['bundle']['snapshot_bytes'])['source_policy']
+
+
+def test_v2_malformed_frozen_policy_or_receipt_holds():
+    no_receipt = snapshot(Store(policy()).rows, policy())
+    del no_receipt['provider_status_receipt']
+    cases = [snapshot(Store(policy()).rows, {'version': 2}),
+             snapshot(Store(policy()).rows, policy(conn=dict(CONN, handle=''))),
+             no_receipt,
+             snapshot(Store(policy()).rows, policy(), dict(RECEIPT, response_sha256='bad')),
+             snapshot(Store(policy()).rows, policy(), dict(RECEIPT, observed_at='not-a-time'))]
+    for broken in cases:
+        store, model = Store(policy()), Model()
+        raw = canonical(broken)
+        store.config['bundle']['snapshot_bytes'] = raw
+        store.config['bundle']['content_sha256'] = sha(raw.encode())
+        store.config['approval_receipt']['content_sha256'] = store.config['bundle']['content_sha256']
+        with pytest.raises(ObservationHold):
+            producer(store, model).observe(GYM)
+        assert not writes(store) and not model.calls
+
+
+def test_v2_current_policy_race_during_assessment_holds():
+    store, model = Store(policy('website_and_social_v2', CONN)), Model()
+    original = model.__call__
+    def drift(url, headers, payload):
+        result = original(url, headers, payload)
+        store.current_policy['instagram_connection']['handle'] = 'changed'
+        return result
+    p = producer(store, model)
+    p.assessor = AstraSemanticAssessor(environ=ENV, transport=drift)
+    with pytest.raises(ObservationHold, match='configuration_or_mapping_changed_during_assessment'):
+        p.observe(GYM)
     assert not writes(store)

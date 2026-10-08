@@ -1,6 +1,7 @@
 """Runtime integration checks use offline provider/storage/DB fixtures only."""
 import copy
 import hashlib
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import json
 import sqlite3
@@ -13,7 +14,7 @@ from agent import generated_infographic_runtime as runtime
 from agent import generated_infographic_preparation as prep
 from agent import forward_media_guard as guard, forward_media_owner as owner
 from test_generated_infographic_preparation import case
-from test_generated_canonical_owner import active, derive, observe
+from test_generated_canonical_owner import active, derive, observe, frozen, identity
 
 REAL_RESERVE_GENERATED = guard.reserve_generated
 
@@ -547,3 +548,260 @@ def test_null_sql_readback_refuses_stale_python_feed_row(system):
     args['readback'] = lambda row_id: None
     with pytest.raises(runtime.RuntimeHold, match='generated_publish_binding_unavailable'):
         runtime.validate_publish_palette(row, **args)
+
+
+# --- Schema-v2 source_policy + provider attestation consumption ------------
+
+import base64
+
+V2_WEBSITE_ONLY = 'website_only_no_connected_instagram_v2'
+V2_BOTH = 'website_and_social_v2'
+IG_OWNER = '17841400000000001'
+
+
+def _v2_connection(**overrides):
+    connection = dict(id='zernio-account-1', platform_user_id=IG_OWNER, handle='verified_gym')
+    connection.update(overrides)
+    return connection
+
+
+def _v2_attestation(gym, base, observed_at, *, connected=False, **overrides):
+    if connected:
+        connection = _v2_connection()
+        instagram = dict(connected=True, account_id=connection['id'],
+            platform_user_id=connection['platform_user_id'], handle=connection['handle'])
+    else:
+        instagram = dict(connected=False, account_id=None, platform_user_id=None, handle=None)
+    attestation = dict(provider='zernio', source='zernio_authenticated_accounts',
+        gym_id=gym, echo_account_key=base, profile_id='profile-1', mapping_revision='map-v1',
+        lookup_status='complete', authenticated=True, observed_at=observed_at.isoformat(),
+        response_sha256='a'*64, instagram=instagram)
+    attestation.update(overrides)
+    return attestation
+
+
+def _v2_receipt(receipt_id, attestation):
+    return dict(id=receipt_id, observed_at=attestation['observed_at'],
+                response_sha256=attestation['response_sha256'])
+
+
+def _v2_snapshot(gym, base, now, mode, attestation, receipt_id=1, kinds=None):
+    text = 'Practice with guidance'
+    website = b'<style>#112233 #44AA77</style> ' + text.encode()
+    social = ('{"caption":"' + text + '"}').encode()
+    if kinds is None:
+        kinds = ['website'] if mode == V2_WEBSITE_ONLY else ['website', 'social']
+    captures = []
+    for kind in kinds:
+        data = website if kind == 'website' else social
+        captures.append(dict(id=identity(), gym_id=gym, echo_account_key=base,
+            source_kind=kind, source_url='https://gym.example.test/' if kind == 'website' else 'https://api.apify.com/v2/datasets/test/items',
+            source_locator=None if kind == 'website' else 'https://www.instagram.com/verified_gym/',
+            capture_provider='direct' if kind == 'website' else 'apify',
+            provider_response_id=None if kind == 'website' else 'dataset:test:1',
+            provider_account_id=None if kind == 'website' else IG_OWNER,
+            source_revision='capture-v1', mapping_revision='map-v1', mapping_evidence={'binding':'gym'},
+            fetched_at=now.isoformat(), bytes_sha256=hashlib.sha256(data).hexdigest(),
+            bytes_base64=base64.b64encode(data).decode()))
+    website_capture = captures[0]
+    instagram = attestation['instagram']
+    connection = (dict(id=instagram['account_id'], platform_user_id=instagram['platform_user_id'],
+                       handle=instagram['handle']) if instagram['connected'] else None)
+    return dict(schema_version=2, gym_id=gym, echo_account_key=base,
+        fact_policy='delegated_supported_facts', captures=captures,
+        palette=dict(capture_id=website_capture['id'], bytes_sha256=website_capture['bytes_sha256'],
+            primary='#112233',secondary='#44AA77',primary_byte_offset=7,secondary_byte_offset=15),
+        selected_facts=[dict(key='coaching',capture_id=website_capture['id'],
+            bytes_sha256=website_capture['bytes_sha256'], source_locator=website_capture['source_url'],
+            byte_offset=website.index(text.encode()),byte_length=len(text.encode()),text=text)],
+        source_policy=dict(version=2, mode=mode, gym_id=gym, echo_account_key=base,
+            provider_identity=dict(provider=attestation['provider'], source=attestation['source'],
+                profile_id=attestation['profile_id'], mapping_revision=attestation['mapping_revision']),
+            instagram_connection=connection),
+        provider_status_receipt=_v2_receipt(receipt_id, attestation))
+
+
+def _v2_active(mode, *, connected, now=None, current='same', kinds=None, gym=None, base='same-gym'):
+    now = now or datetime.now(timezone.utc)
+    gym = gym or identity()
+    frozen_at = now - timedelta(minutes=2)
+    attestation = _v2_attestation(gym, base, frozen_at, connected=connected)
+    raw, sha = frozen(_v2_snapshot(gym, base, frozen_at, mode, attestation, kinds=kinds))
+    bundle_id = identity()
+    bundle = dict(id=bundle_id,gym_id=gym,echo_account_key=base,schema_version=2,version=1,
+        capture_ids=[c['id'] for c in json.loads(raw)['captures']],snapshot_bytes=raw,content_sha256=sha,
+        source_revision='bundle-source-v1',palette_revision='bundle-palette-v1',created_at=frozen_at.isoformat())
+    receipt = dict(id=1,gym_id=gym,bundle_id=bundle_id,bundle_version=1,content_sha256=sha,
+        actor_clerk_user_id='user_authenticated',actor_authority='blake',action='approve',
+        purpose='echo_source_brand_configuration',request_id=identity(),created_at=frozen_at.isoformat())
+    observation = dict(id=1,gym_id=gym,bundle_id=bundle_id,configuration_sha256=sha,
+        snapshot_bytes=raw,content_sha256=sha,validator_revision='trusted-validator-v1',
+        validation_report=dict(selected_facts_status='supported_uncontradicted',identity_status='verified'),
+        created_at=frozen_at.isoformat())
+    result = dict(bundle=bundle,approval_receipt=receipt,observation=observation,
+        fact_approval_mode='delegated_policy',fact_validation='supported_uncontradicted')
+    if current == 'same':
+        result['provider_status'] = _v2_attestation(gym, base, now, connected=connected)
+    elif current is not None:
+        result['provider_status'] = current
+    return result
+
+
+def test_v2_both_source_consumes_with_fresh_connected_attestation():
+    authority = derive(_v2_active(V2_BOTH, connected=True))
+    assert authority['caption'] == 'Practice with guidance'
+    assert authority['copy_approved'] is False
+    runtime.validate_authority_pins(authority['authority_pins'], 'same-gym')
+
+
+def test_v2_website_only_consumes_with_fresh_affirmative_negative():
+    authority = derive(_v2_active(V2_WEBSITE_ONLY, connected=False))
+    assert authority['caption'] == 'Practice with guidance'
+    assert authority['copy_verified'] is True
+
+
+def test_v2_website_only_snapshot_with_social_capture_holds():
+    active = _v2_active(V2_WEBSITE_ONLY, connected=False, kinds=['website', 'social'])
+    with pytest.raises(runtime.RuntimeHold,
+                       match='generated_bundle_website_only_capture_set_required'):
+        derive(active)
+
+
+def test_v2_website_only_fresh_connected_attestation_requires_social():
+    active = _v2_active(V2_WEBSITE_ONLY, connected=False)
+    gym = active['bundle']['gym_id']
+    active['provider_status'] = _v2_attestation(gym, 'same-gym',
+        datetime.now(timezone.utc), connected=True)
+    with pytest.raises(runtime.RuntimeHold,
+                       match='generated_bundle_connected_instagram_requires_social'):
+        derive(active)
+
+
+@pytest.mark.parametrize('current', [
+    None, 'attacker-supplied',
+])
+def test_v2_missing_or_malformed_current_attestation_holds(current):
+    active = _v2_active(V2_BOTH, connected=True, current=current)
+    with pytest.raises(runtime.RuntimeHold,
+                       match='generated_bundle_provider_status_unavailable'):
+        derive(active)
+
+
+@pytest.mark.parametrize('overrides', [
+    dict(lookup_status='partial'),
+    dict(lookup_status='unavailable'),
+    dict(authenticated=False),
+    dict(response_sha256='not-a-hash'),
+    dict(profile_id=''),
+])
+def test_v2_partial_unavailable_or_unauthenticated_attestation_holds(overrides):
+    active = _v2_active(V2_BOTH, connected=True)
+    active['provider_status'] = _v2_attestation(active['bundle']['gym_id'], 'same-gym',
+        datetime.now(timezone.utc), connected=True, **overrides)
+    with pytest.raises(runtime.RuntimeHold,
+                       match='generated_bundle_provider_status_unavailable'):
+        derive(active)
+
+
+def test_v2_stale_attestation_older_than_fifteen_minutes_holds():
+    active = _v2_active(V2_BOTH, connected=True)
+    stale = datetime.now(timezone.utc) - timedelta(minutes=16)
+    active['provider_status'] = _v2_attestation(active['bundle']['gym_id'], 'same-gym',
+        stale, connected=True)
+    with pytest.raises(runtime.RuntimeHold,
+                       match='generated_bundle_provider_status_unavailable'):
+        derive(active)
+
+
+def test_v2_attestation_for_other_tenant_holds():
+    active = _v2_active(V2_BOTH, connected=True)
+    active['provider_status'] = _v2_attestation(identity(), 'same-gym',
+        datetime.now(timezone.utc), connected=True)
+    with pytest.raises(runtime.RuntimeHold,
+                       match='generated_bundle_provider_status_unavailable'):
+        derive(active)
+
+
+@pytest.mark.parametrize('overrides', [
+    dict(profile_id='profile-2'),
+    dict(mapping_revision='map-v2'),
+])
+def test_v2_provider_identity_drift_holds(overrides):
+    active = _v2_active(V2_BOTH, connected=True)
+    active['provider_status'] = _v2_attestation(active['bundle']['gym_id'], 'same-gym',
+        datetime.now(timezone.utc), connected=True, **overrides)
+    with pytest.raises(runtime.RuntimeHold, match='generated_bundle_stale_source_policy'):
+        derive(active)
+
+
+@pytest.mark.parametrize('overrides', [
+    dict(provider='other'),
+    dict(source='other_source'),
+])
+def test_v2_foreign_provider_attestation_holds(overrides):
+    active = _v2_active(V2_BOTH, connected=True)
+    active['provider_status'] = _v2_attestation(active['bundle']['gym_id'], 'same-gym',
+        datetime.now(timezone.utc), connected=True, **overrides)
+    with pytest.raises(runtime.RuntimeHold,
+                       match='generated_bundle_provider_status_unavailable'):
+        derive(active)
+
+
+@pytest.mark.parametrize('mutate', [
+    lambda ig: ig.update(account_id='zernio-account-2'),
+    lambda ig: ig.update(platform_user_id='17841400000000002'),
+    lambda ig: ig.update(handle='other_gym'),
+    lambda ig: ig.update(connected=False, account_id=None, platform_user_id=None, handle=None),
+])
+def test_v2_both_source_connection_drift_holds(mutate):
+    active = _v2_active(V2_BOTH, connected=True)
+    attestation = _v2_attestation(active['bundle']['gym_id'], 'same-gym',
+        datetime.now(timezone.utc), connected=True)
+    mutate(attestation['instagram'])
+    active['provider_status'] = attestation
+    with pytest.raises(runtime.RuntimeHold, match='generated_bundle_stale_source_policy'):
+        derive(active)
+
+
+def test_v2_social_capture_numeric_owner_mismatch_holds():
+    active = _v2_active(V2_BOTH, connected=True)
+    observe(active, lambda s: s['captures'][1].update(provider_account_id='17841400000000002'))
+    with pytest.raises(runtime.RuntimeHold,
+                       match='generated_bundle_provider_instagram_identity_mismatch'):
+        derive(active)
+
+
+def test_v2_observation_must_retain_frozen_policy_exactly():
+    active = _v2_active(V2_BOTH, connected=True)
+    observe(active, lambda s: s['source_policy']['instagram_connection'].update(handle='other_gym'))
+    with pytest.raises(runtime.RuntimeHold, match='generated_bundle_stale_source_policy'):
+        derive(active)
+
+
+def test_v2_website_only_frozen_with_connected_identity_is_invalid():
+    active = _v2_active(V2_BOTH, connected=True)
+    observe(active, lambda s: s['source_policy'].update(mode=V2_WEBSITE_ONLY))
+    with pytest.raises(runtime.RuntimeHold,
+                       match='generated_bundle_website_only_capture_set_required'):
+        derive(active)
+
+
+def test_v2_missing_provider_status_receipt_is_invalid():
+    active = _v2_active(V2_BOTH, connected=True)
+    observe(active, lambda s: s.pop('provider_status_receipt'))
+    with pytest.raises(runtime.RuntimeHold, match='generated_bundle_evidence_invalid'):
+        derive(active)
+
+
+def test_v1_consumption_ignores_unrelated_policy_readback(active):
+    active['provider_status'] = 'attacker-supplied'
+    assert derive(active)['caption'] == 'Practice with guidance'
+
+
+def test_v2_observation_binds_newest_receipt_without_new_approval():
+    active = _v2_active(V2_BOTH, connected=True)
+    newer = _v2_attestation(active['bundle']['gym_id'], 'same-gym',
+        datetime.now(timezone.utc), connected=True, response_sha256='b'*64)
+    observe(active, lambda s: s.update(provider_status_receipt=_v2_receipt(2, newer)))
+    authority = derive(active)
+    assert authority['authority_pins']['configuration_sha256'] == active['bundle']['content_sha256']

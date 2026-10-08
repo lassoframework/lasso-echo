@@ -72,13 +72,74 @@ def _span(data, start, length):
     return data[start:start + length].decode('utf-8')
 
 
+_POLICY_MODES = ('website_only_no_connected_instagram_v2', 'website_and_social_v2')
+_PROVIDER = ('zernio', 'zernio_authenticated_accounts')
+
+
+def _policy(value, gym, key):
+    """Frozen schema-v2 source_policy shape from the portal contract.
+
+    Stable identity excludes heartbeat timestamps and response hashes; those
+    live in the separately bound provider_status_receipt.
+    """
+    if (not isinstance(value, dict)
+            or set(value) != {'version', 'mode', 'gym_id', 'echo_account_key',
+                              'provider_identity', 'instagram_connection'}
+            or value['version'] != 2 or value['gym_id'] != gym
+            or value['echo_account_key'] != key or value['mode'] not in _POLICY_MODES):
+        raise ValueError()
+    identity = value['provider_identity']
+    if (not isinstance(identity, dict)
+            or set(identity) != {'provider', 'source', 'profile_id', 'mapping_revision'}
+            or (identity['provider'], identity['source']) != _PROVIDER
+            or not isinstance(identity['profile_id'], str) or not identity['profile_id']
+            or not isinstance(identity['mapping_revision'], str) or not identity['mapping_revision']):
+        raise ValueError()
+    conn = value['instagram_connection']
+    if conn is not None:
+        # id is the provider's internal account id; platform_user_id is the
+        # numeric Instagram owner identity, distinct from the internal id.
+        if (not isinstance(conn, dict) or set(conn) != {'id', 'platform_user_id', 'handle'}
+                or not isinstance(conn['id'], str) or not conn['id']
+                or not isinstance(conn['platform_user_id'], str)
+                or not conn['platform_user_id'].isdigit()
+                or not isinstance(conn['handle'], str) or not conn['handle']):
+            raise ValueError()
+    # The mode is derived from connection identity; an inconsistent frozen or
+    # current policy is malformed evidence and fails closed.
+    if (value['mode'] == 'website_and_social_v2') != (conn is not None):
+        raise ValueError()
+    return value
+
+
+def _receipt(value):
+    """provider_status_receipt={id, observed_at, response_sha256} binding."""
+    if (not isinstance(value, dict) or set(value) != {'id', 'observed_at', 'response_sha256'}
+            or type(value['id']) is not int or value['id'] < 1
+            or not isinstance(value['response_sha256'], str)
+            or not re.fullmatch(r'[0-9a-f]{64}', value['response_sha256'])):
+        raise ValueError()
+    _stamp(value['observed_at'])
+    return value
+
+
 def _snapshot(raw, digest, gym, key):
     if type(raw) is not str or _hash(raw.encode('utf-8')) != digest:
         raise ValueError()
     s = json.loads(raw)
-    if (s['schema_version'] != 1 or s['gym_id'] != gym
+    if s['schema_version'] == 1:
+        if 'source_policy' in s or 'provider_status_receipt' in s:
+            raise ValueError()
+        policy, minimum = None, 2
+    elif s['schema_version'] == 2:
+        policy = _policy(s.get('source_policy'), gym, key)
+        _receipt(s.get('provider_status_receipt'))
+        minimum = 1 if policy['mode'] == 'website_only_no_connected_instagram_v2' else 2
+    else:
+        raise ValueError()
+    if (s['gym_id'] != gym
             or s['echo_account_key'] != key or s['fact_policy'] != 'delegated_supported_facts'
-            or not 2 <= len(s['captures']) <= 12 or not 1 <= len(s['selected_facts']) <= 30):
+            or not minimum <= len(s['captures']) <= 12 or not 1 <= len(s['selected_facts']) <= 30):
         raise ValueError()
     captures = {}
     locations = set()
@@ -91,6 +152,20 @@ def _snapshot(raw, digest, gym, key):
             raise ValueError()
         captures[c['id']] = c, data
         locations.add(_location(c))
+    if policy is not None:
+        kinds = {c['source_kind'] for c in s['captures']}
+        if 'social' in kinds and policy['mode'] == 'website_only_no_connected_instagram_v2':
+            _hold('website_only_capture_set_required')
+        if policy['mode'] == 'website_and_social_v2' and 'social' not in kinds:
+            raise ValueError()
+        if policy['mode'] == 'website_only_no_connected_instagram_v2' and 'website' not in kinds:
+            raise ValueError()
+        # A connected v2 identity binds the numeric Instagram owner; every
+        # social capture must name exactly that numeric identity.
+        conn = policy['instagram_connection']
+        if conn is not None and any(c['source_kind'] == 'social'
+                and c['provider_account_id'] != conn['platform_user_id'] for c in s['captures']):
+            _hold('provider_instagram_identity_mismatch')
     keys = set()
     for f in s['selected_facts']:
         c, data = captures[f['capture_id']]
@@ -150,7 +225,7 @@ class SourceObservationStore:
 
     def rpc(self, name, params):
         if name not in ('echo_source_brand_configuration', 'echo_source_brand_revalidate',
-                        'echo_source_brand_active'):
+                        'echo_source_brand_active', 'echo_source_brand_current_policy'):
             _hold('observation_rpc_not_allowed')
         return self._request('post', 'rpc/' + name, json=params)
 
@@ -360,11 +435,39 @@ class TrustedSourceObservationProducer:
             old = _snapshot(b['snapshot_bytes'], b['content_sha256'], gym_id, mapping.echo_account_key)
             if set(b['capture_ids']) != {c['id'] for c in old['captures']}:
                 raise ValueError()
+            policy = old.get('source_policy')
+            current_policy = None
+            if policy is not None:
+                # A frozen v2 policy never proves current identity: only an
+                # authenticated CURRENT policy readback does. The portal returns
+                # null unless the newest attestation is a fresh (<=15 min),
+                # authenticated, complete provider listing for the exact current
+                # Echo key, so missing/stale/partial/unavailable proof and
+                # missing tenant mapping all arrive here as null and hold.
+                current_policy = self.store.rpc('echo_source_brand_current_policy', {'p_gym': gym_id})
+                if current_policy is None:
+                    _hold('provider_status_unavailable')
+                try:
+                    current_policy = _policy(current_policy, gym_id, mapping.echo_account_key)
+                except Exception:
+                    _hold('stale_source_policy')
+                if (policy['mode'] == 'website_only_no_connected_instagram_v2'
+                        and current_policy['instagram_connection'] is not None):
+                    _hold('connected_instagram_requires_social')
+                # Stable provider/profile/Instagram identity and Echo mapping
+                # must match the frozen policy exactly; revalidation cannot
+                # waive any drift. Heartbeat/receipt fields are not compared.
+                if current_policy != policy:
+                    _hold('stale_source_policy')
             # The full approved mapping must be represented: incomplete site/social
             # evidence is not silently called complete by the semantic assessor.
+            # Website-only v2 approves without social evidence by policy, so the
+            # social locator set is not part of that completeness check.
+            website_only = policy is not None and policy['mode'] == 'website_only_no_connected_instagram_v2'
             if ({c['source_url'] for c in old['captures'] if c['source_kind'] != 'social'}
                     != set(mapping.website_response_urls)
-                    or {c['source_locator'] for c in old['captures'] if c['source_kind'] == 'social'}
+                    or not website_only
+                    and {c['source_locator'] for c in old['captures'] if c['source_kind'] == 'social'}
                     != set(mapping.social_locators)):
                 _hold('complete_mapping_evidence_required')
             current, by_location = [], {}
@@ -428,7 +531,9 @@ class TrustedSourceObservationProducer:
                 raise ValueError()
             if (_json(mapping.__dict__) != frozen_mapping
                     or _json(self.resolve(gym_id).__dict__) != frozen_mapping
-                    or self.store.rpc('echo_source_brand_configuration', {'p_gym': gym_id}) != config):
+                    or self.store.rpc('echo_source_brand_configuration', {'p_gym': gym_id}) != config
+                    or (policy is not None
+                        and self.store.rpc('echo_source_brand_current_policy', {'p_gym': gym_id}) != current_policy)):
                 _hold('configuration_or_mapping_changed_during_assessment')
             for c in current:
                 if self.store.latest(gym_id, c) != c:
@@ -459,6 +564,7 @@ class TrustedSourceObservationProducer:
                 'primary': old['palette']['primary'], 'secondary': old['palette']['secondary'],
                 'primary_byte_offset': offsets[0], 'secondary_byte_offset': offsets[1]}
             if (observed_facts != expected_facts or snapshot['palette'] != expected_palette
+                    or snapshot.get('source_policy') != policy
                     or sorted((c['id'], c['bytes_sha256']) for c in snapshot['captures']) != sorted((c['id'], c['bytes_sha256']) for c in current)
                     or active is None or active['bundle'] != b or active['approval_receipt'] != r
                     or active['observation'] != observation

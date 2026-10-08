@@ -11,8 +11,10 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import sqlite3
 import uuid
+from datetime import timedelta
 
 from . import generated_infographic_preparation as prep
 
@@ -85,17 +87,145 @@ def _json_exact(raw, sha):
     return json.loads(raw, object_pairs_hook=unique)
 
 
+SNAPSHOT_V1_KEYS = frozenset(('schema_version', 'gym_id', 'echo_account_key',
+    'captures', 'palette', 'fact_policy', 'selected_facts'))
+SNAPSHOT_V2_KEYS = SNAPSHOT_V1_KEYS | {'source_policy', 'provider_status_receipt'}
+POLICY_MODES = ('website_only_no_connected_instagram_v2', 'website_and_social_v2')
+PROVIDER_IDENTITY = ('zernio', 'zernio_authenticated_accounts')
+PROVIDER_ATTESTATION_MAX_AGE = timedelta(minutes=15)
+
+
+def _numeric_text(value):
+    # Numeric Instagram owner identity; distinct from the provider account id.
+    if type(value) is bool:
+        raise ValueError()
+    text = str(value) if type(value) is int else value
+    if not isinstance(text, str) or not re.fullmatch(r'[0-9]+', text):
+        raise ValueError()
+    return text
+
+
+def _connection_identity(connection):
+    # Frozen Instagram identity {id:provider account_id, platform_user_id, handle}.
+    if connection is None:
+        return None
+    if (not isinstance(connection, dict)
+            or set(connection) != {'id', 'platform_user_id', 'handle'}
+            or not isinstance(connection['id'], str) or not connection['id'].strip()
+            or not isinstance(connection['handle'], str) or not connection['handle'].strip()):
+        raise ValueError()
+    return (connection['id'], _numeric_text(connection['platform_user_id']),
+            connection['handle'])
+
+
+def _source_policy(policy, gym, base):
+    """Strict frozen schema-v2 source policy shape pinned to this gym/key."""
+    if (not isinstance(policy, dict)
+            or set(policy) != {'version', 'mode', 'gym_id', 'echo_account_key',
+                               'provider_identity', 'instagram_connection'}
+            or type(policy['version']) is not int or policy['version'] != 2
+            or policy['mode'] not in POLICY_MODES
+            or policy['gym_id'] != gym or policy['echo_account_key'] != base):
+        raise ValueError()
+    identity = policy['provider_identity']
+    if (not isinstance(identity, dict)
+            or set(identity) != {'provider', 'source', 'profile_id', 'mapping_revision'}
+            or (identity['provider'], identity['source']) != PROVIDER_IDENTITY
+            or any(not isinstance(identity[k], str) or not identity[k].strip()
+                   for k in ('profile_id', 'mapping_revision'))):
+        raise ValueError()
+    return dict(mode=policy['mode'],
+                provider=(identity['provider'], identity['source'],
+                          identity['profile_id'], identity['mapping_revision']),
+                connection=_connection_identity(policy['instagram_connection']))
+
+
+def _provider_status_receipt(receipt):
+    # Immutable gym/key-scoped receipt bound into each snapshot/observation.
+    if (not isinstance(receipt, dict)
+            or set(receipt) != {'id', 'observed_at', 'response_sha256'}
+            or not isinstance(receipt['response_sha256'], str)
+            or not re.fullmatch(r'[0-9a-f]{64}', receipt['response_sha256'])):
+        raise ValueError()
+    if type(receipt['id']) is not int and not isinstance(receipt['id'], str):
+        raise ValueError()
+    if type(receipt['id']) is str:
+        _numeric_text(receipt['id'])
+    elif receipt['id'] < 1:
+        raise ValueError()
+    _stamp(receipt['observed_at'])
+    return receipt
+
+
+def _provider_current(attestation, gym, base, now):
+    """Trusted CURRENT portal attestation readback; never the frozen snapshot.
+
+    Only a fresh complete authenticated lookup counts. Missing, malformed,
+    stale, partial, unavailable or unauthenticated evidence holds closed.
+    """
+    try:
+        if (not isinstance(attestation, dict)
+                or set(attestation) != {'provider', 'source', 'gym_id', 'echo_account_key',
+                        'profile_id', 'mapping_revision', 'lookup_status', 'authenticated',
+                        'observed_at', 'response_sha256', 'instagram'}
+                or (attestation['provider'], attestation['source']) != PROVIDER_IDENTITY
+                or attestation['gym_id'] != gym or attestation['echo_account_key'] != base
+                or not isinstance(attestation['mapping_revision'], str)
+                or not attestation['mapping_revision'].strip()
+                or attestation['lookup_status'] not in ('complete', 'partial', 'unavailable')
+                or type(attestation['authenticated']) is not bool):
+            raise ValueError()
+        observed = _stamp(attestation['observed_at'])
+        instagram = attestation['instagram']
+        complete = (attestation['lookup_status'] == 'complete'
+                and attestation['authenticated'] is True
+                and isinstance(attestation['profile_id'], str) and attestation['profile_id'].strip()
+                and isinstance(attestation['response_sha256'], str)
+                and re.fullmatch(r'[0-9a-f]{64}', attestation['response_sha256'])
+                and isinstance(instagram, dict)
+                and set(instagram) == {'connected', 'account_id', 'platform_user_id', 'handle'}
+                and type(instagram['connected']) is bool)
+        if not complete:
+            raise ValueError()
+        if instagram['connected']:
+            connection = _connection_identity(dict(
+                id=instagram['account_id'], platform_user_id=instagram['platform_user_id'],
+                handle=instagram['handle']))
+        elif any(instagram[k] is not None for k in ('account_id', 'platform_user_id', 'handle')):
+            raise ValueError()
+        else:
+            connection = None
+    except (ValueError, KeyError, TypeError, AttributeError):
+        raise RuntimeHold('generated_bundle_provider_status_unavailable') from None
+    if not now - PROVIDER_ATTESTATION_MAX_AGE <= observed <= now:
+        raise RuntimeHold('generated_bundle_provider_status_unavailable')
+    return dict(provider=(attestation['provider'], attestation['source'],
+                          attestation['profile_id'], attestation['mapping_revision']),
+                connection=connection)
+
+
 def _bundle_snapshot(raw, sha, gym, base, *, fresh, now):
     import base64
     from datetime import timedelta
     snapshot = _json_exact(raw, sha)
-    if (not isinstance(snapshot, dict) or set(snapshot) != {'schema_version', 'gym_id',
-            'echo_account_key', 'captures', 'palette', 'fact_policy', 'selected_facts'}
-            or type(snapshot['schema_version']) is not int or snapshot['schema_version'] != 1
+    if not isinstance(snapshot, dict):
+        raise ValueError()
+    keys = set(snapshot)
+    if keys == SNAPSHOT_V1_KEYS:
+        schema = 1
+    elif keys == SNAPSHOT_V2_KEYS:
+        schema = 2
+    else:
+        raise ValueError()
+    policy = None
+    if schema == 2:
+        policy = _source_policy(snapshot['source_policy'], gym, base)
+        _provider_status_receipt(snapshot['provider_status_receipt'])
+    if (type(snapshot['schema_version']) is not int or snapshot['schema_version'] != schema
             or snapshot['gym_id'] != gym or snapshot['echo_account_key'] != base
             or snapshot['fact_policy'] != 'delegated_supported_facts'
             or not isinstance(snapshot['captures'], list)
-            or not 2 <= len(snapshot['captures']) <= 12):
+            or not 1 <= len(snapshot['captures']) <= 12):
         raise ValueError()
     captures, seen, kinds = {}, set(), set()
     for capture in snapshot['captures']:
@@ -134,8 +264,27 @@ def _bundle_snapshot(raw, sha, gym, base, *, fresh, now):
         else:
             raise ValueError()
         captures[identity] = (capture, data)
-    if 'website' not in kinds or 'social' not in kinds:
+    if 'website' not in kinds:
         raise ValueError()
+    if schema == 1 or policy['mode'] == 'website_and_social_v2':
+        # v1 and both-source v2 require website and social evidence. A
+        # both-source policy is frozen only with a connected identity whose
+        # numeric owner matches every social capture exactly.
+        if 'social' not in kinds:
+            raise ValueError()
+        if schema == 2:
+            if policy['connection'] is None:
+                raise ValueError()
+            for capture, data in captures.values():
+                if (capture['source_kind'] == 'social' and
+                        capture['provider_account_id'] != policy['connection'][1]):
+                    raise RuntimeHold('generated_bundle_provider_instagram_identity_mismatch')
+    else:
+        # Website-only v2: never social captures, never a connected identity.
+        if 'social' in kinds:
+            raise RuntimeHold('generated_bundle_website_only_capture_set_required')
+        if policy['connection'] is not None:
+            raise ValueError()
     palette = snapshot['palette']
     capture, data = captures[palette['capture_id']]
     if capture['source_kind'] not in ('website', 'website_asset') or palette['bytes_sha256'] != capture['bytes_sha256']:
@@ -165,7 +314,7 @@ def _bundle_snapshot(raw, sha, gym, base, *, fresh, now):
                 or data[start:start+length].decode('utf-8') != fact['text']
                 or not fact['text'].strip()):
             raise ValueError()
-    return snapshot
+    return snapshot, policy
 
 
 def validate_authority_pins(pins, base):
@@ -207,7 +356,7 @@ def delegated_copy(active, base, *, caption=None, local_date=None, now=None):
         gym = _uuid_text(bundle['gym_id'])
         bundle_id = _uuid_text(bundle['id'])
         if (bundle['echo_account_key'] != base or type(bundle['schema_version']) is not int
-                or bundle['schema_version'] != 1 or type(bundle['version']) is not int or bundle['version'] < 1
+                or bundle['schema_version'] not in (1, 2) or type(bundle['version']) is not int or bundle['version'] < 1
                 or any(receipt.get(k) != v for k, v in dict(gym_id=gym, bundle_id=bundle_id,
                     bundle_version=bundle['version'], content_sha256=bundle['content_sha256'],
                     purpose='echo_source_brand_configuration', action='approve').items())
@@ -224,12 +373,31 @@ def delegated_copy(active, base, *, caption=None, local_date=None, now=None):
                 or observation['validation_report'].get('identity_status') != 'verified'
                 or not _stamp(receipt['created_at']) <= _stamp(observation['created_at']) <= now):
             raise ValueError()
-        configuration = _bundle_snapshot(bundle['snapshot_bytes'], bundle['content_sha256'], gym, base, fresh=False, now=now)
+        configuration, config_policy = _bundle_snapshot(
+            bundle['snapshot_bytes'], bundle['content_sha256'], gym, base, fresh=False, now=now)
+        if bundle['schema_version'] != configuration['schema_version']:
+            raise ValueError()
         ids = bundle['capture_ids']
         if (not isinstance(ids, list) or len(set(ids)) != len(ids)
                 or set(ids) != {capture['id'] for capture in configuration['captures']}):
             raise ValueError()
-        current = _bundle_snapshot(observation['snapshot_bytes'], observation['content_sha256'], gym, base, fresh=True, now=now)
+        current, current_policy = _bundle_snapshot(
+            observation['snapshot_bytes'], observation['content_sha256'], gym, base, fresh=True, now=now)
+        if config_policy is not None:
+            # Schema v2: every observation retains the frozen policy exactly.
+            # The frozen snapshot alone never proves current state; only a
+            # fresh complete authenticated CURRENT provider attestation from
+            # the portal readback can, and drift can never be waived here.
+            if current_policy != config_policy:
+                raise RuntimeHold('generated_bundle_stale_source_policy')
+            current_readback = _provider_current(active.get('provider_status'), gym, base, now)
+            if current_readback['provider'] != config_policy['provider']:
+                raise RuntimeHold('generated_bundle_stale_source_policy')
+            if (config_policy['mode'] == 'website_only_no_connected_instagram_v2'
+                    and current_readback['connection'] is not None):
+                raise RuntimeHold('generated_bundle_connected_instagram_requires_social')
+            if current_readback['connection'] != config_policy['connection']:
+                raise RuntimeHold('generated_bundle_stale_source_policy')
         def fact_identity(snap):
             return sorted((f['key'], f['text'], f['source_locator']) for f in snap['selected_facts'])
         if (fact_identity(configuration) != fact_identity(current)
