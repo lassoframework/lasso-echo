@@ -1,0 +1,14 @@
+{
+  "$schema": "https://railway.app/railway.schema.json",
+  "_comment": "TEMPLATE ONLY — NOT DEPLOYED. Additive cron lane mirroring railway.source-capture.json for agent.source_brand_observation_job. Everything defaults OFF: before any use, an operator must explicitly set ECHO_SOURCE_OBSERVATION_JOB_ENABLED=false placeholder to 'true', provide ECHO_SOURCE_OBSERVATION_JOB_ALLOWLIST (exact canonical gym UUIDs), ECHO_SOURCE_OBSERVATION_ENABLED, and all startup gates (see agent/source_brand_startup.py). No production values are provisioned here.",
+  "build": { "builder": "NIXPACKS" },
+  "deploy": {
+    "startCommand": "/opt/venv/bin/python -m agent.source_brand_observation_job",
+    "cronSchedule": "30 6 * * *",
+    "restartPolicyType": "ON_FAILURE"
+  },
+  "variables": {
+    "ECHO_SOURCE_OBSERVATION_JOB_ENABLED": "false",
+    "ECHO_SOURCE_OBSERVATION_ENABLED": "false"
+  }
+}
