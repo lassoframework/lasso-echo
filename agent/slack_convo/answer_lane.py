@@ -131,8 +131,9 @@ _HOLD_REPEAT_REASONS = frozenset({"cross_date_media_repeat_needs_new_visual",
 _HOLD_REPEAT_PREFIXES = ("cross_gym_", "cross-day ", "cross_day_")
 # gym_media_selector.SCENE_REVIEW_HOLD: rows routed to manual scene review, never auto-approved.
 _HOLD_HUMAN_REVIEW_REASONS = frozenset({"scene_review_hold"})
-_HOLD_REPEAT_TEXT = ("needs a different photo or video, because the same visual can not "
-                     "run on two different days")
+# No "because ..." clause: this text also covers cross_gym_* source holds (e.g. legacy
+# igfill media), where "the same visual ran on two days" would be a false cause.
+_HOLD_REPEAT_TEXT = "needs a different photo or video"
 _HOLD_CAPTION_CHANGED_TEXT = ("needs a new photo or video to match its updated caption")
 _HOLD_PAIRED_STORY_TEXT = ("is a Story waiting for the photo or video of the feed post it "
                            "goes with")
