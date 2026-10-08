@@ -153,12 +153,13 @@ def test_owner_facts_block_before_paid_generation(system, field, value, reason):
     (dict(enabled=False), 'generated_local_census_unavailable'),
     (dict(observed_at=datetime.now(timezone.utc) - timedelta(minutes=11)),
      'generated_local_census_stale'),
-    (dict(observed_at=datetime.now(timezone.utc) + timedelta(minutes=1)),
+    (dict(observed_at=lambda: datetime.now(timezone.utc) + timedelta(minutes=1)),
      'generated_local_census_stale'),
     (dict(observed_at='not-a-timestamp'), 'generated_local_census_stale'),
 ])
 def test_latest_local_census_governs_before_paid_generation(system, change, reason):
     """A positive/incomplete/stale/missing newest census holds pre-generation."""
+    change = {key: value() if callable(value) else value for key, value in change.items()}
     system.census.update(change)
     result = run(system)
     assert result['held'] and result['reason'] == reason
