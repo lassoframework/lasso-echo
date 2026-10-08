@@ -18,7 +18,7 @@ sys.path.insert(0,str(ROOT))
 from agent import forward_media_owner as owner
 from agent.forward_media_source_history import SourceHistoryStore
 from agent.forward_media_source_verifier import verify_source
-from agent.forward_media_photo_certificate import IndependentPhotoAuditor,PhotoCertificateHold,digest
+from agent.forward_media_photo_certificate import IndependentPhotoAuditor,PhotoCertificateHold,digest,verify,canonical
 from tests.test_forward_media_source_verifier import Drive,Hosted,FILE,FOLDER,DATA,URL
 from tests.test_forward_media_photo_certificate import fixtures
 from tests.test_forward_media_owner_two_phase_pg import png
@@ -58,6 +58,7 @@ def main():
                          'DRAFT_fixer_forward_media_source_history_20261007.sql',
                          'DRAFT_fixer_forward_media_photo_certificate_20261007.sql'):
                 sql((ROOT/'migrations'/name).read_text())
+            sql((ROOT/'migrations'/'DRAFT_fixer_photo_historical_clearance_20261008.sql').read_text())
             sql(f'create role {OWNER} login; grant fixer_forward_media_owner_20261006 to {OWNER};'
                 f'create role {AUDITOR} login; grant fixer_forward_media_photo_auditor_20261007 to {AUDITOR};')
             for name in list(os.environ):
@@ -103,8 +104,17 @@ def main():
             sql('insert into fixer_forward_media_photo_baseline_20261007(baseline_id,policy_id,scope_complete,rows_json,historical_manifest_ref,declared_full_fleet_row_count) values(%s,%s,true,%s::jsonb,%s,1)',
                 (baseline,key['policy_id'],json.dumps([row]),'SYNTHETIC full preserved corpus'))
             sql('update fixer_forward_media_photo_state_20261007 set baseline_id=%s where singleton',(baseline,))
-            snapshot=sql('select fixer_forward_media_photo_snapshot_20261007()')[0][0]
+            snapshot=sql('select fixer_forward_media_photo_snapshot_exclusion_20261008()')[0][0]
             assert snapshot['rows']==[row],snapshot['rows']
+            assert snapshot['excluded_rows_count']==0
+            assert snapshot['excluded_rows_digest']==sql("select 'sha256:'||encode(sha256(convert_to('[]'::jsonb::text,'UTF8')),'hex')")[0][0]
+            old_snapshot=sql('select fixer_forward_media_photo_snapshot_20261007()')[0][0]
+            old_packet,_,_,_=fixtures(candidate=candidate,snapshot=old_snapshot,private=private)
+            try:
+                verify(old_packet,key,old_snapshot)
+                raise AssertionError('old snapshot accepted')
+            except PhotoCertificateHold as exc:
+                assert str(exc)=='certificate_exclusions_unaccounted'
             packet,_,_,_=fixtures(candidate=candidate,snapshot=snapshot,private=private)
             auditor_conn=psycopg.connect(dsn(AUDITOR))
             client=IndependentPhotoAuditor(auditor_conn,AUDITOR)
@@ -141,14 +151,14 @@ def main():
             except PhotoCertificateHold as exc:
                 assert str(exc)=='certificate_corpus_stale_or_unapproved'
                 source_conn.rollback()
-            replacement,_,_,_=fixtures(candidate=candidate,snapshot=sql('select fixer_forward_media_photo_snapshot_20261007()')[0][0],private=private)
+            replacement,_,_,_=fixtures(candidate=candidate,snapshot=sql('select fixer_forward_media_photo_snapshot_exclusion_20261008()')[0][0],private=private)
             client.submit(replacement); auditor_conn.commit()
             assert sql('select count(*) from fixer_forward_media_photo_certificate_20261007')[0][0]==2
 
             # Missing live historical row becomes an unresolved corpus member.
             new_history=str(uuid.uuid4())
             sql("insert into content_calendar(id,gym_id,status,image_url) values(%s,'other','published','https://media.example.test/unresolved.png')",(new_history,))
-            changed=sql('select fixer_forward_media_photo_snapshot_20261007()')[0][0]
+            changed=sql('select fixer_forward_media_photo_snapshot_exclusion_20261008()')[0][0]
             assert any(r['resolved'] is False for r in changed['rows'])
             unresolved,_,_,_=fixtures(candidate=candidate,snapshot=changed,private=private)
             try:
@@ -157,6 +167,32 @@ def main():
                 assert str(exc)=='certificate_history_unresolved_or_matching'
                 auditor_conn.rollback()
             sql('delete from content_calendar where id=%s',(new_history,))
+
+            # A reviewed video exclusion is outside rows, yet must hold v1.
+            exclusion_policy='synthetic-video-exclusion-policy'
+            sql("insert into fixer_forward_media_photo_policy_20261007 values(%s,true,'complete_fleet_still_photo_history',%s,%s,%s)",
+                (exclusion_policy,'SYNTHETIC video scope ruling','SYNTHETIC reconciliation','SYNTHETIC administrator'))
+            exclusion_baseline=str(uuid.uuid4())
+            excluded={'history_key':'synthetic-excluded-video','media_kind':'reviewed_video_scope_exclusion',
+                      'published_binding_ref':'SYNTHETIC video publication'}
+            sql('insert into fixer_forward_media_photo_baseline_20261007(baseline_id,policy_id,scope_complete,rows_json,historical_manifest_ref,excluded_video_manifest_ref,excluded_rows_json,declared_full_fleet_row_count) values(%s,%s,true,%s::jsonb,%s,%s,%s::jsonb,2)',
+                (exclusion_baseline,exclusion_policy,json.dumps([row]),'SYNTHETIC full corpus','SYNTHETIC video manifest',json.dumps([excluded])))
+            sql('update fixer_forward_media_photo_state_20261007 set baseline_id=%s where singleton',(exclusion_baseline,))
+            excluded_snapshot=sql('select fixer_forward_media_photo_snapshot_exclusion_20261008()')[0][0]
+            assert excluded_snapshot['scope_complete'] is True
+            assert excluded_snapshot['rows']==[row]
+            assert excluded_snapshot['excluded_rows_count']==1
+            assert excluded_snapshot['excluded_rows_digest']==sql("select 'sha256:'||encode(sha256(convert_to(excluded_rows_json::text,'UTF8')),'hex') from fixer_forward_media_photo_baseline_20261007 where baseline_id=%s",(exclusion_baseline,))[0][0]
+            excluded_packet,excluded_key,_,_=fixtures(candidate=candidate,snapshot=excluded_snapshot,private=private)
+            excluded_key['policy_id']=exclusion_policy
+            excluded_packet['payload']['policy_id']=exclusion_policy
+            excluded_packet['signature_hex']=private.sign(canonical(excluded_packet['payload']).encode()).hex()
+            try:
+                verify(excluded_packet,excluded_key,excluded_snapshot)
+                raise AssertionError('excluded video outside dispositions accepted')
+            except PhotoCertificateHold as exc:
+                assert str(exc)=='certificate_exclusions_unaccounted'
+            sql('update fixer_forward_media_photo_state_20261007 set baseline_id=%s where singleton',(baseline,))
 
             # No publisher/source owner can write certificates or approved keys.
             for role in ('service_role','anon','authenticated','fixer_forward_media_owner_20261006'):

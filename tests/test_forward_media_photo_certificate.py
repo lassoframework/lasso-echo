@@ -15,6 +15,7 @@ def fixtures(candidate=None,snapshot=None,private=None):
     snapshot=snapshot or {'baseline_id':str(uuid.uuid4()),'policy_id':key['policy_id'],
         'policy_approved':True,'scope_complete':True,'generation':0,
         'spine_digest':digest('synthetic complete corpus'),
+        'excluded_rows_count':0,'excluded_rows_digest':digest([]),
         'rows':[{'history_key':'synthetic-history','resolved':True,'media_kind':'still_photo',
             'visual_sha256':digest('synthetic inspected historical photo'),
             'published_binding_ref':'SYNTHETIC publication receipt'}]}
@@ -45,6 +46,16 @@ class CertificateTests(unittest.TestCase):
         v=verify(packet,key,snapshot,packet['payload']['candidate'])
         self.assertTrue(v.receipt_ref.startswith('photo-audit:sha256:'))
         self.assertEqual(v.payload,packet['payload'])
+
+    def test_old_or_nonzero_exclusion_evidence_holds(self):
+        for fields in ({}, {'excluded_rows_count':1,'excluded_rows_digest':digest([])},
+                {'excluded_rows_count':False,'excluded_rows_digest':digest([])},
+                {'excluded_rows_count':0,'excluded_rows_digest':digest('wrong')}):
+            packet,key,snapshot,_=fixtures()
+            snapshot.pop('excluded_rows_count'); snapshot.pop('excluded_rows_digest')
+            snapshot.update(fields)
+            with self.assertRaisesRegex(PhotoCertificateHold,'certificate_exclusions_unaccounted'):
+                verify(packet,key,snapshot)
 
     def test_signature_tamper_and_wrong_approved_public_key_reject(self):
         packet,key,snapshot,_=fixtures()

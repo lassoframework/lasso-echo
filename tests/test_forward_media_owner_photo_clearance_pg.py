@@ -62,6 +62,7 @@ def main():
     sql('update media_asset set content_hash=%s,review_content_hash=%s,moderation_json=%s::jsonb where id=%s',(md5,md5,json.dumps(proof),asset_id))
    for name in ('DRAFT_fixer_forward_media_claim_20261006.sql','DRAFT_fixer_forward_media_observation_bridge_20261007.sql','DRAFT_fixer_forward_media_source_history_20261007.sql','DRAFT_fixer_forward_media_photo_certificate_20261007.sql','DRAFT_fixer_owner_photo_clearance_20261007.sql'):
     sql((ROOT/'migrations'/name).read_text())
+   sql((ROOT/'migrations'/'DRAFT_fixer_photo_historical_clearance_20261008.sql').read_text())
    sql('create role photo_owner login;grant fixer_forward_media_owner_20261006 to photo_owner;'
        'create role photo_auditor login;grant fixer_forward_media_photo_auditor_20261007 to photo_auditor;'
        'grant select,insert,update,delete on content_calendar to service_role;')
@@ -95,7 +96,7 @@ def main():
    history={'history_key':'SYNTHETIC full historical photo','resolved':True,'media_kind':'still_photo','visual_sha256':digest('SYNTHETIC different historic visual'),'published_binding_ref':'SYNTHETIC preserved complete fleet history'}
    sql('insert into fixer_forward_media_photo_baseline_20261007(baseline_id,policy_id,scope_complete,rows_json,historical_manifest_ref,declared_full_fleet_row_count) values(%s,%s,true,%s::jsonb,%s,1)',(baseline,key['policy_id'],json.dumps([history]),'SYNTHETIC complete corpus'))
    sql('update fixer_forward_media_photo_state_20261007 set baseline_id=%s where singleton',(baseline,))
-   packet,_,_,_=fixtures(candidate=candidate,snapshot=sql('select fixer_forward_media_photo_snapshot_20261007()')[0][0],private=private)
+   packet,_,_,_=fixtures(candidate=candidate,snapshot=sql('select fixer_forward_media_photo_snapshot_exclusion_20261008()')[0][0],private=private)
    auditor_conn=psycopg.connect(dsn('photo_auditor'));IndependentPhotoAuditor(auditor_conn,'photo_auditor').submit(packet);auditor_conn.commit()
    owner_auditor=IndependentPhotoAuditor(conn,'photo_owner')
    prepared=prepare_remote_photo(current,drive_reader=drive,hosted_reader=hosted,recipe=recipe,auditor=owner_auditor,audit_id=packet['payload']['audit_id']);conn.rollback()
@@ -124,7 +125,7 @@ def main():
     'source_fingerprint':other_source.original.source_fingerprint,'source_sha256':other_source.evidence['source_sha256'],'source_length':len(other_bytes),'source_receipt_ref':other_source.receipt_ref,
     'image_fingerprint':other_source.original.source_fingerprint,'image_sha256':other_source.evidence['source_sha256'],'image_length':len(other_bytes),
     'content_digest':sql("select 'sha256:'||encode(sha256(convert_to(fixer_forward_media_photo_content_20261007(%s)::text,'UTF8')),'hex')",(other_rid,))[0][0]}
-   other_packet,_,_,_=fixtures(candidate=other_candidate,snapshot=sql('select fixer_forward_media_photo_snapshot_20261007()')[0][0],private=private)
+   other_packet,_,_,_=fixtures(candidate=other_candidate,snapshot=sql('select fixer_forward_media_photo_snapshot_exclusion_20261008()')[0][0],private=private)
    IndependentPhotoAuditor(auditor_conn,'photo_auditor').submit(other_packet);auditor_conn.commit()
    other_prepared=prepare_remote_photo(other_current,drive_reader=other_drive,hosted_reader=Hosted(other_bytes),recipe=recipe,auditor=owner_auditor,audit_id=other_packet['payload']['audit_id']);conn.rollback()
    sql("update media_asset set review_status='pending_review',moderation_status='pending' where id=%s",(FILE,))
@@ -163,7 +164,7 @@ def main():
     assert waiting.result(timeout=8)=='stale pairwise corpus held'
    assert sql('select count(*) from fixer_owner_photo_reservation_20261007')[0][0]==1
    assert sql('select count(*) from fixer_forward_media_render_manifest_20261006')[0][0]==1
-   snapshot=sql('select fixer_forward_media_photo_snapshot_20261007()')[0][0]
+   snapshot=sql('select fixer_forward_media_photo_snapshot_exclusion_20261008()')[0][0]
    assert len(snapshot['rows'])==3 and all(h['resolved'] for h in snapshot['rows'])
    # A fresh real signature with dishonest exact-byte nonmatch judgments
    # cannot clear already reserved visuals; SQL has an independent byte fence.
@@ -402,7 +403,7 @@ def main():
    # A fresh independent certificate after prior sends has reviewed the now
    # reserved/published visuals. Real production run_once discovers it, commits
    # durable admission before remote readers, and atomically persists outcome.
-   fresh_packet,_,_,_=fixtures(candidate=other_candidate,snapshot=sql('select fixer_forward_media_photo_snapshot_20261007()')[0][0],private=private)
+   fresh_packet,_,_,_=fixtures(candidate=other_candidate,snapshot=sql('select fixer_forward_media_photo_snapshot_exclusion_20261008()')[0][0],private=private)
    IndependentPhotoAuditor(auditor_conn,'photo_auditor').submit(fresh_packet);auditor_conn.commit()
    sql('insert into fixer_forward_media_observation_20261007(calendar_row_id,row_revision,observation_digest,tenant_id,gym_id,source_asset_id,source_exact_url,delivered_exact_url,calendar_snapshot,observation_json,digest_input) values(%s,%s,%s,\'gym\',\'gym\',%s,%s,%s,\'{}\'::jsonb,%s,\'SYNTHETIC producer recipe\')',(other_rid,other_revision,'a'*64,other_file,other_url,other_url,json.dumps({'recipe':recipe})))
    os.environ[worker.WORKER_ENV]='true';os.environ[worker.PHOTO_CLEARANCE_ENV]='true';os.environ[worker.TENANTS_ENV]='gym'
@@ -440,7 +441,7 @@ def main():
      'source_length':len(data_bytes),'source_receipt_ref':source_now.receipt_ref,
      'image_fingerprint':source_now.original.source_fingerprint,'image_sha256':source_now.evidence['source_sha256'],'image_length':len(data_bytes),
      'content_digest':sql("select 'sha256:'||encode(sha256(convert_to(fixer_forward_media_photo_content_20261007(%s)::text,'UTF8')),'hex')",(row_id,))[0][0]}
-    certificate,_,_,_=fixtures(candidate=candidate_now,snapshot=sql('select fixer_forward_media_photo_snapshot_20261007()')[0][0],private=private)
+    certificate,_,_,_=fixtures(candidate=candidate_now,snapshot=sql('select fixer_forward_media_photo_snapshot_exclusion_20261008()')[0][0],private=private)
     IndependentPhotoAuditor(auditor_conn,'photo_auditor').submit(certificate);auditor_conn.commit()
     sql('insert into fixer_forward_media_observation_20261007(calendar_row_id,row_revision,observation_digest,tenant_id,gym_id,source_asset_id,source_exact_url,delivered_exact_url,calendar_snapshot,observation_json,digest_input) values(%s,%s,%s,\'gym\',\'gym\',%s,%s,%s,\'{}\'::jsonb,%s,\'SYNTHETIC producer recipe\')',(row_id,revision_now,'a'*64,asset_id,url,url,json.dumps({'recipe':recipe})))
     return certificate,data_bytes,candidate_drive
@@ -535,7 +536,7 @@ def main():
     if thumbnail_url:
      candidate_now.update(thumbnail_url=thumbnail_url,thumbnail_sha256='sha256:'+hashlib.sha256(replay_now['thumbnail_bytes']).hexdigest(),
       thumbnail_fingerprint='md5:'+hashlib.md5(replay_now['thumbnail_bytes']).hexdigest(),thumbnail_length=len(replay_now['thumbnail_bytes']))
-    cert_now,_,_,_=fixtures(candidate=candidate_now,snapshot=sql('select fixer_forward_media_photo_snapshot_20261007()')[0][0],private=private)
+    cert_now,_,_,_=fixtures(candidate=candidate_now,snapshot=sql('select fixer_forward_media_photo_snapshot_exclusion_20261008()')[0][0],private=private)
     IndependentPhotoAuditor(auditor_conn,'photo_auditor').submit(cert_now);auditor_conn.commit()
     prepared_now=prepare_remote_photo(current_now,drive_reader=drive_now,hosted_reader=rendition_hosted,
        recipe=recipe_now,auditor=owner_auditor,audit_id=cert_now['payload']['audit_id']);conn.rollback()
@@ -617,7 +618,7 @@ def main():
     assert runtime_thumb['status']=='complete' and len(runtime_thumb['rows'])==1,runtime_thumb
     assert runtime_thumb['rows'][0]['audit_id']==thumb_cert['payload']['audit_id']
     assert sql("select state from fixer_owner_photo_progress_20261007 where audit_id=%s",(thumb_cert['payload']['audit_id'],))[0][0]=='final'
-    snap_thumb=sql('select fixer_forward_media_photo_snapshot_20261007()')[0][0]
+    snap_thumb=sql('select fixer_forward_media_photo_snapshot_exclusion_20261008()')[0][0]
     assert any(h['history_key']=='owner-reserved-thumbnail:'+thumb_cert['payload']['audit_id']
       and h['visual_sha256']==thumb_cert['payload']['candidate']['thumbnail_sha256'] for h in snap_thumb['rows'])
     assert reconcile_owner_photo(p,thumb_cert['payload']['audit_id'])['manifest']==thumb_prepared.manifest.row();conn.rollback()
@@ -675,7 +676,7 @@ def main():
      'thumbnail_url':thumb_url,'thumbnail_sha256':'sha256:'+hashlib.sha256(replay_now['thumbnail_bytes']).hexdigest(),
      'thumbnail_fingerprint':'md5:'+hashlib.md5(replay_now['thumbnail_bytes']).hexdigest(),'thumbnail_length':len(replay_now['thumbnail_bytes']),
      'content_digest':sql("select 'sha256:'||encode(sha256(convert_to(fixer_forward_media_photo_content_20261007(%s)::text,'UTF8')),'hex')",(row_id,))[0][0]}
-    cert_now,_,_,_=fixtures(candidate=candidate_now,snapshot=sql('select fixer_forward_media_photo_snapshot_20261007()')[0][0],private=private)
+    cert_now,_,_,_=fixtures(candidate=candidate_now,snapshot=sql('select fixer_forward_media_photo_snapshot_exclusion_20261008()')[0][0],private=private)
     IndependentPhotoAuditor(auditor_conn,'photo_auditor').submit(cert_now);auditor_conn.commit()
     prepared_now=prepare_remote_photo(current_now,drive_reader=fresh_drive,hosted_reader=rendition_hosted,recipe=recipe_now,auditor=owner_auditor,audit_id=cert_now['payload']['audit_id']);conn.rollback()
     return prepared_now,cert_now

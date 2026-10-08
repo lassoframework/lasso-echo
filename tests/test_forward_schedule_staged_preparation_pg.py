@@ -193,6 +193,7 @@ def main():
                  / 'DRAFT_fixer_forward_schedule_worker_discovery_20261008.sql').read_text())
             sql((ROOT / 'migrations'
                  / 'DRAFT_fixer_forward_schedule_staged_preparation_20261008.sql').read_text())
+            sql((ROOT / 'migrations' / 'DRAFT_fixer_photo_historical_clearance_20261008.sql').read_text())
             sql('grant select,insert,update,delete on public.content_calendar to service_role;')
             sql('create role staged_owner login; grant fixer_forward_media_owner_20261006 to staged_owner;')
             sql('create role staged_auditor login; grant fixer_forward_media_photo_auditor_20261007 to staged_auditor;')
@@ -339,7 +340,7 @@ def main():
                                      thumbnail_length=candidate['image_length'])
                 packet, _, _, _ = fixtures(
                     candidate=candidate,
-                    snapshot=sql('select public.fixer_forward_media_photo_snapshot_20261007()')[0][0],
+                    snapshot=sql('select public.fixer_forward_media_photo_snapshot_exclusion_20261008()')[0][0],
                     private=private)
                 auditor_conn = psycopg.connect(dsn('staged_auditor'))
                 try:

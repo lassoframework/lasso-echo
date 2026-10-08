@@ -6,6 +6,14 @@ rechecks the authenticated immutable certificate under exclusive graph authority
 Only that RPC can create a positive visual reservation plus the exact immutable
 original/clearance/manifest tuple. The staged lane uses only the staged-specific
 grant RPC and staged discovery/predicate admission. No publisher uses this adapter.
+
+Negative-only history reconciliation: forward_media_source_history's bounded
+index answers only "was this exact original registered as sent"; absence from it
+is never treated as clearance. Positive authority here comes solely from the
+independently signed certificate (complete still-photo corpus, exact candidate,
+approved key/policy/snapshot generation) re-verified by the owner and rechecked
+by the SQL grant RPC under locks. Per-audit reservation RPCs admit one worker;
+a lost race reserves nothing and a non-True reserve result skips the audit.
 """
 from dataclasses import dataclass
 import hashlib
