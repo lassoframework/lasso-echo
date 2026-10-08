@@ -163,6 +163,10 @@ def prepared():
 
 @pytest.fixture(autouse=True)
 def owner_environment(monkeypatch):
+    import os
+    from agent.forward_media_owner import forbidden_credential_names
+    for name in forbidden_credential_names(os.environ):
+        monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv('FORWARD_MEDIA_OWNER_DSN', 'postgres://owner@localhost/fake')
     for name in ('SUPABASE_SERVICE_ROLE_KEY', 'META_PUBLISH_TOKEN'):
         monkeypatch.delenv(name, raising=False)
@@ -215,7 +219,7 @@ def test_partial_existing_rows_fail_closed(prepared):
     original, clearance, manifest, reader = prepared
     svc, conn = adapter(reader=reader)
     svc.persist(original, clearance, manifest)
-    del conn.tables['manifest'][manifest.manifest_digest]  # simulate torn state
+    del conn.tables['clearance'][(original.tenant_id, original.source_asset_id)]  # torn authority
     with pytest.raises(OwnerPersistenceError, match='single exact row'):
         svc.persist(original, clearance, manifest)
     assert conn.rollbacks == 1
@@ -269,15 +273,28 @@ def test_publisher_token_in_environment_fails():
 @pytest.mark.parametrize('credential', [
     'AGENT_SOCIALAPI_KEY', 'AGENT_SOCIALAPI_ENC_KEY',
     'AGENT_GBP_ACCESS_TOKEN', 'ZERNIO_API_KEY',
+    'AGENT_WHATSAPP_TOKEN', 'AGENT_WHATSAPP_APP_SECRET',
+    'AGENT_META_APP_SECRET', 'META_APP_SECRET', 'AGENT_SLACK_APP_TOKEN',
+    'AGENT_SUPPORT_SLACK_BOT_TOKEN', 'AGENT_LASSO_IG_TOKEN',
+    'AGENT_FUTURE_GYM_FB_TOKEN', 'UNLISTED_PROVIDER_API_KEY',
+    'AWS_SECRET_ACCESS_KEY', 'AWS_ACCESS_KEY_ID', 'NEW_PROVIDER_PASSWORD',
+    'AGENT_INTAKE_TOKEN_12', 'AGENT_INTAKE_TOKEN_PIERCE',
+    'AGENT_INTAKE_TOKEN_FUTURE_GYM', 'agent_intake_token_mixed-tenant',
+    'PGPASSWORD', 'MYSQLPASSWORD',
 ])
 def test_provider_credential_in_owner_environment_fails(credential):
     env = {'FORWARD_MEDIA_OWNER_DSN': 'postgres://owner@x/db', credential: 'secret'}
-    with pytest.raises(EnvironmentGuardError, match=credential):
+    with pytest.raises(EnvironmentGuardError, match=credential) as exc:
         check_environment(env)
+    assert 'secret' not in str(exc.value)
 
 
 def test_clean_environment_passes():
-    env = {'FORWARD_MEDIA_OWNER_DSN': 'postgres://owner@x/db', 'PATH': '/usr/bin'}
+    env = {'FORWARD_MEDIA_OWNER_DSN': 'postgres://owner@x/db', 'PATH': '/usr/bin',
+           'FORWARD_MEDIA_OWNER_ROLE': OWNER, 'PGSSLMODE': 'verify-full',
+           'SSL_CERT_FILE': '/etc/ssl/cert.pem', 'AGENT_PUBLISH_ENABLED': '0',
+           'AGENT_TOKEN_WATCHDOG_ENABLED': '0', 'AGENT_TOKEN_WARN_DAYS': '7',
+           'AGENT_ACCOUNT_KEY_GUARD': 'false', 'AGENT_ACCOUNT_KEY_RECONCILE': 'false'}
     check_environment(env)
 
 
@@ -416,3 +433,88 @@ def test_transaction_staging_error_leaves_rollback_to_owner(prepared):
     with pytest.raises(RuntimeError):
         svc.persist_in_transaction(original, clearance, manifest)
     assert conn.commits == conn.rollbacks == 0
+
+
+def second_manifest(original, reader):
+    url = 'https://cdn.example.com/story.jpg'
+    reader.store = {**reader.store, url: b'story crop bytes'}
+    return build_render_manifest(
+        original, image_url=url, image_bytes=reader.store[url], operation='render',
+        render_recipe={'op': 'story_crop'}, render_evidence_ref='render:story')
+
+
+def test_new_manifest_for_existing_exact_authority_and_replay(prepared):
+    original, clearance, manifest, reader = prepared
+    svc, conn = adapter(reader=reader)
+    svc.persist(original, clearance, manifest)
+    new = second_manifest(original, reader)
+    before = len(conn.executed)
+    assert svc.persist_in_transaction(original, clearance, new)['replayed'] is False
+    inserts = [q for q, _ in conn.executed[before:] if q.startswith('insert')]
+    assert len(inserts) == 1 and 'render_manifest' in inserts[0]
+    assert len(conn.tables['registry']) == len(conn.tables['clearance']) == 1
+    assert len(conn.tables['manifest']) == 2
+    assert svc.persist_in_transaction(original, clearance, new)['replayed'] is True
+    assert conn.commits == 1 and conn.rollbacks == 0
+
+
+@pytest.mark.parametrize('table,field,value', [
+    ('registry', 'source_url', 'https://cdn.example.com/other.jpg'),
+    ('clearance', 'history_evidence_ref', 'history:other'),
+    ('manifest', 'tenant_id', 'another-gym'),
+])
+def test_new_manifest_rejects_immutable_authority_or_digest_conflict(
+        prepared, table, field, value):
+    original, clearance, manifest, reader = prepared
+    svc, conn = adapter(reader=reader)
+    svc.persist(original, clearance, manifest)
+    new = second_manifest(original, reader)
+    if table == 'manifest':
+        svc.persist(original, clearance, new)
+    conn.corrupt(table, field, value)
+    with pytest.raises(OwnerPersistenceError, match='immutable authority'):
+        svc.persist(original, clearance, new)
+    assert conn.rollbacks == 1
+
+
+def test_new_manifest_concurrent_insert_conflict_rolls_back(prepared):
+    original, clearance, manifest, reader = prepared
+    svc, conn = adapter(reader=reader)
+    svc.persist(original, clearance, manifest)
+    new = second_manifest(original, reader)
+    insert = svc._insert
+    def competing_insert(query, params):
+        # Simulate another transaction winning the unique digest after our read.
+        insert(query, params)
+        raise RuntimeError('unique manifest digest conflict')
+    svc._insert = competing_insert
+    with pytest.raises(RuntimeError, match='unique manifest digest conflict'):
+        svc.persist(original, clearance, new)
+    assert conn.rollbacks == 1 and conn.commits == 1
+
+
+def test_new_manifest_requires_owner_identity(prepared):
+    original, clearance, manifest, reader = prepared
+    svc, conn = adapter(reader=reader)
+    svc.persist(original, clearance, manifest)
+    conn.current_user = 'service_role'
+    with pytest.raises(OwnerPersistenceError, match='dedicated owner'):
+        svc.persist(original, clearance, second_manifest(original, reader))
+    assert len(conn.tables['manifest']) == 1
+
+
+def test_new_manifest_failed_insert_preserves_committed_authority(prepared):
+    import copy
+    original, clearance, manifest, reader = prepared
+    svc, conn = adapter(reader=reader)
+    svc.persist(original, clearance, manifest)
+    frozen = copy.deepcopy(conn.tables)
+    new = second_manifest(original, reader)
+    def failed_insert(query, params):
+        assert 'render_manifest' in query
+        raise RuntimeError('manifest constraint failed')
+    svc._insert = failed_insert
+    with pytest.raises(RuntimeError, match='manifest constraint failed'):
+        svc.persist(original, clearance, new)
+    assert conn.tables == frozen
+    assert conn.rollbacks == 1 and conn.commits == 1

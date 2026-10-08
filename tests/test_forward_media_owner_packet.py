@@ -44,6 +44,10 @@ class FakePersistence:
 
 @pytest.fixture(autouse=True)
 def owner_env(monkeypatch):
+    import os
+    from agent.forward_media_owner import forbidden_credential_names
+    for name in forbidden_credential_names(os.environ):
+        monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv('FORWARD_MEDIA_OWNER_DSN', 'postgresql://owner@localhost/db')
     monkeypatch.setenv('FORWARD_MEDIA_OWNER_ROLE', 'forward_media_owner_20261006')
 

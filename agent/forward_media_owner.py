@@ -23,7 +23,8 @@ Fail-closed guarantees:
 - Publisher/service credentials must not be present in the process environment;
   their presence aborts before any write.
 - Existing rows are re-read and compared for EXACT equality (idempotent replay
-  of an identical persisted tuple). Any mismatch, missing sibling row or
+  of an identical persisted tuple); distinct manifests may extend an exact
+  registry/clearance pair. Any mismatch, missing registry/clearance sibling or
   uncertain commit outcome fails closed: the transaction is rolled back and an
   OwnerPersistenceError/UncertainCommitError is raised. The caller must resolve
   the conflict manually; nothing is overwritten or repaired automatically.
@@ -54,14 +55,21 @@ MANIFEST_TABLE = 'public.fixer_forward_media_render_manifest_20261006'
 
 OWNER_DSN_ENV = 'FORWARD_MEDIA_OWNER_DSN'
 
-# Publisher/service credential names that must never accompany an owner write.
+# Dedicated processes may keep ordinary OS/runtime and feature settings, but
+# credential-shaped names are forbidden regardless of provider or tenant prefix.
+# Account tokens use a credential suffix; intake overrides put the tenant after
+# INTAKE_TOKEN instead. Match the whole family, never a roster of gym names.
+# PASSWORD also catches compact driver names such as PGPASSWORD.
 _FORBIDDEN_ENV_NAME = re.compile(
-    r'(SERVICE[_-]?ROLE|PUBLISH[_-]?(KEY|TOKEN|SECRET)|SUPABASE_.*_(KEY|SECRET))',
-    re.IGNORECASE)
-_FORBIDDEN_EXACT_ENV_NAMES = frozenset({
-    'AGENT_SOCIALAPI_KEY', 'AGENT_SOCIALAPI_ENC_KEY',
-    'AGENT_GBP_ACCESS_TOKEN', 'ZERNIO_API_KEY',
-})
+    r'(SERVICE[_-]?ROLE|(?:^|[_-])(?:KEY|TOKEN|SECRET|PASSWORD|CREDENTIALS?|APIKEY)'
+    r'(?:$|[_-][0-9]+$)|(?:^|[_-])ACCESS[_-]KEY[_-]ID$|PASSWORD$|'
+    r'(?:^|[_-])INTAKE[_-]TOKEN[_-].+$)', re.IGNORECASE)
+
+
+def forbidden_credential_names(environ):
+    """Return names only; never inspect or expose credential values."""
+    return sorted(name for name in environ if _FORBIDDEN_ENV_NAME.search(name))
+
 
 _URL_RE = re.compile(r'^https://[^\s]+$')
 _MD5_RE = re.compile(r'^md5:[0-9a-f]{32}$')
@@ -120,8 +128,7 @@ class EnvironmentGuardError(OwnerPersistenceError):
 def check_environment(environ=None):
     """Require a dedicated owner DSN and absence of publisher/service credentials."""
     environ = os.environ if environ is None else environ
-    offenders = sorted(k for k in environ if _FORBIDDEN_ENV_NAME.search(k)
-                       or k.upper() in _FORBIDDEN_EXACT_ENV_NAMES)
+    offenders = forbidden_credential_names(environ)
     if offenders:
         raise EnvironmentGuardError(
             'publisher/service credentials present in environment; refusing '
@@ -296,8 +303,9 @@ class ForwardMediaOwnerPersistence:
     def persist(self, original, clearance, manifest):
         """Validate, verify bytes, and persist the exact tuple in one transaction.
 
-        Idempotent: if all three rows already exist they must match exactly and
-        the call succeeds as a re-read; any mismatch fails closed. On any error
+        Idempotent: existing authority must match exactly. A new render manifest
+        may be added to an existing registry/clearance pair; an exact manifest
+        replay succeeds as a re-read. Any mismatch fails closed. On any error
         or uncertain commit the transaction is rolled back and nothing is
         reported as persisted.
         """
@@ -340,12 +348,14 @@ class ForwardMediaOwnerPersistence:
         }
         if any(existing.values()):
             self._verify_existing(original, clearance, manifest, existing)
+            if not existing['manifest']:
+                self._insert(INSERT_MANIFEST, man_row)
         else:
             self._insert(INSERT_REGISTRY, registry)
             self._insert(INSERT_CLEARANCE, clear_row)
             self._insert(INSERT_MANIFEST, man_row)
         return {'registry': registry, 'clearance': clear_row, 'manifest': manifest.row(),
-                'replayed': bool(any(existing.values()))}
+                'replayed': bool(existing['manifest'])}
 
     def _verify_existing(self, original, clearance, manifest, existing):
         """Idempotent exact re-read: every existing row must match the tuple."""
@@ -361,4 +371,5 @@ class ForwardMediaOwnerPersistence:
 
         compare(existing['registry'], registry, 'registry')
         compare(existing['clearance'], clear_row, 'clearance')
-        compare(existing['manifest'], man_row, 'manifest')
+        if existing['manifest']:
+            compare(existing['manifest'], man_row, 'manifest')
