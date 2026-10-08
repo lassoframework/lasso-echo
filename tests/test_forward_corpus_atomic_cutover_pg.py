@@ -339,6 +339,39 @@ def main():
                         assert locks('inventory_waiter', GRAPH) == [('ShareLock', True)]
                         holder.commit()
                         assert future.result(timeout=5)[0] is None
+            # Real authority holders may outlast five seconds. With the caller
+            # deliberately permitting that wait, the candidate trigger must not
+            # replace its deadline with a function-local five-second timeout.
+            config = sql("select proconfig from pg_proc where proname='fixer_forward_corpus_entry_20261008'")[0][0]
+            assert not any(item.startswith('lock_timeout=') for item in config)
+            for key in (GRAPH, CENSUS):
+                name = 'long_' + ('graph' if key == GRAPH else 'census')
+                asset_id = str(uuid.uuid4())
+                with lane(name + '_holder') as holder, lane(name + '_writer') as writer, ThreadPoolExecutor(max_workers=1) as pool:
+                    writer.execute("set lock_timeout='0'; set statement_timeout='12s'")
+                    holder.execute('select pg_advisory_xact_lock(hashtextextended(%s,0))', (key,))
+                    future = pool.submit(run, writer, "insert into media_source(id,gym_id) values(%s,'gym') returning id", (asset_id,))
+                    wait_end = time.monotonic() + 3
+                    waiting_mode = 'ShareLock' if key == GRAPH else 'ExclusiveLock'
+                    while (waiting_mode, False) not in locks(name + '_writer', key):
+                        assert time.monotonic() < wait_end, name + ' did not wait on authority'
+                        assert not future.done(), name + ' prematurely completed'
+                        time.sleep(.01)
+                    if key == GRAPH:
+                        assert locks(name + '_writer', CENSUS) == []
+                    else:
+                        assert locks(name + '_writer', GRAPH) == [('ShareLock', True)]
+                    started_wait = time.monotonic()
+                    while time.monotonic() - started_wait < 5.5:
+                        assert not future.done(), name + ' failed before caller deadline: ' + str(future.result())
+                        time.sleep(.05)
+                    assert (waiting_mode, False) in locks(name + '_writer', key)
+                    holder.commit()
+                    assert future.result(timeout=5) == (None, (asset_id,))
+                    assert writer.execute("select current_setting('lock_timeout'),current_setting('statement_timeout')").fetchone() == ('0', '12s')
+                assert sql('select count(*) from media_source where id=%s', (asset_id,)) == [(1,)]
+                print('PASS: actual candidate media_source INSERT waits >5s on ' + key + ' then commits under caller deadlines', flush=True)
+
             # Negative authority takes final G exclusive before waiting on C;
             # Read Committed guard rejects repeatable-read even for zero rows.
             with lane('negative_holder') as holder, lane('negative_waiter') as writer, ThreadPoolExecutor(max_workers=1) as pool:

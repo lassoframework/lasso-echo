@@ -10,6 +10,8 @@
 -- Ordinary DML takes G shared -> C. Negative authority tables take FINAL G
 -- exclusive -> C (never shared -> exclusive). Statement triggers run after
 -- implicit RowExclusive relation acquisition, but before row locks.
+-- Lock and statement deadlines belong to the caller; the trigger does not
+-- replace a caller's lock_timeout with a shorter function-local deadline.
 --
 -- The numeric trigger name sorts before owner_photo_corpus_write and the
 -- optional #345 generated_inventory_lock. Their existing try-lock checks
@@ -103,7 +105,7 @@ end $guard$;
 
 create function public.fixer_forward_corpus_entry_20261008()
 returns trigger language plpgsql security definer set search_path=pg_catalog,public
-set lock_timeout='5s' as $$
+as $$
 declare v_graph bigint := hashtextextended('fixer_forward_graph_20261006',0);
 begin
  if current_setting('transaction_isolation') <> 'read committed' then
