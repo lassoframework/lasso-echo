@@ -12,6 +12,7 @@ cross-tenant impersonation (Frame 2 MAJOR -- a coach/staff account hitting a
 different gym's ticket endpoint must never be treated as THAT gym's client).
 """
 import os
+import re
 
 import pytest
 
@@ -22,7 +23,8 @@ from agent.slack_convo import identity_gate as IG
 
 
 @pytest.fixture(autouse=True)
-def _armed(monkeypatch):
+def _armed(monkeypatch, tmp_path):
+    monkeypatch.setattr(W.config, "data_dir", lambda: str(tmp_path))
     monkeypatch.setenv("AGENT_PORTAL_ECHO_TICKETS_ENABLED", "true")
     # C2 (2026-09-05 audit): the bridge's QUESTION branch now obeys the same D54 gates as
     # every other client-facing path -- a grounded answer sends unattended ONLY with that
@@ -91,11 +93,41 @@ class FakeBus:
                 "bot_identity", "slack_user_id"))
             if expected != actual:
                 raise RuntimeError("outbound delivery identity changed before insert")
-        row = {"id": f"out-{len(self.outbound)}", **kwargs,
+        row = {"id": kwargs.get("message_id") or f"out-{len(self.outbound)}", **kwargs,
                "delivery_request_version": current_version}
         row["attachments"] = {"kind": kwargs.get("kind"), **(kwargs.get("meta") or {})}
         self.outbound.append(row)
         return row
+
+    def message(self, message_id):
+        return next((dict(row) for row in self.outbound if row["id"] == message_id), None)
+
+    def _get(self, table, params):
+        if table == "support_messages":
+            rows = [dict(r) for r in self.outbound
+                    if r["ticket_id"] == params["ticket_id"][3:]
+                    and r["delivery_status"] == "posted"
+                    and r["delivery_request_version"] == int(params["delivery_request_version"][3:])
+                    and r["attachments"].get("client_details_delivery_intent") is True]
+        else:
+            assert table == "support_tickets"
+            rows = [dict(t) for t in self.tickets.values()
+                    if all(t.get(k) == params[k][3:] for k in
+                           ("product", "source", "bot_identity", "status"))
+                    and ("classification" not in params
+                         or t.get("classification") == params["classification"][3:])
+                    and ("verification_after->hold->>reason" not in params
+                         or (t.get("verification_after") or {}).get("hold", {}).get("reason")
+                         == params["verification_after->hold->>reason"][3:])]
+        if "or" in params:
+            parts = re.fullmatch(r'\(created_at.gt."([^"]+)",and\(created_at.eq."\1",id.gt."([^"]+)"\)\)',
+                                 params["or"])
+            assert parts, params["or"]
+            after = parts.groups()
+            rows = [r for r in rows if (r.get("created_at", ""), r["id"]) > after]
+        rows.sort(key=lambda r: (r.get("created_at", ""), r["id"]),
+                  reverse=params.get("order", "").startswith("created_at.desc"))
+        return rows[:int(params.get("limit", len(rows)))]
 
     def set_ticket(self, ticket_id, **fields):
         self.patches.append((ticket_id, fields))
@@ -190,6 +222,7 @@ class FakeBus:
 def _ticket(**over):
     row = {
         "id": "t-1", "product": "echo", "source": "website_tab",
+        "created_at": "2026-10-08T00:00:00Z",
         "client_id": "g-1", "reporter": "owner@gym.com",
         "raw_text": "my Instagram posts stopped going out",
         "status": "new", "classification": None,
@@ -1353,6 +1386,10 @@ def _run_answer(bus, answer_body):
 
 
 @pytest.mark.parametrize("answer_body", [
+    "Please tell us when this started.",
+    "Can you reconnect Instagram so we can check it?",
+    "When did this start?",
+    "Reconnect Instagram and retry the post.",
     # asks for screenshots
     "I can't see the error yet. Can you send us a screenshot of the Instagram login screen?",
     # asks for post links
@@ -1428,6 +1465,8 @@ def test_complete_grounded_answer_still_resolves_on_delivery():
 
 
 @pytest.mark.parametrize("answer_body", [
+    "I can confirm the account name is LASSO Fitness.",
+    "We can confirm the account name is LASSO Fitness.",
     "Your error message is Instagram's temporary connection warning.",
     "The account name is LASSO Fitness and the latest post went out today.",
     "We received the screenshot and link, and confirmed the schedule is active.",
@@ -1441,3 +1480,203 @@ def test_grounded_answers_mention_requested_objects_still_resolve(answer_body):
 
 def test_common_request_phrasings_are_recognized_without_needing_live_delivery():
     assert W._needs_more_information("Let me know which account you are using.")
+
+
+@pytest.mark.parametrize("lost_response", [False, True])
+def test_client_details_card_insert_failure_recovers_without_resending(monkeypatch, lost_response):
+    bus = FakeBus([_ticket(raw_text="is my instagram connected?", request_version=2)])
+    original = bus.record_outbound
+    failed = False
+
+    def fail_card(**kwargs):
+        nonlocal failed
+        if kwargs.get("meta", {}).get("client_details_requested") and not failed:
+            failed = True
+            if lost_response:
+                original(**kwargs)
+            raise RuntimeError("insert response unavailable")
+        return original(**kwargs)
+
+    monkeypatch.setattr(bus, "record_outbound", fail_card)
+    log, marks = _run_answer(bus, "Please tell us when this started.")
+    assert len(log["posted"]) == 1
+    assert marks[0]["meta_update"] is None
+    hold = bus.tickets["t-1"]["verification_after"]["hold"]
+    assert hold["reason"] == (W.CLIENT_DETAILS_MARKER if lost_response
+                              else W._CLIENT_DETAILS_PENDING)
+    # The real intake poll invokes recovery even though the ticket is now held.
+    retry_log, _ = _run_answer(bus, "must never be sent")
+    assert retry_log["posted"] == []
+    assert bus.tickets["t-1"]["verification_after"]["hold"]["reason"] == W.CLIENT_DETAILS_MARKER
+    _run_answer(bus, "must never be sent")
+    cards = [r for r in bus.outbound if r["meta"].get("client_details_requested")]
+    assert len(cards) == 1
+    assert cards[0]["id"] == W._client_details_card_id(bus.ticket("t-1"))
+    assert cards[0]["delivery_request_version"] == 2
+
+
+def test_client_details_card_readback_failure_retries_existing_id(monkeypatch):
+    bus = FakeBus([_ticket(raw_text="is my instagram connected?", request_version=2)])
+    lookup = bus.message
+    reads = 0
+
+    def missing_readback(mid):
+        nonlocal reads
+        reads += 1
+        return None if reads <= 2 else lookup(mid)
+
+    monkeypatch.setattr(bus, "message", missing_readback)
+    _run_answer(bus, "Can you reconnect Instagram so we can check it?")
+    assert bus.tickets["t-1"]["verification_after"]["hold"]["reason"] == W._CLIENT_DETAILS_PENDING
+    _run_answer(bus, "must never be sent")
+    assert bus.tickets["t-1"]["verification_after"]["hold"]["reason"] == W.CLIENT_DETAILS_MARKER
+    assert len([r for r in bus.outbound if r["meta"].get("client_details_requested")]) == 1
+
+
+@pytest.mark.parametrize("field,value", [
+    ("request_version", 3), ("client_id", "another-gym"),
+    ("slack_user_id", "U_OTHER"), ("bot_identity", "scout"), ("client_id", None),
+])
+def test_pending_client_details_card_never_crosses_request_or_tenant(monkeypatch, field, value):
+    bus = FakeBus([_ticket(raw_text="is my instagram connected?", request_version=2)])
+    original = bus.record_outbound
+
+    def refuse(**kwargs):
+        if kwargs.get("meta", {}).get("client_details_requested"):
+            raise RuntimeError("insert failed")
+        return original(**kwargs)
+
+    monkeypatch.setattr(bus, "record_outbound", refuse)
+    _run_answer(bus, "Please tell us when this started.")
+    bus.tickets["t-1"][field] = value
+    monkeypatch.setattr(bus, "record_outbound", original)
+    assert W._ensure_client_details_card(bus, bus.ticket("t-1")) is False
+    assert not [r for r in bus.outbound if r["meta"].get("client_details_requested")]
+    assert bus.tickets["t-1"]["verification_after"]["hold"]["reason"] == W._CLIENT_DETAILS_PENDING
+
+
+def test_client_details_card_completion_cas_failure_reuses_posted_card(monkeypatch):
+    bus = FakeBus([_ticket(raw_text="is my instagram connected?", request_version=2)])
+    patch = bus.patch_ticket_if_current
+    failed = False
+
+    def refuse_completion(expected, **fields):
+        nonlocal failed
+        hold = (fields.get("verification_after") or {}).get("hold") or {}
+        if hold.get("reason") == W.CLIENT_DETAILS_MARKER and not failed:
+            failed = True
+            return None
+        return patch(expected, **fields)
+
+    monkeypatch.setattr(bus, "patch_ticket_if_current", refuse_completion)
+    _run_answer(bus, "Please tell us when this started.")
+    assert bus.tickets["t-1"]["verification_after"]["hold"]["reason"] == W._CLIENT_DETAILS_PENDING
+    card = next(r for r in bus.outbound if r["meta"].get("client_details_requested"))
+    card["delivery_status"] = "posted"
+    card["attachments"]["outbox_receipt"] = "durable"
+    _run_answer(bus, "must never be sent")
+    assert bus.tickets["t-1"]["verification_after"]["hold"]["staff_card_id"] == card["id"]
+    assert bus.tickets["t-1"]["verification_after"]["hold"]["reason"] == W.CLIENT_DETAILS_MARKER
+    assert len([r for r in bus.outbound if r["meta"].get("client_details_requested")]) == 1
+
+
+@pytest.mark.parametrize("raise_error", [False, True])
+def test_initial_client_details_marker_failure_recovers_from_delivery(monkeypatch, raise_error):
+    bus = FakeBus([_ticket(raw_text="is my instagram connected?", request_version=2)])
+    original = bus.patch_ticket_if_current
+    failed = False
+
+    def refuse_initial_intent(expected, **fields):
+        nonlocal failed
+        hold = (fields.get("verification_after") or {}).get("hold") or {}
+        if hold.get("reason") == W._CLIENT_DETAILS_PENDING and not failed:
+            failed = True
+            if raise_error:
+                raise RuntimeError("first intent write unavailable")
+            return None
+        return original(expected, **fields)
+
+    monkeypatch.setattr(bus, "patch_ticket_if_current", refuse_initial_intent)
+    log, marks = _run_answer(bus, "Please tell us when this started.")
+    assert failed and len(log["posted"]) == 1
+    assert marks[0]["meta_update"] is None
+    assert bus.tickets["t-1"]["status"] == "verification"
+    assert not (bus.tickets["t-1"].get("verification_after") or {}).get("hold")
+    assert not [r for r in bus.outbound if r["meta"].get("client_details_requested")]
+    retry_log, _ = _run_answer(bus, "must never be sent")
+    assert retry_log["posted"] == []
+    assert bus.tickets["t-1"]["status"] == "hold"
+    assert bus.tickets["t-1"]["verification_after"]["hold"]["reason"] == W.CLIENT_DETAILS_MARKER
+    _run_answer(bus, "must never be sent")
+    assert len([r for r in bus.outbound if r["meta"].get("client_details_requested")]) == 1
+    assert len([r for r in bus.outbound if r["attachments"].get("outreach")]) == 1
+
+
+@pytest.mark.parametrize("field,value", [
+    ("request_version", 3), ("client_id", "another-gym"), ("slack_user_id", "U_OTHER"),
+])
+def test_unmarked_delivered_request_recovery_rejects_stale_identity(monkeypatch, field, value):
+    bus = FakeBus([_ticket(raw_text="is my instagram connected?", request_version=2)])
+    original = bus.patch_ticket_if_current
+
+    def refuse(expected, **fields):
+        hold = (fields.get("verification_after") or {}).get("hold") or {}
+        return None if hold.get("reason") == W._CLIENT_DETAILS_PENDING else original(expected, **fields)
+
+    monkeypatch.setattr(bus, "patch_ticket_if_current", refuse)
+    _run_answer(bus, "Please tell us when this started.")
+    monkeypatch.setattr(bus, "patch_ticket_if_current", original)
+    bus.tickets["t-1"][field] = value
+    retry_log, _ = _run_answer(bus, "must never be sent")
+    assert retry_log["posted"] == []
+    assert bus.tickets["t-1"]["status"] == "verification"
+    assert not [r for r in bus.outbound if r["meta"].get("client_details_requested")]
+
+
+@pytest.mark.parametrize("leg", ["unmarked", "pending"])
+def test_client_details_recovery_pages_past_older_ineligible_rows(monkeypatch, tmp_path, leg):
+    bus = FakeBus([_ticket(raw_text="is my instagram connected?", request_version=2,
+                          created_at="2026-10-08T01:00:00Z")])
+    patch = bus.patch_ticket_if_current
+    insert = bus.record_outbound
+
+    def refuse_intent(expected, **fields):
+        hold = (fields.get("verification_after") or {}).get("hold") or {}
+        if leg == "unmarked" and hold.get("reason") == W._CLIENT_DETAILS_PENDING:
+            return None
+        return patch(expected, **fields)
+
+    def refuse_card(**kwargs):
+        if leg == "pending" and kwargs.get("meta", {}).get("client_details_requested"):
+            raise RuntimeError("first card unavailable")
+        return insert(**kwargs)
+
+    monkeypatch.setattr(bus, "patch_ticket_if_current", refuse_intent)
+    monkeypatch.setattr(bus, "record_outbound", refuse_card)
+    log, _ = _run_answer(bus, "Please tell us when this started.")
+    assert len(log["posted"]) == 1
+    monkeypatch.setattr(bus, "patch_ticket_if_current", patch)
+    monkeypatch.setattr(bus, "record_outbound", insert)
+    for n in range(40):
+        old = _ticket(id=f"old-{n:02d}", status="verification" if leg == "unmarked" else "hold",
+                      classification=C.QUESTION if leg == "unmarked" else None,
+                      bot_identity="echo", slack_user_id="U_OLD",
+                      created_at="2026-10-08T00:00:00Z")
+        if leg == "pending":
+            # Irrecoverable old rows remain pending and must not monopolize a page.
+            old["verification_after"] = {"hold": {"reason": W._CLIENT_DETAILS_PENDING,
+                                                   "card_request": {}}}
+        bus.tickets[old["id"]] = old
+    path = str(tmp_path / "recovery.json")
+    for poll in range(3):
+        W._retry_client_details_cards(bus, product="echo", source="website_tab",
+                                      identity_name="echo", cursor_path=path)
+        cards = [r for r in bus.outbound if r["meta"].get("client_details_requested")]
+        assert len(cards) == (1 if poll == 2 else 0)
+        # Simulate restart by dropping process cache; saved keyset state must work.
+        W._INTAKE_CURSOR_CACHE.pop(os.path.abspath(path), None)
+    assert bus.tickets["t-1"]["verification_after"]["hold"]["reason"] == W.CLIENT_DETAILS_MARKER
+    assert len([r for r in bus.outbound if r["attachments"].get("outreach")]) == 1
+    W._retry_client_details_cards(bus, product="echo", source="website_tab",
+                                  identity_name="echo", cursor_path=path)
+    assert len([r for r in bus.outbound if r["meta"].get("client_details_requested")]) == 1
