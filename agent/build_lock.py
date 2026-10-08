@@ -22,7 +22,7 @@ There is no scheduler-level mutex anywhere in this codebase for the rebuild
 path (client_media_sync's nightly scan, a manual restage script, and any
 future ops trigger all call build_client_month directly with no
 coordination). This module is that mutex, backed by the SAME durable kv store
-already used for build-state stamps (agent.db.kv_get/kv_set, the /data volume
+already used for build-state stamps (agent.db.kv_update, the /data volume
 in production), so it holds across process boundaries on one deployed
 instance without a new migration or new dependency.
 
@@ -33,6 +33,8 @@ exclusion. A stale lock (holder crashed / process died without releasing)
 self-clears after HEARTBEAT_STALE_SECONDS so a rebuild can never be wedged
 forever by a lock nobody will ever release.
 
+Each ownership transition reads and writes under SQLite BEGIN IMMEDIATE so
+processes sharing that database cannot both acquire or overwrite a newer owner.
 Pure except for the kv reads/writes; never raises. A kv failure is treated as
 "could not confirm the lock is free" and refuses acquisition (fail CLOSED --
 better to skip one rebuild pass than let two race), except release, which is
@@ -92,6 +94,7 @@ build_client_month call. Auditing that number turned up:
 """
 from __future__ import annotations
 
+import math
 import os
 import threading
 import time
@@ -120,6 +123,27 @@ def _now() -> float:
     return time.time()
 
 
+def _parse_lock(raw: str) -> tuple[str, float] | None:
+    """Parse the persisted ``holder:timestamp`` record.
+
+    Holder tokens are opaque and may contain colons, so the final colon is
+    the only unambiguous separator. Invalid records are rejected rather than
+    treated as an expired/free lock.
+    """
+    if not isinstance(raw, str):
+        return None
+    held_holder, separator, timestamp = raw.rpartition(":")
+    if not separator or not held_holder or not timestamp:
+        return None
+    try:
+        held_at = float(timestamp)
+    except (ValueError, TypeError):
+        return None
+    if not math.isfinite(held_at):
+        return None
+    return held_holder, held_at
+
+
 def acquire(base_key: str, *, holder: str = "") -> bool:
     """True when the per-gym build lock was acquired (or is already held by
     THIS holder token, so a retry from the same caller-issued token is not
@@ -131,18 +155,19 @@ def acquire(base_key: str, *, holder: str = "") -> bool:
     holder = str(holder or f"{os.getpid()}")
     try:
         from . import db
-        raw = db.kv_get(_key(base), "")
-        if raw:
-            try:
-                held_holder, held_at = raw.split(":", 1)
-                held_at = float(held_at)
-            except (ValueError, TypeError):
-                held_holder, held_at = "", 0.0
-            fresh = (_now() - held_at) < STALE_SECONDS
-            if fresh and held_holder != holder:
-                return False  # another live build owns this gym right now
-        db.kv_set(_key(base), f"{holder}:{_now()}")
-        return True
+
+        def _acquire(raw):
+            now = _now()
+            if raw != "":
+                parsed = _parse_lock(raw)
+                if parsed is None:
+                    return None  # malformed state cannot safely be overwritten
+                held_holder, held_at = parsed
+                if (now - held_at) < STALE_SECONDS and held_holder != holder:
+                    return None
+            return f"{holder}:{now}"
+
+        return db.kv_update(_key(base), _acquire)
     except Exception:  # noqa: BLE001 - an unreadable lock store refuses, never races
         return False
 
@@ -157,13 +182,17 @@ def release(base_key: str, *, holder: str = "") -> None:
         return
     try:
         from . import db
-        raw = db.kv_get(_key(base), "")
-        if not raw:
-            return
-        held_holder = raw.split(":", 1)[0]
-        if holder and held_holder != str(holder):
-            return  # not ours to clear
-        db.kv_set(_key(base), "")
+
+        def _release(raw):
+            parsed = _parse_lock(raw)
+            if parsed is None:
+                return None  # empty/malformed state cannot safely be cleared
+            held_holder, _held_at = parsed
+            if holder and held_holder != str(holder):
+                return None
+            return ""
+
+        db.kv_update(_key(base), _release)
     except Exception:  # noqa: BLE001 - release is always best-effort
         pass
 
@@ -178,9 +207,12 @@ def is_locked(base_key: str) -> bool:
     try:
         from . import db
         raw = db.kv_get(_key(base), "")
-        if not raw:
+        if raw == "":
             return False
-        _held_holder, held_at = raw.split(":", 1)
+        parsed = _parse_lock(raw)
+        if parsed is None:
+            return True  # fail closed: malformed persisted lock is occupied
+        _held_holder, held_at = parsed
         return (_now() - float(held_at)) < STALE_SECONDS
     except Exception:  # noqa: BLE001
         return False
@@ -193,10 +225,10 @@ def heartbeat(base_key: str, *, holder: str = "") -> bool:
     NOT fire on a long-running but legitimate build.
 
     Renews (returns True) when the lock is unheld, or already held by
-    `holder`, exactly like acquire() -- a heartbeat from the current holder
+    `holder` -- a heartbeat from the current holder
     is just a renewal, never a re-negotiation. Returns False, WITHOUT
     raising and WITHOUT touching the store, when another holder now owns a
-    fresh lock (this holder lost the lock to a takeover, e.g. it went quiet
+    lock, even if stale (this holder lost the lock to a takeover, e.g. it went quiet
     long enough to be reclaimed and should stop working) or the kv store
     could not be read/written (fail-open for heartbeats specifically: a
     transient kv hiccup must never crash the build or force an early
@@ -209,18 +241,15 @@ def heartbeat(base_key: str, *, holder: str = "") -> bool:
     holder = str(holder or f"{os.getpid()}")
     try:
         from . import db
-        raw = db.kv_get(_key(base), "")
-        if raw:
-            try:
-                held_holder, held_at = raw.split(":", 1)
-                held_at = float(held_at)
-            except (ValueError, TypeError):
-                held_holder, held_at = "", 0.0
-            fresh = (_now() - held_at) < HEARTBEAT_STALE_SECONDS
-            if fresh and held_holder != holder:
-                return False  # someone else now legitimately owns this gym's lock
-        db.kv_set(_key(base), f"{holder}:{_now()}")
-        return True
+
+        def _heartbeat(raw):
+            if raw != "":
+                parsed = _parse_lock(raw)
+                if parsed is None or parsed[0] != holder:
+                    return None  # renewal cannot take over another owner's lock
+            return f"{holder}:{_now()}"
+
+        return db.kv_update(_key(base), _heartbeat)
     except Exception:  # noqa: BLE001 - a heartbeat hiccup never crashes/races the build
         return False
 

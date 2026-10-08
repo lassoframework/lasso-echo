@@ -1,0 +1,14 @@
+{
+  "$schema": "https://railway.app/railway.schema.json",
+  "_comment": "TEMPLATE ONLY — NOT DEPLOYED, AND NON-DEPLOYABLE AS A SEPARATE SERVICE. The capture receipt journal is a local SQLite file under ECHO_SOURCE_CAPTURE_JOURNAL_DIR on a service's private volume; two independent Railway services get two independent volumes and NEVER share data, so a dedicated observation service would see an empty journal and hold on every observation. Do not deploy this template without a verified shared authenticated journal topology. The supported topology is the single-service sequential pipeline in railway.source-pipeline.json (agent.source_brand_pipeline_job): capture then observation in ONE process on ONE service sharing ONE journal volume. Everything defaults OFF: before any use, an operator must explicitly set ECHO_SOURCE_OBSERVATION_JOB_ENABLED placeholder to 'true', provide ECHO_SOURCE_OBSERVATION_JOB_ALLOWLIST (exact canonical gym UUIDs), ECHO_SOURCE_OBSERVATION_ENABLED, and all startup gates (see agent/source_brand_startup.py). No production values are provisioned here.",
+  "build": { "builder": "NIXPACKS" },
+  "deploy": {
+    "startCommand": "/opt/venv/bin/python -m agent.source_brand_observation_job",
+    "cronSchedule": "30 6 * * *",
+    "restartPolicyType": "ON_FAILURE"
+  },
+  "variables": {
+    "ECHO_SOURCE_OBSERVATION_JOB_ENABLED": "false",
+    "ECHO_SOURCE_OBSERVATION_ENABLED": "false"
+  }
+}
