@@ -50,7 +50,8 @@ def status_payload(state='staged', receipt=None):
             'old_row_ids': [O1], 'finalize_receipt': receipt}
 
 
-RECEIPT = {'batch_id': BATCH, 'state': 'finalized', 'row_ids': [M1, M2],
+RECEIPT = {'batch_id': BATCH, 'tenant_id': TENANT, 'request_digest': DIGEST,
+           'state': 'finalized', 'row_ids': [M1, M2],
            'reservation_ids': [R1, R2], 'archived_old_row_ids': [O1]}
 
 
@@ -112,7 +113,9 @@ class FakeHttp:
         table = url.rsplit('/', 1)[-1]
         self.gets.append((table, params))
         if table == 'forward_schedule_stage_batch_20261008':
-            return Response([{'batch_id': BATCH}])
+            if (params or {}).get('batch_id', '')[3:] >= BATCH:
+                return Response([])
+            return Response([{'batch_id': BATCH, 'tenant_id': TENANT}])
         if table == 'forward_schedule_stage_member_20261008':
             return Response(list(self.members))
         if table == 'forward_schedule_stage_old_row_20261008':
@@ -314,3 +317,162 @@ def test_run_forever_disabled_logs_and_returns(monkeypatch, capsys=None):
     logs = []
     finalizer.run_forever(logger=logs.append)
     assert json.loads(logs[0])['status'] == 'disabled'
+
+
+@pytest.mark.parametrize('change', [
+    {'tenant_id': 'other'},
+    {'request_digest': 'c' * 64},
+    {'tenant_id': None},
+    {'request_digest': None},
+    {'row_ids': [M1, M2, M1], 'reservation_ids': [R1, R2, R1]},
+    {'row_ids': [M1], 'reservation_ids': [R1]},
+    {'archived_old_row_ids': [O1, O1]},
+    {'archived_old_row_ids': []},
+    {'archived_old_row_ids': [R1]},
+])
+def test_terminal_receipt_rejects_wrong_duplicate_or_incomplete_binding(change):
+    fake = FakeHttp(status=status_payload('finalized', dict(RECEIPT, **change)))
+    result = run(fake)
+    assert result['batches'][0]['reason'] == 'batch_outcome_unknown'
+    assert not any(fn.startswith('finalize') for fn, _ in fake.posts)
+
+
+def test_platform_siblings_may_share_a_reservation():
+    fake = FakeHttp(finalize_payload=dict(RECEIPT, reservation_ids=[R1, R1]))
+    assert run(fake)['batches'][0]['status'] == 'finalized'
+
+
+def test_unknown_outcome_retry_uses_terminal_status_without_second_finalize():
+    fake = FakeHttp(finalize_error=OSError('lost'))
+    cursors = {}
+    assert run(fake, discovery_state=cursors)['batches'][0]['reason'] == 'finalize_outcome_unknown'
+    fake.status = status_payload('finalized', RECEIPT)
+    # Keep discovery stale to model a concurrent terminal transition.
+    assert run(fake, discovery_state=cursors)['batches'][0]['status'] == 'already_finalized'
+    assert sum(fn.startswith('finalize') for fn, _ in fake.posts) == 1
+
+
+class QueueHttp(FakeHttp):
+    def __init__(self, queue):
+        super().__init__()
+        self.queue = queue
+
+    def get(self, url, params=None, headers=None, timeout=None):
+        if url.rsplit('/', 1)[-1] != finalizer._BATCH_TABLE:
+            return super().get(url, params=params, headers=headers, timeout=timeout)
+        self.gets.append((finalizer._BATCH_TABLE, dict(params)))
+        rows = [row for row in self.queue if row['tenant_id'] == params['tenant_id'][3:]]
+        after = params.get('batch_id', '')[3:]
+        rows = [row for row in rows if row['batch_id'] > after]
+        return Response(sorted(rows, key=lambda row: row['batch_id'])[:int(params['limit'])])
+
+
+def queue_row(number, tenant=TENANT):
+    return {'batch_id': str(uuid.UUID(int=number)), 'tenant_id': tenant}
+
+
+def queue_processors(monkeypatch, fake, holds=()):
+    attempts = []
+    def status(store, bid):
+        row = next(row for row in fake.queue if row['batch_id'] == bid)
+        return dict(status_payload(), batch_id=bid, tenant_id=row['tenant_id'])
+    def finalize(store, status):
+        bid = status['batch_id']
+        attempts.append(bid)
+        if bid in holds:
+            raise finalizer.FinalizerBatchHold('finalize_outcome_unknown')
+        fake.queue[:] = [row for row in fake.queue if row['batch_id'] != bid]
+        return dict(RECEIPT, batch_id=bid), 'finalize_receipt'
+    monkeypatch.setattr(finalizer, 'batch_status', status)
+    monkeypatch.setattr(finalizer, 'finalize_batch', finalize)
+    return attempts
+
+
+def test_six_batch_backlog_processes_bounded_pages_without_skips_or_duplicates(monkeypatch):
+    fake = QueueHttp([queue_row(i) for i in range(1, 7)])
+    attempts = queue_processors(monkeypatch, fake)
+    cursors = {}
+    first = run(fake, discovery_state=cursors)
+    second = run(fake, discovery_state=cursors)
+    assert len(first['batches']) == 5 and len(second['batches']) == 1
+    assert attempts == [queue_row(i)['batch_id'] for i in range(1, 7)]
+    assert not fake.queue
+    assert all(params['limit'] == '5' for _, params in fake.gets)
+
+
+def test_foreign_tenant_backlog_cannot_starve_allowed_batches(monkeypatch):
+    fake = QueueHttp([queue_row(i, 'foreign') for i in range(1, 20)] + [queue_row(20)])
+    attempts = queue_processors(monkeypatch, fake)
+    assert run(fake)['status'] == 'complete'
+    assert attempts == [queue_row(20)['batch_id']]
+    assert all(params['tenant_id'] == 'eq.' + TENANT for _, params in fake.gets)
+
+
+def test_oldest_held_batch_is_revisited_without_starving_later_ready_work(monkeypatch):
+    fake = QueueHttp([queue_row(i) for i in range(1, 4)])
+    held = queue_row(1)['batch_id']
+    attempts = queue_processors(monkeypatch, fake, holds=(held,))
+    cursors = {}
+    settings = finalizer.Settings((TENANT,), batch_size=1)
+    results = [run(fake, settings=settings, discovery_state=cursors) for _ in range(4)]
+    assert attempts == [held, queue_row(2)['batch_id'], queue_row(3)['batch_id'], held]
+    assert [r['batches'][0]['status'] for r in results] == ['hold', 'finalized', 'finalized', 'hold']
+    assert fake.queue == [queue_row(1)]
+
+
+def test_tenant_round_robin_progresses_despite_held_tenant(monkeypatch):
+    monkeypatch.setenv(finalizer.TENANTS_ENV, TENANT + ',other')
+    fake = QueueHttp([queue_row(1), queue_row(2, 'other')])
+    attempts = queue_processors(monkeypatch, fake, holds=(queue_row(1)['batch_id'],))
+    cursors = {}
+    settings = finalizer.Settings((TENANT, 'other'), batch_size=1)
+    run(fake, settings=settings, discovery_state=cursors)
+    assert run(fake, settings=settings, discovery_state=cursors)['status'] == 'complete'
+    assert attempts == [queue_row(1)['batch_id'], queue_row(2)['batch_id']]
+
+
+def test_discovery_transport_failure_preserves_cursor_for_retry(monkeypatch):
+    fake = QueueHttp([queue_row(i) for i in range(1, 3)])
+    attempts = queue_processors(monkeypatch, fake)
+    cursors = {}
+    settings = finalizer.Settings((TENANT,), batch_size=1)
+    run(fake, settings=settings, discovery_state=cursors)
+    before = json.loads(json.dumps(cursors))
+    real_get = fake.get
+    def unavailable(*args, **kwargs):
+        raise OSError('lost')
+    fake.get = unavailable
+    assert run(fake, settings=settings, discovery_state=cursors)['reason'] == 'discovery_unavailable'
+    assert cursors == before
+    fake.get = real_get
+    assert run(fake, settings=settings, discovery_state=cursors)['status'] == 'complete'
+    assert attempts == [queue_row(1)['batch_id'], queue_row(2)['batch_id']]
+
+
+def test_new_batch_behind_cursor_is_seen_after_wrap(monkeypatch):
+    fake = QueueHttp([queue_row(2), queue_row(3)])
+    attempts = queue_processors(monkeypatch, fake)
+    cursors = {}
+    settings = finalizer.Settings((TENANT,), batch_size=1)
+    run(fake, settings=settings, discovery_state=cursors)
+    fake.queue.append(queue_row(1))
+    run(fake, settings=settings, discovery_state=cursors)
+    run(fake, settings=settings, discovery_state=cursors)
+    assert attempts == [queue_row(i)['batch_id'] for i in (2, 3, 1)]
+
+
+def test_run_forever_retains_discovery_cursor_across_passes(monkeypatch):
+    fake = QueueHttp([queue_row(i) for i in range(1, 7)])
+    attempts = queue_processors(monkeypatch, fake, holds=(queue_row(1)['batch_id'],))
+    store = SupabaseCalendarStore(url='http://store.example', service_key='k', http=fake)
+    monkeypatch.setattr(finalizer, 'SupabaseCalendarStore', lambda: store)
+    class Stop:
+        passes = 0
+        def is_set(self):
+            return self.passes >= 2
+        def wait(self, interval):
+            self.passes += 1
+    reports = []
+    finalizer.run_forever(stop=Stop(), logger=lambda report: reports.append(json.loads(report)))
+    assert [len(report['batches']) for report in reports] == [5, 1]
+    assert attempts == [queue_row(i)['batch_id'] for i in range(1, 7)]

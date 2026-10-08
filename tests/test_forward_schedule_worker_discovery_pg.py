@@ -157,9 +157,12 @@ def main():
                 return sql('select public.fixer_forward_media_owner_pending_20261007(%s,%s)',
                            (tenants, limit), role=role)[0][0]
 
-            def binder_pending(tenants, limit=25, role='service_role'):
-                return sql('select public.fixer_forward_schedule_staged_binder_pending_20261008(%s,%s)',
-                           (tenants, limit), role=role)[0][0]
+            def binder_pending(tenants, limit=25, role='service_role', after=None):
+                if after is None:
+                    return sql('select public.fixer_forward_schedule_staged_binder_pending_20261008(%s,%s)',
+                               (tenants, limit), role=role)[0][0]
+                return sql('select public.fixer_forward_schedule_staged_binder_pending_20261008(%s,%s,%s,%s)',
+                           (tenants, limit, after[0], after[1]), role=role)[0][0]
 
             tenant = 'gym_' + uuid.uuid4().hex
             batch, receipt = stage(tenant, [member(tenant), member(tenant, with_obs=False)])
@@ -302,6 +305,78 @@ def main():
             sql('update content_calendar set image_url=%s where id=%s', (member_row[1], observed_id))
             assert len(binder_pending([tenant])) == 1
 
+            # ---- P2 binder starvation regression (two rows, guards ON) ----
+            # A second genuine staged member with complete owner authority...
+            m2 = member(tenant, with_obs=False)
+            _, m2_receipt = stage(tenant, [m2])
+            m2_id = m2_receipt['member_row_ids'][0]
+            m2_cols = sql('select source_media_url,image_url,source_media_asset_id'
+                          ' from content_calendar where id=%s', (m2_id,))[0]
+            m2_fp = 'md5:' + uuid.uuid4().hex
+            sql('insert into fixer_forward_media_original_registry_20261006'
+                '(tenant_id,source_asset_id,source_url,source_fingerprint,source_length,registry_evidence_ref)'
+                " values(%s,%s,%s,%s,10,'SYNTHETIC owner-verified original')",
+                (tenant, m2_cols[2], m2_cols[0], m2_fp))
+            sql('alter table fixer_forward_media_history_clearance_20261006 disable trigger certified_positive_clearance;')
+            sql('insert into fixer_forward_media_history_clearance_20261006'
+                '(tenant_id,source_asset_id,source_url,source_fingerprint,source_length,registry_evidence_ref,'
+                "decision,history_evidence_ref) values(%s,%s,%s,%s,10,'SYNTHETIC owner-verified original',"
+                "'cleared_unused','SYNTHETIC independent audit')",
+                (tenant, m2_cols[2], m2_cols[0], m2_fp))
+            sql('alter table fixer_forward_media_history_clearance_20261006 enable trigger certified_positive_clearance;')
+            digest64b = 'sha256:' + uuid.uuid4().hex + uuid.uuid4().hex
+            sql('insert into fixer_forward_media_render_manifest_20261006'
+                '(manifest_digest,tenant_id,source_asset_id,image_url,image_fingerprint,image_length,'
+                "operation,render_evidence_ref) values(%s,%s,%s,%s,%s,10,'same_object','SYNTHETIC render')",
+                (digest64b, tenant, m2_cols[2], m2_cols[1], 'md5:' + uuid.uuid4().hex))
+            both = binder_pending([tenant], 10)
+            assert sorted(c['calendar_row_id'] for c in both) == sorted([observed_id, m2_id]), both
+            # ...while the FIRST-ordered candidate's source fingerprint
+            # receives a late fleet hold_uncertain (a durable hold receipt;
+            # certified_positive_clearance stays ENABLED for this insert).
+            first_fp = sql('select source_fingerprint from fixer_forward_media_original_registry_20261006'
+                           ' where tenant_id=%s and source_asset_id=%s',
+                           (tenant, sql('select source_media_asset_id from content_calendar where id=%s',
+                                        (both[0]['calendar_row_id'],))[0][0]))[0][0]
+            fleet = 'fleet_' + uuid.uuid4().hex
+            sql('insert into fixer_forward_media_original_registry_20261006'
+                '(tenant_id,source_asset_id,source_url,source_fingerprint,source_length,registry_evidence_ref)'
+                " values(%s,'fleet_asset','https://scratch.example/fleet',%s,10,'SYNTHETIC fleet original')",
+                (fleet, first_fp))
+            sql('insert into fixer_forward_media_history_clearance_20261006'
+                '(tenant_id,source_asset_id,source_url,source_fingerprint,source_length,registry_evidence_ref,'
+                "decision,history_evidence_ref) values(%s,'fleet_asset','https://scratch.example/fleet',%s,10,"
+                "'SYNTHETIC fleet original','hold_uncertain','SYNTHETIC late fleet hold')",
+                (fleet, first_fp))
+            # The definitive refusal is filtered BEFORE the limit: with limit=1
+            # the held first candidate no longer starves the later valid row.
+            assert [c['calendar_row_id'] for c in binder_pending([tenant], 1)] == \
+                [both[1]['calendar_row_id']]
+            assert [c['calendar_row_id'] for c in binder_pending([tenant], 10)] == \
+                [both[1]['calendar_row_id']]
+            # The hold receipt itself is preserved, and the held row keeps its
+            # genuine authority rows untouched.
+            assert sql("select count(*) from fixer_forward_media_history_clearance_20261006"
+                       " where decision='hold_uncertain'")[0][0] == 1
+            assert sql('select count(*) from fixer_forward_media_history_clearance_20261006'
+                       ' where tenant_id=%s', (tenant,))[0][0] == 2
+            # Bounded keyset progress: the caller passes the last attempted
+            # (post_date,row_id); rows at/before it are advanced past, and a
+            # null cursor wraps to revisit repaired evidence.
+            after_first = binder_pending([tenant], 1,
+                                         after=('2026-10-10', '00000000-0000-0000-0000-000000000000'))
+            assert [c['calendar_row_id'] for c in after_first] == [both[1]['calendar_row_id']]
+            assert binder_pending([tenant], 1,
+                                  after=('2026-10-10', both[1]['calendar_row_id'])) == []
+            try:
+                binder_pending([tenant], 1, after=('2026-10-10', None))
+                raise AssertionError('half keyset cursor unexpectedly accepted')
+            except psycopg.Error as exc:
+                assert 'keyset cursor requires both' in str(exc)
+            # Wrap: the same tenant with a null cursor sees the valid row again.
+            assert [c['calendar_row_id'] for c in binder_pending([tenant], 1)] == \
+                [both[1]['calendar_row_id']]
+
             # PHOTO staged discovery: owner-only; empty without a complete
             # signed certificate chain, and never callable by service_role.
             assert sql('select public.fixer_forward_schedule_staged_photo_pending_20261008(%s,%s)',
@@ -328,7 +403,10 @@ def main():
                   'forged marker without membership refused; wrong tenant empty; binding drift '
                   'and claim exclusion with exact predicate reasons; duplicate/re-stage refusal, '
                   'dedupe and bound enforcement; finalized batch terminal; binder discovery '
-                  'requires the exact owner authority tuple and drops on drift; photo discovery '
+                  'requires the exact owner authority tuple and drops on drift; definitive '
+                  'authority refusals are filtered before the binder limit with per-tenant '
+                  'keyset progress and wrap (late fleet hold preserves its receipt); '
+                  'photo discovery '
                   'owner-only and certificate-gated; role ACLs fail closed')
         finally:
             subprocess.run([_pg('pg_ctl'), '-D', str(data), '-m', 'immediate', '-w', 'stop'],

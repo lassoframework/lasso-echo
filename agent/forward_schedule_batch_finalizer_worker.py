@@ -166,6 +166,7 @@ def batch_status(store, batch_id):
         data[key] = [_uuid(store, item, key) for item in data[key]]
     if (not set(data['observation_row_ids']).issubset(set(data['member_row_ids']))
             or set(data['old_row_ids']) & set(data['member_row_ids'])
+            or len(set(data['old_row_ids'])) != len(data['old_row_ids'])
             or len(set(data['member_row_ids'])) != len(data['member_row_ids'])
             or not data['member_row_ids']):
         raise ReservationStoreError(502, 'batch status membership malformed; outcome unknown')
@@ -181,11 +182,18 @@ def validate_receipt(store, status):
     if (not isinstance(receipt, dict)
             or receipt.get('batch_id') != status['batch_id']
             or receipt.get('state') != 'finalized'
+            or receipt.get('tenant_id') != status['tenant_id']
+            or receipt.get('request_digest') != status['request_digest']
             or not isinstance(receipt.get('row_ids'), list)
             or not isinstance(receipt.get('reservation_ids'), list)
+            or len(receipt['row_ids']) != len(status['member_row_ids'])
+            or len(set(map(str, receipt['row_ids']))) != len(receipt['row_ids'])
             or len(receipt['row_ids']) != len(receipt['reservation_ids'])
             or set(map(str, receipt['row_ids'])) != set(status['member_row_ids'])
             or not isinstance(receipt.get('archived_old_row_ids'), list)
+            or len(receipt['archived_old_row_ids']) != len(status['old_row_ids'])
+            or len(set(map(str, receipt['archived_old_row_ids'])))
+                != len(receipt['archived_old_row_ids'])
             or set(map(str, receipt['archived_old_row_ids'])) != set(status['old_row_ids'])):
         raise ReservationStoreError(502, 'finalized batch lacks its complete terminal proof; outcome unknown')
     for item in receipt['row_ids'] + receipt['reservation_ids'] + receipt['archived_old_row_ids']:
@@ -345,7 +353,47 @@ def _resolve_ambiguous(store, status):
     return readback['finalize_receipt']
 
 
-def run_once(*, settings=None, store=None):
+def _discover_page(store, config, cursors):
+    """Tenant-scoped UUID keyset pages, with round robin between tenants.
+
+    Staged membership is immutable. Finalizing another row cannot shift this
+    cursor as it would an offset. Held/unknown rows are revisited after wrap;
+    a restart starts from the beginning safely because status is authoritative.
+    Read at most one page per tenant, plus an empty-tail wrap query.
+    """
+    tenant_cursors = cursors.setdefault('batches', {})
+    start = cursors.get('next_tenant', 0) % len(config.tenants)
+    for offset in range(len(config.tenants)):
+        index = (start + offset) % len(config.tenants)
+        tenant = config.tenants[index]
+        after = tenant_cursors.get(tenant)
+        params = {'state': 'eq.staged', 'tenant_id': 'eq.' + tenant,
+                  'select': 'batch_id,tenant_id', 'order': 'batch_id.asc',
+                  'limit': str(config.batch_size)}
+        if after:
+            params['batch_id'] = 'gt.' + _uuid(store, after, 'batch_id')
+        rows = _get(store, _BATCH_TABLE, params)
+        if not rows and after:
+            params.pop('batch_id')
+            rows = _get(store, _BATCH_TABLE, params)
+            after = None
+        if any(not isinstance(row, dict) for row in rows):
+            raise ReservationStoreError(502, 'batch discovery page malformed')
+        ids = [_uuid(store, row.get('batch_id'), 'batch_id') for row in rows]
+        if (len(ids) > config.batch_size or ids != sorted(set(ids))
+                or any(row.get('tenant_id') != tenant for row in rows)
+                or (after and any(bid <= after for bid in ids))):
+            raise ReservationStoreError(502, 'batch discovery page malformed')
+        if ids:
+            # Advance tenant rotation only after a successful page read. The
+            # batch cursor advances individually after processing, below.
+            cursors['next_tenant'] = (index + 1) % len(config.tenants)
+            return ids, tenant
+    cursors['next_tenant'] = (start + 1) % len(config.tenants)
+    return [], None
+
+
+def run_once(*, settings=None, store=None, discovery_state=None):
     """One bounded pass over staged batches. Injection is for offline fixtures."""
     if not worker_enabled():
         return {'status': 'disabled', 'batches': []}
@@ -357,22 +405,20 @@ def run_once(*, settings=None, store=None):
         if (not config.tenants or len(config.tenants) > 32
                 or any(not _TENANT.fullmatch(t) for t in config.tenants)
                 or not 1 <= config.batch_size <= 10
-                or len(config.batches) > 10):
+                or len(config.batches) > 10
+                or len(set(config.batches)) != len(config.batches)):
             raise FinalizerConfigurationHold('worker_bounds_invalid')
     except FinalizerConfigurationHold as exc:
         return {'status': 'hold', 'reason': str(exc), 'batches': []}
     store = store or SupabaseCalendarStore()
     report = {'status': 'complete', 'batches': []}
+    cursors = {} if discovery_state is None else discovery_state
+    discovered_tenant = None
     try:
         if config.batches:
             batch_ids = list(config.batches)
         else:
-            rows = _get(store, _BATCH_TABLE,
-                        {'state': 'eq.staged', 'select': 'batch_id',
-                         'order': 'created_at.asc', 'limit': str(config.batch_size + 1)})
-            if len(rows) > config.batch_size:
-                raise FinalizerConfigurationHold('worker_bounds_invalid')
-            batch_ids = [_uuid(store, row.get('batch_id'), 'batch_id') for row in rows]
+            batch_ids, discovered_tenant = _discover_page(store, config, cursors)
     except FinalizerConfigurationHold as exc:
         return {'status': 'hold', 'reason': str(exc), 'batches': []}
     except ReservationStoreError:
@@ -381,7 +427,9 @@ def run_once(*, settings=None, store=None):
         batch_report = {'batch_id': batch_id, 'status': 'hold'}
         try:
             status = batch_status(store, batch_id)
-            if status['tenant_id'] not in config.tenants:
+            if (status['tenant_id'] not in config.tenants
+                    or (discovered_tenant is not None
+                        and status['tenant_id'] != discovered_tenant)):
                 raise FinalizerBatchHold('tenant_outside_configured_allowlist')
             if status['state'] == 'finalized':
                 batch_report['status'] = 'already_finalized'
@@ -396,6 +444,10 @@ def run_once(*, settings=None, store=None):
         except Exception:
             batch_report['reason'] = 'batch_processing_failed'
         report['batches'].append(batch_report)
+        if discovered_tenant is not None:
+            # This is discovery progress, never an outcome receipt. Even an
+            # unknown outcome remains staged and is retried on the next wrap.
+            cursors['batches'][discovered_tenant] = batch_id
     if any(b['status'] == 'hold' for b in report['batches']):
         report['status'] = 'partial_hold'
     return report
@@ -404,6 +456,7 @@ def run_once(*, settings=None, store=None):
 def run_forever(*, stop=None, logger=print):
     """Standalone service loop; no attester/owner DSN, provider key or planner lane."""
     stop = stop or threading.Event()
+    discovery_state = {}
     while not stop.is_set():
         if not worker_enabled():
             logger(json.dumps({'status': 'disabled', 'batches': []}, sort_keys=True))
@@ -413,7 +466,7 @@ def run_forever(*, stop=None, logger=print):
         except FinalizerConfigurationHold as exc:
             logger(json.dumps({'status': 'hold', 'reason': str(exc), 'batches': []}, sort_keys=True))
             return
-        logger(json.dumps(run_once(settings=settings), sort_keys=True))
+        logger(json.dumps(run_once(settings=settings, discovery_state=discovery_state), sort_keys=True))
         stop.wait(settings.interval_seconds)
 
 

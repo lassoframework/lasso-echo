@@ -511,3 +511,34 @@ def test_staged_candidate_context_binds_marker_tenant_and_state(lane):
         with pytest.raises(worker.OwnerWorkerHold):
             worker._candidate_context(candidate, tampered, ('gym',), mode='staged',
                                       canonical_tenant=tenant)
+
+
+# ---- running loop (bounded interval, stop-event controlled) ----------------
+
+def test_run_forever_repeats_bounded_passes_until_stopped(monkeypatch):
+    import threading
+    stop = threading.Event()
+    calls = []
+
+    def fake_once():
+        calls.append(1)
+        if len(calls) == 3:
+            stop.set()
+        return {'status': 'disabled', 'rows': []}
+
+    monkeypatch.setenv('AGENT_FORWARD_MEDIA_OWNER_INTERVAL_SECONDS', '5')
+    monkeypatch.setattr(worker, 'run_once', fake_once)
+    worker.run_forever(stop=stop, sleep=lambda _s: None)
+    assert len(calls) == 3
+
+
+def test_run_forever_rejects_out_of_bounds_interval(monkeypatch):
+    monkeypatch.setenv('AGENT_FORWARD_MEDIA_OWNER_INTERVAL_SECONDS', '1')
+    with pytest.raises(worker.OwnerWorkerHold, match='worker_bounds_invalid'):
+        worker.run_forever(sleep=lambda _s: None)
+
+
+def test_main_loop_is_default_off(monkeypatch, capsys):
+    monkeypatch.delenv(worker.WORKER_ENV, raising=False)
+    assert worker.main(['--loop']) == 0
+    assert json.loads(capsys.readouterr().out)['status'] == 'disabled'

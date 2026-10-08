@@ -4,7 +4,8 @@ Remote Drive/hosted reads and deterministic replay finish before final locks.
 The owner independently verifies Ed25519 and exact candidate/corpus, then SQL
 rechecks the authenticated immutable certificate under exclusive graph authority.
 Only that RPC can create a positive visual reservation plus the exact immutable
-original/clearance/manifest tuple. No publisher uses this adapter.
+original/clearance/manifest tuple. The staged lane uses only the staged-specific
+grant RPC and staged discovery/predicate admission. No publisher uses this adapter.
 """
 from dataclasses import dataclass
 import hashlib
@@ -89,17 +90,25 @@ def reconcile_owner_photo(persistence, audit_id):
     return {k: result[k] for k in ('registry', 'clearance', 'manifest', 'replayed', 'progress')}
 
 
-def prepare_remote_photo(snapshot, *, drive_reader, hosted_reader, recipe, auditor, audit_id):
+def prepare_remote_photo(snapshot, *, drive_reader, hosted_reader, recipe, auditor, audit_id,
+                         mode='active'):
     """Read-only remote phase. Uses an existing explicit owner auditor client.
 
     The source receipt must already have been staged/committed by the existing
     isolated source verifier before the independent auditor signs its certificate.
     This function provisions no key, login, approval or database connection.
+    mode='staged' admits only an authorized staged candidate (exact stage
+    marker, pending/draft, membership); 'active' keeps the active-only check.
     """
     if type(auditor) is not IndependentPhotoAuditor:
         raise PhotoCertificateHold('dedicated_owner_certificate_client_required')
     row = snapshot['calendar']
-    if (row.get('status') not in ('draft','pending','queued','approved') or row.get('variant_status')!='active'
+    if mode == 'staged':
+        if (row.get('status') not in ('draft','pending') or row.get('variant_status')!='candidate'
+                or row.get('media_not_ready_reason')!='forward_reservation_staged'
+                or any(row.get(k) is not None for k in ('publish_claim_token','published_at','late_post_id','render_manifest_digest'))):
+            raise PhotoCertificateHold('certified_owner_candidate_not_unsent')
+    elif (row.get('status') not in ('draft','pending','queued','approved') or row.get('variant_status')!='active'
             or any(row.get(k) is not None for k in ('publish_claim_token','published_at','late_post_id','render_manifest_digest'))):
         raise PhotoCertificateHold('certified_owner_candidate_not_unsent')
     recipe = validate_still_recipe(recipe)
@@ -160,7 +169,7 @@ def prepare_remote_photo(snapshot, *, drive_reader, hosted_reader, recipe, audit
     return PreparedOwnerPhoto(source, image_bytes, manifest, certificate, thumbnail.thumbnail_bytes)
 
 
-def stage_prepared_photo(persistence, prepared):
+def _stage_prepared(persistence, prepared, rpc_name):
     """Final phase; caller owns transaction and COMMIT, failures must roll back.
 
     No remote reads. The SQL grant creates all authority/reservation rows in one
@@ -177,7 +186,7 @@ def stage_prepared_photo(persistence, prepared):
     # immutable receipt, current source binding and signed creative under locks.
     original = prepared.source.original
     with persistence._conn.cursor() as cursor:
-        cursor.execute('select public.fixer_prepare_owner_photo_20261007(%s,%s::jsonb,%s::jsonb)',
+        cursor.execute('select public.' + rpc_name + '(%s,%s::jsonb,%s::jsonb)',
             (prepared.certificate.payload['audit_id'], json.dumps(original.row()),
              json.dumps(prepared.manifest.row(), ensure_ascii=False)))
         clearance_row = cursor.fetchone()[0]
@@ -193,6 +202,22 @@ def stage_prepared_photo(persistence, prepared):
     return frozen.persist_in_transaction(original, clearance, prepared.manifest)
 
 
+def stage_prepared_photo(persistence, prepared):
+    """Active-lane grant; see _stage_prepared for the transaction contract."""
+    return _stage_prepared(persistence, prepared, 'fixer_prepare_owner_photo_20261007')
+
+
+def stage_prepared_staged_photo(persistence, prepared):
+    """Staged-lane grant through the staged-specific RPC only.
+
+    fixer_prepare_owner_staged_photo_20261008 re-reads the authorizing
+    predicate, nonterminal membership and canonical tenant under the same
+    graph/row locks as the active grant; the active-only RPC is never called
+    for a staged row and this function never admits an active row.
+    """
+    return _stage_prepared(persistence, prepared, 'fixer_prepare_owner_staged_photo_20261008')
+
+
 def staged_photo_candidates(persistence, *, tenants, limit):
     """Read-only STAGED photo discovery through the owner-only SQL RPC.
 
@@ -202,8 +227,9 @@ def staged_photo_candidates(persistence, *, tenants, limit):
     here through public.forward_schedule_preparation_eligible_20261008 on the
     SAME owner connection; only an exact eligible/staged result with a matching
     allowlisted tenant admits a candidate. The marker alone never authorizes.
-    No staged photo grant authority exists (fixer_prepare_owner_photo_20261007
-    remains active-only), so this discovers only and never stages authority.
+    Authority itself is staged only by run_staged_photo_pass through the
+    staged-specific grant RPC; fixer_prepare_owner_photo_20261007 remains
+    active-only and is never called for a staged row.
     """
     if type(persistence) is not ForwardMediaOwnerPersistence:
         raise PhotoCertificateHold('dedicated_prepared_owner_photo_required')
@@ -285,6 +311,77 @@ def run_photo_pass(*, persistence, reader, drive_reader, tenants, limit):
                     auditor=IndependentPhotoAuditor(conn, persistence._expected_owner), audit_id=audit_id)
                 conn.rollback()  # End read-only certificate tx before final locks.
                 staged = stage_prepared_photo(persistence, prepared)
+                outcome = {'status': 'persisted', 'decision': 'cleared_unused',
+                           'manifest_digest': staged['manifest']['manifest_digest']}
+                if rpc('finish', (audit_id, token, json.dumps(outcome))) is not True:
+                    raise PhotoCertificateHold('certified_owner_outcome_unverified')
+                commit()
+                reports.append({'audit_id': audit_id, 'calendar_row_id': candidate['calendar_row_id'], **outcome})
+            except UncertainCommitError:
+                raise
+            except Exception:
+                conn.rollback()
+                reports.append({'audit_id': audit_id, 'calendar_row_id': candidate['calendar_row_id'],
+                                'status': 'hold', 'reason': 'certified_owner_verification_failed'})
+    except UncertainCommitError:
+        # Never re-admit the audit or continue after a lost COMMIT response.
+        return {'status': 'hold', 'reason': 'uncertain_authority_commit', 'rows': reports}
+    except Exception:
+        conn.rollback()
+        return {'status': 'hold', 'reason': 'certified_owner_transport_unavailable', 'rows': reports}
+    return {'status': 'partial_hold' if any(r['status']=='hold' for r in reports) else 'complete', 'rows': reports}
+
+
+def run_staged_photo_pass(*, persistence, reader, drive_reader, tenants, limit):
+    """Bounded STAGED signed-certificate pass, reached by owner_worker.run_once.
+
+    Same durable attempt quarantine, read-only remote phase and atomic
+    authority/outcome COMMIT as run_photo_pass, but discovery/admission come
+    only from the staged discovery RPC plus the per-row predicate readback,
+    and authority is staged ONLY through fixer_prepare_owner_staged_photo_
+    20261008. The active grant and active discovery are never called here.
+    """
+    from .forward_media_source_history import SourceHistoryStore
+    from .forward_media_owner import UncertainCommitError
+    from psycopg.pq import TransactionStatus
+    reports = []
+    if (type(persistence) is not ForwardMediaOwnerPersistence
+            or persistence._conn.info.transaction_status != TransactionStatus.IDLE):
+        return {'status': 'hold', 'reason': 'owner_transaction_contract_required', 'rows': []}
+    conn = persistence._conn
+
+    def rpc(name, args):
+        with conn.cursor() as cursor:
+            cursor.execute('select public.fixer_owner_photo_'+name+'_20261007('
+                           + ','.join(['%s']*len(args))+')', args)
+            return cursor.fetchone()[0]
+
+    def commit():
+        try:
+            conn.commit()
+        except Exception:
+            raise UncertainCommitError('owner photo commit uncertain') from None
+
+    try:
+        candidates = staged_photo_candidates(persistence, tenants=tenants, limit=limit)
+        for candidate in candidates:
+            audit_id = str(uuid.UUID(candidate['audit_id']))
+            token = str(uuid.uuid4())
+            persistence._assert_owner_identity()
+            reserved = rpc('reserve', (audit_id, token))
+            commit()
+            if reserved is not True:
+                # Another worker admitted the exact audit; never duplicate it.
+                continue
+            try:
+                snapshot = SourceHistoryStore(persistence).snapshot(
+                    candidate['calendar_row_id'], candidate['revision'])
+                prepared = prepare_remote_photo(snapshot, drive_reader=drive_reader,
+                    hosted_reader=reader, recipe=candidate['recipe'],
+                    auditor=IndependentPhotoAuditor(conn, persistence._expected_owner),
+                    audit_id=audit_id, mode='staged')
+                conn.rollback()  # End read-only certificate tx before final locks.
+                staged = stage_prepared_staged_photo(persistence, prepared)
                 outcome = {'status': 'persisted', 'decision': 'cleared_unused',
                            'manifest_digest': staged['manifest']['manifest_digest']}
                 if rpc('finish', (audit_id, token, json.dumps(outcome))) is not True:

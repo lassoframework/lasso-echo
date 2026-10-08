@@ -112,29 +112,33 @@ grant execute on function public.fixer_forward_schedule_staged_owner_pending_202
 -- still has no render_manifest_digest. Discovery only: no staged bind RPC
 -- exists and this draft creates none; finalize-time binding must re-verify
 -- everything against the persisted membership.
-create function public.fixer_forward_schedule_staged_binder_pending_20261008(p_tenants text[],p_limit integer)
+create function public.fixer_forward_schedule_staged_binder_pending_20261008(
+ p_tenants text[],p_limit integer,p_after_post_date date default null,p_after_row_id uuid default null)
 returns jsonb language plpgsql security definer set search_path=pg_catalog,public as $$
 begin
  if p_tenants is null or cardinality(p_tenants) not between 1 and 32
      or p_limit is null or p_limit not between 1 and 100 then
    raise exception 'bounded binder tenant scope required' using errcode='23514';
  end if;
+ if (p_after_post_date is null)<>(p_after_row_id is null) then
+   raise exception 'binder keyset cursor requires both post date and row id' using errcode='23514';
+ end if;
  return coalesce((select jsonb_agg(candidate order by tenant_rank,post_date,calendar_row_id)
  from (select jsonb_build_object('calendar_row_id',r.id,'batch_id',m.batch_id,
-       'tenant_id',m.tenant_id,'manifest_digest',mf.manifest_digest) candidate,
+       'tenant_id',m.tenant_id,'post_date',r.post_date,'manifest_digest',mf.manifest_digest) candidate,
        r.post_date,r.id calendar_row_id,
        row_number() over(partition by m.tenant_id order by r.post_date,r.id) tenant_rank
    from public.forward_schedule_stage_member_20261008 m
    join public.forward_schedule_stage_batch_20261008 b on b.batch_id=m.batch_id and b.state='staged'
    join public.content_calendar r on r.id=m.calendar_row_id
    join public.fixer_forward_media_original_registry_20261006 a
-     on a.tenant_id=m.tenant_id and a.source_asset_id=r.source_media_asset_id
+     on a.tenant_id=btrim(r.gym_id) and a.source_asset_id=r.source_media_asset_id
      and a.source_url=m.source_media_url
    join public.fixer_forward_media_history_clearance_20261006 h
      on h.tenant_id=a.tenant_id and h.source_asset_id=a.source_asset_id
      and h.decision='cleared_unused'
    join public.fixer_forward_media_render_manifest_20261006 mf
-     on mf.tenant_id=m.tenant_id and mf.source_asset_id=a.source_asset_id
+     on mf.tenant_id=a.tenant_id and mf.source_asset_id=a.source_asset_id
      and mf.image_url=m.image_url and mf.thumbnail_url is not distinct from m.thumbnail_url
    where r.variant_status='candidate' and r.media_not_ready_reason='forward_reservation_staged'
      and r.status in ('pending','draft')
@@ -147,20 +151,38 @@ begin
      and r.thumbnail_url is not distinct from m.thumbnail_url
      and r.render_manifest_digest is null
      and r.publish_claim_token is null and r.published_at is null and r.late_post_id is null
+     -- Definitive authority refusals are filtered BEFORE the limit: the bind
+     -- RPC refuses any source whose fingerprint carries a non-cleared fleet
+     -- clearance (e.g. a late fleet hold_uncertain). Selecting such a row
+     -- under a tight limit would starve later valid candidates every pass.
+     -- The hold receipt itself is preserved; repaired evidence (a genuine
+     -- cleared decision once uncertainty resolves) re-admits the row.
+     and not exists(select 1 from public.fixer_forward_media_history_clearance_20261006 hx
+        where hx.source_fingerprint=a.source_fingerprint and hx.decision<>'cleared_unused')
      and public.fixer_forward_schedule_staged_authorized_20261008(r.id,m.tenant_id,m.batch_id)
+     -- Bounded per-tenant keyset progress: callers pass the last attempted
+     -- (post_date,row_id) for a single-tenant scan so a held row is advanced
+     -- past instead of re-selected forever; an exhausted tenant wraps by
+     -- calling again with a null cursor so repaired evidence is revisited.
+     and (p_after_row_id is null
+          or (r.post_date,r.id) > (p_after_post_date,p_after_row_id))
    order by tenant_rank,r.post_date,r.id limit p_limit) q),'[]'::jsonb);
 end;
 $$;
-revoke all on function public.fixer_forward_schedule_staged_binder_pending_20261008(text[],integer)
+revoke all on function public.fixer_forward_schedule_staged_binder_pending_20261008(text[],integer,date,uuid)
   from public,anon,authenticated,fixer_forward_media_attester_20261006,fixer_forward_media_owner_20261006;
-grant execute on function public.fixer_forward_schedule_staged_binder_pending_20261008(text[],integer)
+grant execute on function public.fixer_forward_schedule_staged_binder_pending_20261008(text[],integer,date,uuid)
   to service_role;
 
 -- OWNER PHOTO staged discovery: mirrors fixer_owner_photo_pending_20261007
 -- (which stays active-only) for staged members holding a complete signed
--- certificate chain. The authorizing predicate replaces the active-state
--- checks. Discovery only: fixer_prepare_owner_photo_20261007 remains
--- active-only and no staged photo grant authority is created here.
+-- certificate chain. The signed certificate binds the RAW gym key (the photo
+-- record RPC requires candidate tenant = content_calendar.gym_id) while batch
+-- membership binds the canonical tenant; the alias resolution clause above
+-- requires both to agree. The authorizing predicate replaces the active-state
+-- checks. fixer_prepare_owner_photo_20261007 remains active-only; the staged
+-- grant authority is the separately reviewed
+-- DRAFT_fixer_forward_schedule_staged_preparation_20261008.sql.
 create function public.fixer_forward_schedule_staged_photo_pending_20261008(p_tenants text[],p_limit integer)
 returns jsonb language plpgsql security definer set search_path=pg_catalog,public as $$
 declare snap jsonb;
@@ -185,7 +207,7 @@ begin
     on src.receipt_ref=c.payload_json::jsonb#>>'{candidate,source_receipt_ref}'
   join public.fixer_forward_media_observation_20261007 o
     on o.calendar_row_id=r.id and o.row_revision=src.row_revision
-  where m.tenant_id=any(p_tenants) and m.tenant_id=c.payload_json::jsonb#>>'{candidate,tenant_id}'
+  where m.tenant_id=any(p_tenants) and r.gym_id=c.payload_json::jsonb#>>'{candidate,tenant_id}'
    and m.tenant_id=b.tenant_id and o.tenant_id=m.tenant_id and r.gym_id=m.gym_id
    and m.tenant_id=coalesce((select al.tenant_id from public.fixer_forward_media_tenant_alias_20261006 al
       where al.alias_key=btrim(r.gym_id)),btrim(r.gym_id))

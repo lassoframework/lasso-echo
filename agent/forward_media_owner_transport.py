@@ -25,6 +25,13 @@ from .forward_media_owner_worker import OwnerTransport, OwnerWorkerHold, _identi
 PREFIX = 'fixer_forward_media_owner_'
 STAGED_PENDING_RPC = 'fixer_forward_schedule_staged_owner_pending_20261008'
 ELIGIBILITY_RPC = 'forward_schedule_preparation_eligible_20261008'
+STAGED_SNAPSHOT_RPC = 'fixer_forward_schedule_staged_owner_snapshot_20261008'
+STAGED_LOCKED_RPC = 'fixer_forward_schedule_staged_owner_locked_20261008'
+
+
+def _staged_lane(candidate):
+    """Staged discovery candidates carry tenant_id/batch_id; active never do."""
+    return isinstance(candidate, dict) and candidate.get('batch_id') is not None
 
 
 @dataclass(frozen=True)
@@ -155,7 +162,12 @@ class DedicatedOwnerTransport(OwnerTransport):
                 raise OwnerWorkerHold('owner_manual_reconciliation_required')
             self._active = (*key, token)
             self._recorded = False
-            current = self._rpc('snapshot', self._active)
+            if _staged_lane(candidate):
+                # Staged snapshot RPC resolves the canonical tenant for the
+                # observation binding; raw source/asset ownership is unchanged.
+                current = self._call(STAGED_SNAPSHOT_RPC, self._active)
+            else:
+                current = self._rpc('snapshot', self._active)
             self._conn.rollback()  # End read tx BEFORE any remote byte I/O.
             yield current
             if not self._recorded:
@@ -199,7 +211,10 @@ class DedicatedOwnerTransport(OwnerTransport):
             with self._conn.cursor() as cur:
                 cur.execute("set local lock_timeout='5s'; set local statement_timeout='15s'")
             self._final_phase = True
-            current = self._rpc('locked', self._active)
+            if _staged_lane(candidate):
+                current = self._call(STAGED_LOCKED_RPC, self._active)
+            else:
+                current = self._rpc('locked', self._active)
             yield current
             if not self._recorded:
                 raise OwnerWorkerHold('durable_progress_commit_unverified')

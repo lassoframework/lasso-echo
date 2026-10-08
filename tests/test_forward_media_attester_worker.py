@@ -55,8 +55,21 @@ class Cursor:
                     if params[2] is None or (isinstance(row, dict)
                                               and row.get('calendar_row_id', '') > params[2])]
             self.result = rows if self.conn.over_bound else rows[:params[1]]
+        elif 'staged_attester_pending_20261008' in query:
+            rows = self._lane(self.conn.staged_pending, params)
+            self.result = rows if self.conn.over_bound else rows[:params[1]]
+        elif 'staged_visual_recovery_pending_20261008' in query:
+            rows = self._lane(self.conn.recovery_pending, params)
+            self.result = rows if self.conn.over_bound else rows[:params[1]]
         else:
             raise AssertionError('unexpected database access')
+
+    def _lane(self, store, params):
+        if self.conn.staged_error:
+            raise OSError('lane unavailable')
+        return [(row,) for row in store.get(params[0], [])
+                if params[2] is None or (isinstance(row, dict)
+                                         and row.get('calendar_row_id', '') > params[2])]
 
     def fetchone(self):
         return self.result
@@ -67,10 +80,14 @@ class Cursor:
 
 class Connection:
     def __init__(self, pending=None, role=None, lock=True, over_bound=False,
-                 eligible=None, snapshots=None):
+                 eligible=None, snapshots=None, staged_pending=None,
+                 recovery_pending=None, staged_error=False):
         self.pending = pending or {}
         self.eligible = eligible or {}
         self.snapshots = snapshots or {}
+        self.staged_pending = staged_pending or {}
+        self.recovery_pending = recovery_pending or {}
+        self.staged_error = staged_error
         self.role = role or worker.guard.ROLE
         self.lock = lock
         self.over_bound = over_bound
@@ -83,6 +100,9 @@ class Connection:
 
     def commit(self):
         self.commits += 1
+
+    def rollback(self):
+        pass
 
     def close(self):
         self.closed = True
@@ -132,7 +152,9 @@ def test_production_dispatch_has_no_callback_or_connection_override(monkeypatch)
     assert result['rows'][0]['status'] == 'attested'
     assert result['rows'][0]['evidence_id'] == EVIDENCE
     assert all(conn.closed for conn in conns)
-    assert all(conn.commits == 1 for conn in conns)
+    # One commit ends the active discovery read; a second ends the staged
+    # discovery read. No transaction spans network/object work.
+    assert all(conn.commits == 2 for conn in conns)
     queries = [q for conn in conns for q, _ in conn.calls]
     assert all('content_calendar' not in q for q in queries)
     assert SECRET not in json.dumps(result)
@@ -313,8 +335,9 @@ def test_cli_once_configuration_hold_has_nonzero_exit_and_no_secret(monkeypatch,
 
 # --------------------------------------------------------------------------
 # Staged preparation + missing-visual-role recovery lanes (DRAFT 20261008).
-# Authorization comes ONLY from the SQL predicate; the stage marker alone is
-# never consulted (the worker never reads content_calendar directly).
+# Candidates come ONLY from tenant-scoped SQL discovery; each is re-gated
+# through the exact SQL predicate (the stage marker alone is never consulted
+# and the worker never reads content_calendar directly).
 # --------------------------------------------------------------------------
 
 BATCH = str(uuid.UUID(int=9))
@@ -326,14 +349,28 @@ def eligible_result(eligible=True, mode='staged', tenant='pierce', batch=BATCH,
             'batch_id': batch, 'reason': reason}
 
 
-def staged_conn(**kwargs):
+def staged_candidate(row=ROW, tenant='pierce', revision=REVISION, batch=BATCH):
+    return dict(snapshot(row, tenant, revision), batch_id=batch)
+
+
+def recovery_candidate(row=ROW, tenant='pierce', revision=REVISION, batch=BATCH,
+                       lineage=EVIDENCE, missing=('thumbnail',)):
+    return {'calendar_row_id': row, 'tenant_id': tenant, 'revision': revision,
+            'batch_id': batch, 'lineage_receipt_id': lineage,
+            'missing_roles': list(missing)}
+
+
+def staged_conn(staged=None, recoveries=(), **kwargs):
     kwargs.setdefault('eligible', {ROW: eligible_result()})
     kwargs.setdefault('snapshots', {ROW: snapshot()})
+    kwargs.setdefault('staged_pending',
+                      {'pierce': [staged_candidate()]} if staged is None else {'pierce': staged})
+    kwargs.setdefault('recovery_pending', {'pierce': list(recoveries)})
     return Connection(**kwargs)
 
 
-def staged_settings(rows=(ROW,), recoveries=()):
-    return worker.Settings(('pierce',), staged_rows=rows, recoveries=recoveries)
+def staged_settings():
+    return worker.Settings(('pierce',))
 
 
 def attest_ok(row_id, revision):
@@ -348,6 +385,7 @@ def test_staged_member_attests_with_sql_predicate_authorization():
     assert row['status'] == 'attested' and row['mode'] == 'staged'
     assert row['batch_id'] == BATCH and row['evidence_id'] == EVIDENCE
     queries = [q for q, _ in conn.calls]
+    assert any('staged_attester_pending_20261008' in q for q in queries)
     assert any('forward_schedule_preparation_eligible_20261008' in q for q in queries)
     assert all('content_calendar' not in q for q in queries)
     assert result['status'] == 'complete'
@@ -402,20 +440,98 @@ def test_staged_revision_mismatch_from_attester_holds():
     assert result['rows'][0]['reason'] == 'attestation_unavailable_or_invalid'
 
 
-@pytest.mark.parametrize('env_value', ['not-a-uuid', ROW + ',' + ROW, ROW + ':extra'])
-def test_staged_rows_configuration_bounds_fail_closed(env_value):
-    with pytest.raises(worker.WorkerConfigurationHold, match='worker_bounds_invalid'):
-        worker.settings_from_environment({
-            'AGENT_FORWARD_MEDIA_ATTESTER_DSN': 'postgresql://dedicated-attester',
-            'AGENT_FORWARD_MEDIA_ATTESTER_ROLE': worker.guard.ROLE,
-            worker.TENANTS_ENV: 'pierce',
-            worker.STAGED_ROWS_ENV: env_value})
+def test_staged_discovery_failure_holds_only_the_staged_lane():
+    conn = Connection(pending={'pierce': [snapshot()]}, staged_error=True)
+    result = worker.run_once(settings=staged_settings(),
+                             connection_factory=lambda: conn, attest_fn=attest_ok)
+    assert result['rows'][0]['status'] == 'attested'
+    lane = [t for t in result['tenants']
+            if t.get('reason') == 'staged_discovery_unavailable']
+    assert lane and lane[0]['tenant'] == 'pierce'
+    assert result['status'] == 'partial_hold'
+
+
+def test_staged_lane_over_bound_holds_entire_tenant():
+    conn = staged_conn(staged=[staged_candidate(), staged_candidate(OTHER_ROW)],
+                       over_bound=True)
+    result = worker.run_once(settings=worker.Settings(('pierce',), batch_size=1),
+                             connection_factory=lambda: conn,
+                             attest_fn=lambda *_: pytest.fail('must not attest'))
+    holds = [t for t in result['tenants'] if t.get('reason')]
+    assert holds[0]['reason'] == 'pending_batch_bound_exceeded'
+    assert result['rows'] == []
+
+
+def test_staged_discovery_cursor_revisits_rows_behind_a_held_candidate():
+    def connect():
+        return staged_conn(
+            staged=[staged_candidate(), staged_candidate(OTHER_ROW)],
+            eligible={ROW: eligible_result(eligible=False, mode=None,
+                                           reason='not a staged schedule candidate'),
+                      OTHER_ROW: eligible_result()},
+            snapshots={ROW: snapshot(), OTHER_ROW: snapshot(OTHER_ROW)})
+    settings = worker.Settings(('pierce',), batch_size=1)
+    cursors = {}
+    first = worker.run_once(settings=settings, cursors=cursors,
+                            connection_factory=connect,
+                            attest_fn=lambda *_: pytest.fail('must not attest'))
+    assert [r['calendar_row_id'] for r in first['rows']] == [ROW]
+    assert first['rows'][0]['reason'] == 'preparation_ineligible'
+    assert cursors[('pierce', 'staged')] == ROW
+    second = worker.run_once(settings=settings, cursors=cursors,
+                             connection_factory=connect, attest_fn=attest_ok)
+    assert [r['calendar_row_id'] for r in second['rows']] == [OTHER_ROW]
+    assert second['rows'][0]['status'] == 'attested'
+    third = worker.run_once(settings=settings, cursors=cursors,
+                            connection_factory=connect, attest_fn=attest_ok)
+    assert third['rows'] == []
+    assert ('pierce', 'staged') not in cursors
+
+
+def test_mixed_lanes_share_budget_without_starving_recovery(monkeypatch):
+    """Six-pass fairness: a permanently held staged member must not starve a
+    recovery member behind it. The staged cursor advances only to the last
+    ATTEMPTED row; a fetched-but-unattempted recovery lane keeps its cursor,
+    so the next pass (after the staged lane's genuine empty-tail reset) spends
+    the shared budget on recovery."""
+    monkeypatch.setenv('AGENT_FORWARD_MEDIA_VISUAL_INDEX', '1')
+    from agent import forward_media_visual_index as visual_index
+    settings = worker.Settings(('pierce',), batch_size=1)
+    recoveries = [recovery_candidate(OTHER_ROW)]
+    def connect():
+        return staged_conn(
+            staged=[staged_candidate()], recoveries=recoveries,
+            eligible={ROW: eligible_result(eligible=False, mode=None,
+                                           reason='not a staged schedule candidate'),
+                      OTHER_ROW: eligible_result()},
+            snapshots={ROW: snapshot(), OTHER_ROW: snapshot(OTHER_ROW)})
+    recover_calls = []
+    def recover(row_id, revision, lineage, *, tenant_key=None):
+        recover_calls.append(row_id)
+        return {'attestation_ids': {role: str(uuid.uuid4()) for role in visual_index.ROLES},
+                'tenant_key': tenant_key, 'appended': ['thumbnail'], 'recovered': True}
+    cursors = {}
+    passes = [worker.run_once(settings=settings, cursors=cursors,
+                              connection_factory=connect, attest_fn=attest_ok,
+                              recover_fn=recover)
+              for _ in range(6)]
+    # Odd passes: the held staged member consumes the single budget slot; the
+    # fetched recovery candidate is NOT attempted and its cursor is preserved.
+    for report in passes[0::2]:
+        assert [r['status'] for r in report['rows']] == ['hold']
+        assert report['rows'][0]['reason'] == 'preparation_ineligible'
+    # Even passes: staged lane discovers a genuine empty tail and resets; the
+    # recovery member is attempted and recovered under the shared budget.
+    for report in passes[1::2]:
+        assert [r['status'] for r in report['rows']] == ['recovered']
+        assert report['rows'][0]['calendar_row_id'] == OTHER_ROW
+    assert recover_calls == [OTHER_ROW, OTHER_ROW, OTHER_ROW]
+    assert cursors == {('pierce', 'recovery'): OTHER_ROW}
 
 
 def test_recovery_requires_armed_visual_index():
-    conn = staged_conn()
-    settings = staged_settings(rows=(), recoveries=((ROW, EVIDENCE),))
-    result = worker.run_once(settings=settings, connection_factory=lambda: conn,
+    conn = staged_conn(staged=[], recoveries=[recovery_candidate()])
+    result = worker.run_once(settings=staged_settings(), connection_factory=lambda: conn,
                              recover_fn=lambda *_: pytest.fail('must not recover'))
     assert result['rows'][0]['reason'] == 'visual_index_disabled'
 
@@ -428,42 +544,48 @@ def test_recovery_reuses_same_lineage_and_appends_missing_roles(monkeypatch):
         calls.append((row_id, revision, lineage, tenant_key))
         return {'attestation_ids': ids, 'tenant_key': 'pierce',
                 'appended': ['thumbnail'], 'recovered': True}
-    conn = staged_conn(eligible={ROW: eligible_result(mode='active', batch=None)})
-    settings = staged_settings(rows=(), recoveries=((ROW, EVIDENCE),))
-    result = worker.run_once(settings=settings, connection_factory=lambda: conn,
+    conn = staged_conn(staged=[], recoveries=[recovery_candidate()])
+    result = worker.run_once(settings=staged_settings(), connection_factory=lambda: conn,
                              recover_fn=recover)
     assert calls == [(ROW, REVISION, EVIDENCE, 'pierce')]
     row = result['rows'][0]
     assert row['status'] == 'recovered' and row['appended'] == ['thumbnail']
-    assert row['mode'] == 'active'
+    assert row['mode'] == 'staged'
 
 
 def test_recovery_ineligible_row_never_touches_lineage(monkeypatch):
     monkeypatch.setenv('AGENT_FORWARD_MEDIA_VISUAL_INDEX', '1')
-    conn = staged_conn(eligible={ROW: eligible_result(eligible=False, mode=None)})
-    settings = staged_settings(rows=(), recoveries=((ROW, EVIDENCE),))
-    result = worker.run_once(settings=settings, connection_factory=lambda: conn,
+    conn = staged_conn(staged=[], recoveries=[recovery_candidate()],
+                       eligible={ROW: eligible_result(eligible=False, mode=None)})
+    result = worker.run_once(settings=staged_settings(), connection_factory=lambda: conn,
                              recover_fn=lambda *_: pytest.fail('must not recover'))
     assert result['rows'][0]['reason'] == 'preparation_ineligible'
 
 
 def test_recovery_malformed_result_holds_without_claiming(monkeypatch):
     monkeypatch.setenv('AGENT_FORWARD_MEDIA_VISUAL_INDEX', '1')
-    conn = staged_conn(eligible={ROW: eligible_result(mode='active', batch=None)})
-    settings = staged_settings(rows=(), recoveries=((ROW, EVIDENCE),))
-    result = worker.run_once(settings=settings, connection_factory=lambda: conn,
+    conn = staged_conn(staged=[], recoveries=[recovery_candidate()])
+    result = worker.run_once(settings=staged_settings(), connection_factory=lambda: conn,
                              recover_fn=lambda *_: {'attestation_ids': {'original': EVIDENCE},
                                                     'tenant_key': 'pierce'})
     assert result['rows'][0]['reason'] == 'attestation_unavailable_or_invalid'
 
 
-def test_recovery_pairs_configuration_bounds_fail_closed():
-    with pytest.raises(worker.WorkerConfigurationHold, match='worker_bounds_invalid'):
-        worker.settings_from_environment({
-            'AGENT_FORWARD_MEDIA_ATTESTER_DSN': 'postgresql://dedicated-attester',
-            'AGENT_FORWARD_MEDIA_ATTESTER_ROLE': worker.guard.ROLE,
-            worker.TENANTS_ENV: 'pierce',
-            worker.RECOVER_ROWS_ENV: ROW})
+@pytest.mark.parametrize('bad', [
+    recovery_candidate(lineage='not-a-uuid'),
+    recovery_candidate(missing=()),
+    recovery_candidate(missing=('thumbnail', 'thumbnail')),
+    recovery_candidate(missing=('bogus',)),
+    dict(recovery_candidate(), tenant_id='other'),
+    'not-a-row',
+])
+def test_malformed_recovery_candidate_fails_closed(bad, monkeypatch):
+    monkeypatch.setenv('AGENT_FORWARD_MEDIA_VISUAL_INDEX', '1')
+    conn = staged_conn(staged=[], recoveries=[bad])
+    result = worker.run_once(settings=staged_settings(), connection_factory=lambda: conn,
+                             recover_fn=lambda *_: pytest.fail('must not recover'))
+    assert result['rows'][0]['status'] == 'hold'
+    assert SECRET not in json.dumps(result)
 
 
 def test_staged_lane_wrong_role_holds_everything():
@@ -471,5 +593,5 @@ def test_staged_lane_wrong_role_holds_everything():
     result = worker.run_once(settings=staged_settings(), connection_factory=lambda: conn,
                              attest_fn=lambda *_: pytest.fail('must not attest'))
     assert result['rows'] == []
-    assert result['tenants'][-1]['reason'] == 'attester_role_mismatch'
+    assert result['tenants'][0]['reason'] == 'attester_role_mismatch'
     assert result['status'] == 'partial_hold'

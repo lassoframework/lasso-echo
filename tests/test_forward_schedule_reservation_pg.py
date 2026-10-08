@@ -634,8 +634,11 @@ def main():
             rb_sock = work / 'rb_sock'
             rb_sock.mkdir()
             rb_data = work / 'rb_data'
-            subprocess.run([_pg('initdb'), '-D', str(rb_data), '-U', 'postgres', '--no-sync'],
-                           check=True, capture_output=True, timeout=60)
+            rollback_init = subprocess.run(
+                [_pg('initdb'), '-D', str(rb_data), '-U', 'postgres', '--no-sync'],
+                text=True, capture_output=True, timeout=60,
+            )
+            assert rollback_init.returncode == 0, rollback_init.stderr
             subprocess.run([_pg('pg_ctl'), '-D', str(rb_data), '-l', str(work / 'rb_pg.log'),
                             '-o', f"-k {rb_sock} -p 55472 -c listen_addresses=''", '-w', 'start'],
                            check=True, capture_output=True, timeout=60)

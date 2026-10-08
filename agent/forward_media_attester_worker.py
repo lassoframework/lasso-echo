@@ -18,17 +18,6 @@ from . import forward_media_guard as guard
 
 TENANTS_ENV = 'AGENT_FORWARD_MEDIA_ATTESTER_TENANTS'
 WORKER_ENV = 'AGENT_FORWARD_MEDIA_ATTESTER_WORKER'
-# Explicit staged-preparation lane (two-phase schedule contract, DRAFT 20261008).
-# A staged row is NEVER discoverable through the pending RPC (active rows only),
-# so the operator supplies exact staged row UUIDs; each must independently pass
-# the SQL predicate public.forward_schedule_preparation_eligible_20261008 with
-# mode='staged'. The Python marker is never consulted as authority.
-STAGED_ROWS_ENV = 'AGENT_FORWARD_MEDIA_ATTESTER_STAGED_ROWS'
-# Missing-visual-role recovery lane: exact "row_uuid:lineage_evidence_uuid"
-# pairs for rows whose lineage committed but whose visual role attestations are
-# incomplete after a crash. The SAME lineage is reused; no new lineage, claim,
-# publish or approval is ever created here.
-RECOVER_ROWS_ENV = 'AGENT_FORWARD_MEDIA_ATTESTER_RECOVER_ROWS'
 _FORBIDDEN_CREDENTIALS = (
     'SUPABASE_SERVICE_ROLE_KEY', 'AGENT_SOCIALAPI_KEY', 'AGENT_SOCIALAPI_ENC_KEY',
     'ZERNIO_API_KEY', 'AGENT_GBP_ACCESS_TOKEN',
@@ -37,6 +26,14 @@ _TENANT = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,127}\Z')
 _REVISION = re.compile(r'[0-9a-f]{32}\Z')
 _ELIGIBLE_RPC = 'select public.forward_schedule_preparation_eligible_20261008(%s)'
 _SNAPSHOT_RPC = 'select public.fixer_forward_media_attestation_request_20261006(%s)'
+# Tenant-scoped staged discovery (DRAFT_fixer_forward_schedule_attester_
+# discovery_20261008.sql): staged rows owing attestation and existing-lineage
+# rows missing visual roles. Discovery replaces operator-supplied UUID lists;
+# every candidate is re-gated through the exact SQL predicate before use.
+_STAGED_PENDING_RPC = ('select public.fixer_forward_schedule_staged_attester'
+                       '_pending_20261008(%s,%s,%s)')
+_RECOVERY_PENDING_RPC = ('select public.fixer_forward_schedule_staged_visual'
+                         '_recovery_pending_20261008(%s,%s,%s)')
 
 
 class WorkerConfigurationHold(RuntimeError):
@@ -48,39 +45,6 @@ class Settings:
     tenants: tuple[str, ...]
     batch_size: int = 50
     interval_seconds: int = 60
-    staged_rows: tuple[str, ...] = ()
-    recoveries: tuple[tuple[str, str], ...] = ()
-
-
-def _uuid_list(raw, *, limit=100):
-    values = []
-    for token in raw.split(','):
-        token = token.strip()
-        if token:
-            try:
-                values.append(guard._uuid(token))
-            except guard.ForwardMediaVerificationHold:
-                raise WorkerConfigurationHold('worker_bounds_invalid') from None
-    if len(values) > limit or len(set(values)) != len(values):
-        raise WorkerConfigurationHold('worker_bounds_invalid')
-    return tuple(values)
-
-
-def _recovery_list(raw, *, limit=100):
-    pairs = []
-    for token in raw.split(','):
-        token = token.strip()
-        if token:
-            parts = token.split(':')
-            if len(parts) != 2:
-                raise WorkerConfigurationHold('worker_bounds_invalid')
-            try:
-                pairs.append((guard._uuid(parts[0]), guard._uuid(parts[1])))
-            except guard.ForwardMediaVerificationHold:
-                raise WorkerConfigurationHold('worker_bounds_invalid') from None
-    if len(pairs) > limit or len({row for row, _ in pairs}) != len(pairs):
-        raise WorkerConfigurationHold('worker_bounds_invalid')
-    return tuple(pairs)
 
 
 def _integer(env, name, default, minimum, maximum):
@@ -107,8 +71,6 @@ def settings_from_environment(env=None):
         tenants,
         _integer(env, 'AGENT_FORWARD_MEDIA_ATTESTER_BATCH_SIZE', 50, 1, 100),
         _integer(env, 'AGENT_FORWARD_MEDIA_ATTESTER_INTERVAL_SECONDS', 60, 5, 60),
-        _uuid_list(env.get(STAGED_ROWS_ENV, '')),
-        _recovery_list(env.get(RECOVER_ROWS_ENV, '')),
     )
 
 
@@ -220,6 +182,44 @@ def _recover_visual(conn, row_id, evidence_id, config, recover):
             'appended': list(result.get('appended') or [])}
 
 
+def _advance_cursor(cursors, key, fetched, attempted):
+    """Keyset cursor: only an ATTEMPTED valid persisted UUID advances discovery.
+
+    Capacity-stopped lanes keep their cursor so unattempted fetched rows are
+    revisited first on the next pass; a fetched-but-unattempted lane is never
+    advanced past and never reset. Malformed trailing attempts leave the
+    cursor unmoved (their holds stay visible); only a genuinely empty fetched
+    tail resets to the beginning so new or revised rows behind the cursor are
+    revisited on the next pass."""
+    if attempted:
+        last = attempted[-1]
+        try:
+            cursors[key] = guard._uuid(last[0]['calendar_row_id'])
+        except (TypeError, KeyError, IndexError, ValueError,
+                guard.ForwardMediaVerificationHold):
+            pass
+    elif not fetched:
+        cursors.pop(key, None)
+
+
+def _recovery_identity(snapshot, tenant):
+    """Strictly parsed staged visual-recovery candidate identity.
+
+    The persisted lineage identity is the ONLY recovery authority: the row and
+    revision are re-gated through the eligibility predicate by _recover_visual,
+    and SQL revalidates the lineage against the current revision."""
+    row_id, revision = _row_identity(snapshot, tenant)
+    lineage_id = guard._uuid(snapshot.get('lineage_receipt_id'))
+    guard._uuid(snapshot.get('batch_id'))
+    from . import forward_media_visual_index as visual_index
+    missing = snapshot.get('missing_roles')
+    if (not isinstance(missing, list) or not missing
+            or len(set(missing)) != len(missing)
+            or any(role not in visual_index.ROLES for role in missing)):
+        raise ValueError('pending_identity_invalid')
+    return row_id, revision, lineage_id
+
+
 def run_once(*, settings=None, tenant_offset=0, cursors=None,
              connection_factory=None, attest_fn=None, recover_fn=None):
     """Bound one pass; connection/attest injection is for offline fixtures only.
@@ -308,61 +308,95 @@ def run_once(*, settings=None, tenant_offset=0, cursors=None,
                 except Exception:
                     row_report['reason'] = 'attestation_unavailable_or_invalid'
                 report['rows'].append(row_report)
-            if pending:
-                # The attester result itself is validated per row above. Only
-                # a valid persisted UUID may advance discovery; malformed
-                # responses still produce visible holds without leaking data.
-                last = pending[-1]
+            _advance_cursor(cursors, tenant, pending, pending)
+            # Tenant-scoped staged discovery (DRAFT_fixer_forward_schedule_
+            # attester_discovery_20261008.sql): staged member rows still owing
+            # attestation, and SAME-lineage rows missing one or more visual
+            # roles. SQL discovery replaces operator UUID lists; every
+            # candidate is re-gated through the exact eligibility predicate
+            # before any preparation. A lane failure holds only this lane;
+            # committed active results above are preserved.
+            staged, recoveries = None, None
+            if remaining > 0:
                 try:
-                    cursors[tenant] = guard._uuid(last[0]['calendar_row_id'])
-                except (TypeError, KeyError, IndexError, ValueError,
-                        guard.ForwardMediaVerificationHold):
-                    pass
-            elif cursors.get(tenant):
-                cursors.pop(tenant, None)
+                    with conn.cursor() as cur:
+                        cur.execute(_STAGED_PENDING_RPC,
+                                    (tenant, limit, cursors.get((tenant, 'staged'))))
+                        staged = cur.fetchmany(limit + 1)
+                        if len(staged) > limit:
+                            raise WorkerConfigurationHold('pending_batch_bound_exceeded')
+                        cur.execute(_RECOVERY_PENDING_RPC,
+                                    (tenant, limit, cursors.get((tenant, 'recovery'))))
+                        recoveries = cur.fetchmany(limit + 1)
+                        if len(recoveries) > limit:
+                            raise WorkerConfigurationHold('pending_batch_bound_exceeded')
+                    conn.commit()
+                except WorkerConfigurationHold:
+                    raise
+                except Exception:
+                    try:
+                        conn.rollback()
+                    except Exception:
+                        pass
+                    report['tenants'].append({'tenant': tenant, 'status': 'hold',
+                                              'reason': 'staged_discovery_unavailable'})
+                    staged, recoveries = None, None
+            staged_attempted = []
+            for item in staged or []:
+                if remaining <= 0:
+                    break
+                row_report = {'tenant': tenant, 'mode': 'staged', 'status': 'hold'}
+                try:
+                    if not isinstance(item, (tuple, list)) or len(item) != 1:
+                        raise ValueError('invalid_pending_shape')
+                    row_id, revision = _row_identity(item[0], tenant)
+                    row_report['calendar_row_id'] = row_id
+                    row_report['revision'] = revision
+                    if (row_id, revision) in seen:
+                        row_report.update(status='skipped', reason='duplicate_pending_revision')
+                    else:
+                        seen.add((row_id, revision))
+                        row_report.update(_prepare_staged(conn, row_id, config, attest))
+                except guard.ForwardMediaVerificationHold:
+                    row_report['reason'] = 'verification_hold'
+                except Exception:
+                    row_report['reason'] = 'attestation_unavailable_or_invalid'
+                remaining -= 1
+                staged_attempted.append(item)
+                report['rows'].append(row_report)
+            if staged is not None:
+                _advance_cursor(cursors, (tenant, 'staged'), staged, staged_attempted)
+            recovery_attempted = []
+            for item in recoveries or []:
+                if remaining <= 0:
+                    break
+                row_report = {'tenant': tenant, 'mode': 'recovery', 'status': 'hold'}
+                try:
+                    if not isinstance(item, (tuple, list)) or len(item) != 1:
+                        raise ValueError('invalid_pending_shape')
+                    row_id, revision, lineage_id = _recovery_identity(item[0], tenant)
+                    row_report['calendar_row_id'] = row_id
+                    row_report['revision'] = revision
+                    if (row_id, revision) in seen:
+                        row_report.update(status='skipped', reason='duplicate_pending_revision')
+                    else:
+                        seen.add((row_id, revision))
+                        row_report.update(_recover_visual(conn, row_id, lineage_id,
+                                                          config, recover_fn))
+                except guard.ForwardMediaVerificationHold:
+                    row_report['reason'] = 'verification_hold'
+                except Exception:
+                    row_report['reason'] = 'attestation_unavailable_or_invalid'
+                remaining -= 1
+                recovery_attempted.append(item)
+                report['rows'].append(row_report)
+            if recoveries is not None:
+                _advance_cursor(cursors, (tenant, 'recovery'), recoveries,
+                                recovery_attempted)
         except WorkerConfigurationHold as exc:
             report['tenants'].append({'tenant': tenant, 'status': 'hold', 'reason': str(exc)})
         except Exception:
             report['tenants'].append({'tenant': tenant, 'status': 'hold', 'reason': 'discovery_unavailable'})
-        finally:
-            if conn is not None:
-                _close(conn)
-    # Explicit staged-preparation and missing-visual-role recovery lanes. These
-    # rows are never discoverable through the active-only pending RPC; the
-    # operator supplies exact identities, and each row must independently pass
-    # the SQL eligibility predicate before any preparation is attempted.
-    if config.staged_rows or config.recoveries:
-        conn = None
-        try:
-            conn = connect()
-            with conn.cursor() as cur:
-                cur.execute('select current_user')
-                if cur.fetchone() != (guard.ROLE,):
-                    raise WorkerConfigurationHold('attester_role_mismatch')
-            for row_id in config.staged_rows:
-                row_report = {'calendar_row_id': row_id, 'mode': 'staged', 'status': 'hold'}
-                try:
-                    row_report.update(_prepare_staged(conn, row_id, config, attest))
-                except guard.ForwardMediaVerificationHold:
-                    row_report['reason'] = 'verification_hold'
-                except Exception:
-                    row_report['reason'] = 'attestation_unavailable_or_invalid'
-                report['rows'].append(row_report)
-            for row_id, evidence_id in config.recoveries:
-                row_report = {'calendar_row_id': row_id, 'mode': 'recovery',
-                              'status': 'hold'}
-                try:
-                    row_report.update(_recover_visual(conn, row_id, evidence_id,
-                                                      config, recover_fn))
-                except guard.ForwardMediaVerificationHold:
-                    row_report['reason'] = 'verification_hold'
-                except Exception:
-                    row_report['reason'] = 'attestation_unavailable_or_invalid'
-                report['rows'].append(row_report)
-        except WorkerConfigurationHold as exc:
-            report['tenants'].append({'tenant': None, 'status': 'hold', 'reason': str(exc)})
-        except Exception:
-            report['tenants'].append({'tenant': None, 'status': 'hold', 'reason': 'discovery_unavailable'})
         finally:
             if conn is not None:
                 _close(conn)

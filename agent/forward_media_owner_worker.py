@@ -7,7 +7,9 @@ commits. Unknown history never creates the asset's unique immutable authority
 clearance, so a later reviewed positive audit can prepare that authority.
 Producer observations and used_count=0 never establish authority.
 The separate default-OFF photo-clearance mode admits independently stored signed
-certificates, with durable quarantine before reads and atomic authority/outcome.
+certificates, with durable quarantine before reads and atomic authority/outcome;
+with the staged lane flag it uses only the staged-specific grant RPC
+(fixer_prepare_owner_staged_photo_20261008), never the active-only grant.
 The generic adapter also supports offline fixtures; those are not live proof.
 """
 from __future__ import annotations
@@ -488,9 +490,14 @@ def run_once():
         reader = owner.HostedObjectReader()
         persistence = owner.ForwardMediaOwnerPersistence.connect_from_environment(reader=reader)
         if os.getenv(PHOTO_CLEARANCE_ENV, '').lower() in ('1', 'true', 'yes', 'on'):
-            from .forward_media_owner_photo_prepare import run_photo_pass
-            report = run_photo_pass(persistence=persistence, reader=reader,
-                                    drive_reader=OriginalDriveReader(), tenants=tenants, limit=limit)
+            from .forward_media_owner_photo_prepare import run_photo_pass, run_staged_photo_pass
+            drive = OriginalDriveReader()
+            if staged_enabled():
+                report = run_staged_photo_pass(persistence=persistence, reader=reader,
+                                               drive_reader=drive, tenants=tenants, limit=limit)
+            else:
+                report = run_photo_pass(persistence=persistence, reader=reader,
+                                        drive_reader=drive, tenants=tenants, limit=limit)
         else:
             transport = DedicatedOwnerTransport(persistence)
             if staged_enabled():
@@ -518,8 +525,39 @@ def run_once():
     return report
 
 
+def run_forever(*, stop=None, sleep=None):
+    """Running loop: single bounded pass semantics stay in run_once.
+
+    Default OFF exactly like run_once; each pass opens and closes its own
+    isolated owner connection. The interval is bounded so a misconfigured
+    loop cannot hot-spin the owner authority plane.
+    """
+    import threading
+    import time
+    stop = stop or threading.Event()
+    sleep = sleep or time.sleep
+    try:
+        interval = int(os.getenv('AGENT_FORWARD_MEDIA_OWNER_INTERVAL_SECONDS', '60'))
+    except ValueError:
+        raise OwnerWorkerHold('worker_bounds_invalid') from None
+    if not 5 <= interval <= 900:
+        raise OwnerWorkerHold('worker_bounds_invalid')
+    while not stop.is_set():
+        run_once()
+        sleep(interval)
+
+
 def main(argv=None):
-    argparse.ArgumentParser(description=__doc__.splitlines()[0]).parse_args(argv)
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument('--loop', action='store_true',
+                        help='keep polling on the configured interval')
+    args = parser.parse_args(argv)
+    if args.loop:
+        if not worker_enabled():
+            print(json.dumps({'status': 'disabled', 'rows': []}, sort_keys=True))
+            return 0
+        run_forever()
+        return 0
     report = run_once()
     print(json.dumps(report, sort_keys=True))
     return 0 if (report['status'] == 'disabled'
