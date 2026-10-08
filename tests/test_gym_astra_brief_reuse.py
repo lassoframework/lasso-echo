@@ -35,7 +35,8 @@ def test_gym_brief_reuses_complete_content_layout_with_gym_identity_and_palette(
     assert "Two coached sessions each week" in brief
     assert "Progress tracked monthly" in brief
     assert "Book a visit" in brief and "examplegym.com" in brief
-    assert "approved source DATA" in brief
+    assert "supported source DATA" in brief
+    assert "approved source" not in brief.lower()
     assert "BRAND COLORS, VERIFIED FOR THIS GYM" in brief
     assert "#123456, #F4A261" in brief
     assert "Use only the verified gym palette" in brief
@@ -64,6 +65,6 @@ def test_gym_brief_holds_without_a_verified_gym_palette(palette):
     _copy(facts=[]),
     _copy(facts=[" "]),
 ])
-def test_gym_brief_holds_without_complete_approved_source_facts(copy):
-    with pytest.raises(ValueError, match="Approved gym copy required"):
+def test_gym_brief_holds_without_complete_supported_source_facts(copy):
+    with pytest.raises(ValueError, match="Supported gym facts required"):
         build_verified_gym_content_brief("gym-123", copy, _palette())
