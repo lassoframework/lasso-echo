@@ -13,6 +13,9 @@ GATES (all fail-closed; everything defaults OFF):
     ECHO_SOURCE_COLLECTOR_ENABLED, ECHO_SOURCE_CAPTURE_INGEST_ENABLED, the private
     operator-owned approved-mappings file, the private journal dir, the collector
     Supabase config and the Zernio credential (see source_brand_startup.py).
+    If trusted startup returns no runner while the job is armed (e.g. the
+    runner flag is unset), the run HOLDS with source_capture_runner_disabled
+    — an armed run never degrades to a silent off.
   - ECHO_SOURCE_CAPTURE_JOB_ALLOWLIST is a REQUIRED comma-separated list of exact
     canonical gym UUIDs. Missing, empty, malformed, or non-UUID entries hold the
     whole run — there is never a fallback to "all mapped gyms" or any untrusted
@@ -139,7 +142,8 @@ def run_job(environ=None, *, http=None, identity_http=None, apify_client=None,
             log(f'held: {exc} — no fallback to untrusted data')
             return _hold(str(exc))
         if runner is None:
-            return {'state': 'off'}
+            log('held: source capture startup returned no runner')
+            return _hold('source_capture_runner_disabled')
         approved = tuple(runner.collector._resolve._approved.keys())
     else:
         runner, approved = _runner, _approved_gyms

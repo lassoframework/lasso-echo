@@ -62,6 +62,48 @@ class FakeRunner:
         return {'captures': [{'id': 'c1'}]}
 
 
+def test_armed_run_holds_when_capture_runner_disabled(tmp_path):
+    # Job flag explicitly true + valid allowlist, but the trusted startup
+    # runner gate is off: hold the whole run (never a silent off, never a
+    # fallback composition).
+    env = dict(environment(), ECHO_SOURCE_CAPTURE_JOB_ENABLED='true',
+               ECHO_SOURCE_CAPTURE_JOB_ALLOWLIST=GYM,
+               ECHO_SOURCE_CAPTURE_RUNNER_ENABLED='false',
+               ECHO_SOURCE_CAPTURE_JOURNAL_DIR=str(tmp_path))
+    receipt = run_job(environ=env)
+    assert receipt == {'state': 'held', 'hold': 'source_capture_runner_disabled',
+                       'gyms': [], 'captured': 0, 'held': 1, 'errors': 0}
+    assert not list(tmp_path.iterdir())
+
+
+def test_cli_runner_disabled_hold_exits_nonzero(monkeypatch, tmp_path):
+    monkeypatch.setenv('ECHO_SOURCE_CAPTURE_JOB_ENABLED', 'true')
+    monkeypatch.setenv('ECHO_SOURCE_CAPTURE_JOB_ALLOWLIST', GYM)
+    monkeypatch.setenv('ECHO_SOURCE_CAPTURE_RUNNER_ENABLED', 'false')
+    monkeypatch.setenv('ECHO_SOURCE_CAPTURE_JOURNAL_DIR', str(tmp_path))
+    assert main([]) == 1
+
+
+def test_cli_default_off_exits_zero_without_io(monkeypatch, tmp_path):
+    monkeypatch.delenv('ECHO_SOURCE_CAPTURE_JOB_ENABLED', raising=False)
+    assert main([]) == 0
+    assert not list(tmp_path.iterdir())
+
+
+def test_allowlist_stays_exact_no_widening(tmp_path):
+    # Only the exact configured allowlist is ever worked: an allowlisted gym
+    # outside the approved mapping holds, nothing is discovered or added.
+    runner = FakeRunner([GYM])
+    env = dict(environment(), ECHO_SOURCE_CAPTURE_JOB_ENABLED='true',
+               ECHO_SOURCE_CAPTURE_JOB_ALLOWLIST=f'{GYM},{OTHER_GYM}',
+               ECHO_SOURCE_CAPTURE_JOB_DAY='2026-10-08')
+    receipt = run_job(environ=env, _runner=runner, _approved_gyms=(GYM,))
+    assert receipt['captured'] == 1 and receipt['held'] == 1
+    assert [g for g, _ in runner.calls] == [GYM]
+    assert receipt['gyms'][1]['hold'] == 'gym_not_in_approved_mapping'
+    assert not list(tmp_path.iterdir())
+
+
 def test_off_no_io_and_exit_clean(tmp_path, monkeypatch):
     def _boom(*a, **k):
         raise AssertionError('composition must not run while OFF')
