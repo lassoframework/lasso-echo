@@ -51,6 +51,7 @@ class _Lease:
         self.used=False
         self.attempted=False
         self.lock=threading.Lock()
+        self.generated=None
 
     def require(self):
         if self.closed or self.actor!=_actor() or time.monotonic()>self.deadline:
@@ -110,6 +111,11 @@ def authorized_send(store,row,claim_token):
                 or image['fingerprint'] not in receipt.get('fingerprints',[])):
             raise ProviderSendHold('trusted delivered byte receipt unavailable')
         lease=_Lease(store,frozen,token,image)
+        from .generated_infographic_runtime import PREFIX
+        if str(frozen.get('source_media_asset_id') or '').startswith(PREFIX):
+            from .generated_send_lease import GeneratedSendLease
+            lease.generated=GeneratedSendLease(store,frozen,token)
+            lease.generated.acquire()
         context_token=_SCOPE.set(lease)
         yield
     except ProviderSendHold:
@@ -193,13 +199,29 @@ def guarded_publisher(provider):
             _revalidate(lease)
             target=(account.get_target_id() if provider=='meta' and callable(getattr(account,'get_target_id',None)) else None)
             token=_CALL.set((lease,provider,str(target) if target is not None else None))
-            try: return fn(draft,account,*args,**kwargs)
+            try:
+                try:
+                    result=fn(draft,account,*args,**kwargs)
+                except Exception as exc:
+                    if lease.generated is not None:
+                        try: lease.generated.finish(error=exc)
+                        except Exception:
+                            raise ProviderSendHold('generated outcome requires reconciliation',attempted=True) from None
+                    raise
+                if lease.generated is not None:
+                    try:
+                        outcome=lease.generated.finish(result=result)
+                        if outcome=='unknown':
+                            raise ProviderSendHold('generated outcome requires reconciliation',attempted=True)
+                    except Exception:
+                        raise ProviderSendHold('generated outcome requires reconciliation',attempted=True) from None
+                return result
             finally: _CALL.reset(token)
         return wrapped
     return decorate
 
 
-def boundary(provider,*,draft=None,account=None,format=None,target=None,attempt=False):
+def boundary(provider,*,draft=None,account=None,format=None,target=None,attempt=False,caption=None):
     if not guard.enabled(): return
     active=_CALL.get()
     if not isinstance(active,tuple) or len(active)!=3 or active[1]!=provider or type(active[0]) is not _Lease:
@@ -211,11 +233,20 @@ def boundary(provider,*,draft=None,account=None,format=None,target=None,attempt=
     if target is not None and str(target)!=active[2]:
         raise ProviderSendHold('provider target changed after authorization',attempted=lease.attempted)
     if attempt:
+        if lease.generated is not None and caption is not None and caption!=lease.row.get('caption'):
+            raise ProviderSendHold('generated outgoing caption differs from canonical source',attempted=lease.attempted)
         # Repeat the atomic row/token/revision check immediately before every
         # external mutation, including Meta's post-poll media_publish step.
         # No database lock is retained across any provider network request.
         _revalidate(lease)
         lease.require()
+        if lease.generated is not None:
+            # Mark ambiguity BEFORE the committed begin request: its response
+            # can be lost after PostgreSQL has durably consumed permission.
+            lease.attempted=True
+            try: lease.generated.begin(provider)
+            except Exception:
+                raise ProviderSendHold('generated begin requires reconciliation',attempted=True) from None
         lease.attempted=True
 
 

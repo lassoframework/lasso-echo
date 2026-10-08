@@ -65,6 +65,11 @@ def authorize(store, row, claim_token):
                 or str(persisted.get('publish_claim_token') or '') != token
                 or any(persisted.get(key) != row.get(key) for key in _CREATIVE)):
             raise guard.ForwardMediaVerificationHold('owned persisted creative unavailable or changed')
+        from .generated_infographic_runtime import validate_publish_palette, RuntimeHold
+        try:
+            validate_publish_palette(persisted, store=store)
+        except RuntimeHold as exc:
+            raise guard.ForwardMediaVerificationHold(str(exc)) from None
         persisted = _bind_gbp_reservation_day(store, row, token, persisted)
         if any(persisted.get(key) != row.get(key) for key in _CREATIVE):
             raise guard.ForwardMediaVerificationHold('owned GBP creative changed while binding send day')

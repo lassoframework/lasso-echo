@@ -1,0 +1,178 @@
+# Generated infographic runtime integration
+
+This lane is a default OFF code candidate. No provider was called, credential added, migration applied, calendar changed or sender activated.
+
+## Implemented path
+
+- Existing media scheduler: `client_media_sync._maybe_infographic_fill`. `AGENT_GENERATED_INFOGRAPHIC_RUNTIME=true` selects the fresh runtime and prevents legacy `client_infographic_fill.fill_gaps` from running, including after a hold. OFF preserves existing behavior.
+- Existing-row owner runner: `python -m agent.generated_infographic_runtime --gym <exact Echo base> --account <exact base_ig or base_fb> --row <persisted UUID>`. Uses `ForwardMediaOwnerPersistence.connect_from_environment`, the existing Astra original provider, separate Astra reviewer and R2 original-byte host. `AGENT_FORWARD_MEDIA_GUARD` must also be enabled. The existing owner-worker settings require an explicit tenant allowlist and reject publisher credentials. It never uses publisher/service-role credentials as an owner fallback.
+- Trusted loader: dedicated B DB snapshot with exact gym/date/logical UUID and separate visual group; exact IG/FB feed account; complete photo inventory and zero eligible photos; current controlled gym palette file with source notes/approval and content revision; a verbatim current approved same-gym source caption. Rephrased captions hold pending an approved copy receipt rather than being inferred approved. Complete delivered visual history is checked before paid generation. SQL-issued immutable SHA/pHash cache proofs are reused only from the dedicated owner snapshot; unresolved URLs are observed once per URL. B independently reloads authenticated cache proof and observes unresolved bytes before reservation.
+- A strict candidate validation checks job, original bytes, storage key and readback before B reservation. The owner reloads copy/palette/photo/history facts after generation. B retains final SQL locks and source reservation.
+- `/data/generated-infographic-jobs.sqlite` is required on a mounted durable `/data` volume. `AGENT_GENERATED_INFOGRAPHIC_JOURNAL` may select a file beneath the same volume; ephemeral paths hold. The A journal fences generation, and a separate runtime row-to-job table binds identity before the first provider call and preserves it across history-spine changes, incomplete review and ambiguous responses. A durable `committing` marker holds unknown DB commits for independent reconciliation; no new provider job or automatic commit retry follows uncertainty.
+- Successful reservation leaves normal calendar status/approval/holds intact. It adds no coach-review category, legacy client-safe-review suffix, direct send or automatic approval. Existing client approval gates govern publication.
+- Calendar publication validates current palette before the calendar claim. The existing `forward_media_publish.authorize` repeats current approved source metadata, exact source copy, palette and job bindings before forward-media claims and every lower provider revalidation. Both publisher boundaries read a minimal immutable reservation binding from SQL through the calendar store; the owner's local SQLite journal grants no publisher authority. DB lineage and final publication claims remain mandatory.
+
+## Draft gap dispatch and owner binding
+
+`run_scheduled` uses the current read-only photo status and empty upcoming calendar dates, then calls only `fixer_generated_gap_dispatch_20261007` through the existing publisher REST client. The RPC accepts request UUID, exact Echo gym base, local date, platform and feed format. It enqueues a bounded immutable request; it receives no source/copy/palette/approval assertions and creates no calendar row. The scheduler never opens the owner DSN, calls `insert_rows` or uses the source observation bridge.
+
+`python -m agent.generated_infographic_runtime --scan` makes one finite discovery pass in the existing isolated owner execution. `generated_infographic_gap_owner.GapOwnerTransport` calls owner-only pending/bind/record RPCs from `migrations/DRAFT_fixer_generated_gap_dispatch_20261007.sql`. The owner verifies the configured tenant allowlist, local upcoming date and local account mapping, selects an exact current approved source, and reads the controlled gym palette. The bind takes existing graph and photo-census locks, then slot and request locks. It refuses conflicting active feed rows (including legacy platform aliases), creates exactly one null-image **pending** row, and rechecks complete zero-photo inventory plus B's sealed history under those locks. It stores immutable caption, approved source metadata revision and palette evidence/digest/revision refs. A replay must match the original refs and still-current row identity.
+
+Instagram and Facebook requests on the same gym/date share one logical UUID and visual group. The runtime pins both rows to one journal execution across unrelated history-spine drift; a changed copy/palette/inventory binding or ambiguous first execution holds. B independently decides whether that exact original may be reserved for the sibling. Completed outcome recording requires an already committed B reservation matching the bound row. Ordinary approval and existing holds remain untouched. No coach-review marker is inserted.
+
+The owner records a durable binding/commit phase before the DB mutation, and a lost commit requires independent reconciliation. Expired/changed/occupied requests hold. Existing held cards require a separately authorized hold-clear operation; this package never clears them. This draft supplies code and disposable database proof, not a provisioned owner process or live dispatch capability.
+
+## Read-only production configuration evidence
+
+On 2026-10-07, first-party Railway `describe_service` returned variable names only for production project `b49e41ea-ae21-4668-bcc8-022d596bbc69`, environment `53cb47a0-bb88-4e4f-9209-41e66ea18a11`.
+
+| Service | Existing execution | Durable storage | Owner provision evidence |
+| --- | --- | --- | --- |
+| echo `73787c53-f58e-4bd7-8e1c-e9f2cb936577` | `python -m agent listen` | mounted `/data`, echo-volume | No `FORWARD_MEDIA_OWNER_DSN`, `FORWARD_MEDIA_OWNER_ROLE`, owner worker flag or generated runtime flag name |
+| echo-intake-web `3adb8f0e-025e-40fe-9b26-fcb29710b7fc` | `/opt/venv/bin/python -m agent intake-web` | distinct mounted `/data`, echo-intake-web-volume | Same owner names absent |
+| fixer-worker `3b6f0436-2434-45a8-a034-ec011e0be6b8` | Node hosted fixer from separate scout repository | no listed volume | Same owner names absent |
+
+Echo/intake list existing `OPENAI_API_KEY` and R2/S3 variable names. All three list `SUPABASE_SERVICE_ROLE_KEY`; Echo/intake list `ZERNIO_API_KEY`. These current environments violate the owner-isolation contract and cannot run the owner by simply adding its DSN. No variable values were read or printed. The existing owner CLI is a code route, not a provisioned production process.
+
+## Smallest safe release requirements
+
+1. Integrate reviewed A, repaired B (including sealed baseline and account/format snapshot), and this runtime behind their OFF flags. Finish independent review and required SQL/release checks.
+2. Independently review and apply the draft gap dispatch migration after accepted B authority migrations. The minimal approved-copy capability accepts verbatim current approved source words; paraphrased copy remains held without a persisted approval receipt. Preserve approval and existing media holds.
+3. Provision the already-designed dedicated owner role/execution with only its intended DB grants, current approved source/account/palette reads, existing Astra/storage credentials and durable journal. Do not put owner DSN into the publisher/service-role process or weaken its environment guards. No new microservice/credential mutation is part of this lane.
+4. Apply and verify the reviewed draft SQL reservation readback before publisher activation. The code now uses a minimal service-role readback at both publisher boundaries and holds when it is absent or stale. The owner supplies an immutable approved-source revision distinct from the DB copy digest. Echo and intake have distinct `/data` volumes; neither publisher depends on the owner's SQLite journal. This draft SQL is not applied in production.
+5. Retain all sealed historic baseline image/thumbnail objects and current delivered visuals. B's selected repair returns immutable SQL proof references joined to exact history key, binding, URL and sealed baseline SHA/epoch. Runtime accepts only these owner-issued cache facts, never producer cache flags. Unresolved URLs remain independently observed. This requires the repaired B migration/API; a URL or previous pHash alone cannot authorize reuse.
+6. Run an offline then staged end-to-end gap/create/prepare/reserve/attest/claim/provider-readback check. Only then consider scoped flag activation under the existing release owner.
+
+## Offline evidence
+
+`tests/test_generated_infographic_runtime.py` covers fresh candidate preparation through mocked owner reservation, strict original/job/storage binding, exact account/gym/date/logical identity, photo availability and late-photo rechecks, current approved copy and palette revision, complete history byte failure, ambiguity fencing, durable owner commit uncertainty, reservation-spine replay without regeneration, SQL readback loss or identity drift, owner-journal absence at the publisher, and explicit scheduler hold without legacy fallback.
+
+No live generation or mutation is established by these fixtures. This runtime does not close the global image activation gap.
+
+Selected offline commands passed in the compatible existing Echo virtualenv:
+
+- Runtime/A/B/forward publisher/legacy fill selection: 167 passed (before final two OFF-default regression additions).
+- Calendar autopublish and media-sync regression selection: 256 passed.
+- Runtime plus explicit provider send scope: 37 passed (30 runtime and 7 provider scope, before final OFF-default additions).
+- Final runtime selection: 33 passed.
+- `git diff --check`: clean.
+
+Tests used offline fixtures only; no dependency installation or full-suite run occurred.
+
+After the cross-volume readback repair, 319 focused Python tests passed. Three disposable PostgreSQL 17 contract scripts passed, including an actual SQL reservation-to-publisher binding, immutable approved-source revision, a changed live feed format, and the existing owner/still-photo guards. A separate nonimplementing reviewer found no remaining P1/P2 code issue in this repair. Production owner provisioning, approved source and palette availability across services, migration application, and staged provider readback remain unverified.
+
+Selected runtime review repairs: before-provider row/job fencing, SQL-issued history cache reuse and URL deduplication, suppression of the no-source legacy seed under fresh ON, and current approved source revision checks at calendar/provider boundary. The focused runtime/publisher/media-sync/provider-scope selection passed 125 tests. These remain offline checks; no live generation or activation.
+
+## Gap package offline evidence
+
+- Publisher dispatch tests use mocked REST responses and prove no calendar insert or owner content assertions, photo-first holds, exact account mapping, unavailable/occupied calendar behavior and idempotent request IDs.
+- Owner discovery tests bind a mock persisted row and run actual A preparation/reviewer/storage logic plus mocked B reservation; they cover approved-source revocation, finite allowlisted dates, binding rollback and durable unknown commits.
+- `tests/test_generated_infographic_gap_owner_pg.py` runs against a unique disposable PostgreSQL 17 cluster, using existing installed psycopg. It applies the authority draft migrations plus this draft, verifies publisher/owner/mixed-role denial, immutable slot/request/ref behavior, concurrent binding, existing holds and client approval, late-photo and missing baseline rollback, SQL bind through B reservation/completion and normal attester/publisher claim, and same-day sibling reservation. No provider or production database is involved.
+- B `e50d840f` was the initial fixture dependency. Its independent review identified more owner-authority repairs; integration must rerun this fixture against B's final accepted freeze. This package does not certify that intermediate B commit.
+
+Gap package selection: 223 focused offline tests passed using the existing Echo virtualenv. The disposable PG17 script passed against intermediate B `e50d840f`; required rerun against final accepted B remains explicit. `git diff --check` was clean. Free disk measured 16 GiB before the PG fixture; the bounded temporary cluster is removed after shutdown. No dependencies were installed.
+
+Discovery starvation repair: owner discovery now supplies each configured gym's exact local tomorrow/+2 window to the owner-only pending RPC. SQL validates a bounded window for every allowlisted gym and filters those dates before the batch limit. It never deletes, expires, rebinds or resets old bound/uncertain jobs. The PG17 regression inserts 26 expired requests plus one fresh date, proves the fresh request is returned with limit 25, and proves the old bound row and queue states are unchanged.
+
+Starvation repair evidence: 59 focused runtime/gap tests passed; the disposable PG17 script passed the 26-expired-plus-fresh regression, bound-job preservation and invalid-window holds, alongside its existing authority checks. The discovery RPC's date-window bounds use UTC independently of session timezone. Intermediate B dependency and final accepted B rerun hold are unchanged.
+
+## Canonical approval and durable send boundary intermediate (2026-10-07)
+
+This default-OFF intermediate adds `generated_authority_pins` to the unapplied
+lease draft. The approval trigger copies exact tenant/epoch/source ID/revision/
+palette key/revision from the immutable owner reservation, validates current
+canonical authority and verbatim caption under its tenant lock, and clears the
+pins when a row returns to pending. It never creates source approval, infers a
+human identity, imports a local file, or upgrades a legacy reservation. Pending
+revocation and stale canonical revisions hold approval. The normal human proof
+and claim gates remain required.
+
+The SQL reservation readback exposes these owner pins. The lower Meta,
+SocialAPI and Zernio scopes acquire a durable attempt bound to the exact calendar
+claim and require those same approval pins. The first provider mutation commits
+`begin`; later mutations inside that invocation retain the same lease. Actual
+outgoing captions must equal the canonical caption, so appended hashtags or
+mentions hold before the first mutation. Settlement occurs before calendar
+publication recording. A published adapter result with a post ID records `sent`
+(provider acceptance as reported by that adapter, not independent platform
+publication). Ambiguous exceptions, unidentifiable success and lost terminal
+responses retain the fence for independent reconciliation. A lost begin response
+is never replayed or cancelled by this runtime. Cached prior publication cannot
+certify a new canonical attempt. There is no automatic expiry or reconciliation.
+A reservation left before a lower call begins also requires explicit cancellation
+through the guarded outcome workflow.
+
+**Activation blocker:** the current generation route still selects local
+`client_sources.approved_sources` and verified palette files. Its strict candidate
+schema rejects `authority_pins`, and the existing owner reservation expects the
+legacy `client-source:sha256` reference. No current runtime candidate can reach
+this new approval/send boundary successfully. A separate accepted owner change
+must ingest original verified bytes/explicit receipts into canonical authority,
+select canonical source/palette revisions before generation, bind those revisions
+into job identity and the strict candidate schema, validate them under canonical
+locks at reservation, and preserve exact palette/copy rendering provenance. It
+must not bootstrap authority from local approved labels or reconstructed bytes.
+Current local source/palette rechecks remain an additional hold; their removal or
+migration is part of that owner integration. No migration, flag, production write,
+deploy, real generation or provider send occurred here.
+
+Evidence: 136 focused Python tests passed (including real lower adapters with
+synthetic vendors). The disposable PostgreSQL 17 lease script passed exact
+approval-pin persistence, missing/changed/stale approval holds, durable lease
+identity, one begin, pending revocation, explicit unknown reconciliation, immutable
+calendar fencing/ACLs and both overlapping lock-order races. The PG script uses
+real canonical/lease/readback SQL with synthetic prerequisite claim/reservation
+rows; it does not prove the entire assembled claim/approval stack or production.
+Existing compatible dependencies were reused; disk measured 19 GiB free before
+these checks. No new worktree or dependency installation was created.
+
+## Canonical owner prerequisite audit and stop (2026-10-07)
+
+The next owner milestone stopped before implementation because the inspected
+source path cannot establish the required original-byte and explicit approval
+receipts. The existing tested approval/send hold remains the valid intermediate.
+No new reader shim, unconditional generation gate, source importer or synthetic
+production authority was added.
+
+| Inspected path | Actual retained evidence | Missing prerequisite |
+| --- | --- | --- |
+| `agent/db.py:56` and `agent/client_sources.py:77` | Source ID, account key, category, normalized text, citation, status and creation time | Original intake bytes/reference/revision/hash and authenticated explicit approval receipt bound to exact source revision/content |
+| `agent/client_sources.py:110` and `agent/client_sources.py:129` | `add_source` defaults approved; intake may auto-approve | Approved status cannot prove explicit human approval |
+| `agent/client_sources.py:274` | Single-source approval updates status only | No approver identity, approval timestamp, mode or immutable receipt; bulk approval audit at line 293 identifies the account and count, not each source/actor/revision |
+| `agent/generated_infographic_runtime.py:42` | Palette JSON file bytes/hash, colors, either `owner_approved=true` or HTTPS URL plus note | Original intake bytes/revision/hash and authenticated palette verification receipt bound to exact original palette file revision/bytes |
+| `agent/generated_authority.py:33` | Unwired helpers accept original bytes and caller-supplied actor/receipt strings | Helpers do not authenticate receipts, fetch source originals or run in any existing intake route; no automatic migration authority |
+
+Concrete evidence required before canonical owner integration:
+
+1. An exact tenant grant and original intake artifact obtainable through a
+   trusted internal source, with immutable origin reference, intake revision and
+   the actual original bytes. The ingestion owner computes its SHA256 from those
+   bytes, never from a normalized text bundle or reconstructed JSON.
+2. An independently authenticated explicit source approval receipt that binds
+   tenant, stable source ID, exact canonical revision, exact UTF8 text content
+   digest and intake digest, plus the verified actor and receipt reference. An
+   auto-approval setting, local label, audit count or body-supplied actor cannot
+   satisfy this. New/updated source content starts pending.
+3. The original verified palette file bytes and exact file revision, plus the
+   intake origin/revision/original bytes and a verified actor/receipt reference
+   binding those bytes and the selected colors. A file read can establish its
+   current hash, but a boolean or note does not establish explicit verification.
+4. An existing authenticated producer that can verify those receipts and perform
+   the canonical function-only CAS writes. The isolated generation owner reads
+   accepted authority; it must not obtain publisher/service-role credentials,
+   self-approve content, or mint receipt authenticity from a caller assertion.
+
+Once that evidence source is established, the remaining bounded implementation
+is to select exact canonical source/palette revisions, include tenant epoch and
+both revisions in the generation job identity and strict candidate schema,
+revalidate verbatim copy and original-file colors, and acquire the graph,
+canonical and calendar reservation locks in the established order before the
+final SQL reservation. Existing photo-first, original-byte history, approval,
+tenant and durable ambiguity gates remain acceptance requirements. Legacy jobs
+must not be upgraded in place or regenerated automatically after ambiguity.
+
+This audit covers repository producer capability only. It did not inspect live
+client data, Drive/Slack receipt archives or production DB canonical rows, so it
+does not claim those evidence sources do not exist. Source discovery remains
+with the lead. The prior 136 Python/PG17 evidence is reused unchanged; this
+follow-up edits documentation only and does not establish canonical generation.

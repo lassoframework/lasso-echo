@@ -1122,6 +1122,12 @@ def _maybe_infographic_fill(base, account, store, log):
     AGENT_CLIENT_INFOGRAPHIC_FILL (client_infographic_fill self-gates); INSERT-only,
     pending rows, capped per pass. Best effort: never blocks or fails the scan."""
     try:
+        from . import generated_infographic_runtime as generated
+        if generated.enabled():
+            # The publisher scheduler cannot open owner credentials. The fresh
+            # lane holds until a trusted isolated owner dispatch is provisioned.
+            # Never fall back to legacy igfill after a fresh-lane hold.
+            return generated.run_scheduled(base, account, store, logger=log)
         from .client_infographic_fill import fill_enabled, fill_gaps
         # Module-level helper: load_voice must be imported HERE. It used to lean on
         # scan_and_generate's function-local import, which is invisible in this scope,
@@ -1162,6 +1168,9 @@ def _maybe_seed_no_media_astra(base_key, account, store, log):
     failure must never sink or slow the scan; the generic onboarding sample
     (seeded just above this call site) still covers the gym either way."""
     try:
+        from . import generated_infographic_runtime as generated
+        if generated.enabled():
+            return generated.run_scheduled(base_key, account, store, logger=log)
         from . import no_media_astra_seed
         if not no_media_astra_seed.enabled():
             return
