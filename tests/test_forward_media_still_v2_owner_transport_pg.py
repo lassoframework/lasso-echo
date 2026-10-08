@@ -1,11 +1,12 @@
 """Disposable PG17, complete composed authority, genuine Ed25519 schema 2.
 
-All assets, reviews, policy rulings and 113 accounted video rows are synthetic.
+Narrow owner transport regression: all assets, reviews, policy rulings and 113 accounted video rows are synthetic.
 No production, provider, GHL or network operations. SQL relies on authenticated
 independent verifier, with real Ed25519 verification in Python before append.
 """
 from dataclasses import asdict
 import copy
+import concurrent.futures
 import hashlib
 import json
 import os
@@ -34,7 +35,8 @@ MIGRATIONS=(
  'DRAFT_fixer_forward_schedule_stage_20261008.sql','DRAFT_fixer_forward_schedule_worker_discovery_20261008.sql',
  'DRAFT_fixer_forward_schedule_staged_preparation_20261008.sql',
  'DRAFT_fixer_photo_historical_clearance_20261008.sql','DRAFT_fixer_prospective_photo_authority_20261008.sql',
- 'DRAFT_fixer_photo_historical_clearance_20261008.sql','DRAFT_fixer_prospective_still_v2_20261008.sql')
+ 'DRAFT_fixer_photo_historical_clearance_20261008.sql','DRAFT_fixer_prospective_still_v2_20261008.sql',
+ 'DRAFT_fixer_still_v2_owner_transport_20261008.sql')
 
 
 def pg17_bin():
@@ -60,7 +62,7 @@ def main(*, runtime_check=None, extra_migrations=(), genuine_sources=False):
  import psycopg
  pg=pg17_bin()
  assert shutil.disk_usage('/tmp').free>5*1024**3
- with tempfile.TemporaryDirectory(prefix='still_v2_pg_',dir='/tmp') as tmp:
+ with tempfile.TemporaryDirectory(prefix='still_v2_owner_transport_pg_',dir='/tmp') as tmp:
   work=Path(tmp); sock=work/'sock';sock.mkdir();data=work/'data';port=random.randint(41000,59000)
   subprocess.run([str(pg/'initdb'),'-D',str(data),'-U','postgres','--no-sync'],check=True,capture_output=True,timeout=60)
   subprocess.run([str(pg/'pg_ctl'),'-D',str(data),'-l',str(work/'pg.log'),'-o',f"-k {sock} -p {port} -c listen_addresses=''",'-w','start'],check=True,capture_output=True,timeout=60)
@@ -107,7 +109,7 @@ def main(*, runtime_check=None, extra_migrations=(), genuine_sources=False):
    recipe=attester.make_still_recipe('identity')
 
    def seed(tenant='gym',day='2026-10-10',logical=None,data_bytes=None):
-    data_bytes=data_bytes or png('blue'); md5=hashlib.md5(data_bytes).hexdigest();sha=hashlib.sha256(data_bytes).hexdigest()
+    data_bytes=data_bytes or png('#'+uuid.uuid4().hex[:6]); md5=hashlib.md5(data_bytes).hexdigest();sha=hashlib.sha256(data_bytes).hexdigest()
     rid=str(uuid.uuid4());logical=logical or str(uuid.uuid4());asset='asset_'+uuid.uuid4().hex;source='src_'+uuid.uuid4().hex;url='https://scratch.example/'+uuid.uuid4().hex+'.png';group='vg_'+uuid.uuid4().hex
     sql("insert into media_source values(%s,%s,'gym_drive',%s,true)",(source,tenant,'FolderOriginal1234567' if genuine_sources else 'folder'))
     moderation={'verdict':'clean','provider':'SYNTHETIC scanner','content_hash':md5,'asset_id':asset,'gym_id':tenant,'people_detected':False,'observed_at':'2026-10-08T00:00:00Z','sha256':sha}
@@ -181,106 +183,148 @@ def main(*, runtime_check=None, extra_migrations=(), genuine_sources=False):
     runtime_check(sql=sql,denied=denied,seed=seed,attest=attest,dsn=dsn)
     admin.close();return
 
+   def pending(tenants=('gym',),limit=100):
+    return sql('select fixer_still_v2_owner_pending_20261008(%s,%s)',(list(tenants),limit),'photo_owner')[0][0]
+   def identity(c):return c['packet']['payload']['audit_id']
+   def reserve(c,phase='prepare',token=None):
+    token=token or str(uuid.uuid4())
+    ok=sql('select fixer_still_v2_owner_reserve_20261008(%s,%s,%s)',(identity(c),phase,token),'photo_owner')[0][0]
+    return token,ok
+   def status(c,phase,token):
+    return sql('select fixer_still_v2_owner_status_20261008(%s,%s,%s)',(identity(c),phase,token),'photo_owner')[0][0]
+   def finish_prepare(c,token,commit=True):
+    conn=psycopg.connect(dsn);conn.execute('set role photo_owner')
+    try:
+     snap=conn.execute('select fixer_still_v2_owner_locked_20261008(%s,\'prepare\',%s)',(identity(c),token)).fetchone()[0]
+     assert 'hold_reason' not in snap,snap
+     assert snap['source_receipt_revision']==snap['revision']
+     conn.execute('select fixer_prepare_owner_staged_still_v2_20261008(%s,%s::jsonb,%s::jsonb)',(identity(c),json.dumps(c['original']),json.dumps(c['manifest'])))
+     outcome={'status':'persisted','decision':'cleared_unused','manifest_digest':c['manifest']['manifest_digest']}
+     assert conn.execute('select fixer_still_v2_owner_finish_20261008(%s,\'prepare\',%s,%s::jsonb)',(identity(c),token,json.dumps(outcome))).fetchone()[0]
+     if commit:conn.commit()
+     else:conn.rollback()
+     return outcome
+    finally:conn.close()
+   def attest_only(c,roles=('original','delivered','thumbnail')):
+    sql('select fixer_bind_forward_schedule_staged_manifest_20261008(%s)',(c['rid'],),'service_role')
+    rev=sql('select fixer_forward_media_attestation_request_20261006(%s)->>\'revision\'',(c['rid'],))[0][0]
+    ev=str(uuid.uuid4())
+    sql('select fixer_attest_forward_media_20261006(%s,%s,%s,%s,%s,%s,%s,null,null,\'same_object\',\'SYNTHETIC trusted byte read\')',(c['rid'],rev,ev,'md5:'+c['md5'],len(c['bytes']),'md5:'+c['md5'],len(c['bytes'])),'fixer_forward_media_attester_20261006')
+    reads=sql('select source_read_receipt,image_read_receipt from fixer_forward_media_lineage_20261006 where evidence_id=%s',(ev,))[0]
+    for role in roles:
+     sql('insert into forward_media_visual_attestation(attestation_id,tenant_key,media_url,role,source_sha256,source_md5,byte_length,phash_v1,row_revision,lineage_receipt_id,object_read_receipt_id) values(%s,%s,%s,%s,%s,%s,%s,0,%s,%s,%s)',(str(uuid.uuid4()),c['tenant'],c['url'],role,c['sha'],c['md5'],len(c['bytes']),int(rev[:15],16),ev,reads[0] if role=='original' else reads[1]),'fixer_forward_media_attester_20261006')
+    c.update(rev=rev,evidence=ev,reads=reads)
+
    c=seed()
-   denied('select fixer_prepare_owner_staged_photo_20261008(%s,%s::jsonb,%s::jsonb)',(c['packet']['payload']['audit_id'],json.dumps(c['original']),json.dumps(c['manifest'])),'photo_owner','exclusions')
+   assert pending()==[] # Gate defaults OFF; no worker authority enabled by DDL.
+   for role in ('service_role','anon','authenticated','fixer_forward_media_attester_20261006','photo_auditor'):
+    denied('select fixer_still_v2_owner_pending_20261008(array[\'gym\'],1)',role=role)
+    denied('select * from fixer_still_v2_owner_progress_20261008',role=role)
+   assert sql("select count(*) from pg_proc f join pg_namespace n on n.oid=f.pronamespace where n.nspname='public' and f.proname like 'fixer_still_v2_owner_%' and has_function_privilege('service_role',f.oid,'EXECUTE')")[0][0]==0
+   sql('create role mixed_owner; grant fixer_forward_media_owner_20261006,fixer_forward_media_attester_20261006 to mixed_owner;')
+   denied('select fixer_still_v2_owner_pending_20261008(array[\'gym\'],1)',role='mixed_owner',fragment='isolated')
    sql('update forward_prospective_photo_gate_20261008 set enabled=true')
-   # Independent verification rejects signature tampering and unknown kinds.
-   snap=sql('select fixer_still_photo_snapshot_v2_20261008()')[0][0]
+   items=pending();assert len(items)==1 and items[0]['phase']=='prepare',items
+   assert items[0]['calendar_row_id']==c['rid'] and items[0]['batch_id']==c['batch']
+   assert pending(('outside',))==[]
+   denied('select fixer_still_v2_owner_pending_20261008(array[\'gym\'],101)',role='photo_owner',fragment='bounded')
+   # Invalid tenant/source/logical/revision changes exclude before work.
+   for query,args,undo,undoargs in (
+    ('update media_source set gym_id=%s where id=(select source_id from media_asset where id=%s)',('outside',c['asset']),
+     'update media_source set gym_id=%s where id=(select source_id from media_asset where id=%s)',('gym',c['asset'])),
+    ('update content_calendar set caption=%s where id=%s',('drift',c['rid']),
+     'update content_calendar set caption=null where id=%s',(c['rid'],))):
+    sql(query,args);assert pending()==[];sql(undo,undoargs);assert len(pending())==1
+   denied('update content_calendar set logical_post_id=%s where id=%s',(str(uuid.uuid4()),c['rid']),role='service_role',fragment='logical_post_id')
+   # Competing owners get precisely one durable reservation.
+   with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+    winners=list(pool.map(lambda _:reserve(c),range(2)))
+   assert sorted(ok for _,ok in winners)==[False,True],winners
+   token=next(token for token,ok in winners if ok)
+   assert status(c,'prepare',token)['state']=='quarantine' and pending()==[]
+   denied('select fixer_still_v2_owner_snapshot_20261008(%s,\'prepare\',%s)',(identity(c),str(uuid.uuid4())),'photo_owner','quarantine')
+   # Remote read snapshot has no row locks; source changes afterward are refused.
+   snap=sql('select fixer_still_v2_owner_snapshot_20261008(%s,\'prepare\',%s)',(identity(c),token),'photo_owner')[0][0]
+   assert snap['asset']['id']==c['asset'] and snap['source_receipt']['receipt_ref']==c['original']['registry_evidence_ref']
+   sql('update media_source set folder_id=\'changed\' where id=(select source_id from media_asset where id=%s)',(c['asset'],))
+   assert sql('select fixer_still_v2_owner_locked_20261008(%s,\'prepare\',%s)',(identity(c),token),'photo_owner')[0][0]['hold_reason']=='still_v2_candidate_binding_changed'
+   sql('update media_source set folder_id=\'folder\' where id=(select source_id from media_asset where id=%s)',(c['asset'],))
+   # Rollback after grant+finish leaves only durable quarantine. Readback never infers success.
+   outcome=finish_prepare(c,token,commit=False)
+   assert status(c,'prepare',token)['state']=='quarantine'
+   assert sql('select count(*) from fixer_owner_photo_reservation_20261007 where audit_id=%s',(identity(c),))[0][0]==0
+   outcome=finish_prepare(c,token)
+   assert status(c,'prepare',token)['outcome']==outcome
+   assert sql('select fixer_still_v2_owner_finish_20261008(%s,\'prepare\',%s,%s::jsonb)',(identity(c),token,json.dumps(outcome)),'photo_owner')[0][0]
+   denied('select fixer_still_v2_owner_finish_20261008(%s,\'prepare\',%s,%s::jsonb)',(identity(c),token,json.dumps({'status':'hold','reason':'hide success'})),'photo_owner','immutable')
+   denied("update fixer_still_v2_owner_progress_20261008 set state='quarantine',outcome=null,finished_at=null where audit_id=%s",(identity(c),),role='postgres',fragment='immutable')
+   denied('delete from fixer_still_v2_owner_progress_20261008 where audit_id=%s',(identity(c),),role='postgres',fragment='evidence')
+   denied('truncate fixer_still_v2_owner_progress_20261008',role='postgres',fragment='evidence')
+   # A persisted grant alone is insufficient: binder plus all 3 exact trusted roles required.
+   assert pending()==[]
+   attest_only(c,roles=('original','delivered'))
+   assert pending()==[]
+   aid=str(uuid.uuid4())
+   sql('insert into forward_media_visual_attestation(attestation_id,tenant_key,media_url,role,source_sha256,source_md5,byte_length,phash_v1,row_revision,lineage_receipt_id,object_read_receipt_id) values(%s,%s,%s,\'thumbnail\',%s,%s,%s,0,%s,%s,%s)',(aid,c['tenant'],c['url'],c['sha'],c['md5'],len(c['bytes']),int(c['rev'][:15],16),c['evidence'],c['reads'][1]),'fixer_forward_media_attester_20261006')
+   items=pending();assert len(items)==1 and items[0]['phase']=='admit',items
+   a=items[0];assert len(a['attestation_ids'])==3 and a['expected_revision']==c['rev']
+   token2,ok=reserve(c,'admit');assert ok
+   snap=sql('select fixer_still_v2_owner_snapshot_20261008(%s,\'admit\',%s)',(identity(c),token2),'photo_owner')[0][0]
+   assert snap['revision']!=snap['source_receipt_revision']
    approved=sql('select fixer_forward_media_photo_approved_key_20261007(%s)',(key['key_id'],))[0][0]
-   bad=copy.deepcopy(c['packet']);bad['signature_hex']='0'*128
-   try:verify_still_v2(bad,approved,snap);raise AssertionError('tampered signature accepted')
-   except PhotoCertificateHold as exc:assert str(exc)=='certificate_signature_invalid'
-   unknown_snap=copy.deepcopy(snap);unknown_snap['accounted_video_rows'][0]['media_kind']='unknown'
-   try:verify_still_v2(c['packet'],approved,unknown_snap);raise AssertionError('unknown kind accepted')
-   except PhotoCertificateHold as exc:assert 'unknown_kind_hold' in str(exc)
-   incomplete=copy.deepcopy(c['packet']['payload']);incomplete['audit_id']=str(uuid.uuid4());incomplete['accounted_videos'].pop()
-   text=canonical(incomplete);sig=private.sign(text.encode()).hex();ref='photo-audit:sha256:'+hashlib.sha256((text+'\n'+sig).encode()).hexdigest()
-   denied('select fixer_still_photo_record_v2_20261008(%s,%s,%s)',(text,sig,ref),'photo_auditor','complete separately versioned')
-   prepare_and_attest(c,delivered_phash=(1<<32)-1)
-   sql('update forward_prospective_photo_gate_20261008 set enabled=false')
-   denied('select admit_prospective_still_v2_20261008(%s,%s,%s,%s::uuid[],%s)',(c['rid'],c['logical'],c['rev'],c['ids'],c['packet']['payload']['audit_id']),'photo_owner','OFF')
-   sql('update forward_prospective_photo_gate_20261008 set enabled=true')
-   occupancy=admit(c);assert occupancy==admit(c)
-   sql('update forward_schedule_reservation_gate_20261008 set enabled=true')
-   sql('update forward_media_visual_gate_20261008 set enabled=true')
-   candidates=[{'calendar_row_id':c['rid'],'logical_post_id':c['logical'],'expected_revision':c['rev'],'attestation_ids':c['ids'],'expected_reservation_id':None}]
-   args=(c['tenant'],c['batch'],json.dumps(candidates),'[]')
-   fin=sql('select finalize_forward_schedule_staged_batch_20261008(%s,%s,%s::jsonb,%s::jsonb)',args,'service_role')[0][0]
-   assert fin==sql('select finalize_forward_schedule_staged_batch_20261008(%s,%s,%s::jsonb,%s::jsonb)',args,'service_role')[0][0]
-   sql('insert into fixer_forward_media_claim_gate_20261006 values(%s,true)',(c['tenant'],))
-   token=str(uuid.uuid4())
-   sql("update content_calendar set status='publishing',publish_claim_token=%s,publish_reservation_day=post_date where id=%s",(token,c['rid']))
-   claimargs=(c['rid'],token,c['evidence'],c['rev'],c['ids'])
-   assert sql('select fixer_forward_visual_index_claim_20261008(%s,%s,%s,%s,%s::uuid[])',claimargs,'service_role')[0][0]
-   assert sql('select fixer_forward_visual_index_claim_20261008(%s,%s,%s,%s,%s::uuid[])',claimargs,'service_role')[0][0]
-   # Unknown published history holds finalization/claim replay, then removal
-   # of this synthetic unknown restores the original immutable receipts.
-   unknown=str(uuid.uuid4())
-   sql("insert into content_calendar(id,gym_id,post_date,status,variant_status,image_url) values(%s,'unknown-gym','2026-10-09','published','active','https://scratch.example/unknown')",(unknown,))
-   denied('select fixer_forward_visual_index_claim_20261008(%s,%s,%s,%s,%s::uuid[])',claimargs,'service_role','unknown or ambiguous')
-   denied('select finalize_forward_schedule_staged_batch_20261008(%s,%s,%s::jsonb,%s::jsonb)',args,'service_role','unknown or ambiguous')
-   sql('delete from content_calendar where id=%s',(unknown,))
-   assert sql('select fixer_forward_visual_index_claim_20261008(%s,%s,%s,%s,%s::uuid[])',claimargs,'service_role')[0][0]
-
-   # A second independent visual may prepare, but cannot skip permanent
-   # admission at reserve, finalization or claim; an aborted admission leaves
-   # neither occupancy nor a row binding and does not activate its stage.
-   pending=seed(data_bytes=png('green'));prepare_and_attest(pending,phash=-1)
-   pending_candidates=[{'calendar_row_id':pending['rid'],'logical_post_id':pending['logical'],'expected_revision':pending['rev'],'attestation_ids':pending['ids'],'expected_reservation_id':None}]
-   pending_args=(pending['tenant'],pending['batch'],json.dumps(pending_candidates),'[]')
-   denied('select finalize_forward_schedule_staged_batch_20261008(%s,%s,%s::jsonb,%s::jsonb)',pending_args,'service_role','requires permanent prospective admission')
-   denied('select reserve_forward_slot_20261008(%s,%s,%s,%s::uuid[],null)',(pending['rid'],pending['logical'],pending['rev'],pending['ids']),'service_role','requires permanent prospective admission')
-   denied('select fixer_forward_visual_index_claim_20261008(%s,%s,%s,%s,%s::uuid[])',(pending['rid'],str(uuid.uuid4()),pending['evidence'],pending['rev'],pending['ids']),'service_role','requires permanent prospective admission')
-   rollback_conn=psycopg.connect(dsn)
-   rollback_conn.execute('set role photo_owner')
-   rollback_conn.execute('select admit_prospective_still_v2_20261008(%s,%s,%s,%s::uuid[],%s)',(pending['rid'],pending['logical'],pending['rev'],pending['ids'],pending['packet']['payload']['audit_id']))
-   rollback_conn.rollback();rollback_conn.close()
-   assert sql('select count(*) from forward_prospective_photo_occupancy_20261008')[0][0]==1
-   assert sql('select variant_status from content_calendar where id=%s',(pending['rid'],))[0][0]=='candidate'
-
-   sql('select release_forward_slot_20261008(%s,\'SYNTHETIC release\')',(fin['reservation_ids'][0],),'service_role')
-   assert sql('select count(*) from forward_prospective_photo_occupancy_20261008')[0][0]==1
-   # Permanence survives schedule release. A fresh signed packet cannot
-   # overrule used still bytes for a different tenant, date or logical post.
-   for tenant,day in [('other-gym','2026-10-10'),('gym','2026-10-11'),('gym','2026-10-10')]:
-    competitor=seed(tenant=tenant,day=day,data_bytes=c['bytes'])
-    denied('select fixer_prepare_owner_staged_still_v2_20261008(%s,%s::jsonb,%s::jsonb)',(competitor['packet']['payload']['audit_id'],json.dumps(competitor['original']),json.dumps(competitor['manifest'])),'photo_owner','already used cleared or reserved')
-    # Trusted original receipt already provides the exact conflict key;
-    # neither absence of a manifest nor a fake claim token bypasses it.
-    denied('select reserve_forward_slot_20261008(%s,%s,%s,%s::uuid[],null)',(competitor['rid'],competitor['logical'],c['rev'],c['ids']),'service_role','permanent prospective still occupancy conflict')
-    denied('select fixer_forward_visual_index_claim_20261008(%s,%s,%s,%s,%s::uuid[])',(competitor['rid'],str(uuid.uuid4()),c['evidence'],c['rev'],c['ids']),'service_role','permanent prospective still occupancy conflict')
-    cmp_candidates=[{'calendar_row_id':competitor['rid'],'logical_post_id':competitor['logical'],'expected_revision':c['rev'],'attestation_ids':c['ids'],'expected_reservation_id':None}]
-    denied('select finalize_forward_schedule_staged_batch_20261008(%s,%s,%s::jsonb,%s::jsonb)',(tenant,competitor['batch'],json.dumps(cmp_candidates),'[]'),'service_role','permanent prospective still occupancy conflict')
-   advisory=sql('select check_reservation_conflicts_20261008(%s,%s,%s,%s,%s)',('other-gym','2026-10-10',str(uuid.uuid4()),c['sha'],0),'service_role')[0][0]
-   assert advisory['allowed'] is False and any(x['kind']=='permanent_prospective_still' for x in advisory['conflicts'])
-   # Synthetic per-role pHashes deliberately differ by >30 bits: only the
-   # occupied delivered/thumbnail hashes match this independent contender.
-   role_match=seed(data_bytes=png('red'));prepare_and_attest(role_match,phash=(1<<32)-1)
-   denied('select admit_prospective_still_v2_20261008(%s,%s,%s,%s::uuid[],%s)',(role_match['rid'],role_match['logical'],role_match['rev'],role_match['ids'],role_match['packet']['payload']['audit_id']),'photo_owner','permanent prospective still occupancy conflict')
-   denied('select reserve_forward_slot_20261008(%s,%s,%s,%s::uuid[],null)',(role_match['rid'],role_match['logical'],role_match['rev'],role_match['ids']),'service_role','permanent prospective still occupancy conflict')
-   inverse=seed(data_bytes=png('yellow'));prepare_and_attest(inverse,phash=-1)
-   inverse_read=sql('select source_read_receipt from fixer_forward_media_lineage_20261006 where evidence_id=%s',(inverse['evidence'],))[0][0]
-   occupied_read=sql('select source_read_receipt from fixer_forward_media_lineage_20261006 where evidence_id=%s',(c['evidence'],))[0][0]
-   sql("insert into fixer_forward_media_lineage_20261006(evidence_id,calendar_row_id,row_revision,operation,tenant_id,group_key,source_read_receipt,image_read_receipt,source_asset_id,manifest_digest,render_evidence_ref,verified_by) values(%s,%s,'SYNTHETIC inverse historical revision','render','gym','SYNTHETIC inverse transform',%s,%s,%s,%s,'SYNTHETIC candidate ancestor to occupied derivative','SYNTHETIC history attester')",(str(uuid.uuid4()),str(uuid.uuid4()),inverse_read,occupied_read,inverse['asset'],inverse['manifest']['manifest_digest']))
-   denied('select admit_prospective_still_v2_20261008(%s,%s,%s,%s::uuid[],%s)',(inverse['rid'],inverse['logical'],inverse['rev'],inverse['ids'],inverse['packet']['payload']['audit_id']),'photo_owner','permanent prospective still occupancy conflict')
-   denied('select reserve_forward_slot_20261008(%s,%s,%s,%s::uuid[],null)',(inverse['rid'],inverse['logical'],inverse['rev'],inverse['ids']),'service_role','permanent prospective still occupancy conflict')
-   # Seed one durable trusted derivative edge in the synthetic history graph.
-   # Green has distinct bytes and pHash distance 64; the ancestry alone blocks.
-   blue_read=sql('select source_read_receipt from fixer_forward_media_lineage_20261006 where evidence_id=%s',(c['evidence'],))[0][0]
-   green_read=sql('select source_read_receipt from fixer_forward_media_lineage_20261006 where evidence_id=%s',(pending['evidence'],))[0][0]
-   sql("insert into fixer_forward_media_lineage_20261006(evidence_id,calendar_row_id,row_revision,operation,tenant_id,group_key,source_read_receipt,image_read_receipt,source_asset_id,manifest_digest,render_evidence_ref,verified_by) values(%s,%s,'SYNTHETIC historical revision','render','gym','SYNTHETIC historic transform',%s,%s,%s,%s,'SYNTHETIC durable independently verified derivative edge','SYNTHETIC history attester')",(str(uuid.uuid4()),str(uuid.uuid4()),blue_read,green_read,c['asset'],c['manifest']['manifest_digest']))
-   denied('select reserve_forward_slot_20261008(%s,%s,%s,%s::uuid[],null)',(pending['rid'],pending['logical'],pending['rev'],pending['ids']),'service_role','permanent prospective still occupancy conflict')
-   denied('select fixer_forward_media_provenance_lookup_20261006(%s)',(pending['rid'],),'fixer_forward_media_attester_20261006','permanent prospective still occupancy conflict')
-   assert sql('select jsonb_array_length(excluded_rows_json) from fixer_forward_media_photo_baseline_20261007 where baseline_id=%s',(baseline,))[0][0]==113
-   sql('update forward_prospective_photo_gate_20261008 set enabled=false')
-   denied('select finalize_forward_schedule_staged_batch_20261008(%s,%s,%s::jsonb,%s::jsonb)',args,'service_role','OFF')
-   # Turning off the feature preserves the permanent conflict fence.
-   denied('select reserve_forward_slot_20261008(%s,%s,%s,%s::uuid[],null)',(pending['rid'],pending['logical'],pending['rev'],pending['ids']),'service_role','permanent prospective still occupancy conflict')
-   print('PASS: complete PG17 stack, 113 accounted videos retained, v1 HOLD, real Ed25519 v2, owner staged preparation, permanent admission, owned staged finalization/replay and final claim/replay; no-admission bypass holds; unknown history/signature/accounting holds; atomic rollback; tenant/date/logical, all occupied-role pHashes and BOTH derivative directions rejected after release; OFF holds with fences preserved. No provider publication asserted.')
+   verify_still_v2(c['packet'],approved,snap['certificate_snapshot'],c['packet']['payload']['candidate'])
+   def finish_admit(commit=True):
+    conn=psycopg.connect(dsn);conn.execute('set role photo_owner')
+    try:
+     locked=conn.execute('select fixer_still_v2_owner_locked_20261008(%s,\'admit\',%s)',(identity(c),token2)).fetchone()[0]
+     assert locked==snap
+     occ=conn.execute('select admit_prospective_still_v2_20261008(%s,%s,%s,%s::uuid[],%s)',(c['rid'],c['logical'],a['expected_revision'],a['attestation_ids'],identity(c))).fetchone()[0]
+     out={'status':'persisted','occupancy_id':str(occ)}
+     conn.execute('select fixer_still_v2_owner_finish_20261008(%s,\'admit\',%s,%s::jsonb)',(identity(c),token2,json.dumps(out)))
+     if commit:conn.commit()
+     else:conn.rollback()
+     return out
+    finally:conn.close()
+   finish_admit(commit=False)
+   assert status(c,'admit',token2)['state']=='quarantine'
+   assert sql('select count(*) from forward_prospective_photo_binding_20261008 where calendar_row_id=%s',(c['rid'],))[0][0]==0
+   out=finish_admit()
+   assert status(c,'admit',token2)['outcome']==out and pending()==[]
+   assert sql('select fixer_still_v2_owner_finish_20261008(%s,\'admit\',%s,%s::jsonb)',(identity(c),token2,json.dumps(out)),'photo_owner')[0][0]
+   assert sql('select status,variant_status,media_not_ready_reason from content_calendar where id=%s',(c['rid'],))[0]==('pending','candidate','forward_reservation_staged')
+   # Exact evidence readback distinguishes before/after COMMIT uncertainty;
+   # fresh workers never reenter either committed-quarantine or committed-final.
+   for committed in (False,True):
+    d=seed(tenant='other-gym')
+    conn=psycopg.connect(dsn);conn.execute('set role photo_owner');dt=str(uuid.uuid4())
+    assert conn.execute('select fixer_still_v2_owner_reserve_20261008(%s,\'prepare\',%s)',(identity(d),dt)).fetchone()[0]
+    if committed:conn.commit()
+    else:conn.rollback()
+    conn.close()
+    read=status(d,'prepare',dt)
+    assert read['state']==('quarantine' if committed else 'absent')
+    assert bool(pending(('other-gym',))) is not committed
+    if committed:
+     assert reserve(d)[1] is False
+     # Final HOLD is durable evidence, does not grant positive authority.
+     sql('select fixer_still_v2_owner_finish_20261008(%s,\'prepare\',%s,%s::jsonb)',(identity(d),dt,json.dumps({'status':'hold','reason':'synthetic remote unavailable'})),'photo_owner')
+     assert status(d,'prepare',dt)['state']=='final'
+    else:
+     dt,ok=reserve(d);assert ok
+   # Foreign newly prepared history remains part of reconstruction, no blanket self exemption.
+   d=seed(tenant='foreign');dt,ok=reserve(d);assert ok;finish_prepare(d,dt)
+   rebuilt=sql('select fixer_still_v2_owner_certificate_snapshot_20261008(%s)',(identity(c),))[0][0]
+   try:verify_still_v2(c['packet'],approved,rebuilt);raise AssertionError('foreign grant excluded from current corpus')
+   except PhotoCertificateHold as exc:assert 'corpus_stale' in str(exc)
    admin.close()
+   print('PASS PG17: composed still v2 owner default OFF, dedicated roles, tenant/batch/logical/revision/source CAS, exact signed self corpus, complete trusted roles, concurrent owner, durable phase quarantine, rollback/commit receipt readback, approval unchanged')
   finally:
-   subprocess.run([str(pg/'pg_ctl'),'-D',str(data),'-m','immediate','stop'],check=True,capture_output=True,timeout=60)
+   subprocess.run([str(pg/'pg_ctl'),'-D',str(data),'-m','immediate','-w','stop'],check=True,capture_output=True,timeout=60)
 
 
-def test_still_v2_pg():main()
-if __name__=='__main__':main()
+def test_still_v2_owner_transport_pg17():
+ main()
+
+
+if __name__=='__main__':
+ main()

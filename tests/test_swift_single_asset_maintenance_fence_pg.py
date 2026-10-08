@@ -11,6 +11,7 @@ prospective calendar admission are deliberately outside this SQL proof.
 """
 import concurrent.futures
 import json
+import os
 from pathlib import Path
 import shutil
 import subprocess
@@ -27,8 +28,24 @@ OTHER_ASSET = '1esVxnCv-EU-6N5R_-QYUNxCg9oypjk4s'
 
 
 def pg(name):
-    bundled = Path('/opt/homebrew/opt/postgresql@17/bin') / name
-    return str(bundled) if bundled.is_file() else shutil.which(name)
+    candidates = []
+    if os.environ.get('PG17_BIN'):
+        candidates.append(Path(os.environ['PG17_BIN']))
+    candidates.extend((Path('/opt/homebrew/opt/postgresql@17/bin'),
+                       Path('/usr/local/opt/postgresql@17/bin'),
+                       Path('/usr/lib/postgresql/17/bin')))
+    found = shutil.which(name)
+    if found:
+        candidates.append(Path(found).resolve().parent)
+    for candidate in candidates:
+        binary = candidate / name
+        server = candidate / 'postgres'
+        if binary.is_file() and server.is_file():
+            version = subprocess.run([str(server), '--version'], capture_output=True,
+                                     text=True, check=False)
+            if version.returncode == 0 and ' 17.' in version.stdout:
+                return str(binary)
+    return None
 
 
 def quote(value):

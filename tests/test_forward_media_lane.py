@@ -246,3 +246,24 @@ def test_staged_preparation_flags_allowed_only_in_their_own_lanes():
     assert worker.settings_from_environment({**ATTESTER, **attester_flag}).tenants == ('pierce',)
     assert lane.unknown_environment_names({**OWNER, **attester_flag}, 'owner') == list(attester_flag)
     assert lane.unknown_environment_names({**ATTESTER, **owner_flag}, 'attester') == sorted(owner_flag)
+
+
+def test_prospective_v2_flags_are_exact_owner_only_names():
+    flags = {'AGENT_FORWARD_MEDIA_OWNER_PROSPECTIVE_STILL_V2': 'false',
+             'AGENT_FORWARD_PROSPECTIVE_PHOTO_PREPARE': 'false'}
+    owner.check_environment({**OWNER, **flags})
+    assert lane.unknown_environment_names({**ATTESTER, **flags}, 'attester') == sorted(flags)
+    for name in flags:
+        with pytest.raises(owner.EnvironmentGuardError):
+            owner.check_environment({**OWNER, name + '_ALIAS': ''})
+
+
+def test_isolated_launcher_reaches_running_owner_entrypoint(monkeypatch):
+    from agent import forward_media_lane_launcher as launcher
+    runner = Mock(return_value=SimpleNamespace(returncode=0))
+    monkeypatch.setattr(launcher.subprocess, 'run', runner)
+    env = {**OWNER, 'AGENT_FORWARD_MEDIA_OWNER_WORKER': 'true'}
+    launcher.launch_isolated('owner', ['--loop'], environment=env)
+    args, kwargs = runner.call_args
+    assert args[0][1:] == ['-m', 'agent.forward_media_owner_worker', '--loop']
+    assert kwargs['env'] == env

@@ -74,6 +74,7 @@ from .forward_media_photo_certificate import (
 )
 from .forward_media_source_verifier import verify_source
 from .forward_media_still_certificate_v2 import IndependentStillPhotoAuditorV2
+from .forward_media_still_certificate_v2 import verify_still_v2
 from .forward_media_thumbnail_candidate import prepare_thumbnail_candidate
 
 
@@ -219,7 +220,17 @@ def prepare_prospective_photo(snapshot, *, asset, drive_reader, hosted_reader,
             raise ProspectivePhotoHold('prospective_staged_membership_unavailable')
     evidence = _approval_evidence(asset, snapshot)
     recipe = validate_still_recipe(recipe)
-    source = verify_source(snapshot, drive_reader, hosted_reader)
+    source_snapshot = snapshot
+    if type(auditor) is IndependentStillPhotoAuditorV2 and snapshot.get('source_receipt_revision') is not None:
+        # Binding the manifest changes the calendar revision between owner
+        # phases. Recompute the original immutable source receipt with its
+        # independently stored revision; every current byte/version/path and
+        # asset/source binding must still produce the signed receipt exactly.
+        revision = snapshot['source_receipt_revision']
+        if not isinstance(revision, str) or not re.fullmatch(r'[0-9a-f]{32}', revision):
+            raise ProspectivePhotoHold('prospective_receipt_ref_invalid')
+        source_snapshot = dict(snapshot, revision=revision)
+    source = verify_source(source_snapshot, drive_reader, hosted_reader)
     _attested_source_sha256(source.source_bytes, asset)
     image_bytes = hosted_reader.read(row['image_url'])
     replay = replay_still_recipe(source.source_bytes, recipe,
@@ -261,7 +272,13 @@ def prepare_prospective_photo(snapshot, *, asset, drive_reader, hosted_reader,
                 thumbnail_sha256=('sha256:' + thumbnail.thumbnail_sha256 if thumbnail.thumbnail_sha256 else None),
                 thumbnail_fingerprint=thumbnail.thumbnail_fingerprint,
                 thumbnail_length=thumbnail.thumbnail_length)
-    certificate = auditor.lookup_for_owner(audit_id, candidate)
+    if type(auditor) is IndependentStillPhotoAuditorV2 and snapshot.get('certificate_snapshot') is not None:
+        # Dedicated SQL readback removes only this exact existing grant from
+        # the live corpus. Foreign reservations and all unknown history remain.
+        certificate = verify_still_v2(stored['packet'], stored['approved_key'],
+                                     snapshot['certificate_snapshot'], candidate)
+    else:
+        certificate = auditor.lookup_for_owner(audit_id, candidate)
     source_url = source.original.source_url
     thumb_url = thumbnail.thumbnail_url if thumbnail else None
     thumb_bytes = thumbnail.thumbnail_bytes if thumbnail else None
@@ -275,6 +292,23 @@ def prepare_prospective_photo(snapshot, *, asset, drive_reader, hosted_reader,
         operation, certificate.receipt_ref, render_recipe=recipe,
         thumbnail_url=thumb_url, thumbnail_bytes=thumb_bytes)
     return PreparedProspectivePhoto(source, image_bytes, manifest, certificate, evidence, thumb_bytes)
+
+
+def stage_prepared_still_v2(persistence, prepared):
+    """Stage v2 source/clearance/manifest authority; caller commits outcome.
+
+    The accepted prospective helper already checked approval, consent, source,
+    rendition and real signature. Existing owner persistence defensively reads
+    frozen local bytes only while the SQL grant holds the authority locks.
+    Permanent occupancy remains a separate phase after attester evidence.
+    """
+    if (type(prepared) is not PreparedProspectivePhoto
+            or prepared.certificate.payload.get('schema_version') != 2):
+        raise ProspectivePhotoHold('dedicated_prepared_prospective_photo_required')
+    from .forward_media_owner_photo_prepare import PreparedOwnerPhoto, _stage_prepared
+    photo = PreparedOwnerPhoto(prepared.source, prepared.image_bytes, prepared.manifest,
+                               prepared.certificate, prepared.thumbnail_bytes)
+    return _stage_prepared(persistence, photo, 'fixer_prepare_owner_staged_still_v2_20261008')
 
 
 def admission_receipt(prepared):
