@@ -380,6 +380,9 @@ begin
     raise exception 'forward media authority requires read committed isolation' using errcode='25000';
   end if;
   perform pg_advisory_xact_lock(hashtextextended('fixer_forward_graph_20261006',0));
+  -- Take census authority before calendar rows: provenance below re-enters
+  -- this lock, preserving the same order as census-protected writers.
+  perform pg_advisory_xact_lock(hashtextextended('fixer_forward_photo_census_20261007',0));
   -- Serialize with a publisher or concurrent edit before deriving the snapshot.
   perform 1 from public.content_calendar where id=p_calendar_row_id for update;
   snapshot:=public.fixer_forward_media_attestation_request_20261006(p_calendar_row_id);
