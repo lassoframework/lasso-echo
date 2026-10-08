@@ -421,6 +421,15 @@ class CollectorPortalReader:
     def __call__(self, table, params):
         if table not in ('echo_intake_tokens', 'echo_social_connections', 'echo_gym_settings'):
             _fail('mapping_table_not_allowed')
+        # This service credential may resolve one approved gym, never enumerate
+        # the shared portal token table or the wider LASSO client universe.
+        if (not isinstance(params, dict) or set(params) - {'gym_id', 'platform', 'select'}
+                or not isinstance(params.get('gym_id'), str)
+                or not params['gym_id'].startswith('eq.')
+                or (params.get('platform') is not None
+                    and params['platform'] != 'eq.instagram')):
+            _fail('mapping_scope_invalid')
+        _canonical_gym(params['gym_id'][3:])
         if self._env.get('ECHO_SOURCE_COLLECTOR_ENABLED') != 'true':
             _fail('source_collector_disabled')
         base = self._env.get('ECHO_SOURCE_CAPTURE_SUPABASE_URL', '')

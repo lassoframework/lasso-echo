@@ -146,6 +146,12 @@ def test_portal_reader_authenticates_and_disables_redirects():
     assert calls[0][1]['headers']['Authorization'] == 'Bearer synthetic-service'
     with pytest.raises(CaptureIngestError, match='mapping_table_not_allowed'):
         reader('other', {})
+    for unscoped in ({}, {'gym_id': 'neq.' + GYM},
+                     {'gym_id': 'eq.' + GYM, 'or': '(gym_id.neq.' + GYM + ')'},
+                     {'gym_id': 'eq.not-a-uuid'}):
+        with pytest.raises(CaptureIngestError, match='mapping_scope_invalid|mapping_gym_invalid'):
+            reader('echo_intake_tokens', unscoped)
+    assert len(calls) == 1
 
 
 def test_stale_live_connection_hold():
