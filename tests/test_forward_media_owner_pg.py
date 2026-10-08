@@ -3,6 +3,7 @@
 Run as a standalone script with PostgreSQL 17 tools and psycopg installed in the
 selected interpreter. No production DSN, network connection, or existing DB is used.
 """
+from dataclasses import replace
 import os
 from pathlib import Path
 import random
@@ -85,22 +86,29 @@ def main():
                 original, "https://media.example.test/render.jpg", RENDER,
                 "render", "synthetic-render-evidence", render_recipe={"op": "synthetic"})
             dsn = f"host={sock} port={port} user={OWNER} dbname=postgres"
-            old_dsn = os.environ.get("FORWARD_MEDIA_OWNER_DSN")
-            os.environ["FORWARD_MEDIA_OWNER_DSN"] = dsn
+            # Model the same explicit clean process contract as production.
+            old_environment = dict(os.environ)
+            from agent.forward_media_lane import RUNTIME_NAMES
+            clean_environment = {k: v for k, v in old_environment.items() if k in RUNTIME_NAMES}
+            clean_environment.update(FORWARD_MEDIA_OWNER_DSN=dsn, FORWARD_MEDIA_OWNER_ROLE=OWNER)
+            os.environ.clear()
+            os.environ.update(clean_environment)
             try:
                 with psycopg.connect(dsn, autocommit=False) as conn:
                     owner = ForwardMediaOwnerPersistence(conn, OWNER, Reader())
                     assert owner.persist(original, clearance, manifest)["replayed"] is False
                     assert owner.persist(original, clearance, manifest)["replayed"] is True
-                    bad = build_render_manifest(
-                        original, "https://media.example.test/render.jpg", RENDER,
-                        "render", "changed-render-evidence", render_recipe={"op": "synthetic"})
+                    # A distinct manifest is a permitted extension, not a
+                    # conflict. Change the immutable existing registry tuple
+                    # and its matching clearance to exercise real conflict.
+                    bad_original = replace(original, registry_evidence_ref="changed-registry")
+                    bad_clearance = replace(clearance, registry_evidence_ref="changed-registry")
                     try:
-                        owner.persist(original, clearance, bad)
+                        owner.persist(bad_original, bad_clearance, manifest)
                     except OwnerPersistenceError:
                         pass
                     else:
-                        raise AssertionError("changed manifest was accepted")
+                        raise AssertionError("changed registry was accepted")
                 assert sql("select count(*) from public.fixer_forward_media_original_registry_20261006") == "1"
                 assert sql("select count(*) from public.fixer_forward_media_history_clearance_20261006") == "1"
                 assert sql("select count(*) from public.fixer_forward_media_render_manifest_20261006") == "1"
@@ -122,10 +130,8 @@ def main():
                     else:
                         raise AssertionError("service role impersonated owner")
             finally:
-                if old_dsn is None:
-                    os.environ.pop("FORWARD_MEDIA_OWNER_DSN", None)
-                else:
-                    os.environ["FORWARD_MEDIA_OWNER_DSN"] = old_dsn
+                os.environ.clear()
+                os.environ.update(old_environment)
             print("PASS: real PG17 owner insert, exact replay, conflict rollback, role isolation")
         finally:
             if started:

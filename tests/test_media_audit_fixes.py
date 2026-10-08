@@ -133,8 +133,15 @@ def _arm(monkeypatch, store, drive, host=None):
     monkeypatch.setattr("agent.integrations.drive_client.DriveClient", lambda *a, **k: drive)
     monkeypatch.setattr("agent.vision.analyze_and_store",
                         lambda *a, **k: pytest.fail("vision must not run"))
-    monkeypatch.setattr("agent.client_content.make_caption",
-                        lambda *a, **k: ("A grounded caption about the class", []))
+    # Media tests retain the original first caption, but a copy retry must model
+    # successful regeneration instead of returning the same poisoned constant.
+    retries = {"count": 0}
+    def make_caption(*args, **kwargs):
+        if kwargs.get("avoid_openings"):
+            retries["count"] += 1
+            return (f"Coaching detail {retries['count']} gives members a fresh class focus.", [])
+        return ("A grounded caption about the class", [])
+    monkeypatch.setattr("agent.client_content.make_caption", make_caption)
     monkeypatch.setattr("agent.media_host.host_media",
                         host or (lambda path, gym: f"https://cdn.fake/{os.path.basename(path)}"))
     monkeypatch.setattr("agent.gym_media_index.probe_video",
@@ -1469,3 +1476,69 @@ def test_story_reburn_and_meta_publisher_use_the_shared_video_definition():
         assert meta_publisher._is_video(f"https://cdn/x{ext}") is True, ext
     assert meta_publisher._is_video("https://cdn/x.jpg") is False
     assert meta_publisher._is_video(None) is False
+
+
+def test_drive_photo_prepass_cannot_repeat_same_date_approved_feed(monkeypatch, tmp_path):
+    """Ledger same-date exemption must not let PM repeat the protected AM copy."""
+    from agent import caption_ledger
+    monkeypatch.setenv('ECHO_CADENCE_2X_ENABLED', 'true')
+    monkeypatch.setenv('AGENT_CAPTION_COOLDOWN', 'true')
+    monkeypatch.setenv('AGENT_SB7_ENABLED', 'false')
+    _sources()
+    media = FakeMediaStore(assets=[make_asset('fresh', gym_id='gritx', title='fresh.jpg')])
+    _arm(monkeypatch, media, FakeDrive())
+    day = '2026-08-01'
+    owned = dict(id='owned', gym_id='gritx', post_date=day, format='feed',
+                 account='instagram', status='approved', slot_index=0,
+                 variant_status='active', caption='A grounded caption about the class',
+                 image_url='https://cdn.fake/owned.jpg')
+    caption_ledger.record_staged('gritx', owned['caption'], day)
+    assert not caption_ledger.is_verbatim_blocked('gritx', owned['caption'], day)
+
+    class PartialDayStore(_CalStore):
+        def gym_posts_per_day(self, *a):
+            return 2
+
+        def delete_month(self, base_key, month, *, preserve_dates=(),
+                         preserve_slots=(), preserve_gbp=None):
+            assert (day, 0) in preserve_slots and (day, 1) not in preserve_slots
+            assert day not in preserve_dates
+            return 0
+
+    cal = PartialDayStore(existing=[owned])
+    output = cmr.build_client_month(_account(), 'gritx', day, days=1, voice=_voice(),
+                                    library_path=_lib(tmp_path, n=0), store=cal,
+                                    banned_words=())
+    assert output['ok'], output
+    assert owned in cal.existing
+    feeds = _feeds(cal)
+    assert len(feeds) == 1 and feeds[0]['slot_index'] == 1
+    assert feeds[0]['source_media_asset_id'] == 'fresh'
+    assert cmr._drive_build_caption_hash(feeds[0]['caption']) != cmr._drive_build_caption_hash(owned['caption'])
+
+
+def test_unreadable_protected_caption_month_aborts_before_calendar_write(monkeypatch, tmp_path):
+    monkeypatch.setenv('ECHO_CADENCE_2X_ENABLED', 'true')
+    monkeypatch.setenv('AGENT_CAPTION_COOLDOWN', 'true')
+    _sources()
+    media = FakeMediaStore(assets=[make_asset('fresh', gym_id='gritx', title='fresh.jpg')])
+    _arm(monkeypatch, media, FakeDrive())
+    day = '2026-08-01'
+    # Lock snapshot succeeded, then the independent protected-copy read becomes
+    # unavailable. No seed means no proof that PM differs from protected AM.
+    monkeypatch.setattr(cmr, '_locked_calendar_state',
+                        lambda *a, **kw: ({day}, set(), {(day, 0)}))
+
+    class Unreadable(_CalStore):
+        def gym_posts_per_day(self, *a):
+            return 2
+        def list_month(self, *a):
+            raise RuntimeError('read unavailable')
+
+    cal = Unreadable()
+    with pytest.raises(RuntimeError, match='protected caption read unavailable'):
+        cmr.build_client_month(_account(), 'gritx', day, days=1, voice=_voice(),
+                               library_path=_lib(tmp_path, n=0), store=cal,
+                               banned_words=())
+    assert not cal.deleted and not cal.inserted
+    assert media.assets['fresh']['used_count'] == 0
