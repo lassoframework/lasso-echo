@@ -52,9 +52,11 @@ def test_hashtags_do_not_count_as_content():
 def test_dash_is_rejected():
     assert any("dash" in i for i in pq.caption_issues(
         "You are strong and ready - come train with us today at the gym near you."))
-    # a hyphen INSIDE a word is fine
+    # CONSUMER COPY LAW (Blake, 2026-10-07): a hyphen inside a word now fails too
+    assert any("consumer copy law" in i for i in pq.caption_issues(
+        "Our co-op community shows up every single morning to train together strong."))
     assert pq.caption_issues(
-        "Our co-op community shows up every single morning to train together strong.") == []
+        "Our coop community shows up every single morning to train together strong.") == []
 
 
 def test_banned_word_rejected():

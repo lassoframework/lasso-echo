@@ -20,10 +20,11 @@ Fail-closed guarantees:
   service-role or publisher fallback DSN; a missing DSN is an error.
 - ``SELECT current_user`` must equal the expected owner identity; anything else
   (anon/authenticated/service_role/attester) aborts before any write.
-- Publisher/service credentials must not be present in the process environment;
-  their presence aborts before any write.
+- The exact owner environment allowlist must be satisfied; any unknown name,
+  even empty, aborts before any write.
 - Existing rows are re-read and compared for EXACT equality (idempotent replay
-  of an identical persisted tuple). Any mismatch, missing sibling row or
+  of an identical persisted tuple); distinct manifests may extend an exact
+  registry/clearance pair. Any mismatch, missing registry/clearance sibling or
   uncertain commit outcome fails closed: the transaction is rolled back and an
   OwnerPersistenceError/UncertainCommitError is raised. The caller must resolve
   the conflict manually; nothing is overwritten or repaired automatically.
@@ -34,6 +35,7 @@ production state beyond the draft's owner tables, and never activates anything.
 import json
 import os
 import re
+from .forward_media_lane import unknown_environment_names, read_public_object
 from agent.forward_media_prepare import (
     HistoryClearance,
     OriginalRegistration,
@@ -45,6 +47,7 @@ from agent.forward_media_prepare import (
 )
 
 MAX_OBJECT_LENGTH = 134217728
+DB_DEADLINE_OPTIONS = '-c lock_timeout=5000 -c statement_timeout=20000'
 
 # Tables created by the DRAFT migration. Owner-only: no grant exists for
 # anon/authenticated/service_role/attester on these three tables.
@@ -54,10 +57,10 @@ MANIFEST_TABLE = 'public.fixer_forward_media_render_manifest_20261006'
 
 OWNER_DSN_ENV = 'FORWARD_MEDIA_OWNER_DSN'
 
-# Publisher/service credential names that must never accompany an owner write.
-_FORBIDDEN_ENV_NAME = re.compile(
-    r'(SERVICE[_-]?ROLE|PUBLISH[_-]?(KEY|TOKEN|SECRET)|SUPABASE_.*_(KEY|SECRET))',
-    re.IGNORECASE)
+def forbidden_credential_names(environ):
+    """Compatibility name: every unknown owner-lane name is forbidden."""
+    return unknown_environment_names(environ, 'owner')
+
 
 _URL_RE = re.compile(r'^https://[^\s]+$')
 _MD5_RE = re.compile(r'^md5:[0-9a-f]{32}$')
@@ -114,18 +117,23 @@ class EnvironmentGuardError(OwnerPersistenceError):
 
 
 def check_environment(environ=None):
-    """Require a dedicated owner DSN and absence of publisher/service credentials."""
+    """Require the exact owner environment contract and dedicated DSN/role."""
     environ = os.environ if environ is None else environ
-    offenders = sorted(k for k in environ if _FORBIDDEN_ENV_NAME.search(k))
+    offenders = forbidden_credential_names(environ)
     if offenders:
         raise EnvironmentGuardError(
-            'publisher/service credentials present in environment; refusing '
+            'unrecognized owner environment names; refusing '
             f'owner write: {offenders}')
     dsn = environ.get(OWNER_DSN_ENV)
     if not dsn or not dsn.strip():
         raise EnvironmentGuardError(
             f'dedicated owner DSN missing (set {OWNER_DSN_ENV}); no generic '
             'service-role or publisher fallback is provisioned')
+    role = environ.get('FORWARD_MEDIA_OWNER_ROLE', '')
+    if (not role or role != role.strip() or role in (
+            'service_role', 'anon', 'authenticated',
+            'fixer_forward_media_attester_20261006')):
+        raise EnvironmentGuardError('dedicated owner role missing or forbidden')
 
 
 class ObjectReader:
@@ -144,13 +152,10 @@ class HostedObjectReader(ObjectReader):
     """Production bounded reader for exact objects on Echo's configured host."""
 
     def read(self, url):
-        from agent import visual_writer_prepare
-        if not visual_writer_prepare._own_media_url(url):
-            raise OwnerPersistenceError('owner source or rendition is outside approved media host')
-        data = visual_writer_prepare._bytes_for_url(url)
-        if not isinstance(data, bytes) or not data:
-            raise OwnerPersistenceError('owner exact object read unavailable')
-        return data
+        try:
+            return read_public_object(url, max_bytes=MAX_OBJECT_LENGTH)
+        except Exception:
+            raise OwnerPersistenceError('owner exact public object read unavailable') from None
 
 
 def _check(condition, message):
@@ -263,7 +268,8 @@ class ForwardMediaOwnerPersistence:
             raise EnvironmentGuardError('dedicated owner role missing or forbidden')
         try:
             import psycopg
-            conn = psycopg.connect(os.environ[OWNER_DSN_ENV], autocommit=False)
+            conn = psycopg.connect(os.environ[OWNER_DSN_ENV], autocommit=False,
+                                   options=DB_DEADLINE_OPTIONS)
         except Exception as exc:
             raise OwnerPersistenceError('dedicated owner database unavailable') from exc
         return cls(conn, expected, reader or HostedObjectReader())
@@ -291,8 +297,9 @@ class ForwardMediaOwnerPersistence:
     def persist(self, original, clearance, manifest):
         """Validate, verify bytes, and persist the exact tuple in one transaction.
 
-        Idempotent: if all three rows already exist they must match exactly and
-        the call succeeds as a re-read; any mismatch fails closed. On any error
+        Idempotent: existing authority must match exactly. A new render manifest
+        may be added to an existing registry/clearance pair; an exact manifest
+        replay succeeds as a re-read. Any mismatch fails closed. On any error
         or uncertain commit the transaction is rolled back and nothing is
         reported as persisted.
         """
@@ -320,10 +327,18 @@ class ForwardMediaOwnerPersistence:
         successful hold. This method does not report durable persistence.
         """
         check_environment()
+        if self._expected_owner != os.environ['FORWARD_MEDIA_OWNER_ROLE']:
+            raise EnvironmentGuardError('owner role differs from configured lane')
         _validate_and_bind(original, clearance, manifest)
         _verify_reader_bytes(self._reader, original, manifest)
         if getattr(self._conn, 'autocommit', None) is not False:
             raise OwnerPersistenceError('owner connection must use one transaction')
+        # Bound every outer INSERT too: its graph-lock trigger restores its
+        # local settings before a unique/FK wait in the INSERT can occur.
+        # Caller-owned connections receive the same pre-command protection.
+        with self._conn.cursor() as cur:
+            cur.execute("set local lock_timeout = '5s'")
+            cur.execute("set local statement_timeout = '20s'")
         self._assert_owner_identity()
         registry, clear_row, man_row = original.row(), clearance.row(), manifest.row()
         man_row['render_recipe'] = json.dumps(manifest.render_recipe, sort_keys=True)
@@ -335,12 +350,14 @@ class ForwardMediaOwnerPersistence:
         }
         if any(existing.values()):
             self._verify_existing(original, clearance, manifest, existing)
+            if not existing['manifest']:
+                self._insert(INSERT_MANIFEST, man_row)
         else:
             self._insert(INSERT_REGISTRY, registry)
             self._insert(INSERT_CLEARANCE, clear_row)
             self._insert(INSERT_MANIFEST, man_row)
         return {'registry': registry, 'clearance': clear_row, 'manifest': manifest.row(),
-                'replayed': bool(any(existing.values()))}
+                'replayed': bool(existing['manifest'])}
 
     def _verify_existing(self, original, clearance, manifest, existing):
         """Idempotent exact re-read: every existing row must match the tuple."""
@@ -356,4 +373,5 @@ class ForwardMediaOwnerPersistence:
 
         compare(existing['registry'], registry, 'registry')
         compare(existing['clearance'], clear_row, 'clearance')
-        compare(existing['manifest'], man_row, 'manifest')
+        if existing['manifest']:
+            compare(existing['manifest'], man_row, 'manifest')
