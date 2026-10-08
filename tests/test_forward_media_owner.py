@@ -168,6 +168,7 @@ def owner_environment(monkeypatch):
     for name in forbidden_credential_names(os.environ):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv('FORWARD_MEDIA_OWNER_DSN', 'postgres://owner@localhost/fake')
+    monkeypatch.setenv('FORWARD_MEDIA_OWNER_ROLE', OWNER)
     for name in ('SUPABASE_SERVICE_ROLE_KEY', 'META_PUBLISH_TOKEN'):
         monkeypatch.delenv(name, raising=False)
 
@@ -292,9 +293,7 @@ def test_provider_credential_in_owner_environment_fails(credential):
 def test_clean_environment_passes():
     env = {'FORWARD_MEDIA_OWNER_DSN': 'postgres://owner@x/db', 'PATH': '/usr/bin',
            'FORWARD_MEDIA_OWNER_ROLE': OWNER, 'PGSSLMODE': 'verify-full',
-           'SSL_CERT_FILE': '/etc/ssl/cert.pem', 'AGENT_PUBLISH_ENABLED': '0',
-           'AGENT_TOKEN_WATCHDOG_ENABLED': '0', 'AGENT_TOKEN_WARN_DAYS': '7',
-           'AGENT_ACCOUNT_KEY_GUARD': 'false', 'AGENT_ACCOUNT_KEY_RECONCILE': 'false'}
+           'SSL_CERT_FILE': '/etc/ssl/cert.pem'}
     check_environment(env)
 
 
@@ -518,3 +517,17 @@ def test_new_manifest_failed_insert_preserves_committed_authority(prepared):
         svc.persist(original, clearance, new)
     assert conn.tables == frozen
     assert conn.rollbacks == 1 and conn.commits == 1
+
+
+@pytest.fixture(autouse=True)
+def isolated_process_environment(monkeypatch):
+    # Pytest injects PYTEST_CURRENT_TEST after fixture setup. This test-only
+    # process view excludes that harness marker; production accepts no such name.
+    import os
+    class ProcessEnvironment:
+        @property
+        def environ(self):
+            return {k: v for k, v in os.environ.items() if k != 'PYTEST_CURRENT_TEST'}
+        getenv = staticmethod(os.getenv)
+    from agent import forward_media_owner
+    monkeypatch.setattr(forward_media_owner, 'os', ProcessEnvironment())

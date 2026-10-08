@@ -31,8 +31,7 @@ class Connection:
 
 @pytest.fixture
 def lane(monkeypatch):
-    from agent import visual_writer_prepare
-    monkeypatch.setattr(visual_writer_prepare, '_own_media_url', lambda u: u.startswith('https://owned.example/'))
+    monkeypatch.setenv('AGENT_S3_PUBLIC_BASE_URL', 'https://owned.example')
     row_id = str(uuid.uuid4())
     snapshot = {'calendar_row_id': row_id, 'revision': 'revision',
                 'source_url': 'https://owned.example/source',
@@ -175,3 +174,18 @@ def test_remote_reads_follow_read_transaction_end(lane):
     guard.attest(row_id, 'revision', connection_factory=lambda: conn,
                  read_bytes=read, original_verifier=lambda *_: True)
     assert conn.committed and conn.closed
+
+
+@pytest.fixture(autouse=True)
+def isolated_process_environment(monkeypatch):
+    # Pytest injects PYTEST_CURRENT_TEST after fixture setup. This test-only
+    # process view excludes that harness marker; production accepts no such name.
+    import os
+    class ProcessEnvironment:
+        @property
+        def environ(self):
+            return {k: v for k, v in os.environ.items() if k != 'PYTEST_CURRENT_TEST'}
+        getenv = staticmethod(os.getenv)
+    for key in list(os.environ):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setattr(guard, 'os', ProcessEnvironment())

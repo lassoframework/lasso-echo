@@ -330,8 +330,19 @@ def test_dedicated_attester_settings_and_runtime_flags_allowed():
         'AGENT_FORWARD_MEDIA_ATTESTER_ROLE': worker.guard.ROLE,
         worker.TENANTS_ENV: 'pierce', worker.WORKER_ENV: 'true',
         'PATH': '/usr/bin', 'SSL_CERT_FILE': '/etc/ssl/cert.pem',
-        'AGENT_TOKEN_WATCHDOG_ENABLED': 'false', 'AGENT_PUBLISH_ENABLED': 'false',
-        'AGENT_TOKEN_WARN_DAYS': '7', 'AGENT_ACCOUNT_KEY_GUARD': 'false',
-        'AGENT_ACCOUNT_KEY_RECONCILE': 'false',
+
     })
     assert settings.tenants == ('pierce',)
+
+
+@pytest.fixture(autouse=True)
+def isolated_process_environment(monkeypatch):
+    # Pytest injects PYTEST_CURRENT_TEST after fixture setup. This test-only
+    # process view excludes that harness marker; production accepts no such name.
+    import os
+    class ProcessEnvironment:
+        @property
+        def environ(self):
+            return {k: v for k, v in os.environ.items() if k != 'PYTEST_CURRENT_TEST'}
+        getenv = staticmethod(os.getenv)
+    monkeypatch.setattr(worker, 'os', ProcessEnvironment())

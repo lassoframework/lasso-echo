@@ -11,6 +11,8 @@ import hashlib
 import os
 import uuid
 
+from .forward_media_lane import unknown_environment_names, approved_url, read_public_object
+
 ROLE = 'fixer_forward_media_attester_20261006'
 MAX_BYTES = 128 * 1024 * 1024
 
@@ -35,6 +37,8 @@ def _uuid(value):
 
 
 def _connect():
+    if unknown_environment_names(os.environ, 'attester'):
+        raise ForwardMediaVerificationHold('unrecognized attester environment')
     dsn = os.getenv('AGENT_FORWARD_MEDIA_ATTESTER_DSN')
     expected = os.getenv('AGENT_FORWARD_MEDIA_ATTESTER_ROLE')
     if not enabled() or not dsn or expected != ROLE:
@@ -55,11 +59,10 @@ def _connect():
 
 
 def _read(url, reader):
-    from . import visual_writer_prepare as prepare
-    if not prepare._own_media_url(url):
+    if not approved_url(url):
         raise ForwardMediaVerificationHold('object is outside approved media host')
     try:
-        data = (reader or prepare._bytes_for_url)(url)
+        data = (reader or read_public_object)(url)
     except Exception as exc:
         raise ForwardMediaVerificationHold('exact object read unavailable') from exc
     if not isinstance(data, bytes) or not data or len(data) > MAX_BYTES:

@@ -15,7 +15,7 @@ import re
 import threading
 
 from . import forward_media_guard as guard
-from .forward_media_owner import forbidden_credential_names
+from .forward_media_lane import unknown_environment_names
 
 TENANTS_ENV = 'AGENT_FORWARD_MEDIA_ATTESTER_TENANTS'
 WORKER_ENV = 'AGENT_FORWARD_MEDIA_ATTESTER_WORKER'
@@ -46,7 +46,7 @@ def _integer(env, name, default, minimum, maximum):
 
 def settings_from_environment(env=None):
     env = os.environ if env is None else env
-    if forbidden_credential_names(env):
+    if unknown_environment_names(env, 'attester'):
         raise WorkerConfigurationHold('publisher_or_service_credentials_present')
     if (not env.get('AGENT_FORWARD_MEDIA_ATTESTER_DSN')
             or env.get('AGENT_FORWARD_MEDIA_ATTESTER_ROLE') != guard.ROLE):

@@ -20,8 +20,8 @@ Fail-closed guarantees:
   service-role or publisher fallback DSN; a missing DSN is an error.
 - ``SELECT current_user`` must equal the expected owner identity; anything else
   (anon/authenticated/service_role/attester) aborts before any write.
-- Publisher/service credentials must not be present in the process environment;
-  their presence aborts before any write.
+- The exact owner environment allowlist must be satisfied; any unknown name,
+  even empty, aborts before any write.
 - Existing rows are re-read and compared for EXACT equality (idempotent replay
   of an identical persisted tuple); distinct manifests may extend an exact
   registry/clearance pair. Any mismatch, missing registry/clearance sibling or
@@ -35,6 +35,7 @@ production state beyond the draft's owner tables, and never activates anything.
 import json
 import os
 import re
+from .forward_media_lane import unknown_environment_names, read_public_object
 from agent.forward_media_prepare import (
     HistoryClearance,
     OriginalRegistration,
@@ -55,20 +56,9 @@ MANIFEST_TABLE = 'public.fixer_forward_media_render_manifest_20261006'
 
 OWNER_DSN_ENV = 'FORWARD_MEDIA_OWNER_DSN'
 
-# Dedicated processes may keep ordinary OS/runtime and feature settings, but
-# credential-shaped names are forbidden regardless of provider or tenant prefix.
-# Account tokens use a credential suffix; intake overrides put the tenant after
-# INTAKE_TOKEN instead. Match the whole family, never a roster of gym names.
-# PASSWORD also catches compact driver names such as PGPASSWORD.
-_FORBIDDEN_ENV_NAME = re.compile(
-    r'(SERVICE[_-]?ROLE|(?:^|[_-])(?:KEY|TOKEN|SECRET|PASSWORD|CREDENTIALS?|APIKEY)'
-    r'(?:$|[_-][0-9]+$)|(?:^|[_-])ACCESS[_-]KEY[_-]ID$|PASSWORD$|'
-    r'(?:^|[_-])INTAKE[_-]TOKEN[_-].+$)', re.IGNORECASE)
-
-
 def forbidden_credential_names(environ):
-    """Return names only; never inspect or expose credential values."""
-    return sorted(name for name in environ if _FORBIDDEN_ENV_NAME.search(name))
+    """Compatibility name: every unknown owner-lane name is forbidden."""
+    return unknown_environment_names(environ, 'owner')
 
 
 _URL_RE = re.compile(r'^https://[^\s]+$')
@@ -126,18 +116,23 @@ class EnvironmentGuardError(OwnerPersistenceError):
 
 
 def check_environment(environ=None):
-    """Require a dedicated owner DSN and absence of publisher/service credentials."""
+    """Require the exact owner environment contract and dedicated DSN/role."""
     environ = os.environ if environ is None else environ
     offenders = forbidden_credential_names(environ)
     if offenders:
         raise EnvironmentGuardError(
-            'publisher/service credentials present in environment; refusing '
+            'unrecognized owner environment names; refusing '
             f'owner write: {offenders}')
     dsn = environ.get(OWNER_DSN_ENV)
     if not dsn or not dsn.strip():
         raise EnvironmentGuardError(
             f'dedicated owner DSN missing (set {OWNER_DSN_ENV}); no generic '
             'service-role or publisher fallback is provisioned')
+    role = environ.get('FORWARD_MEDIA_OWNER_ROLE', '')
+    if (not role or role != role.strip() or role in (
+            'service_role', 'anon', 'authenticated',
+            'fixer_forward_media_attester_20261006')):
+        raise EnvironmentGuardError('dedicated owner role missing or forbidden')
 
 
 class ObjectReader:
@@ -156,13 +151,10 @@ class HostedObjectReader(ObjectReader):
     """Production bounded reader for exact objects on Echo's configured host."""
 
     def read(self, url):
-        from agent import visual_writer_prepare
-        if not visual_writer_prepare._own_media_url(url):
-            raise OwnerPersistenceError('owner source or rendition is outside approved media host')
-        data = visual_writer_prepare._bytes_for_url(url)
-        if not isinstance(data, bytes) or not data:
-            raise OwnerPersistenceError('owner exact object read unavailable')
-        return data
+        try:
+            return read_public_object(url, max_bytes=MAX_OBJECT_LENGTH)
+        except Exception:
+            raise OwnerPersistenceError('owner exact public object read unavailable') from None
 
 
 def _check(condition, message):
@@ -333,6 +325,8 @@ class ForwardMediaOwnerPersistence:
         successful hold. This method does not report durable persistence.
         """
         check_environment()
+        if self._expected_owner != os.environ['FORWARD_MEDIA_OWNER_ROLE']:
+            raise EnvironmentGuardError('owner role differs from configured lane')
         _validate_and_bind(original, clearance, manifest)
         _verify_reader_bytes(self._reader, original, manifest)
         if getattr(self._conn, 'autocommit', None) is not False:
