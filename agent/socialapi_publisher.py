@@ -207,6 +207,10 @@ def _resolve(resp, draft, account):
         f"held for retry.")
 
 
+from .forward_media_send_context import guarded_publisher, boundary, delivered_bytes
+
+
+@guarded_publisher('socialapi')
 def publish(draft, account, http=None):
     """Publish one approved draft through SocialAPI. Returns a PublishResult."""
     # 1) Draft-only short-circuit: no network call when publishing is not armed.
@@ -266,10 +270,13 @@ def publish(draft, account, http=None):
         text = _compose_caption(draft)
         content_type = "stories" if getattr(draft, "is_story", False) else "feed"
         data = _fetch_bytes(media_url, client)
+        delivered_bytes(data,media_url)
         filename, mime = _media_meta(media_url)
+        boundary('socialapi',draft=draft,account=account,attempt=True)
         media_id = socialapi_client.upload_media(data, filename, mime, http=client)
         if not media_id:
             raise SocialApiPublishError("SocialAPI returned no media_id for the upload.")
+        boundary('socialapi',draft=draft,account=account,attempt=True)
         resp = socialapi_client.create_post(
             sapi_account_id, text, [media_id], content_type=content_type,
             http=client, idempotency_key=draft.draft_id)

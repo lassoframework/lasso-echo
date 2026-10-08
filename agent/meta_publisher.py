@@ -139,6 +139,10 @@ def release_dedup(account_key, draft):
     db.kv_set(_dedup_key(account_key, draft), "")
 
 
+from .forward_media_send_context import guarded_publisher, boundary, unsupported
+
+
+@guarded_publisher('meta')
 def publish(draft, account, http=None):
     """
     Publish a draft to the right Meta surface. Returns a PublishResult.
@@ -200,6 +204,7 @@ def publish(draft, account, http=None):
 
 def _publish_gated(draft, account, http=None):
     """The real publish dispatch (post-gates, post-dedup)."""
+    boundary('meta',draft=draft,account=account)
     token = account.get_token()
     if not token:
         raise MissingToken(f"No token set for account '{account.key}'.")
@@ -327,6 +332,7 @@ def _publish_instagram(client, account, draft, caption, token):
             "Host it and set public_url in its sidecar. See AGENT_README.md."
         )
     base = config.GRAPH_API_BASE
+    boundary('meta',draft=draft,account=account,format='feed',target=ig_id,attempt=True)
     media_param = "video_url" if draft.platform and _is_video(draft.creative_public_url) else "image_url"
     # step 1: create container
     r1 = client.post(
@@ -354,6 +360,7 @@ def _publish_instagram_carousel(client, ig_id, draft, caption, token):
     DORMANT in draft-only mode: publish() short-circuits before we ever get here
     while the publish flag is OFF. This path only runs once Blake arms publishing.
     """
+    unsupported('carousel')
     base = config.GRAPH_API_BASE
     child_ids = []
     for url in draft.slide_urls:
@@ -406,6 +413,7 @@ def _publish_container(client, base, ig_id, container_id, token,
     Raises MediaNotReady if all retries are exhausted, PublishError otherwise.
     """
     for attempt in range(POST_FINISH_RETRIES + 1):
+        boundary('meta',target=ig_id,attempt=True)
         r = client.post(
             f"{base}/{ig_id}/media_publish",
             data={"creation_id": container_id, "access_token": token},
@@ -478,6 +486,7 @@ def _publish_instagram_reel(client, account, draft, caption, token, ig_id):
     DORMANT in draft-only mode: publish() short-circuits before we ever get here
     while the publish flag is OFF. This path only runs once Blake arms publishing.
     """
+    unsupported('video')
     if not draft.creative_public_url:
         raise PublishError(
             "Instagram Reels need a PUBLIC video URL. This creative has none. "
@@ -523,6 +532,7 @@ def _publish_instagram_story(client, account, draft, token):
             "Host it first. See AGENT_README.md."
         )
     base = config.GRAPH_API_BASE
+    boundary('meta',draft=draft,account=account,format='story',target=ig_id,attempt=True)
     media_param = "video_url" if _is_video(draft.creative_public_url) else "image_url"
     r1 = client.post(
         f"{base}/{ig_id}/media",
@@ -557,6 +567,7 @@ def _publish_fb_page_story(client, account, draft, token):
             "Host it first. See AGENT_README.md."
         )
     base = config.GRAPH_API_BASE
+    boundary('meta',draft=draft,account=account,format='story',target=page_id,attempt=True)
     if _is_video(draft.creative_public_url):
         r = client.post(
             f"{base}/{page_id}/video_stories",
@@ -574,6 +585,7 @@ def _publish_fb_page_story(client, account, draft, token):
     )
     _raise_for_status(r1)
     photo_id = r1.json().get("id")
+    boundary('meta',draft=draft,account=account,format='story',target=page_id,attempt=True)
     r2 = client.post(
         f"{base}/{page_id}/photo_stories",
         data={"photo_id": photo_id, "access_token": token},
@@ -588,6 +600,7 @@ def _publish_fb_page_story(client, account, draft, token):
 def _crosspost_story(client, account, draft, token):
     """Post the same creative as a Story right after the main reel/image publish.
     Called only when AGENT_STORY_CROSSPOST_ENABLED=true; errors are caught upstream."""
+    boundary('meta',draft=draft,account=account,format='story')
     if account.platform == Platform.INSTAGRAM:
         r = _publish_instagram_story(client, account, draft, token)
         print(f"[meta] ig story crossposted: {r.media_id}", flush=True)
@@ -601,6 +614,7 @@ def _publish_fb_page(client, account, draft, caption, token):
     if not page_id:
         raise PublishError(f"No Page id for '{account.key}'.")
     base = config.GRAPH_API_BASE
+    boundary('meta',draft=draft,account=account,format='feed',target=page_id,attempt=True)
     if draft.creative_public_url and (_is_video(draft.creative_public_url)
                                       or _is_video(draft.creative_path)):
         # A reel/video posts to the Page /videos endpoint (file_url), NOT /photos
