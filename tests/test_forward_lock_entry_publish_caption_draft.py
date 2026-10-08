@@ -24,8 +24,9 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 MIGRATION = ROOT / "migrations" / "DRAFT_fixer_forward_lock_entry_publish_caption_20261008.sql"
-FROZEN = ROOT.parent / "evidence" / "portal-function-definitions-20261008.sql"
-INVENTORY = ROOT.parent / "evidence" / "portal-legacy-function-inventory-20261008.json"
+FIXTURES = ROOT / "tests" / "fixtures" / "forward_lock_entry"
+FROZEN = FIXTURES / "portal-function-definitions-20261008.sql"
+INVENTORY = FIXTURES / "portal-legacy-function-inventory-20261008.json"
 
 REDEFINED = (
     "calendar_patch_caption_autonomous_clean",
@@ -221,7 +222,7 @@ def test_helper_contract_documented_and_search_path_preserved():
 def test_exact_identity_owner_and_accepted_helper_guards():
     text = _migration_text()
     guard = text[text.index("do $$"):text.index("end $$;")]
-    rows = json.loads((ROOT.parent / "evidence/portal-entry-function-identities-p2b-20261008.json").read_text())["rows"]
+    rows = json.loads((FIXTURES / "portal-entry-function-identities-p2b-20261008.json").read_text())["rows"]
     for row in rows:
         if row["proname"] in REDEFINED + WRAPPERS:
             assert f"'{row['identity_args']}'" in guard
@@ -257,8 +258,7 @@ def test_pg17_guards_reject_identity_owner_and_helper_drift(
     if not all(shutil.which(tool) for tool in ('initdb', 'pg_ctl', 'psql')):
         pytest.skip('existing local PostgreSQL tools unavailable; no install attempted')
     helper_migration = ROOT / 'migrations/DRAFT_fixer_forward_lock_entry_calendar_20261008.sql'
-    if not helper_migration.exists():
-        helper_migration = ROOT.parent / 'echo-b-entry-locks-kimi-20261008/migrations/DRAFT_fixer_forward_lock_entry_calendar_20261008.sql'
+    assert helper_migration.is_file(), 'tracked calendar helper migration fixture is required'
     helper_definition = re.search(
         r'create function public.fixer_forward_calendar_entry_lock_20261008\(\).*?\$\$;',
         helper_migration.read_text(), re.DOTALL).group(0)

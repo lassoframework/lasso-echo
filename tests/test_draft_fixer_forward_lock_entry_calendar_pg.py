@@ -17,9 +17,9 @@ import subprocess
 import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
-WORK = ROOT.parent
-EVIDENCE = WORK / 'evidence/portal-function-definitions-20261008.sql'
-INVENTORY = WORK / 'evidence/portal-legacy-function-inventory-20261008.json'
+FIXTURES = ROOT / 'tests/fixtures/forward_lock_entry'
+EVIDENCE = FIXTURES / 'portal-function-definitions-20261008.sql'
+INVENTORY = FIXTURES / 'portal-legacy-function-inventory-20261008.json'
 MIGRATION = ROOT / 'migrations/DRAFT_fixer_forward_lock_entry_calendar_20261008.sql'
 HELPER = 'public.fixer_forward_calendar_entry_lock_20261008()'
 GRAPH_KEY = 'fixer_forward_graph_20261006'

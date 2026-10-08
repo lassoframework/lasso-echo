@@ -168,7 +168,7 @@ def test_exact_identity_owner_and_accepted_helper_guards():
 
 
 def test_business_bodies_match_frozen_definitions_with_only_entry_insertion():
-    frozen = (Path(__file__).resolve().parents[1].parent / "evidence/portal-function-definitions-20261008.sql").read_text()
+    frozen = (Path(__file__).resolve().parent / "fixtures/forward_lock_entry/portal-function-definitions-20261008.sql").read_text()
     for name in FROZEN_SIGNATURES:
         original = re.search(rf"CREATE OR REPLACE FUNCTION public\.{name}\(.*?\$function\$\n;", frozen, re.DOTALL).group(0)
         actual = _function_block(name)
