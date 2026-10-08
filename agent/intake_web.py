@@ -2365,7 +2365,15 @@ def build_server(port=None):
                     # a GET on /studio/story is the LIST read (create-story is a POST).
                     from urllib.parse import urlparse, parse_qs
                     automatic_only = parse_qs(urlparse(self.path).query).get('automatic') == ['1']
-                    status, body = _ss.handle_list_stories(account_key, automatic_only=automatic_only)
+                    # Automatic Reels needs a real clip-upload action, not directions
+                    # that merely name the Media page. The URL reuses this request's
+                    # already-authenticated gym token and points at Echo's existing
+                    # video-capable uploader. The story handler only returns it inside
+                    # the client-safe automatic-reels projection.
+                    upload_url = f"{_upload_base_url()}/u/{ss_token}"
+                    status, body = _ss.handle_list_stories(
+                        account_key, automatic_only=automatic_only,
+                        upload_url=upload_url)
                 return self._send_json(body, status)
 
             # Zernio social-connect read routes (Blake ruling 2026-07-29: Zernio is the vendor;

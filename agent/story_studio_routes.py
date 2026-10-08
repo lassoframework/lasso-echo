@@ -314,7 +314,71 @@ def _render_row(row, request=None):
     }
 
 
-def handle_list_stories(account_key, *, store=None, status=None, automatic_only=False):
+def _automatic_job_for_client(job):
+    """Project one operator job into the small, client-safe status contract.
+
+    ``auto_reels.gym_status`` deliberately retains request UUIDs, retry counters and
+    exact validator failures so an operator can diagnose a render. None of those are
+    useful instructions for a gym owner. In particular, an overlay-gate failure is an
+    internal team task, not an error the owner can fix. Keep the operational snapshot
+    intact and redact it only at this portal boundary.
+    """
+    job = job if isinstance(job, dict) else {}
+    internal_status = str(job.get("status") or "").strip().lower()
+    if internal_status == "superseded":
+        return None
+    if internal_status == "staged":
+        status = "staged"
+        message = "Your finished reel is waiting for your review in Approvals."
+    elif internal_status == "running":
+        status = "running"
+        message = "Echo is building a reel from your clips."
+    elif internal_status == "waiting_pool":
+        status = "waiting_pool"
+        message = "Upload at least three usable raw clips in Media so Echo can build a reel."
+    else:
+        # Preserve the status value the existing portal already presents as
+        # "Needs team review", but never send the rejected overlay text, exception
+        # class, retry details or identifier that used to follow that label.
+        status = "exhausted"
+        message = "Our team is reviewing this reel. No action is needed from you."
+    return {
+        # The current portal treats this as optional display text. An empty value
+        # preserves its response shape without exposing an internal request UUID.
+        "request_id": "",
+        "status": status,
+        "reason": message,
+        "updated_at": job.get("updated_at"),
+        "clip_count": int(job.get("clip_count") or 0),
+    }
+
+
+def _automatic_status_for_client(snapshot, upload_url=""):
+    """Return only automatic-reel fields intended for a gym-facing page."""
+    snapshot = snapshot if isinstance(snapshot, dict) else {}
+    jobs = []
+    for raw in sorted(snapshot.get("jobs") or [],
+                      key=lambda j: j.get("updated_at") or 0
+                      if isinstance(j, dict) else 0, reverse=True):
+        projected = _automatic_job_for_client(raw)
+        if projected is not None:
+            jobs.append(projected)
+        if len(jobs) >= 20:
+            break
+    reason = ""
+    if not snapshot.get("ok", False):
+        reason = "Automatic reel status is temporarily unavailable."
+    action = {
+        "url": str(upload_url or ""),
+        "label": "Upload video clips",
+        "received_means_indexed": False,
+    }
+    return {"enabled": True, "ok": bool(snapshot.get("ok", False)),
+            "reason": reason, "jobs": jobs, "upload_action": action}
+
+
+def handle_list_stories(account_key, *, store=None, status=None, automatic_only=False,
+                        upload_url=""):
     """GET /studio/story — this gym's Story Studio history, newest first, plus the
     clip-picker bounds. Response: {ok, stories: [...], clip_bounds: {...}}.
 
@@ -331,10 +395,7 @@ def handle_list_stories(account_key, *, store=None, status=None, automatic_only=
     if config.auto_reels_portrait_active_for(gym):
         from .auto_reel_status import read
         snapshot = read(gym)
-        automatic = {"enabled": True, "ok": snapshot.get('ok', False),
-                     "reason": snapshot.get('reason', ''),
-                     "jobs": sorted(snapshot.get('jobs', []),
-                                    key=lambda j: j.get('updated_at') or 0, reverse=True)[:20]}
+        automatic = _automatic_status_for_client(snapshot, upload_url=upload_url)
     if automatic_only:
         return 200, {"ok": True, "automatic_reels": automatic}
     st = store

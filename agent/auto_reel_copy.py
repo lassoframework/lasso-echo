@@ -241,6 +241,15 @@ def prepare_copy(gym, analysis, *, voice=None, account=None, writer=None,
             ctas=[_clean(approved_ask)];ask_source={'kind':'existing_gym_source',**ask_provenance}
         if not ctas:
             return _held('No approved gym call to action is available')
+        # Story Studio enforces exactly one ask phrase on the final frame. Apply
+        # that SAME counter here, before selecting copy, so the approved voice
+        # examples "Save this post" and "Tag a gym owner" cannot pass preparation
+        # and then be misreported as zero asks during rendering. If a rotation has
+        # another valid approved CTA, use it; never rewrite or invent one.
+        from .story_overlay import count_asks
+        ctas = [cta for cta in ctas if count_asks(cta) == 1]
+        if not ctas:
+            return _held('No approved gym call to action contains exactly one ask')
         if any(len(s)>120 or copy_gate.violations(s) or _URL.search(s) for s in ctas):
             return _held('Approved call to action violates copy limits')
         writer_voice=copy.copy(voice);writer_voice.ctas=ctas
