@@ -4913,3 +4913,10 @@ settled.
 - [ ] Canonical original-byte intake and generation owner binding remain required.
   Existing local-source candidates lack canonical pins and are held. Draft SQL is
   unapplied; generated runtime activation and live delivery are unverified.
+
+Canonical owner follow-up audit (2026-10-07): [ ] blocked on an authenticated
+original-byte intake and explicit source/palette receipt producer. Existing
+SQLite source approval labels and palette JSON notes do not establish that
+provenance. Exact inspected paths and required receipt bindings are recorded in
+`docs/GENERATED_INFOGRAPHIC_RUNTIME_20261007.md`. No owner rewrite or activation
+was attempted; the previously verified missing-pin publisher hold remains.

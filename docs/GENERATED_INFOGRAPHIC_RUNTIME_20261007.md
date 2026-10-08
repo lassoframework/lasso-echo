@@ -125,3 +125,54 @@ real canonical/lease/readback SQL with synthetic prerequisite claim/reservation
 rows; it does not prove the entire assembled claim/approval stack or production.
 Existing compatible dependencies were reused; disk measured 19 GiB free before
 these checks. No new worktree or dependency installation was created.
+
+## Canonical owner prerequisite audit and stop (2026-10-07)
+
+The next owner milestone stopped before implementation because the inspected
+source path cannot establish the required original-byte and explicit approval
+receipts. The existing tested approval/send hold remains the valid intermediate.
+No new reader shim, unconditional generation gate, source importer or synthetic
+production authority was added.
+
+| Inspected path | Actual retained evidence | Missing prerequisite |
+| --- | --- | --- |
+| `agent/db.py:56` and `agent/client_sources.py:77` | Source ID, account key, category, normalized text, citation, status and creation time | Original intake bytes/reference/revision/hash and authenticated explicit approval receipt bound to exact source revision/content |
+| `agent/client_sources.py:110` and `agent/client_sources.py:129` | `add_source` defaults approved; intake may auto-approve | Approved status cannot prove explicit human approval |
+| `agent/client_sources.py:274` | Single-source approval updates status only | No approver identity, approval timestamp, mode or immutable receipt; bulk approval audit at line 293 identifies the account and count, not each source/actor/revision |
+| `agent/generated_infographic_runtime.py:42` | Palette JSON file bytes/hash, colors, either `owner_approved=true` or HTTPS URL plus note | Original intake bytes/revision/hash and authenticated palette verification receipt bound to exact original palette file revision/bytes |
+| `agent/generated_authority.py:33` | Unwired helpers accept original bytes and caller-supplied actor/receipt strings | Helpers do not authenticate receipts, fetch source originals or run in any existing intake route; no automatic migration authority |
+
+Concrete evidence required before canonical owner integration:
+
+1. An exact tenant grant and original intake artifact obtainable through a
+   trusted internal source, with immutable origin reference, intake revision and
+   the actual original bytes. The ingestion owner computes its SHA256 from those
+   bytes, never from a normalized text bundle or reconstructed JSON.
+2. An independently authenticated explicit source approval receipt that binds
+   tenant, stable source ID, exact canonical revision, exact UTF8 text content
+   digest and intake digest, plus the verified actor and receipt reference. An
+   auto-approval setting, local label, audit count or body-supplied actor cannot
+   satisfy this. New/updated source content starts pending.
+3. The original verified palette file bytes and exact file revision, plus the
+   intake origin/revision/original bytes and a verified actor/receipt reference
+   binding those bytes and the selected colors. A file read can establish its
+   current hash, but a boolean or note does not establish explicit verification.
+4. An existing authenticated producer that can verify those receipts and perform
+   the canonical function-only CAS writes. The isolated generation owner reads
+   accepted authority; it must not obtain publisher/service-role credentials,
+   self-approve content, or mint receipt authenticity from a caller assertion.
+
+Once that evidence source is established, the remaining bounded implementation
+is to select exact canonical source/palette revisions, include tenant epoch and
+both revisions in the generation job identity and strict candidate schema,
+revalidate verbatim copy and original-file colors, and acquire the graph,
+canonical and calendar reservation locks in the established order before the
+final SQL reservation. Existing photo-first, original-byte history, approval,
+tenant and durable ambiguity gates remain acceptance requirements. Legacy jobs
+must not be upgraded in place or regenerated automatically after ambiguity.
+
+This audit covers repository producer capability only. It did not inspect live
+client data, Drive/Slack receipt archives or production DB canonical rows, so it
+does not claim those evidence sources do not exist. Source discovery remains
+with the lead. The prior 136 Python/PG17 evidence is reused unchanged; this
+follow-up edits documentation only and does not establish canonical generation.
