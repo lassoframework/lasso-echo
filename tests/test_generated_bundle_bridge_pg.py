@@ -21,7 +21,11 @@ from agent import generated_infographic_preparation as prep, generated_infograph
 from tests.test_generated_owner_guard import candidate, trusted, image_bytes
 
 PG=Path('/opt/homebrew/opt/postgresql@17/bin')
-PORTAL=ROOT.parent/'portal-brand-source-bundle-20261008/supabase/migrations/DRAFT_echo_source_brand_bundle.sql'
+PORTAL_MIGRATIONS=ROOT.parent/'portal-brand-source-bundle-20261008/supabase/migrations'
+PORTAL=PORTAL_MIGRATIONS/'0611_echo_source_brand_bundle.sql'
+PORTAL_VERIFY=PORTAL_MIGRATIONS/'0611_echo_source_brand_bundle.verify.sql'
+assert PORTAL.exists(),PORTAL
+assert PORTAL_VERIFY.exists(),PORTAL_VERIFY
 
 
 def main(source_mode=None):
