@@ -9,6 +9,12 @@ The owner checks the contract at packet apply, connection construction and
 transaction entry. The attester checks it at worker settings and direct database
 connection. The shared publisher and its S3 reader are unchanged.
 
+The staged owner discovery flag `AGENT_FORWARD_MEDIA_OWNER_STAGED_WORKER` is
+owner-only. The visual recovery flag `AGENT_FORWARD_MEDIA_VISUAL_INDEX` is
+attester-only. Both are explicit opt-in controls for draft schedule preparation;
+each remains rejected in the opposite lane. Neither admits publisher credentials
+or changes the dedicated DSN and role requirement.
+
 The owner original reader uses only `FORWARD_MEDIA_OWNER_DRIVE_SA_JSON`, an
 inline JSON key for a dedicated Google service account with Viewer access to
 the approved gym source folders. It requests only `drive.readonly`, uses the

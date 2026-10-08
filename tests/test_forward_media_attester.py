@@ -230,3 +230,79 @@ def test_production_callbacks_use_narrow_exact_row_rpc():
     assert 'fixer_forward_media_provenance_lookup_20261006' in calls[0][0]
     assert 'from public.' not in calls[0][0]
     assert calls[0][1] == (row_id,)
+
+
+def alias_callbacks(*, mutate=None, binding=True):
+    row_id = '47b0460a-e931-4492-a6b0-8b7d4e0af739'
+    raw = 'raw-alpha'
+    captured = snapshot(calendar_row_id=row_id, gym_id=raw)
+    provenance = {'original': registry_row(tenant_id=raw),
+                  'manifest': manifest_row(tenant_id=raw)}
+    if binding:
+        provenance['staged_alias_binding'] = {
+            'authority_tenant_id': raw, 'snapshot': dict(captured)}
+    if mutate:
+        mutate(provenance)
+
+    class Cursor:
+        def __enter__(self): return self
+        def __exit__(self, *args): return None
+        def execute(self, sql, args):
+            assert sql == 'select public.fixer_forward_media_provenance_lookup_20261006(%s)'
+            assert args == (row_id,)
+        def fetchone(self): return (provenance,)
+
+    class Conn:
+        def cursor(self): return Cursor()
+
+    return captured, provenance, attester.production_callbacks(
+        Conn(), row_id, expected_revision='rev-1')
+
+
+def test_production_alias_bridge_preserves_raw_authority_and_replays(monkeypatch):
+    monkeypatch.setattr(attester, '_story_burn', lambda *args: IMAGE)
+    captured, provenance, (verify, render) = alias_callbacks()
+    assert verify(captured, SOURCE) is True
+    assert render(SOURCE, captured)['image_bytes'] == IMAGE
+    assert captured['tenant_id'] == TENANT
+    assert provenance['original']['tenant_id'] == 'raw-alpha'
+    assert provenance['manifest']['tenant_id'] == 'raw-alpha'
+    with pytest.raises(ForwardMediaVerificationHold, match='bytes changed'):
+        verify(captured, b'X' + SOURCE[1:])
+
+
+@pytest.mark.parametrize('field,value', [
+    ('tenant_id', 'foreign'), ('gym_id', 'foreign'), ('revision', 'rev-2'),
+    ('calendar_row_id', 'f696efc9-6087-4222-bd42-09222e65bede'),
+    ('source_asset_id', 'foreign'), ('source_url', 'https://other/source'),
+    ('image_url', 'https://other/image'), ('thumbnail_url', THUMB_URL),
+    ('render_manifest_digest', 'sha256:' + '0' * 64),
+])
+def test_production_alias_bridge_rejects_any_snapshot_drift(field, value):
+    captured, _, (verify, render) = alias_callbacks()
+    captured[field] = value
+    with pytest.raises(ForwardMediaVerificationHold, match='alias snapshot changed'):
+        verify(captured, SOURCE)
+    with pytest.raises(ForwardMediaVerificationHold, match='alias snapshot changed'):
+        render(SOURCE, captured)
+
+
+@pytest.mark.parametrize('mutate', [
+    lambda p: p['original'].update(tenant_id='foreign'),
+    lambda p: p['manifest'].update(tenant_id='foreign'),
+    lambda p: p['staged_alias_binding'].update(authority_tenant_id='foreign'),
+    lambda p: p['staged_alias_binding']['snapshot'].update(revision='rev-2'),
+    lambda p: p['staged_alias_binding']['snapshot'].update(calendar_row_id='foreign'),
+    lambda p: p['staged_alias_binding']['snapshot'].update(tenant_id='raw-alpha'),
+    lambda p: p['staged_alias_binding'].update(unverified=True),
+    lambda p: p.update(staged_alias_binding=None),
+])
+def test_production_alias_bridge_rejects_malformed_rpc_authority(mutate):
+    with pytest.raises(ForwardMediaVerificationHold, match='alias authority binding'):
+        alias_callbacks(mutate=mutate)
+
+
+def test_production_raw_authority_without_verified_alias_bridge_holds():
+    captured, _, (verify, _) = alias_callbacks(binding=False)
+    with pytest.raises(ForwardMediaVerificationHold, match='registry'):
+        verify(captured, SOURCE)

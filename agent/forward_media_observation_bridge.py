@@ -48,9 +48,21 @@ def _json(value):
 
 
 def prepare(row, observations):
-    """Select exactly one observation by the complete media edge, not URL alone."""
+    """Select exactly one observation by the complete media edge, not URL alone.
+
+    Accepts an ordinary unverified active insert candidate OR an exact staged
+    reservation candidate (variant_status='candidate' with the
+    'forward_reservation_staged' marker). The marker is NEVER authority here:
+    this is client-side fail-fast packaging only. The stage RPC records the
+    observation atomically with the registered batch membership, and the SQL
+    preparation-eligibility predicate re-validates exact nonterminal
+    membership (tenant, immutable content/media binding, candidate state,
+    marker, no claim/send/approval) before any preparation lane may act."""
+    staged_candidate = (
+        row.get('variant_status') == 'candidate'
+        and row.get('media_not_ready_reason') == 'forward_reservation_staged')
     if (row.get('status') not in ('draft', 'pending', 'queued')
-            or row.get('variant_status', 'active') != 'active'
+            or not (row.get('variant_status', 'active') == 'active' or staged_candidate)
             or not row.get('post_date') or not row.get('gym_id')
             or not row.get('source_media_asset_id') or not row.get('source_media_url')
             or not row.get('image_url')
