@@ -82,6 +82,18 @@ begin
  foreach t in array array['content_calendar','media_asset','media_source',
   'fixer_forward_media_claim_receipt_20261006','fixer_forward_media_photo_state_20261007',
   'fixer_forward_media_photo_key_revocation_20261007','fixer_owner_photo_revocation_20261007'] loop
+  if not exists(select 1 from pg_trigger g
+    where g.tgrelid=('public.'||t)::regclass and g.tgname='owner_photo_corpus_write'
+     and not g.tgisinternal and g.tgtype=62 and g.tgenabled='O'
+     and g.tgfoid='public.fixer_owner_photo_corpus_write_lock_20261007()'::regprocedure) then
+   raise exception 'atomic corpus cutover owner-photo trigger drift on %',t using errcode='23514'; end if;
+  if t in ('media_asset','media_source')
+   and to_regprocedure('public.fixer_generated_inventory_lock_20261007()') is not null
+   and not exists(select 1 from pg_trigger g
+    where g.tgrelid=('public.'||t)::regclass and g.tgname='generated_inventory_lock'
+     and not g.tgisinternal and g.tgtype=62 and g.tgenabled='O'
+     and g.tgfoid=to_regprocedure('public.fixer_generated_inventory_lock_20261007()')) then
+   raise exception 'atomic corpus cutover generated trigger drift on %',t using errcode='23514'; end if;
   if exists(select 1 from pg_trigger g where g.tgrelid=('public.'||t)::regclass
    and not g.tgisinternal and (g.tgtype & 1)=0 and (g.tgtype & 2)=2
    and (g.tgtype & 28)<>0 and g.tgname collate "C" <= '000_fixer_forward_corpus_entry_20261008' collate "C") then
