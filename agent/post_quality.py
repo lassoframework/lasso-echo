@@ -165,12 +165,20 @@ def caption_issues(caption, banned_words=()):
                       "words) — likely the raw source, not a real caption")
     if _DASH_RE.search(cap):
         issues.append("caption contains a dash (violates the no-dash copy law)")
+    _law = [v for v in _copy_gate.caption_violations(cap)
+            if v in ("hyphen", "intraword_hyphen", "colon", "semicolon")]
+    if _law:
+        issues.append("caption breaks the consumer copy law (" + ", ".join(_law)
+                      + "): no hyphens, colons or semicolons")
     if _SCAFFOLD_RE.match(cap):
         issues.append("caption starts with LLM scaffolding (a header or a "
                       "'Caption:'/'Body:' label), not real copy")
     if _HINT_LEAK_RE.search(cap):
         issues.append("caption carries an internal prompt hint block "
                       "(scene/grounding scaffolding), not client copy")
+    if _copy_gate.is_meta_reply(cap):
+        issues.append("caption is a clarification request or model meta reply "
+                      "(it talks to us instead of the audience), not client copy")
     if _EDIT_META_RE.search(cap):
         issues.append("caption carries an internal edit-rationale block "
                       "(a bracketed meta-label like [why]), not client copy")

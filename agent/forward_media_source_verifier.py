@@ -43,7 +43,7 @@ class _BoundedBuffer(io.BytesIO):
 
 
 class OriginalDriveReader:
-    """Existing read-only Drive credential route; no thumbnail/export fallback.
+    """Dedicated owner Drive credential route; no thumbnail/export fallback.
 
     Instantiation does not fetch credentials. The existing dedicated transport
     uses a 30-second request timeout; downloads also have a 120-second streaming
@@ -54,8 +54,8 @@ class OriginalDriveReader:
 
     def _t(self):
         if self._transport is None:
-            from .integrations.drive_client import GoogleDriveTransport
-            self._transport = GoogleDriveTransport()
+            from .forward_media_owner_drive import DedicatedOwnerDriveTransport
+            self._transport = DedicatedOwnerDriveTransport()
         return self._transport
 
     def metadata(self, file_id):

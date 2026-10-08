@@ -13,7 +13,8 @@ class Cursor:
     def __exit__(self, *args): pass
     def execute(self, sql, args=None):
         self.conn.calls.append((sql, args))
-        self.result = ((self.conn.role,) if 'current_user' in sql else
+        self.result = (None if sql.startswith('set local ') else
+                       (self.conn.role,) if 'current_user' in sql else
                        (self.conn.snapshot,) if 'attestation_request' in sql else
                        (args[2],))
     def fetchone(self): return self.result
@@ -31,8 +32,7 @@ class Connection:
 
 @pytest.fixture
 def lane(monkeypatch):
-    from agent import visual_writer_prepare
-    monkeypatch.setattr(visual_writer_prepare, '_own_media_url', lambda u: u.startswith('https://owned.example/'))
+    monkeypatch.setenv('AGENT_S3_PUBLIC_BASE_URL', 'https://owned.example')
     row_id = str(uuid.uuid4())
     snapshot = {'calendar_row_id': row_id, 'revision': 'revision',
                 'source_url': 'https://owned.example/source',
@@ -54,11 +54,30 @@ def test_same_object_computes_hash_and_uses_narrow_rpc(lane):
     assert result['fingerprints'] == ['md5:50c68002746cabbaf1bec7acc3b0dd6c']
     conn = lane[1]
     assert conn.committed and conn.closed
+    deadlines = [("set local lock_timeout = '5s'", None),
+                 ("set local statement_timeout = '20s'", None)]
+    assert conn.calls[:2] == deadlines
+    assert conn.calls[-3:-1] == deadlines  # Fresh final transaction after rollback.
     sql, args = conn.calls[-1]
     assert 'fixer_attest_forward_media_20261006' in sql
     assert args[-2] == 'same_object'
     assert args[3:7] == ('md5:50c68002746cabbaf1bec7acc3b0dd6c', 15,
                         'md5:50c68002746cabbaf1bec7acc3b0dd6c', 15)
+
+
+def test_attester_startup_deadlines_precede_role_query(monkeypatch):
+    import sys
+    conn = Connection({})
+    calls = []
+    def connect(dsn, **kwargs):
+        calls.append((dsn, kwargs))
+        return conn
+    monkeypatch.setitem(sys.modules, 'psycopg', SimpleNamespace(connect=connect))
+    monkeypatch.setenv('AGENT_FORWARD_MEDIA_GUARD', 'true')
+    monkeypatch.setenv('AGENT_FORWARD_MEDIA_ATTESTER_DSN', 'isolated-test-dsn')
+    monkeypatch.setenv('AGENT_FORWARD_MEDIA_ATTESTER_ROLE', guard.ROLE)
+    assert guard._connect() is conn
+    assert calls == [('isolated-test-dsn', {'options': '-c lock_timeout=5000 -c statement_timeout=20000'})]
 
 
 @pytest.mark.parametrize('role', ['postgres', 'service_role', 'authenticated'])
@@ -127,6 +146,33 @@ def test_unconfigured_lane_defaults_off(monkeypatch):
     with pytest.raises(guard.ForwardMediaVerificationHold, match='not configured'): guard._connect()
 
 
+@pytest.mark.parametrize('failure', ['cursor', 'execute', 'fetchone'])
+def test_connection_closed_when_role_query_fails(monkeypatch, failure):
+    import sys
+    conn = Connection({})
+    class FailingCursor(Cursor):
+        def execute(self, sql, args=None):
+            if failure == 'execute':
+                raise RuntimeError('role query unavailable')
+            super().execute(sql, args)
+        def fetchone(self):
+            if failure == 'fetchone':
+                raise RuntimeError('role result unavailable')
+            return super().fetchone()
+    def cursor():
+        if failure == 'cursor':
+            raise RuntimeError('cursor unavailable')
+        return FailingCursor(conn)
+    conn.cursor = cursor
+    monkeypatch.setitem(sys.modules, 'psycopg', SimpleNamespace(connect=lambda _, **kwargs: conn))
+    monkeypatch.setenv('AGENT_FORWARD_MEDIA_GUARD', 'true')
+    monkeypatch.setenv('AGENT_FORWARD_MEDIA_ATTESTER_DSN', 'isolated-test-dsn')
+    monkeypatch.setenv('AGENT_FORWARD_MEDIA_ATTESTER_ROLE', guard.ROLE)
+    with pytest.raises(guard.ForwardMediaVerificationHold, match='database unavailable'):
+        guard._connect()
+    assert conn.closed and not conn.committed
+
+
 @pytest.mark.parametrize('status,payload,error', [
     (200, True, None), (200, 'true', guard.ForwardMediaVerificationHold),
     (200, {}, guard.ForwardMediaVerificationHold),
@@ -175,3 +221,18 @@ def test_remote_reads_follow_read_transaction_end(lane):
     guard.attest(row_id, 'revision', connection_factory=lambda: conn,
                  read_bytes=read, original_verifier=lambda *_: True)
     assert conn.committed and conn.closed
+
+
+@pytest.fixture(autouse=True)
+def isolated_process_environment(monkeypatch):
+    # Pytest injects PYTEST_CURRENT_TEST after fixture setup. This test-only
+    # process view excludes that harness marker; production accepts no such name.
+    import os
+    class ProcessEnvironment:
+        @property
+        def environ(self):
+            return {k: v for k, v in os.environ.items() if k != 'PYTEST_CURRENT_TEST'}
+        getenv = staticmethod(os.getenv)
+    for key in list(os.environ):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setattr(guard, 'os', ProcessEnvironment())

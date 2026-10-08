@@ -75,21 +75,19 @@ def main(*, provider_fence=False):
             clearance = prepare.clear_history(original, 'cleared_unused', 'synthetic-independent-history',
                                               production_evidence_ref='synthetic-fresh-production')
             manifest = prepare.build_render_manifest(original, url, reader.read(url), 'same_object', 'synthetic-render')
-            saved = {key: value for key, value in os.environ.items() if owner._FORBIDDEN_ENV_NAME.search(key)}
-            for key in saved:
-                os.environ.pop(key)
-            prior_dsn = os.environ.get('FORWARD_MEDIA_OWNER_DSN')
-            os.environ['FORWARD_MEDIA_OWNER_DSN'] = dsn
+            saved = dict(os.environ)
+            from agent.forward_media_lane import RUNTIME_NAMES
+            os.environ.clear()
+            os.environ.update({k:v for k,v in saved.items() if k in RUNTIME_NAMES})
+            os.environ.update(FORWARD_MEDIA_OWNER_DSN=dsn, FORWARD_MEDIA_OWNER_ROLE='gbp_test_owner')
             try:
                 with lane('gbp_test_owner') as conn:
                     owner.ForwardMediaOwnerPersistence(conn, 'gbp_test_owner', reader).persist(original, clearance, manifest)
             finally:
+                os.environ.clear()
                 os.environ.update(saved)
-                if prior_dsn is None:
-                    os.environ.pop('FORWARD_MEDIA_OWNER_DSN', None)
-                else:
-                    os.environ['FORWARD_MEDIA_OWNER_DSN'] = prior_dsn
             media_host.config.S3_PUBLIC_BASE_URL = 'https://media.example.test'
+            os.environ['AGENT_S3_PUBLIC_BASE_URL'] = 'https://media.example.test'
 
             def new_row(photo=False, trusted=True):
                 rid, token = str(uuid4()), str(uuid4())

@@ -36,10 +36,64 @@ _UUID = re.compile(
     r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\Z")
 _HASH = re.compile(r"[0-9a-f]{64}\Z")
 _FIXER_RECEIPT_NAMESPACE = uuid.UUID("f1cb5464-b72e-4b0b-a9c2-fc07383017be")
+_FIXER_SUPPRESSED_ALERT_NAMESPACE = uuid.UUID("1f1455e2-5a9d-4e4b-b332-6bd425d915fe")
 
 
 def _fixer_receipt_id(source_message_id):
     return str(uuid.uuid5(_FIXER_RECEIPT_NAMESPACE, str(source_message_id)))
+
+
+def _suppressed_current_notice_alert_id(source_message_id):
+    return str(uuid.uuid5(_FIXER_SUPPRESSED_ALERT_NAMESPACE, str(source_message_id)))
+
+
+def _unsent_suppressed_current_notice(row, identity):
+    att = (row or {}).get("attachments") or {}
+    return bool(row and row.get("delivery_status") == "suppressed"
+                and row.get("direction") == "outbound"
+                and row.get("author_type") == identity
+                and _UUID.fullmatch(str(row.get("id") or ""))
+                and att.get("identity") == identity
+                and att.get("fixer") is True
+                and _UUID.fullmatch(str(att.get("fixer_current_attempt_token") or ""))
+                and att.get("fixer_slack_delivery_intent") is None
+                and not row.get("slack_ts") and not row.get("slack_event_id")
+                and att.get("delivery_readback_verified") is not True
+                and att.get("fixer_route_uncertain") is not True
+                and att.get("fixer_slack_delivery_uncertain") is not True)
+
+
+def _suppressed_notice_alert_body(notice):
+    return (f"FIXER notice {notice['id']} on ticket {notice['ticket_id']} was canceled "
+            "before Slack delivery. Review the ticket before opening another notice.")
+
+
+def _verified_suppressed_notice_alert(alert, notice, identity):
+    att = (alert or {}).get("attachments") or {}
+    if (not _unsent_suppressed_current_notice(notice, identity)
+            or not alert or alert.get("ticket_id") != notice.get("ticket_id")
+            or alert.get("direction") != "outbound" or alert.get("author_type") != "system"
+            or att.get("identity") != identity or att.get("kind") != _a_kind_escalation()
+            or att.get("suppressed_message_id") != notice.get("id")
+            or att.get("fixer") is True or att.get("fixer_current_attempt_token")
+            or att.get("fixer_route_pending") is True):
+        return False
+    mid, tid = notice["id"], notice["ticket_id"]
+    if alert.get("id") == _suppressed_current_notice_alert_id(mid):
+        return (att.get("fixer_suppressed_notice_alert") is True
+                and alert.get("body") == _suppressed_notice_alert_body(notice))
+    legacy_bodies = {
+        (f"FIXER first-contact notice {mid} on ticket {tid} was canceled before Slack delivery. "
+         "Review the ticket before opening another notice."),
+        (f"FIXER notice {mid} on ticket {tid} was suppressed after a pre-send claim expired. "
+         "Review the ticket before a new customer notice."),
+    }
+    reason = (notice.get("attachments") or {}).get("suppressed_why")
+    if isinstance(reason, str) and reason:
+        legacy_bodies.add(f"SUPPRESSED reply on ticket {tid} ({identity}): {reason}. "
+                          "Nothing was posted; a person should look.")
+    return bool(_UUID.fullmatch(str(alert.get("id") or ""))
+                and alert.get("body") in legacy_bodies)
 
 
 def _a_kind_escalation():
@@ -263,6 +317,86 @@ class Bus:
             return data
         return data[0] if isinstance(data, list) and len(data) == 1 else None
 
+    def _current_notice_rpc(self, name, body):
+        # These RPCs are idempotent for the same notice UUID and token. A lost
+        # HTTP response may follow a committed reservation/bind/close.
+        for attempt in range(2):
+            try:
+                r = self._client().post(
+                    f"{self._url}/rest/v1/rpc/{name}", data=json.dumps(body),
+                    headers=self._headers(), timeout=30)
+                break
+            except Exception:
+                if attempt:
+                    raise
+        if r.status_code >= 400:
+            raise BusError(r.status_code, (r.text or "")[:200])
+        return r.json()
+
+    def begin_current_notice(self, ticket, notice_id, *, unrouted=False):
+        """Reserve one exact notice before its outbound INSERT (portal 0384)."""
+        if not config.slack_convo_echo_current_notice_enabled():
+            return None
+        if not _UUID.fullmatch(str(notice_id or "")):
+            raise BusError(400, "invalid current notice id")
+        version = ticket.get("request_version")
+        if type(version) is not int or version < 0:
+            raise BusError(400, "invalid current notice request version")
+        body = {
+            "p_ticket_id": ticket["id"],
+            "p_expected_request_version": version,
+            "p_expected_status": ticket.get("status"),
+            "p_expected_classification": ticket.get("classification"),
+            "p_expected_product": ticket.get("product"),
+            "p_expected_client_id": ticket.get("client_id"),
+            "p_expected_bot_identity": ticket.get("bot_identity"),
+            "p_expected_slack_user_id": ticket.get("slack_user_id"),
+            "p_notice_message_id": notice_id,
+        }
+        if not unrouted:
+            body["p_expected_slack_channel_id"] = ticket.get("slack_channel_id")
+            body["p_expected_slack_thread_ts"] = ticket.get("slack_thread_ts")
+        name = ("fixer_begin_current_delivery_unrouted" if unrouted else
+                "fixer_begin_current_delivery")
+        token = self._current_notice_rpc(name, body)
+        return token if isinstance(token, str) and _UUID.fullmatch(token) else None
+
+    def bind_current_notice_route(self, ticket_id, request_version, notice_id,
+                                  token, channel_id, thread_ts):
+        if not config.slack_convo_echo_current_notice_enabled():
+            return False
+        return self._current_notice_rpc("fixer_bind_current_delivery_route", {
+            "p_ticket_id": ticket_id,
+            "p_expected_request_version": request_version,
+            "p_notice_message_id": notice_id,
+            "p_attempt_token": token,
+            "p_returned_channel_id": channel_id,
+            "p_returned_thread_ts": thread_ts,
+        }) is True
+
+    def resolve_current_notice(self, ticket, notice_id, token, delivery_status):
+        """Close only the posted row named by this current attempt."""
+        if not config.slack_convo_echo_current_notice_enabled():
+            return None
+        result = self._current_notice_rpc("fixer_resolve_current_notice", {
+            "p_ticket_id": ticket["id"],
+            "p_expected_request_version": ticket["request_version"],
+            "p_expected_status": ticket["status"],
+            "p_expected_delivery_status": delivery_status,
+            "p_expected_classification": ticket["classification"],
+            "p_expected_product": ticket.get("product"),
+            "p_expected_client_id": ticket.get("client_id"),
+            "p_expected_bot_identity": ticket.get("bot_identity"),
+            "p_expected_slack_user_id": ticket.get("slack_user_id"),
+            "p_expected_slack_channel_id": ticket.get("slack_channel_id"),
+            "p_expected_slack_thread_ts": ticket.get("slack_thread_ts"),
+            "p_notice_message_id": notice_id,
+            "p_attempt_token": token,
+        })
+        if isinstance(result, dict):
+            return result
+        return result[0] if isinstance(result, list) and len(result) == 1 else None
+
     def portal_client_id(self, gym_key):
         """The one portal UUID mapped to an exact Echo account key, or None.
 
@@ -482,7 +616,7 @@ class Bus:
         return self._insert(_MESSAGES, row)
 
     def record_outbound(self, *, ticket_id, author_type, body, delivery_status, kind,
-                        meta=None, expected_request_version=None):
+                        meta=None, expected_request_version=None, message_id=None):
         """The bot's reply AS A ROW. Nothing posts until the outbox reads it back in 'ready'.
         `kind` (ack | answer | template | escalation | fixer_request | hold_notice | status)
         rides in attachments so the outbox can apply the verification gate per kind without a
@@ -490,9 +624,61 @@ class Bus:
         att = {"kind": kind}
         if meta:
             att.update(meta)
+        if (att.get("fixer_current_attempt_token")
+                and not config.slack_convo_echo_current_notice_enabled()):
+            raise BusError(409, "current notice capability disabled")
+        # Portal 0384 requires the exact notice ID and attempt token at INSERT.
+        # Only a current unheld Echo website-tab completion enters this path.
+        current_notice = (att.get("fixer") is True
+                          and (kind == "answer" or
+                               kind == "status" and att.get("resolve_notice") is True))
+        if current_notice and message_id is None:
+            ticket = self.ticket(ticket_id)
+            current_notice = ((ticket or {}).get("product") == "echo"
+                              and (ticket or {}).get("source") == "website_tab")
+            if current_notice:
+                if kind == "answer":
+                    from . import adapter as _adapter
+                    if (_adapter.promises_human_follow_up(body or "")
+                            or _adapter.answer_commits_to_action(body or "")):
+                        current_notice = False
+                if (ticket.get("status") not in ("verification", "merged")
+                        or ticket.get("escalated") is True
+                        or ticket.get("hold_tier") is not None):
+                    current_notice = False
+            if current_notice:
+                if not config.slack_convo_echo_current_notice_enabled():
+                    raise BusError(409, "current notice capability disabled")
+                message_id = str(uuid.uuid4())
+                token = self.begin_current_notice(ticket, message_id)
+                if not token:
+                    raise BusError(409, "current notice reservation refused")
+                att["fixer_current_attempt_token"] = token
+                att.setdefault("request_version", ticket["request_version"])
+                att.update({
+                    "delivery_identity_fence": True,
+                    "delivery_expected_status": ticket.get("status"),
+                    "delivery_expected_classification": ticket.get("classification"),
+                    "delivery_expected_product": ticket.get("product"),
+                    "delivery_expected_client_id": ticket.get("client_id"),
+                    "delivery_expected_bot_identity": ticket.get("bot_identity"),
+                    "delivery_expected_slack_user_id": ticket.get("slack_user_id"),
+                    "delivery_expected_slack_channel_id": ticket.get("slack_channel_id"),
+                    "delivery_expected_slack_thread_ts": ticket.get("slack_thread_ts"),
+                })
+                expected_request_version = ticket.get("request_version")
+                if (ticket.get("slack_channel_id")
+                        and att.get("recipient_kind") not in ("staff", "coach")):
+                    mention = f"<@{config.APPROVER_SLACK_ID}>"
+                    if mention not in (body or ""):
+                        body = f"{mention} {body or ''}"
         row = {"ticket_id": ticket_id, "author_type": author_type, "author_id": None,
                "body": (body or "")[:8000], "attachments": att, "direction": "outbound",
                "delivery_status": delivery_status}
+        if message_id is not None:
+            if not _UUID.fullmatch(str(message_id)):
+                raise BusError(400, "invalid outbound message id")
+            row["id"] = message_id
         if expected_request_version is not None:
             if type(expected_request_version) is not int or expected_request_version < 0:
                 raise BusError(400, "invalid outbound expected request version")
@@ -500,9 +686,28 @@ class Bus:
             # insert lock. A new requester cycle between Python read and INSERT
             # refuses the row before any Slack post can use it as completion proof.
             row["delivery_request_version"] = expected_request_version
-        created, dup = self._insert(_MESSAGES, row)
-        if dup:  # cannot happen (no unique key on outbound), but never mask it
-            raise BusError(409, "unexpected duplicate on outbound insert")
+        try:
+            created, dup = self._insert(_MESSAGES, row)
+        except Exception:
+            # A lost response is indistinguishable from a committed INSERT.
+            # Exact-ID readback resolves it without minting another notice.
+            existing = self.message(message_id) if message_id else None
+            if not existing or any(existing.get(k) != row.get(k) for k in
+                                   ("id", "ticket_id", "author_type", "body",
+                                    "direction", "delivery_request_version")) \
+                    or (existing.get("attachments") or {}) != att:
+                raise
+            return existing
+        if dup:
+            # A lost INSERT response may leave the designated row in the database.
+            # Accept only the exact row and original immutable content/fence.
+            existing = self.message(message_id) if message_id else None
+            if not existing or any(existing.get(k) != row.get(k) for k in
+                                   ("id", "ticket_id", "author_type", "body",
+                                    "direction", "delivery_request_version")) \
+                    or (existing.get("attachments") or {}) != att:
+                raise BusError(409, "conflicting outbound notice id")
+            return existing
         return created
 
     def inbound_count(self, ticket_id):
@@ -627,6 +832,7 @@ class Bus:
         starving delivery reconciliation while keeping each sweep bounded.
         """
         if marker not in {"fixer_slack_delivery_uncertain",
+                          "fixer_route_uncertain",
                           "fixer_slack_route_missing",
                           "fixer_slack_config_missing"}:
             raise BusError(400, "invalid FIXER hold marker")
@@ -720,9 +926,16 @@ class Bus:
             snapshot = dict(att or {})
             if snapshot.get("fixer_slack_delivery_intent") != intent:
                 return None
-            if (row.get("delivery_status") == "held"
-                    and snapshot.get("fixer_slack_delivery_uncertain") is not True):
-                return None
+            if row.get("delivery_status") == "held":
+                known_route_uncertain = (
+                    snapshot.get("fixer_slack_delivery_uncertain") is True
+                    and snapshot.get("fixer_route_pending") is not True)
+                pending_route_uncertain = (
+                    snapshot.get("fixer_route_pending") is True
+                    and snapshot.get("fixer_route_uncertain") is True
+                    and bool(snapshot.get("fixer_current_attempt_token")))
+                if not (known_route_uncertain or pending_route_uncertain):
+                    return None
             existing = row.get("slack_ts")
             if existing:
                 return row if existing == slack_ts else None
@@ -752,16 +965,158 @@ class Bus:
                 snapshot, separators=(",", ":"), sort_keys=True),
         }, {"attachments": att})
 
+    def suppress_unattempted_current_notice(self, message_id, reason, *,
+                                            expected_identity=None, expected_token=None):
+        """Terminally park an exact ready/claimed notice before durable Slack intent."""
+        row = self.message(message_id)
+        raw_att = (row or {}).get("attachments")
+        att = dict(raw_att or {})
+        if (not row or row.get("delivery_status") not in {"ready", "posting"}
+                or not att.get("fixer_current_attempt_token")
+                or expected_identity is not None and att.get("identity") != expected_identity
+                or expected_token is not None and att.get("fixer_current_attempt_token") != expected_token
+                or att.get("fixer_slack_delivery_intent") is not None
+                or row.get("slack_ts") or row.get("slack_event_id")
+                or att.get("delivery_readback_verified") is True):
+            return None
+        next_att = {**att, "suppressed_why": str(reason)[:300]}
+        return self._patch(_MESSAGES, {
+            "id": f"eq.{message_id}", "delivery_status": f"eq.{row['delivery_status']}",
+            "slack_ts": "is.null", "slack_event_id": "is.null",
+            "attachments": ("is.null" if raw_att is None else
+                            "eq." + json.dumps(att, separators=(",", ":"),
+                                               sort_keys=True)),
+        }, {"delivery_status": "suppressed", "attachments": next_att})
+
+    def suppress_unclaimed_current_notice(self, message_id, reason):
+        """Cancel an exact reserved ready row after a failed direct claim."""
+        row = self.message(message_id)
+        raw_att = (row or {}).get("attachments")
+        att = dict(raw_att or {})
+        if (not row or row.get("delivery_status") != "ready"
+                or not att.get("fixer_current_attempt_token")
+                or att.get("fixer_route_pending") is not True
+                or att.get("fixer_slack_delivery_intent") is not None
+                or row.get("slack_ts") or row.get("slack_event_id")
+                or att.get("delivery_readback_verified") is True):
+            return None
+        next_att = {**att, "suppressed_why": str(reason)[:300]}
+        return self._patch(_MESSAGES, {
+            "id": f"eq.{message_id}", "delivery_status": "eq.ready",
+            "slack_ts": "is.null", "slack_event_id": "is.null",
+            "attachments": ("is.null" if raw_att is None else
+                            "eq." + json.dumps(att, separators=(",", ":"),
+                                               sort_keys=True)),
+        }, {"delivery_status": "suppressed", "attachments": next_att})
+
+    def ensure_suppressed_current_notice_alert(self, message_id, identity):
+        """Queue one stable staff row without mutating or resending the notice.
+
+        Suppression itself is the durable retry record. Read it freshly, and
+        accept only a definitely pre-POST terminal notice. The deterministic
+        alert UUID makes INSERT retries and concurrent reconcilers idempotent;
+        existing alerts retain their delivery state and transport metadata.
+        """
+        notice = self.message(message_id)
+        if not _unsent_suppressed_current_notice(notice, identity):
+            return None
+        ticket_id = notice["ticket_id"]
+        alert_id = _suppressed_current_notice_alert_id(message_id)
+        body = _suppressed_notice_alert_body(notice)
+        meta = {"identity": identity, "suppressed_message_id": message_id,
+                "fixer_suppressed_notice_alert": True}
+
+        def exact_alert(row):
+            return bool(row and row.get("id") == alert_id
+                        and _verified_suppressed_notice_alert(row, notice, identity))
+
+        existing = self.message(alert_id)
+        if existing:
+            if not exact_alert(existing):
+                raise BusError(409, "suppressed notice alert identity conflict")
+            return existing
+        # Recognize staff rows emitted before stable alert IDs were introduced.
+        # An already queued or posted legacy escalation must not be duplicated.
+        legacy = self._get(_MESSAGES, {
+            "ticket_id": f"eq.{ticket_id}", "direction": "eq.outbound",
+            "author_type": "eq.system", "attachments->>kind": "eq.escalation",
+            "attachments->>identity": f"eq.{identity}",
+            "attachments->>suppressed_message_id": f"eq.{message_id}",
+            "select": "*", "order": "created_at.asc,id.asc", "limit": "20",
+        })
+        for row in legacy:
+            if _verified_suppressed_notice_alert(row, notice, identity):
+                return row
+        try:
+            created = self.record_outbound(
+                ticket_id=ticket_id, author_type="system", body=body,
+                delivery_status="ready", kind=_a_kind_escalation(),
+                meta=meta, message_id=alert_id)
+            if not exact_alert(created):
+                raise BusError(409, "suppressed notice alert insert not confirmed")
+            return created
+        except Exception:
+            # A committed INSERT may already have been claimed/posted before
+            # the response arrives. Validate its immutable identity only; never
+            # overwrite added delivery metadata or return it to ready.
+            existing = self.message(alert_id)
+            if exact_alert(existing):
+                return existing
+            raise
+
+    def verified_suppressed_current_notice_alert(self, alert, ticket, identity):
+        """An informational internal alert may retain its original dispatcher.
+
+        Ticket ownership can change after suppression. Only freshly verified
+        source-linked system escalations may cross that identity fence; this
+        grants no customer delivery, action button or ticket state transition.
+        """
+        if not ticket or (alert or {}).get("ticket_id") != ticket.get("id"):
+            return False
+        mid = ((alert or {}).get("attachments") or {}).get("suppressed_message_id")
+        if not _UUID.fullmatch(str(mid or "")):
+            return False
+        notice = self.message(mid)
+        return _verified_suppressed_notice_alert(alert, notice, identity)
+
+    def suppressed_unattempted_current_notices(self, identity, *, limit=20, after=None):
+        """Bounded keyset page; unrelated suppressed rows cannot starve alerts."""
+        params = {
+            "direction": "eq.outbound", "delivery_status": "eq.suppressed",
+            "attachments->>identity": f"eq.{identity}",
+            "attachments->>fixer": "eq.true",
+            "attachments->>fixer_current_attempt_token": "not.is.null",
+            "attachments->>fixer_slack_delivery_intent": "is.null",
+            "slack_ts": "is.null", "slack_event_id": "is.null",
+            "select": "*", "order": "created_at.asc,id.asc",
+            "limit": str(min(20, max(1, int(limit)))),
+        }
+        if after:
+            ts = str(after.get("created_at") or "").replace('"', "")
+            mid = str(after.get("id") or "").replace('"', "")
+            if ts and mid:
+                params["or"] = (f'(created_at.gt."{ts}",'
+                                f'and(created_at.eq."{ts}",id.gt."{mid}"))')
+        return self._get(_MESSAGES, params)
+
     def hold_uncertain_fixer_delivery(self, message_id, reason):
         """Quarantine an uncertain client post; never put it back in ready."""
         row = self.message(message_id)
         if not row or row.get("delivery_status") != "posting":
             return row
-        att = {**(row.get("attachments") or {}),
-               "fixer_slack_delivery_uncertain": True,
-               "held_why": str(reason)[:300]}
+        old_att = row.get("attachments")
+        att = dict(old_att or {})
+        if att.get("fixer_route_pending") is True:
+            # 0384 permits only this marker on the reserved unrouted row.
+            att["fixer_route_uncertain"] = True
+        else:
+            att.update(fixer_slack_delivery_uncertain=True,
+                       held_why=str(reason)[:300])
         return self._patch(_MESSAGES, {
             "id": f"eq.{message_id}", "delivery_status": "eq.posting",
+            "attachments": ("is.null" if old_att is None else
+                            "eq." + json.dumps(old_att, separators=(",", ":"),
+                                               sort_keys=True)),
         }, {"delivery_status": "held", "attachments": att})
 
     def hold_fixer_config_missing(self, message_id, reason):
@@ -789,7 +1144,6 @@ class Bus:
         params = {
             "direction": "eq.outbound", "delivery_status": "eq.held",
             "attachments->>identity": f"eq.{identity}",
-            "attachments->>fixer_slack_delivery_uncertain": "eq.true",
             "attachments->>fixer_slack_delivery_intent": "not.is.null",
             "select": "*", "order": "created_at.asc,id.asc",
             "limit": str(int(limit)),
@@ -905,10 +1259,52 @@ class Bus:
                 att.get("fixer_slack_delivery_uncertain")
                 and att.get("fixer_slack_delivery_intent")
                 and att.get("fixer_slack_delivery_intent") == expected_intent
+                and (not att.get("fixer_current_attempt_token")
+                     or (att.get("delivery_readback_verified") is True
+                         and att.get("delivery_readback_ts") == expected_ts))
                 and _row.get("slack_ts") == expected_ts),
             updates=lambda _row, _att: proof,
             fields={"delivery_status": "posted",
                     "slack_ts": proof["delivery_readback_ts"]},
+            match_update=lambda _row, _att: {"slack_ts": f"eq.{expected_ts}"})
+
+    def record_held_fixer_readback(self, message_id, proof, *,
+                                  expected_intent, expected_ts):
+        """Stage exact Slack proof on a known-route held notice before promotion."""
+        if (not isinstance(proof, dict)
+                or proof.get("delivery_readback_verified") is not True
+                or proof.get("delivery_readback_ts") != expected_ts):
+            return None
+        return self._patch_held_fixer_attachments(
+            message_id,
+            eligible=lambda row, att: bool(
+                att.get("fixer_route_pending") is not True
+                and att.get("fixer_slack_delivery_uncertain") is True
+                and att.get("fixer_current_attempt_token")
+                and att.get("fixer_slack_delivery_intent") == expected_intent
+                and row.get("slack_ts") == expected_ts),
+            updates=lambda _row, _att: proof,
+            match_update=lambda _row, _att: {"slack_ts": f"eq.{expected_ts}"})
+
+    def record_held_current_notice_readback(self, message_id, proof, *,
+                                            expected_intent, expected_ts):
+        """Persist exact readback on a held pending-route row before SQL binds it.
+
+        The route binder alone may move this row back to posting. This method
+        never makes a row resendable or marks a notice posted.
+        """
+        if (not isinstance(proof, dict)
+                or proof.get("delivery_readback_verified") is not True
+                or proof.get("delivery_readback_ts") != expected_ts):
+            return None
+        return self._patch_held_fixer_attachments(
+            message_id,
+            eligible=lambda row, att: bool(
+                att.get("fixer_route_pending") is True
+                and att.get("fixer_current_attempt_token")
+                and att.get("fixer_slack_delivery_intent") == expected_intent
+                and row.get("slack_ts") == expected_ts),
+            updates=lambda _row, _att: proof,
             match_update=lambda _row, _att: {"slack_ts": f"eq.{expected_ts}"})
 
     def uncertain_fixer_alert_status(self, message_id):
