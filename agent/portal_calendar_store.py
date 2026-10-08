@@ -355,10 +355,208 @@ class ReceiptSelectionError(ReceiptStoreError):
     Definite no-write, and it will fail identically on replay."""
 
 
+# ---- forward schedule reservation (DRAFT, flag-gated, 2026-10-08) ------------
+#
+# Backing contract (Child 1, landed): migrations/
+# DRAFT_fixer_forward_schedule_reservation_20261008.sql and
+# docs/FORWARD_SCHEDULE_RESERVATION_20261008.md. A durable reservation binds
+# one attested source proof to exactly one (tenant, post_date, logical_post_id)
+# future slot via the SECURITY DEFINER RPCs reserve_forward_slot_20261008 /
+# release_forward_slot_20261008 / revoke_source_reservations_20261008 /
+# check_reservation_conflicts_20261008 / forward_reservation_proof_20261008.
+# Every wrapper here is RPC-only: this client NEVER touches the reservation
+# table directly. Gate: AGENT_FORWARD_SCHEDULE_RESERVATION (default OFF). The
+# flag is tri-state: an unrecognized non-empty value is AMBIGUOUS and fails
+# closed -- an armed-but-unreadable gate must never silently behave like the
+# legacy delete-then-insert path. With the flag OFF none of these are invoked.
+#
+# SQLSTATE mapping (the draft's own codes): 23514 -> validation/conflict/hold
+# (definite no-write; the unique-index backstop's 23505 is mapped here too),
+# 22023 -> malformed arguments (definite no-write), 55000 -> the DB gate is
+# OFF (definite no-write). Anything else, a transport failure, or an
+# unparseable/foreign response is UNKNOWN: fail closed, never guess.
+FORWARD_RESERVATION_FLAG_ENV = "AGENT_FORWARD_SCHEDULE_RESERVATION"
+
+#: Row metadata key carrying the planner's byte-bound screening proof
+#: (source_sha256 + phash_v1 + source_media_asset_id of the ACTUAL served
+#: bytes). Never a content_calendar column; insert_rows strips it before any
+#: write and only consults it for fail-closed pre-insert validation.
+RESERVATION_PROOF = "_reservation_proof"
+
+_FINALIZE_RPC = "finalize_forward_schedule_staged_batch_20261008"
+# Two-phase batch contract (phase 2, 2026-10-08; default OFF). The planner
+# stages one immutable inactive batch through a single service-role RPC that
+# creates candidate rows + unverified observations atomically and returns a
+# `staged` receipt. Preparation (owner/photo/binder/attester) happens only
+# in the isolated workers; finalization is keyed by the batch id and writes
+# its terminal receipt in the activation transaction. The batch status RPC is
+# the SOLE readback authority after a lost stage/finalize HTTP response --
+# mutable calendar rows never prove an outcome.
+_STAGE_RPC = "stage_forward_schedule_batch_20261008"
+_BATCH_STATUS_RPC = "forward_schedule_batch_status_20261008"
+_PREPARATION_ELIGIBLE_RPC = "forward_schedule_preparation_eligible_20261008"
+_FORWARD_TENANT_ALIAS_TABLE = "fixer_forward_media_tenant_alias_20261006"
+_RESERVE_RPC = "reserve_forward_slot_20261008"
+_RELEASE_RPC = "release_forward_slot_20261008"
+_REVOKE_RPC = "revoke_source_reservations_20261008"
+_CHECK_RPC = "check_reservation_conflicts_20261008"
+_PROOF_RPC = "forward_reservation_proof_20261008"
+_SNAPSHOT_RPC = "fixer_forward_media_attestation_request_20261006"
+_LINEAGE_TABLE = "fixer_forward_media_lineage_20261006"
+
+
+def forward_reservation_flag():
+    """Tri-state read of AGENT_FORWARD_SCHEDULE_RESERVATION: True (on), False
+    (off or unset), None (ambiguous value -- fail closed). Same truthy set as
+    the other visual flags; anything else is not a silent default."""
+    import os
+    raw = (os.environ.get(FORWARD_RESERVATION_FLAG_ENV, "") or "").strip().lower()
+    if raw in ("1", "true", "yes", "on"):
+        return True
+    if raw in ("", "0", "false", "no", "off"):
+        return False
+    return None
+
+
+class ReservationStoreError(PortalStoreError):
+    """A reservation RPC failed or returned something that fails strict
+    parsing. The reservation outcome is UNKNOWN: fail closed."""
+
+
+class ReservationStagingError(ReservationStoreError):
+    """Candidate preparation failed before finalization; old rows are intact.
+
+    Inactive rows/attestation evidence may remain. This never asserts that no
+    insert happened and never authorizes deleting a possibly activated batch.
+    """
+
+
+class ReservationHoldError(ReservationStoreError):
+    """SQLSTATE 23514 (or the unique-index backstop's 23505): the candidate
+    failed validation, conflicts with committed or reserved occupancy, and the
+    slot is HELD. Definite: nothing was written."""
+
+
+class ReservationGateError(ReservationHoldError):
+    """SQLSTATE 55000: the DB reservation gate is OFF. Definite no-write."""
+
+
+class ReservationArgumentError(ReservationStoreError):
+    """SQLSTATE 22023: the reservation arguments failed the server allowlist.
+    Definite no-write, and it will fail identically on replay."""
+
+
+_CONFLICT_KINDS = ("negative", "committed_claim", "active_reservation",
+                   "phash_block", "phash_review")
+_SHA256_RE = _re.compile(r"[0-9a-f]{64}")
+_DATE_RE = _re.compile(r"\d{4}-\d{2}-\d{2}")
+
+
+def valid_reservation_proof(proof):
+    """True only for a complete, well-formed byte-bound screening proof.
+
+    The proof binds the ACTUAL served source/rendition bytes the planner
+    screened: source_sha256 (64 lowercase hex, required), phash_v1 (signed
+    bigint, required -- the advisory conflict RPC refuses a null pHash and an
+    undecodable candidate holds upstream), and a non-empty
+    source_media_asset_id. Anything less fails closed."""
+    if not isinstance(proof, dict):
+        return False
+    sha = proof.get("source_sha256")
+    phash = proof.get("phash_v1")
+    asset = proof.get("source_media_asset_id")
+    if not isinstance(sha, str) or not _SHA256_RE.fullmatch(sha):
+        return False
+    if type(phash) is not int:
+        return False
+    return isinstance(asset, str) and bool(asset.strip())
+
+
 # The learning-lever columns patch_pending_plan is allowed to re-stamp when a
 # repair changes a caption. An explicit allowlist, so this lane can never be
 # used to write an arbitrary column.
 _LEVER_COLUMNS = ("hook_family", "ask_type", "caption_len_band")
+
+# Deterministic identity for the two-phase batch contract. A retry after a
+# lost HTTP response must reproduce the SAME row ids, request digest and
+# batch id from identical content, so uuid4 minting is never used on the
+# armed lane. The SQL authority refuses the same batch id with a different
+# digest (fail closed on a changed request).
+_FORWARD_ROW_NS = "https://echo.invalid/forward-schedule-row/20261008"
+_FORWARD_BATCH_NS = "https://echo.invalid/forward-schedule-batch/20261008"
+
+
+def _canonical_json(value):
+    import json as _json
+    return _json.dumps(value, sort_keys=True, separators=(",", ":"),
+                       ensure_ascii=False, allow_nan=False)
+
+
+def _forward_content_digest(tenant, rows, observation_meta=None, old_rows=None):
+    """SHA-256 over the exact candidate content BEFORE row ids are minted.
+
+    Covers tenant, the normalized candidate rows (sans id), each row's raw
+    observation metadata AND the frozen old-row snapshot, so any content or
+    old-row change yields a different batch while an identical retry is
+    byte-stable. The old-row snapshot is frozen ONCE at stage time and bound
+    to the immutable request digest; the finalizer never refreezes it — it
+    uses only the set persisted with the batch."""
+    import hashlib
+    meta = list(observation_meta) if observation_meta is not None else [None] * len(rows)
+    pre_image = {
+        "tenant_id": str(tenant),
+        "rows": [{k: v for k, v in row.items() if k != "id"} for row in rows],
+        "observations": meta,
+        "old_rows": list(old_rows or []),
+    }
+    return hashlib.sha256(_canonical_json(pre_image).encode("utf-8")).hexdigest()
+
+
+def freeze_old_row_snapshots(account_key, old_rows):
+    """Validate and deep-freeze the exact old-row snapshot ONCE, at stage time.
+
+    Returns a canonical JSON round-tripped copy (every column, including
+    NULLs), so a later caller-side mutation or a live re-read can never
+    change what the batch is bound to. Own-tenant rows with unique UUID ids
+    only; anything else is a definite pre-write refusal. SQL remains the
+    authority on old-row eligibility — this freeze only pins identity."""
+    import json as _json
+    if old_rows is None:
+        return []
+    if not isinstance(old_rows, list):
+        raise ReservationArgumentError(422, "exact old row manifest required")
+    frozen, seen = [], set()
+    for old in old_rows:
+        if not isinstance(old, dict) or str(old.get("gym_id") or "") != str(account_key):
+            raise ReservationArgumentError(422, "foreign or unreadable old row")
+        ident = _reservation_uuid_static(old.get("id"), "old row id")
+        if ident in seen:
+            raise ReservationArgumentError(422, "duplicate old row identity")
+        seen.add(ident)
+        try:
+            frozen.append(_json.loads(_canonical_json(old)))
+        except (TypeError, ValueError):
+            raise ReservationArgumentError(
+                422, "old row snapshot is not canonical JSON; refusing to stage") from None
+    return frozen
+
+
+def _reservation_uuid_static(value, field):
+    try:
+        import uuid as _uuid_mod
+        return str(_uuid_mod.UUID(str(value)))
+    except (ValueError, AttributeError, TypeError):
+        raise ReservationArgumentError(422, f"{field} must be a uuid")
+
+
+def forward_batch_identity(tenant, request_digest):
+    """The stable batch id for one exact stage request. Identical retries
+    resolve to the same batch (idempotent receipt replay); a changed request
+    is a DIFFERENT batch, and reusing this id with a different digest is
+    refused by the SQL authority."""
+    import uuid as _uuid
+    return str(_uuid.uuid5(_uuid.NAMESPACE_URL,
+                           f"{_FORWARD_BATCH_NS}:{tenant}:{request_digest}"))
 
 
 class SupabaseCalendarStore:
@@ -369,6 +567,13 @@ class SupabaseCalendarStore:
         self._url = (url if url is not None else config.supabase_url())
         self._key = (service_key if service_key is not None else config.supabase_service_key())
         self._http = http
+        #: The validated `preparing` receipt of the last successful stage RPC
+        #: on this store instance (None before/after any failure). The exact
+        #: batch attempt (batch_id + request_digest) is recorded BEFORE the
+        #: RPC so an unknown outcome can be resolved through the batch status
+        #: RPC, never through mutable calendar rows.
+        self.last_forward_stage = None
+        self.last_forward_stage_attempt = None
 
     #: Set once when a write proves echo_social_connections.late_account_id is not
     #: deployed on this environment, so the sweep stops re-attempting it every gym.
@@ -580,6 +785,9 @@ class SupabaseCalendarStore:
             "gym_id": f"eq.{account_key}",
             "post_date": [f"gte.{first}", f"lte.{last}"],
             "variant_status": "eq.candidate",
+            # Reservation preparation is an internal inactive batch, never
+            # a client-selectable alternate or a staff review candidate.
+            "or": "(media_not_ready_reason.is.null,media_not_ready_reason.neq.forward_reservation_staged)",
             "order": "post_date",
         }
         r = self._client().get(
@@ -590,7 +798,9 @@ class SupabaseCalendarStore:
         )
         if r.status_code >= 400:
             raise PortalStoreError(r.status_code, _scrub((r.text or "")[:200]))
-        return r.json() or []
+        rows = r.json() or []
+        return [row for row in rows
+                if row.get("media_not_ready_reason") != "forward_reservation_staged"]
 
     def has_owner_visible_rows(self, account_key):
         """GATE 2 (coach-screens-first-month): True if the gym has EVER had an owner-visible
@@ -1257,6 +1467,634 @@ class SupabaseCalendarStore:
              "p_request_fingerprint": str(fingerprint),
              "p_prepared": dict(prepared or {})},
             account_key, action_id, expect_fingerprint=fingerprint, timeout=60)
+
+    # ---- forward schedule reservation RPC wrappers (DRAFT, flag-gated) ------
+    # Wire contract: docs/FORWARD_SCHEDULE_RESERVATION_20261008.md. Every
+    # wrapper fails closed: a transport failure, an unexpected SQLSTATE or an
+    # unparseable/foreign response is NEVER treated as free or reserved.
+
+    def _reservation_rpc(self, fn, args, timeout=60):
+        """POST one reservation RPC and map SQLSTATEs onto typed errors.
+
+        Never tenant-parses here (each wrapper validates its own shape); this
+        only enforces transport + error-code discipline."""
+        try:
+            r = self._client().post(
+                self._rest(f"rpc/{fn}"),
+                headers=self._headers({"Content-Type": "application/json"}),
+                json=args, timeout=timeout)
+        except Exception as exc:  # noqa: BLE001 - transport failure: unknown outcome
+            raise ReservationStoreError(0, f"rpc {fn} transport: {type(exc).__name__}")
+        if r.status_code >= 400:
+            code, message = "", ""
+            try:
+                err = r.json()
+                if isinstance(err, dict):
+                    code = str(err.get("code") or "")
+                    message = str(err.get("message") or "")
+            except Exception:  # noqa: BLE001 - fall through to generic below
+                pass
+            detail = _scrub((message or r.text or "")[:200])
+            if code in ("23505", "23514"):
+                # 23514 is the draft's validation/conflict/hold code; 23505 is
+                # the partial unique index backstop firing on a lost race. Both
+                # are definite no-writes (the RPC transaction rolled back).
+                raise ReservationHoldError(r.status_code, detail)
+            if code == "22023":
+                raise ReservationArgumentError(r.status_code, detail)
+            if code == "55000":
+                raise ReservationGateError(r.status_code, detail)
+            raise ReservationStoreError(r.status_code, detail)
+        try:
+            return r.json()
+        except Exception as exc:  # noqa: BLE001
+            raise ReservationStoreError(
+                r.status_code, f"rpc {fn} unparseable response: {type(exc).__name__}")
+
+    @staticmethod
+    def _reservation_uuid(value, field):
+        try:
+            import uuid as _uuid_mod
+            return str(_uuid_mod.UUID(str(value)))
+        except (ValueError, AttributeError, TypeError):
+            raise ReservationArgumentError(422, f"{field} must be a uuid")
+
+    def reserve_forward_slot(self, calendar_row_id, logical_post_id,
+                             expected_revision, attestation_ids, *,
+                             expected_reservation_id=None):
+        """Create (or idempotently return) the active reservation for the slot
+        of one PERSISTED, unsent calendar row.
+
+        The server re-validates everything from the persisted row: tenant,
+        local date, the validated logical_post_id column, the exact outgoing
+        media revision, current owner/history clearance, the three role
+        attestations bound to one lineage, negatives, committed claims and
+        existing reservations. Returns the reservation uuid as a string. Raises
+        ReservationGateError (DB gate OFF), ReservationHoldError (held or
+        conflict), ReservationArgumentError (bad args) or ReservationStoreError
+        (unknown outcome)."""
+        row_id = self._reservation_uuid(calendar_row_id, "calendar_row_id")
+        logical = self._reservation_uuid(logical_post_id, "logical_post_id")
+        revision = str(expected_revision or "")
+        if not revision.strip():
+            raise ReservationArgumentError(422, "expected_revision is required")
+        if (not isinstance(attestation_ids, (list, tuple))
+                or len(attestation_ids) != 3
+                or len({str(a) for a in attestation_ids}) != 3):
+            raise ReservationArgumentError(
+                422, "attestation_ids must be exactly three distinct ids")
+        ids = [self._reservation_uuid(a, "attestation_id") for a in attestation_ids]
+        args = {"p_calendar_row_id": row_id, "p_logical_post_id": logical,
+                "p_expected_revision": revision, "p_attestation_ids": ids}
+        if expected_reservation_id is not None:
+            args["p_expected_reservation_id"] = self._reservation_uuid(
+                expected_reservation_id, "expected_reservation_id")
+        data = self._reservation_rpc(_RESERVE_RPC, args, timeout=60)
+        # PostgREST returns a scalar uuid as a plain JSON string.
+        if not isinstance(data, str) or not _UUID_RE.fullmatch(data):
+            raise ReservationStoreError(502, "reserve_forward_slot response malformed")
+        return data
+
+    def release_forward_slot(self, reservation_id, reason):
+        """Transition one reservation active -> released, freeing its slot.
+        Idempotent on terminal rows; literal true only. Callable while OFF."""
+        rid = self._reservation_uuid(reservation_id, "reservation_id")
+        if not str(reason or "").strip():
+            raise ReservationArgumentError(422, "a release reason is required")
+        data = self._reservation_rpc(_RELEASE_RPC, {
+            "p_reservation_id": rid, "p_reason": str(reason)}, timeout=30)
+        if data is not True:
+            raise ReservationStoreError(502, "release_forward_slot did not return literal true")
+        return True
+
+    def revoke_source_reservations(self, tenant_id, source_sha256, reason):
+        """Terminally revoke every active reservation this tenant holds for
+        these exact source bytes. Returns the revoked count (0 allowed).
+        Callable while the gate is OFF."""
+        tenant = str(tenant_id or "").strip()
+        if not tenant:
+            raise ReservationArgumentError(422, "tenant_id is required")
+        if not isinstance(source_sha256, str) or not _SHA256_RE.fullmatch(source_sha256):
+            raise ReservationArgumentError(422, "source_sha256 must be 64 hex")
+        if not str(reason or "").strip():
+            raise ReservationArgumentError(422, "a revocation reason is required")
+        data = self._reservation_rpc(_REVOKE_RPC, {
+            "p_tenant_id": tenant, "p_source_sha256": source_sha256,
+            "p_reason": str(reason)}, timeout=30)
+        if type(data) is not int or data < 0:
+            raise ReservationStoreError(502, "revoke_source_reservations response malformed")
+        return data
+
+    def check_reservation_conflicts(self, tenant_id, *, post_date,
+                                    logical_post_id, source_sha256, phash_v1):
+        """Read-only ADVISORY candidate screen: {"allowed": bool, "conflicts":
+        [...]}. Takes no locks and grants no authority -- only
+        reserve_forward_slot admits occupancy. ANY failure raises; unknown
+        occupancy is never treated as free."""
+        tenant = str(tenant_id or "").strip()
+        if not tenant:
+            raise ReservationArgumentError(422, "tenant_id is required")
+        day = str(post_date or "")[:10]
+        if not _DATE_RE.fullmatch(day):
+            raise ReservationArgumentError(422, "post_date must be YYYY-MM-DD")
+        logical = self._reservation_uuid(logical_post_id, "logical_post_id")
+        if not isinstance(source_sha256, str) or not _SHA256_RE.fullmatch(source_sha256):
+            raise ReservationArgumentError(422, "source_sha256 must be 64 hex")
+        if type(phash_v1) is not int:
+            raise ReservationArgumentError(422, "phash_v1 must be a signed bigint")
+        data = self._reservation_rpc(_CHECK_RPC, {
+            "p_tenant_id": tenant, "p_post_date": day,
+            "p_logical_post_id": logical, "p_source_sha256": source_sha256,
+            "p_phash_v1": phash_v1}, timeout=30)
+        if (not isinstance(data, dict) or type(data.get("allowed")) is not bool
+                or not isinstance(data.get("conflicts"), list)):
+            raise ReservationStoreError(502, "check_reservation_conflicts response malformed")
+        for conflict in data["conflicts"]:
+            if (not isinstance(conflict, dict)
+                    or conflict.get("kind") not in _CONFLICT_KINDS):
+                raise ReservationStoreError(
+                    502, "check_reservation_conflicts returned an unreadable row")
+        return data
+
+    def forward_reservation_proof(self, calendar_row_id, source_sha256):
+        """Consult the EXACT active reservation for one persisted row + source
+        bytes (final publication path). Returns the strictly parsed proof dict;
+        raises on any mismatch, terminal state or failure."""
+        row_id = self._reservation_uuid(calendar_row_id, "calendar_row_id")
+        if not isinstance(source_sha256, str) or not _SHA256_RE.fullmatch(source_sha256):
+            raise ReservationArgumentError(422, "source_sha256 must be 64 hex")
+        data = self._reservation_rpc(_PROOF_RPC, {
+            "p_calendar_row_id": row_id, "p_source_sha256": source_sha256},
+            timeout=30)
+        if not isinstance(data, dict):
+            raise ReservationStoreError(502, "forward_reservation_proof response malformed")
+        if (not _UUID_RE.fullmatch(str(data.get("reservation_id") or ""))
+                or not str(data.get("tenant_id") or "").strip()
+                or not _DATE_RE.fullmatch(str(data.get("post_date") or "")[:10])
+                or not _UUID_RE.fullmatch(str(data.get("logical_post_id") or ""))
+                or data.get("source_sha256") != source_sha256
+                or not str(data.get("row_revision") or "").strip()
+                or not isinstance(data.get("attestation_ids"), list)
+                or len(data["attestation_ids"]) != 3
+                or any(not _UUID_RE.fullmatch(str(a or ""))
+                       for a in data["attestation_ids"])):
+            raise ReservationStoreError(502, "forward_reservation_proof returned a foreign proof")
+        return data
+
+    def _reservation_snapshot_revision(self, calendar_row_id):
+        """The exact persisted outgoing media revision for one row (the same
+        snapshot RPC the publisher consults). Any failure is UNKNOWN."""
+        data = self._reservation_rpc(_SNAPSHOT_RPC, {
+            "p_calendar_row_id": self._reservation_uuid(
+                calendar_row_id, "calendar_row_id")}, timeout=30)
+        if (not isinstance(data, dict)
+                or not str(data.get("revision") or "").strip()):
+            raise ReservationStoreError(502, "media snapshot revision unavailable")
+        return str(data["revision"])
+
+    def _reservation_lineage_evidence(self, calendar_row_id, revision):
+        """The persisted owner lineage evidence id for (row, revision), the
+        same read the publisher performs before its claim."""
+        try:
+            r = self._client().get(
+                self._rest(_LINEAGE_TABLE),
+                params={"calendar_row_id": "eq." + self._reservation_uuid(
+                            calendar_row_id, "calendar_row_id"),
+                        "row_revision": "eq." + str(revision),
+                        "select": "evidence_id",
+                        "order": "verified_at.desc", "limit": "1"},
+                headers=self._headers(), timeout=30)
+            rows = r.json()
+        except Exception as exc:  # noqa: BLE001 - transport failure: unknown
+            raise ReservationStoreError(0, f"lineage read transport: {type(exc).__name__}")
+        if (r.status_code >= 400 or not isinstance(rows, list) or len(rows) != 1
+                or not isinstance(rows[0], dict)):
+            raise ReservationStoreError(
+                r.status_code if r.status_code >= 400 else 502,
+                "persisted trusted media evidence unavailable")
+        return self._reservation_uuid(rows[0].get("evidence_id"), "evidence_id")
+
+    def finalize_forward_schedule_batch(self, account_key, batch_id, candidates, expected_old_rows):
+        """Activate an attested batch and replace exact old rows in ONE transaction.
+
+        Keyed by the staged batch id; the terminal receipt is written in the
+        same transaction as activation. expected_old_rows MUST be the exact
+        snapshot frozen at stage time and persisted with the batch -- the
+        caller NEVER refreezes a live old-row read, and the SQL authority
+        rejects any caller-supplied old-row mismatch against the persisted
+        set. A lost or malformed result is unknown: resolve ONLY through
+        forward_schedule_batch_status bound to the exact attempt identity,
+        never replay and never infer an outcome from mutable calendar rows.
+        """
+        tenant = str(account_key or "").strip()
+        bid = self._reservation_uuid(batch_id, "batch_id")
+        if not tenant or not isinstance(candidates, list) or not candidates:
+            raise ReservationArgumentError(422, "tenant and candidates required")
+        if not isinstance(expected_old_rows, list):
+            raise ReservationArgumentError(422, "exact old row manifest required")
+        row_ids, logical_ids = set(), set()
+        for candidate in candidates:
+            if not isinstance(candidate, dict):
+                raise ReservationArgumentError(422, "candidate must be an object")
+            row_id = self._reservation_uuid(candidate.get("calendar_row_id"), "calendar_row_id")
+            if row_id in row_ids:
+                raise ReservationArgumentError(422, "duplicate candidate row")
+            row_ids.add(row_id)
+            logical_ids.add(self._reservation_uuid(candidate.get("logical_post_id"), "logical_post_id"))
+            ids = candidate.get("attestation_ids")
+            if (not str(candidate.get("expected_revision") or "").strip()
+                    or not isinstance(ids, list) or len(ids) != 3
+                    or len(set(map(str, ids))) != 3):
+                raise ReservationArgumentError(422, "exact candidate proof required")
+            for ident in ids:
+                self._reservation_uuid(ident, "attestation_id")
+        old_ids = set()
+        for old in expected_old_rows:
+            if not isinstance(old, dict) or old.get("gym_id") != account_key:
+                raise ReservationArgumentError(422, "foreign or unreadable old row")
+            ident = self._reservation_uuid(old.get("id"), "old row id")
+            if ident in old_ids or ident in row_ids:
+                raise ReservationArgumentError(422, "duplicate or overlapping old row")
+            old_ids.add(ident)
+        data = self._reservation_rpc(_FINALIZE_RPC, {
+            "p_tenant_id": tenant, "p_batch_id": bid, "p_candidates": candidates,
+            "p_expected_old_rows": expected_old_rows}, timeout=60)
+        if not isinstance(data, dict):
+            raise ReservationStoreError(502, "batch finalization response malformed; outcome unknown")
+        if (data.get("batch_id") != bid or data.get("state") != "finalized"
+                or data.get("tenant_id") != tenant
+                or not isinstance(data.get("request_digest"), str)
+                or not _SHA256_RE.fullmatch(data["request_digest"])):
+            raise ReservationStoreError(502, "batch finalization terminal receipt mismatch; outcome unknown")
+        returned_rows, reservations = data.get("row_ids"), data.get("reservation_ids")
+        archived = data.get("archived_old_row_ids")
+        if (not isinstance(returned_rows, list) or len(returned_rows) != len(row_ids)
+                or set(map(str, returned_rows)) != row_ids
+                or not isinstance(reservations, list)
+                or len(reservations) != len(row_ids)
+                or any(not _UUID_RE.fullmatch(str(ident)) for ident in reservations)
+                or not isinstance(archived, list)
+                or set(map(str, archived)) != old_ids):
+            raise ReservationStoreError(502, "batch finalization proof incomplete; outcome unknown")
+        groups = {}
+        by_row = {candidate["calendar_row_id"]: candidate["logical_post_id"]
+                  for candidate in candidates}
+        for row_id, reservation_id in zip(returned_rows, reservations):
+            group = by_row[str(row_id)]
+            if groups.setdefault(group, reservation_id) != reservation_id:
+                raise ReservationStoreError(502, "sibling batch reservation mismatch; outcome unknown")
+        if len(set(groups.values())) != len(groups):
+            raise ReservationStoreError(502, "different groups share reservation; outcome unknown")
+        return data
+
+    def _forward_batch_tenant(self, account_key):
+        """Resolve only batch routing through the existing service-read alias
+        table. Raw account ownership and calendar filters remain unchanged.
+        A successful empty read means the raw key is canonical, matching SQL;
+        failed or ambiguous reads never establish an unmapped tenant."""
+        raw_key = str(account_key or "").strip()
+        predicate = _eq_filter(raw_key)
+        if not raw_key or predicate is None:
+            raise CalendarInsertNotStartedError(422, "forward batch account key invalid")
+        try:
+            response = self._client().get(
+                self._rest(_FORWARD_TENANT_ALIAS_TABLE),
+                params={"select": "alias_key,tenant_id", "alias_key": predicate, "limit": "2"},
+                headers=self._headers(), timeout=30)
+            aliases = response.json()
+            if not 200 <= response.status_code < 300 or not isinstance(aliases, list):
+                raise ValueError("alias read unavailable")
+            if not aliases:
+                return raw_key
+            if (len(aliases) != 1 or not isinstance(aliases[0], dict)
+                    or aliases[0].get("alias_key") != raw_key
+                    or not isinstance(aliases[0].get("tenant_id"), str)
+                    or not aliases[0]["tenant_id"]
+                    or aliases[0]["tenant_id"] != aliases[0]["tenant_id"].strip()):
+                raise ValueError("alias binding malformed")
+            return aliases[0]["tenant_id"]
+        except Exception as exc:
+            raise CalendarInsertNotStartedError(
+                503, "canonical batch tenant unavailable before staging") from exc
+
+    @staticmethod
+    def _forward_batch_observation(row, packet, account_key, tenant):
+        """Project an intact unverified producer packet to canonical routing.
+
+        The producer's own raw account (or its resolved canonical tenant) and
+        exact media edge must agree before changing anything. This self-hash
+        is packaging integrity, never registry, manifest or signed authority.
+        All observed bytes, recipe and holds survive the detached projection.
+        """
+        from . import forward_media_observation_bridge as bridge
+        import hashlib
+        import json
+        try:
+            if (not isinstance(packet, dict)
+                    or any(not isinstance(packet.get(k), str)
+                           or not packet[k]
+                           or len(packet[k].encode('utf-8')) > bridge.MAX_JSON_BYTES
+                           for k in ('observation_json', 'digest_input'))):
+                raise ValueError('bounded packet required')
+            observation = json.loads(packet['observation_json'])
+            if (not isinstance(observation, dict)
+                    or observation.get('tenant') not in (account_key, tenant)):
+                raise ValueError('own observation tenant required')
+            original_input = packet['digest_input']
+            original_digest = observation.get('observation_digest')
+            without_digest = {k: v for k, v in observation.items()
+                              if k != 'observation_digest'}
+            if (not isinstance(original_digest, str)
+                    or not _SHA256_RE.fullmatch(original_digest)
+                    or hashlib.sha256(original_input.encode('utf-8')).hexdigest() != original_digest
+                    or json.loads(original_input) != without_digest):
+                raise ValueError('observation preimage differs')
+            # SQL hashes the exact supplied preimage; valid direct callers can
+            # use different JSON spacing. Verify that first, then use the
+            # bridge's canonical packet validator on a detached self-hash.
+            checked = dict(observation, observation_digest=hashlib.sha256(
+                bridge._json(without_digest).encode('utf-8')).hexdigest())
+            bridge.prepare(
+                dict(row, variant_status='candidate',
+                     media_not_ready_reason='forward_reservation_staged'),
+                [checked])
+            observation['tenant'] = tenant
+            digest_input = bridge._json({k: v for k, v in observation.items()
+                                         if k != 'observation_digest'})
+            observation['observation_digest'] = hashlib.sha256(
+                digest_input.encode('utf-8')).hexdigest()
+            return {'observation_json': bridge._json(observation),
+                    'digest_input': digest_input}
+        except Exception as exc:
+            raise ReservationArgumentError(
+                422, 'own unverified observation packet invalid before staging') from exc
+
+    def stage_forward_schedule_batch(self, account_key, rows, old_rows=None):
+        """Atomically stage one immutable inactive batch; returns the receipt.
+
+        The single service-role RPC registers the immutable batch (batch id,
+        canonical tenant, request digest, membership, content/media snapshots AND the
+        frozen old-row snapshot), creates the inactive marked candidate rows
+        and records the unverified observations in ONE transaction. The
+        request is ONE canonical JSON text ({"tenant_id": <resolved tenant>,
+        "members": [{"row": {...},
+        "observation": {...}|null}, ...], "old_rows": [{<every column,
+        including NULLs>}]}); the persisted digest is SHA-256 of its exact
+        bytes, recomputed in SQL. The old-row snapshot is frozen ONCE here
+        (freeze_old_row_snapshots) and bound to the immutable request digest;
+        the finalizer NEVER refreezes it — it uses only the set persisted
+        with the batch and rejects any caller-supplied old-row mismatch. An
+        exact retry (same content + same old snapshot -> same deterministic
+        ids/request text/digest/batch id) replays the persisted receipt; the
+        SQL authority refuses the same batch id with a changed digest. The
+        receipt's `staged` state is NOT a replacement: old rows stay active
+        and visible until a later attested finalization.
+
+        A lost or malformed response is UNKNOWN -- resolve only through
+        forward_schedule_batch_status bound to last_forward_stage_attempt
+        (batch id + tenant + digest + exact member/old sets). This lane never
+        calls the attester, never opens a trusted DSN and never deletes or
+        finalizes anything."""
+        import hashlib
+        tenant = str(account_key or "").strip()
+        if not tenant or not isinstance(rows, list) or not rows or len(rows) > 100:
+            raise ReservationArgumentError(422, "tenant and staged rows required")
+        planned_ids, observed_ids, members = [], [], []
+        for row in rows:
+            if (not isinstance(row, dict) or row.get("gym_id") != account_key
+                    or row.get("status") not in ("pending", "draft")
+                    or row.get("media_not_ready_reason") is not None
+                    or row.get("variant_status") not in (None, "candidate")):
+                raise ReservationArgumentError(
+                    422, "staged rows must be own-tenant unheld pending/draft rows")
+            planned_ids.append(self._reservation_uuid(row.get("id"), "calendar_row_id"))
+            self._reservation_uuid(row.get("logical_post_id"), "logical_post_id")
+            packet = row.get("observation")
+            if packet is not None:
+                if (not isinstance(packet, dict)
+                        or not str(packet.get("observation_json") or "").strip()
+                        or not str(packet.get("digest_input") or "").strip()):
+                    raise ReservationArgumentError(422, "observation packet malformed")
+                observed_ids.append(planned_ids[-1])
+            members.append({"row": {k: v for k, v in row.items() if k != "observation"},
+                            "observation": packet})
+        if len(set(planned_ids)) != len(planned_ids):
+            raise ReservationArgumentError(422, "duplicate staged row identity")
+        frozen_old = freeze_old_row_snapshots(account_key, old_rows)
+        old_ids = [self._reservation_uuid(old.get("id"), "old row id")
+                   for old in frozen_old]
+        if set(old_ids) & set(planned_ids):
+            raise ReservationArgumentError(422, "old row overlaps a staged candidate")
+        tenant = self._forward_batch_tenant(account_key)
+        for member in members:
+            if member['observation'] is not None:
+                member['observation'] = self._forward_batch_observation(
+                    member['row'], member['observation'], account_key, tenant)
+        request_text = _canonical_json({"tenant_id": tenant,
+                                        "members": members, "old_rows": frozen_old})
+        digest = hashlib.sha256(request_text.encode("utf-8")).hexdigest()
+        batch_id = forward_batch_identity(tenant, digest)
+        self.last_forward_stage = None
+        # The complete attempt identity, recorded BEFORE the RPC: it is the
+        # ONLY handle for resolving a lost response, and every element is
+        # required on the status readback (never calendar row readback).
+        self.last_forward_stage_attempt = {
+            "batch_id": batch_id, "tenant_id": tenant, "request_digest": digest,
+            "member_row_ids": list(planned_ids), "old_row_ids": list(old_ids)}
+        data = self._reservation_rpc(_STAGE_RPC, {
+            "p_tenant_id": tenant, "p_batch_id": batch_id,
+            "p_request": request_text, "p_request_digest": digest}, timeout=60)
+        if (not isinstance(data, dict)
+                or data.get("batch_id") != batch_id
+                or data.get("tenant_id") != tenant
+                or data.get("request_digest") != digest
+                or data.get("state") != "staged"
+                or data.get("member_row_ids") != planned_ids
+                or data.get("observation_row_ids") != observed_ids
+                or data.get("old_row_ids") != old_ids
+                or data.get("finalize_receipt") is not None):
+            # A replayed receipt in any other state (e.g. already finalized) is
+            # NOT this lane's outcome to claim: resolve through the status RPC.
+            raise ReservationStoreError(
+                502, "batch stage receipt mismatch; outcome unknown -- resolve "
+                "through forward_schedule_batch_status, never calendar rows")
+        self.last_forward_stage = data
+        return data
+
+    def forward_schedule_batch_status(self, batch_id, *, tenant_id=None,
+                                      request_digest=None, member_row_ids=None,
+                                      old_row_ids=None):
+        """The SOLE readback authority for a staged batch after a lost response.
+
+        The response must carry the exact batch id, a non-empty tenant and
+        the persisted request digest. When the caller supplies expected
+        tenant_id / request_digest / member_row_ids / old_row_ids (always do
+        after a lost response -- pass the recorded attempt), EVERY supplied
+        binding must match exactly; a mismatch is UNKNOWN, never a resolved
+        outcome. State is `staged` or `finalized`, with member/observation/
+        old row id lists and the persisted finalize_receipt. `finalized`
+        requires the COMPLETE terminal receipt written in the activation
+        transaction: matching batch id, tenant and digest, row_ids +
+        reservation_ids, and archived_old_row_ids exactly equal to the
+        batch's persisted old-row set. A batch that does not exist raises
+        ReservationHoldError from the SQL authority -- definite
+        non-existence, never a success. Anything malformed raises
+        ReservationStoreError (unknown)."""
+        bid = self._reservation_uuid(batch_id, "batch_id")
+        data = self._reservation_rpc(_BATCH_STATUS_RPC, {"p_batch_id": bid}, timeout=30)
+        if (not isinstance(data, dict) or data.get("batch_id") != bid
+                or data.get("state") not in ("staged", "finalized")
+                or not str(data.get("tenant_id") or "").strip()
+                or not isinstance(data.get("request_digest"), str)
+                or not _SHA256_RE.fullmatch(data["request_digest"])
+                or not isinstance(data.get("member_row_ids"), list)
+                or not isinstance(data.get("observation_row_ids"), list)
+                or not isinstance(data.get("old_row_ids"), list)
+                or any(not _UUID_RE.fullmatch(str(i or ""))
+                       for i in (data["member_row_ids"] + data["observation_row_ids"]
+                                 + data["old_row_ids"]))
+                or any(len(ids) != len(set(ids)) for ids in (
+                    data["member_row_ids"], data["observation_row_ids"],
+                    data["old_row_ids"]))
+                or not set(data["observation_row_ids"]).issubset(set(data["member_row_ids"]))
+                or set(data["old_row_ids"]) & set(data["member_row_ids"])):
+            raise ReservationStoreError(502, "batch status response malformed; outcome unknown")
+        if tenant_id is not None and data["tenant_id"] != str(tenant_id):
+            raise ReservationStoreError(
+                502, "batch status tenant mismatch; outcome unknown")
+        if request_digest is not None and data["request_digest"] != str(request_digest):
+            raise ReservationStoreError(
+                502, "batch status request digest mismatch; outcome unknown")
+        if member_row_ids is not None and data["member_row_ids"] != [
+                self._reservation_uuid(i, "member_row_id") for i in member_row_ids]:
+            raise ReservationStoreError(
+                502, "batch status member set mismatch; outcome unknown")
+        if old_row_ids is not None and data["old_row_ids"] != [
+                self._reservation_uuid(i, "old_row_id") for i in old_row_ids]:
+            raise ReservationStoreError(
+                502, "batch status old row set mismatch; outcome unknown")
+        if data["state"] == "finalized":
+            receipt = data.get("finalize_receipt")
+            if (not isinstance(receipt, dict)
+                    or receipt.get("batch_id") != bid
+                    or receipt.get("state") != "finalized"
+                    or receipt.get("tenant_id") != data["tenant_id"]
+                    or receipt.get("request_digest") != data["request_digest"]
+                    or not isinstance(receipt.get("row_ids"), list)
+                    or not isinstance(receipt.get("reservation_ids"), list)
+                    or len(receipt["row_ids"]) != len(receipt["reservation_ids"])
+                    or len(receipt["row_ids"]) != len(data["member_row_ids"])
+                    or len(set(map(str, receipt["row_ids"]))) != len(receipt["row_ids"])
+                    or set(map(str, receipt["row_ids"])) != set(data["member_row_ids"])
+                    or any(not _UUID_RE.fullmatch(str(i or ""))
+                           for i in receipt["row_ids"] + receipt["reservation_ids"])
+                    or not isinstance(receipt.get("archived_old_row_ids"), list)
+                    or len(receipt["archived_old_row_ids"]) != len(data["old_row_ids"])
+                    or len(set(map(str, receipt["archived_old_row_ids"]))) != len(receipt["archived_old_row_ids"])
+                    or any(not _UUID_RE.fullmatch(str(i or ""))
+                           for i in receipt["archived_old_row_ids"])
+                    or set(map(str, receipt["archived_old_row_ids"]))
+                    != set(data["old_row_ids"])):
+                raise ReservationStoreError(
+                    502, "finalized batch lacks its complete terminal proof; outcome unknown")
+        return data
+
+    def resolve_forward_stage_attempt(self):
+        """Resolve the last recorded stage attempt through the ONLY authority:
+        the batch status RPC bound to the exact attempt identity (batch id,
+        tenant, request digest, member set and old-row set). Raises
+        ReservationStoreError when no attempt was recorded or the readback
+        does not match it exactly; never consults calendar rows."""
+        attempt = self.last_forward_stage_attempt
+        if not isinstance(attempt, dict) or not attempt.get("batch_id"):
+            raise ReservationStoreError(502, "no forward stage attempt recorded")
+        return self.forward_schedule_batch_status(
+            attempt["batch_id"], tenant_id=attempt.get("tenant_id"),
+            request_digest=attempt.get("request_digest"),
+            member_row_ids=attempt.get("member_row_ids"),
+            old_row_ids=attempt.get("old_row_ids"))
+
+    def forward_preparation_eligible(self, calendar_row_id):
+        """Strictly parsed read of the SQL preparation-eligibility predicate.
+
+        Returns {"eligible": bool, "mode": "active"|"staged"|None,
+        "tenant_id": ..., "batch_id": ..., "reason": ...}. Eligible only for
+        an ordinary eligible active row or an EXACT registered nonterminal
+        staged member (tenant, immutable content/media binding, candidate
+        state, stage marker, no claim/send/approval checked in SQL). The
+        stage marker alone is never trusted anywhere in Python."""
+        row_id = self._reservation_uuid(calendar_row_id, "calendar_row_id")
+        data = self._reservation_rpc(
+            _PREPARATION_ELIGIBLE_RPC, {"p_calendar_row_id": row_id}, timeout=30)
+        if (not isinstance(data, dict) or type(data.get("eligible")) is not bool
+                or data.get("mode") not in ("active", "staged", None)
+                or (data["eligible"] and data["mode"] is None)
+                or (not data["eligible"] and data["mode"] is not None)):
+            raise ReservationStoreError(
+                502, "preparation eligibility response malformed; treating as ineligible")
+        return data
+
+    def _stage_forward_candidate_batch(self, account_key, payload,
+                                       armed_observations, observation_bridge,
+                                       old_rows=None):
+        """Derive deterministic identity, bind observation packets and stage the
+        whole batch through ONE atomic RPC.
+
+        Row ids, the request text, its digest and the batch id are all derived
+        from the exact request content -- including the frozen old-row
+        snapshot -- so an identical retry after a lost response replays the
+        same batch receipt and a changed request (content OR old snapshot) is
+        a different batch (or a refused digest). The old snapshot is frozen
+        ONCE here, before any identity is derived; the finalizer never
+        refreezes it. The SQL stamps the inactive candidate marker itself;
+        this lane sends unmarked rows. Returns the STAGED INACTIVE candidate
+        rows after the exact `staged` receipt. Never POSTs content_calendar
+        directly, never calls the attester lane or a trusted DSN, never
+        finalizes and never deletes old rows. Observation packaging and
+        old-row freeze failures are definite pre-write refusals (nothing has
+        been sent)."""
+        import uuid as _uuid
+        try:
+            frozen_old = freeze_old_row_snapshots(account_key, old_rows)
+        except ReservationStoreError as exc:
+            raise CalendarInsertNotStartedError(
+                422, f"old row snapshot freeze failed before batch staging: "
+                f"{exc.detail}") from exc
+        meta = [armed_observations.get(i) for i in range(len(payload))]
+        content_digest = _forward_content_digest(account_key, payload, meta,
+                                                 old_rows=frozen_old)
+        for i, row in enumerate(payload):
+            row["id"] = str(_uuid.uuid5(
+                _uuid.NAMESPACE_URL, f"{_FORWARD_ROW_NS}:{content_digest}:{i}"))
+        packets = 0
+        try:
+            for i, row in enumerate(payload):
+                if meta[i] is not None:
+                    # Validate against the exact shape the stage RPC persists:
+                    # an inactive marked staged candidate. The marker is not
+                    # sent on the row (SQL stamps it) and is never authority --
+                    # the RPC records the observation atomically with the
+                    # registered membership and the SQL preparation predicate
+                    # re-checks exact nonterminal membership before any lane.
+                    packet = observation_bridge.prepare(
+                        dict(row, variant_status="candidate",
+                             media_not_ready_reason="forward_reservation_staged"),
+                        meta[i])
+                    row["observation"] = {"observation_json": packet["observation_json"],
+                                          "digest_input": packet["digest_input"]}
+                    packets += 1
+            if packets:
+                # Schema/transport refusal before staging leaves zero new rows.
+                observation_bridge.preflight(self)
+        except Exception as exc:
+            raise CalendarInsertNotStartedError(
+                422, f"observation packaging failed before batch staging: "
+                f"{type(exc).__name__}") from exc
+        self.stage_forward_schedule_batch(account_key, payload, frozen_old)
+        return [dict({k: v for k, v in row.items() if k != "observation"},
+                     variant_status="candidate",
+                     media_not_ready_reason="forward_reservation_staged")
+                for row in payload]
 
     def list_active_logical_post_rows(self, account_key, logical_post_id):
         """Every own-tenant active content_calendar row of one logical post,
@@ -2003,7 +2841,7 @@ class SupabaseCalendarStore:
         NOT itself the 'one row per post' read path (list_month is); this is
         the review-surface read that WANTS to see every candidate."""
         seed = self.get_row(account_key, row_id)
-        if seed is None:
+        if seed is None or seed.get("media_not_ready_reason") == "forward_reservation_staged":
             return []
         anchor = seed.get("variant_of") or seed.get("id")
         r = self._client().get(
@@ -2012,6 +2850,7 @@ class SupabaseCalendarStore:
                 "gym_id": f"eq.{account_key}",
                 "or": f"(id.eq.{anchor},variant_of.eq.{anchor})",
                 "variant_status": "in.(active,candidate)",
+                "and": "(or(media_not_ready_reason.is.null,media_not_ready_reason.neq.forward_reservation_staged))",
                 "order": "variant_status.desc,created_at",
             },
             headers=self._headers(), timeout=30,
@@ -2019,7 +2858,8 @@ class SupabaseCalendarStore:
         if r.status_code >= 400:
             raise PortalStoreError(r.status_code, _scrub((r.text or "")[:200]))
         return [row for row in (r.json() or [])
-                if str(row.get("gym_id")) == str(account_key)]
+                if str(row.get("gym_id")) == str(account_key)
+                and row.get("media_not_ready_reason") != "forward_reservation_staged"]
 
     def create_variant_candidate(self, account_key, anchor_row, image_url,
                                  caption=None, thumbnail_url=None,
@@ -3831,7 +4671,8 @@ class SupabaseCalendarStore:
 
     def insert_rows(self, account_key, rows, *, preserve_ids=False,
                     render_evidence_by_url=None, poster_render_evidence_by_url=None,
-                    required_feed_slots=None, prevalidated_cadence=False):
+                    required_feed_slots=None, prevalidated_cadence=False,
+                    expected_old_rows=None):
         """INSERT content_calendar rows for account_key WITHOUT sending an `id`, so the
         DB generates the uuid primary key itself. content_calendar.id is a Postgres uuid
         (DB default gen_random_uuid); sending a non-uuid string (a draft_id) is what
@@ -3842,8 +4683,18 @@ class SupabaseCalendarStore:
         Every row's gym_id is FORCED to account_key (a caller can never write another
         gym's row through this store). IDs are stripped by default. The explicit
         preserve_ids option accepts validated UUIDs for crash-safe automatic jobs.
-        No on_conflict/upsert: apply is delete-then-insert, so a plain insert is correct
-        and idempotent. Returns the list of inserted row dicts (each with its new uuid).
+        With the reservation gate OFF, rebuild uses the existing delete/insert path.
+        ON, rows become inactive marked candidates of ONE immutable staged batch
+        (single atomic stage RPC: batch record + candidate rows + unverified
+        observations) and this returns the STAGED INACTIVE rows after the exact
+        `staged` receipt -- never an active replacement. Deterministic row
+        ids/request text/digest/batch id make an identical retry replay the same
+        receipt; a changed request is a different batch and a reused batch id
+        with a changed digest is refused. A lost stage response is UNKNOWN:
+        resolve through forward_schedule_batch_status, never calendar row
+        readback. Activation, old-row archival and reservation happen only in
+        the later attested finalization transaction, owned by the isolated
+        finalizer.
 
         KEY NORMALIZATION: PostgREST rejects a heterogeneous batch with PGRST102 "All
         object keys must match". Our rows are NOT uniform — a video row carries
@@ -3851,14 +4702,31 @@ class SupabaseCalendarStore:
         and video posts) used to 400 the ENTIRE insert and write 0 rows (GritX rebuild
         stuck at 1 day). We normalize every row to the UNION of keys across the batch,
         filling missing keys with None, so the batch is always uniform."""
+        reservation_flag = forward_reservation_flag()
+        if reservation_flag is None:
+            raise CalendarInsertNotStartedError(503, "forward reservation gate unreadable before insert")
+        if expected_old_rows is not None and not reservation_flag:
+            raise CalendarInsertNotStartedError(503, "atomic replacement requires armed reservation gate")
+        if reservation_flag and expected_old_rows is None:
+            expected_old_rows = []  # Append-only caller; no authority to replace old rows.
+        if reservation_flag and not isinstance(expected_old_rows, list):
+            raise CalendarInsertNotStartedError(422, "exact old row manifest required")
         from . import forward_media_observation_bridge as _observation_bridge
         observation_bridge_on = _observation_bridge.enabled()
         observations_by_id = {}
+        armed_observations = {}
+        # Forward schedule reservation (DRAFT): the planner's per-candidate
+        # screening proof rides the row as metadata and is STRIPPED here, never
+        # written to content_calendar. Collected per logical-post group so the
+        # armed pre-insert gate below can require one consistent byte identity
+        # per group before any row is staged.
+        reservation_proofs = {}
         payload = []
         from .copy_gate import bound_opening_hook, format_caption
         for row in (rows or []):
             clean = {k: v for k, v in dict(row or {}).items()
-                     if k not in ("id", "scene_candidate", _observation_bridge.METADATA)}
+                     if k not in ("id", "scene_candidate",
+                                  _observation_bridge.METADATA, RESERVATION_PROOF)}
             if "caption" in clean and clean["caption"] is not None:
                 # Every calendar-building lane converges here. Prompts and individual
                 # generators can miss the hook limit, so enforce the grader's exact
@@ -3888,16 +4756,27 @@ class SupabaseCalendarStore:
                 # Explicit stable UUIDs support crash-safe automatic render retries.
                 clean["id"] = str(uuid.UUID(str((row or {}).get("id") or "")))
             if observation_bridge_on and _observation_bridge.METADATA in (row or {}):
-                import uuid
-                # Mint before filtering/preparation so response order and duplicate
-                # media URLs cannot invent a row association. The off path retains
-                # the established DB-generated UUID behavior.
-                clean.setdefault("id", str(uuid.uuid4()))
-                if clean["id"] in observations_by_id:
-                    raise _observation_bridge.ObservationBridgeHold(
-                        "calendar_candidate_identity_duplicate")
-                observations_by_id[clean["id"]] = (row or {})[_observation_bridge.METADATA]
+                if reservation_flag:
+                    # Armed lane: no random id minting -- identity is derived
+                    # from the exact request below so an identical retry
+                    # replays the same batch. Metadata is keyed by payload
+                    # position until deterministic ids exist.
+                    armed_observations[len(payload)] = (row or {})[_observation_bridge.METADATA]
+                else:
+                    import uuid
+                    # Mint before filtering/preparation so response order and duplicate
+                    # media URLs cannot invent a row association. The off path retains
+                    # the established DB-generated UUID behavior.
+                    clean.setdefault("id", str(uuid.uuid4()))
+                    if clean["id"] in observations_by_id:
+                        raise _observation_bridge.ObservationBridgeHold(
+                            "calendar_candidate_identity_duplicate")
+                    observations_by_id[clean["id"]] = (row or {})[_observation_bridge.METADATA]
             clean["gym_id"] = account_key  # gym scope: never trust a foreign gym_id
+            if reservation_flag:
+                clean["variant_status"] = "candidate"
+                if clean.get("status") not in ("pending", "draft"):
+                    raise CalendarInsertNotStartedError(422, "inactive candidates must be pending or draft")
             # LOGICAL POST IDENTITY (2026-10-04): a caller may stamp each row with
             # the ONE logical_post_id minted upstream for the sibling group (IG
             # feed + FB mirror + paired Story share one UUID). We pass it through
@@ -3913,7 +4792,29 @@ class SupabaseCalendarStore:
                     raise ValueError(
                         "logical_post_id must be a UUID shared by the sibling "
                         f"post group; got {clean['logical_post_id']!r}")
+            if RESERVATION_PROOF in (row or {}):
+                # A proof object that fails strict validation is not "no
+                # proof": a caller TRIED to bind bytes and produced garbage.
+                # Fail the whole batch before any write, armed or not.
+                proof = (row or {}).get(RESERVATION_PROOF)
+                if not valid_reservation_proof(proof):
+                    raise ValueError(
+                        "invalid forward reservation proof on row for "
+                        f"{clean.get('post_date')}; refusing the batch")
+                group = clean.get("logical_post_id")
+                if group is None:
+                    raise ValueError(
+                        "a forward reservation proof requires the row's "
+                        "logical_post_id; refusing the batch")
+                prior = reservation_proofs.setdefault(group, proof)
+                if (prior["source_sha256"] != proof["source_sha256"]
+                        or prior["phash_v1"] != proof["phash_v1"]):
+                    raise ValueError(
+                        "sibling rows of one logical post carry different "
+                        "reservation byte proofs; refusing the batch")
             payload.append(clean)
+        planned_candidate_ids = (sorted(_canonical_json(row) for row in payload)
+                                 if reservation_flag else [])
         # STAGE-TIME BELTS (report-card build, 2026-08-28; both flags default OFF,
         # account-agnostic — LASSO and gyms share the bug class):
         #   1. AGENT_EMPTY_CAPTION_GUARD: a FEED row with zero visible characters
@@ -3972,31 +4873,38 @@ class SupabaseCalendarStore:
         # A previously inserted hold is the durable retry signal when its
         # support seed failed. Retry confirmed held rows before slot dedupe can
         # drop a repeated planner proposal; READY preserved rows never emit.
-        _retry_story_hold_provenance(self, account_key, payload)
-        payload, recovered = _reconcile_story_media_holds(self, account_key, payload)
-        # Retained holds own their exact slot until explicit recovery or wipe.
-        # Story recovery above uses its retained UUID; this barrier governs NEW
-        # rows of every format. Caption/image changes cannot bypass it, and it
-        # does not collapse numbered slots or channel siblings.
-        if not prevalidated_cadence:
-            payload = _preserve_held_slots(self, account_key, payload)
-            payload = _dedupe_slots(self, account_key, payload)
+        recovered = []
+        if reservation_flag:
+            # Do not PATCH/recover any old row while preparing a replacement.
+            # SQL checks human ownership, holds and concurrent slot occupants
+            # under the same locks used for reservation and activation.
+            payload = _dedupe_slots(self, account_key, payload, existing=set())
         else:
-            # Re-read only the durable/concurrent ownership barriers immediately
-            # before POST. Deterministic caption/media/in-batch filtering was frozen
-            # by preflight; these two checks must remain live so an approval or hold
-            # created after preflight is never stacked with a new row.
-            live_months = sorted({str(row.get("post_date") or "")[:7]
-                                  for row in payload
-                                  if str(row.get("post_date") or "")[:7]})
-            try:
-                payload, _ = _preserve_and_prune_strict(
-                    self, account_key, live_months, payload)
-            except Exception as exc:
-                raise CalendarInsertNotStartedError(
-                    503, "live human-owned slot read failed before calendar insert") from exc
-            payload = _preserve_held_slots(self, account_key, payload)
-            payload = _dedupe_slots(self, account_key, payload)
+            _retry_story_hold_provenance(self, account_key, payload)
+            payload, recovered = _reconcile_story_media_holds(self, account_key, payload)
+            # Retained holds own their exact slot until explicit recovery or wipe.
+            # Story recovery above uses its retained UUID; this barrier governs NEW
+            # rows of every format. Caption/image changes cannot bypass it, and it
+            # does not collapse numbered slots or channel siblings.
+            if not prevalidated_cadence:
+                payload = _preserve_held_slots(self, account_key, payload)
+                payload = _dedupe_slots(self, account_key, payload)
+            else:
+                # Re-read only the durable/concurrent ownership barriers immediately
+                # before POST. Deterministic caption/media/in-batch filtering was frozen
+                # by preflight; these two checks must remain live so an approval or hold
+                # created after preflight is never stacked with a new row.
+                live_months = sorted({str(row.get("post_date") or "")[:7]
+                                      for row in payload
+                                      if str(row.get("post_date") or "")[:7]})
+                try:
+                    payload, _ = _preserve_and_prune_strict(
+                        self, account_key, live_months, payload)
+                except Exception as exc:
+                    raise CalendarInsertNotStartedError(
+                        503, "live human-owned slot read failed before calendar insert") from exc
+                payload = _preserve_held_slots(self, account_key, payload)
+                payload = _dedupe_slots(self, account_key, payload)
         # A recovered Story was patched in place under its retained UUID and is
         # deliberately absent from the POST payload. Count the exact planned
         # Story slot as satisfied for companion atomicity without re-inserting it.
@@ -4014,10 +4922,18 @@ class SupabaseCalendarStore:
             if not required.issubset(actual):
                 raise CadencePreconditionError(
                     409, "calendar cadence precondition failed before insert")
+        if reservation_flag and sorted(_canonical_json(row) for row in payload) != planned_candidate_ids:
+            raise CalendarInsertNotStartedError(409, "atomic candidate batch filtered before insert")
         if not payload:
             return recovered
         from . import visual_writer_prepare
-        prepared_write = visual_writer_prepare.enabled()
+        # CREDENTIAL ISOLATION (phase 3, 2026-10-08): on the armed reservation
+        # lane the planner NEVER runs visual writer preparation -- it opens the
+        # trusted owner receipt boundary (owner DSN) which the planner must not
+        # hold. Staged candidates carry UNVERIFIED observation packets only;
+        # trusted preparation resumes exclusively in the isolated workers
+        # against the exact registered batch membership.
+        prepared_write = visual_writer_prepare.enabled() and not reservation_flag
         if prepared_write:
             # Poster evidence is scoped to the whole media edge, not only to
             # the poster URL. Two videos can intentionally share a poster URL
@@ -4049,43 +4965,94 @@ class SupabaseCalendarStore:
             import uuid
             for row in payload:
                 row.setdefault("id", str(uuid.uuid4()))
+        # FORWARD SCHEDULE RESERVATION GATE (DRAFT, 2026-10-08; default OFF).
+        # Freeze at batch entry and confirm before POST so an unreadable gate cannot
+        # silently take the legacy path and an armed gate refuses rows that
+        # could never reserve BEFORE anything is written. With the flag OFF
+        # this block is inert and the legacy path is byte-identical.
+        if forward_reservation_flag() is not reservation_flag:
+            raise CalendarInsertNotStartedError(503, "forward reservation gate changed before insert")
+        if reservation_flag:
+            seen_slot_bytes = {}
+            for row in payload:
+                if (not _UUID_RE.match(str(row.get("logical_post_id") or ""))
+                        or row.get("logical_post_id") not in reservation_proofs):
+                    raise CalendarInsertNotStartedError(
+                        422, "forward reservation requires every staged row to "
+                        "carry a logical_post_id and its planner screening "
+                        "proof; refusing before any write")
+                # Contract correction (2026-10-08): same tenant/date alone is
+                # NOT reuse authority -- only siblings of ONE validated
+                # logical_post_id may share a visual. Refuse a batch that
+                # stages the same source bytes under two different logical
+                # posts on one date before anything is written.
+                proof = reservation_proofs[row["logical_post_id"]]
+                slot_bytes = (str(row.get("post_date") or "")[:10],
+                              proof["source_sha256"])
+                prior = seen_slot_bytes.setdefault(
+                    slot_bytes, row["logical_post_id"])
+                if prior != row["logical_post_id"]:
+                    raise CalendarInsertNotStartedError(
+                        422, "the same source bytes are staged for two "
+                        "different logical posts on one date; refusing before "
+                        "any write")
+        if reservation_flag:
+            for row in payload:
+                if row.get("media_not_ready_reason") is not None:
+                    raise CalendarInsertNotStartedError(409, "candidate media is held before staging")
+                # The stage RPC stamps variant_status='candidate' and the exact
+                # 'forward_reservation_staged' marker itself; the planner sends
+                # unmarked rows and never writes the marker directly.
         all_keys = set()
         for r in payload:
             all_keys.update(r.keys())
         payload = [{k: r.get(k) for k in all_keys} for r in payload]
-        r = self._client().post(
-            self._rest(_TABLE),
-            headers=self._headers({
-                "Content-Type": "application/json",
-                "Prefer": "return=representation",
-            }),
-            json=payload,
-            timeout=30,
-        )
-        if r.status_code >= 400:
-            raise PortalStoreError(r.status_code, _scrub((r.text or "")[:200]))
-        out = r.json() or []
-        if prepared_write:
-            if not isinstance(out, list) or len(out) != len(payload):
-                raise PortalStoreError(502, "calendar insert returned unverified visual rows")
-            unmatched = list(payload)
-            seen_ids = set()
-            for row in out:
-                if not isinstance(row, dict) or not row.get("id") or row["id"] in seen_ids:
+        if reservation_flag:
+            # TWO-PHASE BATCH (phase 2, 2026-10-08): ONE atomic stage RPC
+            # registers the immutable batch (membership + the frozen old-row
+            # snapshot, bound to the request digest) and creates the inactive
+            # candidate rows + unverified observations. The old calendar stays
+            # active and visible; nothing is attested, finalized, archived or
+            # deleted here. The returned rows are STAGED INACTIVE CANDIDATES,
+            # never an active replacement. A lost response is unknown and is
+            # resolved only through the batch status RPC.
+            inserted = self._stage_forward_candidate_batch(
+                account_key, payload, armed_observations, _observation_bridge,
+                old_rows=expected_old_rows)
+        else:
+            r = self._client().post(
+                self._rest(_TABLE),
+                headers=self._headers({
+                    "Content-Type": "application/json",
+                    "Prefer": "return=representation",
+                }),
+                json=payload,
+                timeout=30,
+            )
+            if r.status_code >= 400:
+                raise PortalStoreError(r.status_code, _scrub((r.text or "")[:200]))
+            out = r.json() or []
+            if prepared_write:
+                if not isinstance(out, list) or len(out) != len(payload):
                     raise PortalStoreError(502, "calendar insert returned unverified visual rows")
-                matches = [candidate for candidate in unmatched
-                           if all(key in row and row[key] == value for key, value in candidate.items())]
-                if not matches:
-                    raise PortalStoreError(502, "calendar insert returned unverified visual rows")
-                unmatched.remove(matches[0])
-                seen_ids.add(row["id"])
-        if observation_candidates:
-            # A crash or refusal after POST leaves no owner manifest/lineage and
-            # therefore no publish authority under the global guard. Raise a static
-            # hold; do not return a successful insert with lost observations.
-            _observation_bridge.persist_inserted(
-                self, payload, out, observation_candidates)
-        inserted = [x for x in out if str(x.get("gym_id")) == str(account_key)]
+                unmatched = list(payload)
+                seen_ids = set()
+                for row in out:
+                    if not isinstance(row, dict) or not row.get("id") or row["id"] in seen_ids:
+                        raise PortalStoreError(502, "calendar insert returned unverified visual rows")
+                    matches = [candidate for candidate in unmatched
+                               if all(key in row and row[key] == value for key, value in candidate.items())]
+                    if not matches:
+                        raise PortalStoreError(502, "calendar insert returned unverified visual rows")
+                    unmatched.remove(matches[0])
+                    seen_ids.add(row["id"])
+            if observation_candidates:
+                # A crash or refusal after POST leaves no owner manifest/lineage and
+                # therefore no publish authority under the global guard. Raise a static
+                # hold; do not return a successful insert with lost observations.
+                _observation_bridge.persist_inserted(
+                    self, payload, out, observation_candidates)
+            inserted = [x for x in out if str(x.get("gym_id")) == str(account_key)]
         _record_confirmed_story_holds(account_key, inserted)
         # Wave 3 (AGENT_CAPTION_COOLDOWN): stamp each successfully staged row in
         # the caption ledger so future planner runs see the cooldown. Failure is
