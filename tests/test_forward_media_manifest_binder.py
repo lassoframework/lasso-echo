@@ -273,3 +273,234 @@ def test_module_import_has_no_side_effects(monkeypatch):
     import importlib
     importlib.reload(binder)
     assert not binder.binder_enabled()
+
+
+# ---- staged discovery (DRAFT worker discovery 20261008) --------------------
+
+def staged_row(tenant='gym-a', post_date='2026-10-10'):
+    return {'calendar_row_id': str(uuid.uuid4()), 'batch_id': str(uuid.uuid4()),
+            'tenant_id': tenant, 'post_date': post_date,
+            'manifest_digest': 'sha256:' + uuid.uuid4().hex + uuid.uuid4().hex}
+
+
+def test_staged_discovery_is_off_without_lane(enabled, monkeypatch):
+    monkeypatch.delenv('AGENT_FORWARD_MEDIA_GUARD', raising=False)
+    with pytest.raises(binder.ForwardMediaBinderHold) as exc:
+        binder.staged_candidates(make_store(FakeHTTP()))
+    assert 'binder_lane_disabled' in str(exc.value)
+
+
+def test_staged_discovery_sends_only_allowlist_and_bound(enabled):
+    http = FakeHTTP(rpc_payload=[staged_row()])
+    rows = binder.staged_candidates(make_store(http))
+    assert len(rows) == 1
+    call = http.posts[0]
+    assert call['url'].endswith(f"rpc/{binder.STAGED_PENDING_RPC}")
+    assert set(call['json']) == {'p_tenants', 'p_limit'}
+    assert call['json']['p_tenants'] == ['gym-a', 'gym-b']
+    assert isinstance(call['json']['p_limit'], int)
+    # Discovery never binds: the active-only bind RPC is never called.
+    assert all(binder.RPC_NAME not in p['url'] for p in http.posts)
+
+
+def test_staged_discovery_rejects_wrong_tenant_and_bad_digest(enabled):
+    with pytest.raises(binder.ForwardMediaBinderHold) as exc:
+        binder.staged_candidates(make_store(FakeHTTP(rpc_payload=[staged_row('foreign')])))
+    assert 'candidate_discovery_malformed' in str(exc.value)
+    bad = staged_row()
+    bad['manifest_digest'] = 'sha256:not-hex'
+    with pytest.raises(binder.ForwardMediaBinderHold):
+        binder.staged_candidates(make_store(FakeHTTP(rpc_payload=[bad])))
+    broken = staged_row()
+    broken['batch_id'] = 'not-a-uuid'
+    with pytest.raises(binder.ForwardMediaBinderHold):
+        binder.staged_candidates(make_store(FakeHTTP(rpc_payload=[broken])))
+
+
+def test_staged_discovery_transport_and_status_failures_are_holds(enabled):
+    with pytest.raises(binder.ForwardMediaBinderHold) as exc:
+        binder.staged_candidates(make_store(FakeHTTP(rpc_status=500, rpc_payload=[])))
+    assert 'candidate_discovery_unavailable' in str(exc.value)
+
+
+# ---- staged bind pass (DRAFT staged preparation 20261008) ------------------
+
+class RoutedHTTP(FakeHTTP):
+    """Per-RPC routed PostgREST double."""
+
+    def __init__(self, pending, bind_status=200, bind_payload=True):
+        super().__init__()
+        self.pending = pending
+        self.bind_status = bind_status
+        self.bind_payload = bind_payload
+
+    def post(self, url, headers=None, json=None, timeout=None):
+        self.posts.append({'url': url, 'json': json})
+        if url.endswith(f"rpc/{binder.STAGED_PENDING_RPC}"):
+            return FakeResponse(200, self.pending)
+        if url.endswith(f"rpc/{binder.STAGED_BIND_RPC}"):
+            return FakeResponse(self.bind_status, self.bind_payload)
+        raise AssertionError(f'unexpected RPC URL: {url}')
+
+
+def test_staged_pass_binds_only_via_staged_rpc(enabled, monkeypatch):
+    monkeypatch.setenv(binder.TENANTS_ENV, 'gym-a')
+    rows = [staged_row(), staged_row()]
+    http = RoutedHTTP(rows)
+    summary = binder.run_staged_once(store=make_store(http))
+    assert summary == {'bound': 2, 'held': 0, 'scanned': 2, 'attempted': 2}
+    binds = [p for p in http.posts if p['url'].endswith(binder.STAGED_BIND_RPC)]
+    assert len(binds) == 2
+    for call in binds:
+        assert set(call['json']) == {'p_calendar_row_id'}
+    # The active-only bind RPC is never touched by the staged lane.
+    assert all(binder.RPC_NAME not in p['url'] for p in http.posts)
+
+
+def test_staged_pass_refusals_are_visible_holds(enabled, monkeypatch):
+    monkeypatch.setenv(binder.TENANTS_ENV, 'gym-a')
+    rows = [staged_row()]
+    http = RoutedHTTP(rows, bind_status=500)
+    held = {}
+    summary = binder.run_staged_once(store=make_store(http), held=held)
+    assert summary['held'] == 1 and summary['bound'] == 0
+    assert held[rows[0]['calendar_row_id']] == 'rpc_bind_refused'
+    # A non-boolean or false payload is also a refusal.
+    http = RoutedHTTP(rows, bind_payload=False)
+    summary = binder.run_staged_once(store=make_store(http))
+    assert summary['held'] == 1
+    # Discovery failure stops the pass before any bind call.
+    http = RoutedHTTP(rows)
+    http.pending = RuntimeError('malformed')
+    with pytest.raises(binder.ForwardMediaBinderHold):
+        binder.run_staged_once(store=make_store(http))
+    assert not any(p['url'].endswith(binder.STAGED_BIND_RPC) for p in http.posts)
+
+
+def test_staged_loop_runs_passes_until_stopped(enabled):
+    import threading
+    stop = threading.Event()
+    calls = []
+
+    def fake_pass(**kwargs):
+        calls.append(kwargs)
+        if len(calls) == 2:
+            stop.set()
+        return {'bound': 0, 'held': 0, 'scanned': 0, 'attempted': 0}
+
+    original = binder.run_staged_once
+    try:
+        binder.run_staged_once = fake_pass
+        binder.run_staged_forever(stop=stop, sleep=lambda _s: None,
+                                  store=make_store(RoutedHTTP([])), logger=lambda _m: None)
+    finally:
+        binder.run_staged_once = original
+    assert len(calls) == 2
+
+
+class KeysetHTTP(FakeHTTP):
+    """PostgREST double emulating the SQL keyset/limit contract.
+
+    Rows are ordered by (post_date, calendar_row_id); a p_after cursor is
+    applied BEFORE the limit, mirroring the SQL authority. Bind refusals are
+    per-row and durable until `repaired` is set.
+    """
+
+    def __init__(self, rows, refused=()):
+        super().__init__()
+        self.rows = sorted(rows, key=lambda r: (r['post_date'], r['calendar_row_id']))
+        self.refused = set(refused)
+        self.repaired = False
+
+    def post(self, url, headers=None, json=None, timeout=None):
+        self.posts.append({'url': url, 'json': json})
+        if url.endswith(f"rpc/{binder.STAGED_PENDING_RPC}"):
+            assert set(json) >= {'p_tenants', 'p_limit'}
+            after = json.get('p_after_row_id')
+            page = [r for r in self.rows if r['tenant_id'] in json['p_tenants']]
+            if after is not None:
+                page = [r for r in page
+                        if (r['post_date'], r['calendar_row_id'])
+                           > (json['p_after_post_date'], after)]
+            return FakeResponse(200, page[:json['p_limit']])
+        if url.endswith(f"rpc/{binder.STAGED_BIND_RPC}"):
+            if not self.repaired and json['p_calendar_row_id'] in self.refused:
+                return FakeResponse(500, None)
+            return FakeResponse(200, True)
+        raise AssertionError(f'unexpected RPC URL: {url}')
+
+
+def test_staged_held_row_never_starves_later_candidate(enabled, monkeypatch):
+    """P2 regression: limit=1, first candidate durably refused, second valid."""
+    monkeypatch.setenv(binder.TENANTS_ENV, 'gym-a')
+    held_row = staged_row(post_date='2026-10-09')
+    valid_row = staged_row(post_date='2026-10-11')
+    http = KeysetHTTP([held_row, valid_row], refused={held_row['calendar_row_id']})
+    store = make_store(http)
+    cursors = {}
+    # Pass 1: only the held row is discovered (limit=1); cursor advances past it.
+    first = binder.run_staged_once(store=store, limit=1, cursors=cursors)
+    assert first == {'bound': 0, 'held': 1, 'scanned': 1, 'attempted': 1}
+    # Pass 2: the keyset cursor skips the held row and binds the valid one.
+    second = binder.run_staged_once(store=store, limit=1, cursors=cursors)
+    assert second == {'bound': 1, 'held': 0, 'scanned': 1, 'attempted': 1}
+    binds = [p['json']['p_calendar_row_id'] for p in http.posts
+             if p['url'].endswith(binder.STAGED_BIND_RPC)]
+    assert binds == [held_row['calendar_row_id'], valid_row['calendar_row_id']]
+
+
+def test_staged_cursor_wraps_to_revisit_repaired_evidence(enabled, monkeypatch):
+    """An exhausted tenant wraps; a repaired (no longer refused) row rebinds."""
+    monkeypatch.setenv(binder.TENANTS_ENV, 'gym-a')
+    row = staged_row()
+    http = KeysetHTTP([row], refused={row['calendar_row_id']})
+    store = make_store(http)
+    cursors = {}
+    assert binder.run_staged_once(store=store, limit=1, cursors=cursors)['held'] == 1
+    assert 'gym-a' in cursors  # held row keeps its cursor; not lost
+    # Tenant not exhausted: no new candidates after the cursor -> wrap.
+    assert binder.run_staged_once(store=store, limit=1, cursors=cursors)['scanned'] == 0
+    assert cursors == {}
+    # After repair the same row is rediscovered from the top and binds.
+    http.repaired = True
+    final = binder.run_staged_once(store=store, limit=1, cursors=cursors)
+    assert final['bound'] == 1 and final['held'] == 0
+
+
+def test_staged_running_loop_advances_past_held_row(enabled, monkeypatch):
+    """Running-loop regression: three limit=1 passes select/refuse the held
+    row once, then bind the later valid row instead of starving it forever."""
+    import threading
+    monkeypatch.setenv(binder.TENANTS_ENV, 'gym-a')
+    monkeypatch.setenv('AGENT_FORWARD_MEDIA_BINDER_BATCH_SIZE', '1')
+    monkeypatch.setenv('AGENT_FORWARD_MEDIA_BINDER_INTERVAL_SECONDS', '5')
+    held_row = staged_row(post_date='2026-10-09')
+    valid_row = staged_row(post_date='2026-10-11')
+    http = KeysetHTTP([held_row, valid_row], refused={held_row['calendar_row_id']})
+    stop = threading.Event()
+    passes = []
+
+    original = binder.run_staged_once
+    try:
+        def counted(**kwargs):
+            summary = original(**kwargs)
+            passes.append(summary)
+            if len(passes) == 4:
+                stop.set()
+            return summary
+        binder.run_staged_once = counted
+        binder.run_staged_forever(stop=stop, sleep=lambda _s: None,
+                                  store=make_store(http), logger=lambda _m: None)
+    finally:
+        binder.run_staged_once = original
+    assert len(passes) == 4
+    # Pass 1 holds the refused row; pass 2 binds the valid row; pass 3 wraps
+    # the exhausted tenant keyset; pass 4 revisits the still-held row.
+    assert [p['held'] for p in passes] == [1, 0, 0, 1]
+    assert [p['bound'] for p in passes] == [0, 1, 0, 0]
+    binds = [p['json']['p_calendar_row_id'] for p in http.posts
+             if p['url'].endswith(binder.STAGED_BIND_RPC)]
+    # The valid row IS bound exactly once; the held row keeps its hold and is
+    # revisited after wrap (pass 3) instead of blocking the valid row forever.
+    assert binds.count(valid_row['calendar_row_id']) == 1
+    assert valid_row['calendar_row_id'] in binds

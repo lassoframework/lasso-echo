@@ -52,6 +52,13 @@ _ATTEST_INSERT = ('insert into public.forward_media_visual_attestation'
                   'phash_version,phash_v1,row_revision,lineage_receipt_id,object_read_receipt_id)'
                   ' values(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) returning attestation_id')
 _NEGATIVE_INSERT = 'select public.fixer_forward_visual_negative_append_20261008(%s,%s,%s,%s,%s)'
+# Recovery read: the attester role holds SELECT on its own evidence table. A
+# crash after lineage commit leaves the row outside pending discovery; the
+# existing role attestations under the SAME immutable lineage are reused, and
+# only missing roles are appended. No second lineage is ever created here.
+_EXISTING_ROLES_SELECT = ('select role,attestation_id,media_url from '
+                          'public.forward_media_visual_attestation '
+                          'where lineage_receipt_id=%s and row_revision=%s and tenant_key=%s')
 
 
 def enabled():
@@ -223,6 +230,117 @@ def attest(calendar_row_id, expected_revision, lineage_receipt_id, *,
                 ids[role] = str(cur.fetchone()[0])
         conn.commit()
         return {'attestation_ids': ids, 'row_revision': row_revision, 'tenant_key': tenant}
+    except Exception as exc:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        if isinstance(exc, ForwardMediaVerificationHold):
+            raise
+        raise ForwardMediaVerificationHold('visual index attestation transaction failed') from exc
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _observe_role(conn, tenant, lineage_id, row_revision, role, url, receipt, read_bytes, cache):
+    """Fetch actual bytes for one role and build its attestation tuple.
+
+    ``cache`` deduplicates aliased URLs so aliased roles observe identical
+    bytes; the caller rereads every fetched URL before committing."""
+    if url not in cache:
+        try:
+            cache[url] = _read(url, read_bytes)
+        except ForwardMediaVerificationHold as exc:
+            raise ForwardMediaVerificationHold('visual index object evidence unavailable') from exc
+    data = cache[url]
+    sha = hashlib.sha256(data).hexdigest()
+    phash = phash_v1(data)
+    if phash is None:
+        if _proven_non_image(data):
+            _record_negative(conn, tenant, 'undecodable media bytes', lineage_id=lineage_id, source_sha256=sha)
+            raise ForwardMediaVerificationHold('visual index media bytes are undecodable')
+        raise ForwardMediaVerificationHold('visual index media fingerprint unavailable')
+    return (role, url, str(uuid.UUID(str(receipt))), sha,
+            hashlib.md5(data).hexdigest(), len(data), phash)
+
+
+def recover(calendar_row_id, expected_revision, lineage_receipt_id, *,
+            tenant_key=None, connection_factory=None, read_bytes=None):
+    """Resume the MISSING visual roles after a crash, reusing the same lineage.
+
+    Recovery contract for the documented gap (attester discovery drops a row
+    once lineage exists): the caller supplies the exact persisted lineage
+    identity; ``fixer_forward_visual_receipts_20261008`` revalidates it against
+    the current revision, existing role attestations under that SAME lineage
+    are reused verbatim, and only missing roles are fetched and appended in one
+    transaction. A second lineage is never created, nothing is claimed,
+    approved or published, and an existing attestation whose URL contradicts
+    the current persisted binding holds the row. Returns the complete role ->
+    attestation id map with ``appended`` naming the roles this call wrote."""
+    row_id = _uuid(calendar_row_id)
+    lineage_id = _uuid(lineage_receipt_id)
+    row_revision = row_revision_from(expected_revision)
+    try:
+        conn = connection_factory() if connection_factory else _connect()
+    except ForwardMediaVerificationHold:
+        raise
+    except Exception as exc:
+        raise ForwardMediaVerificationHold(
+            'visual index attester database unavailable') from exc
+    try:
+        with conn.cursor() as cur:
+            cur.execute('select current_user')
+            if cur.fetchone() != (ROLE,):
+                raise ForwardMediaVerificationHold('trusted attester role mismatch')
+            snapshot, receipts = _snapshot_and_receipts(
+                cur, row_id, expected_revision, lineage_id)
+            tenant = snapshot.get('tenant_id')
+            cur.execute(_EXISTING_ROLES_SELECT, (lineage_id, row_revision, tenant))
+            existing_rows = cur.fetchall()
+        urls = dict(zip(ROLES, (snapshot.get('source_url'), snapshot.get('image_url'),
+                                snapshot.get('thumbnail_url') or snapshot.get('image_url'))))
+        receipt_by_role = dict(zip(ROLES, receipts))
+        if tenant_key is not None and tenant_key != tenant:
+            raise ForwardMediaVerificationHold('visual index evidence contradicts persisted snapshot')
+        if any(not isinstance(url, str) or not url for url in urls.values()):
+            raise ForwardMediaVerificationHold('visual index requires original, delivered and thumbnail objects')
+        existing = {}
+        for item in existing_rows or []:
+            if not isinstance(item, (tuple, list)) or len(item) != 3:
+                raise ForwardMediaVerificationHold('persisted visual evidence shape invalid')
+            role, attestation_id, media_url = item
+            if role not in ROLES or role in existing:
+                raise ForwardMediaVerificationHold('persisted visual evidence ambiguous')
+            if media_url != urls[role]:
+                raise ForwardMediaVerificationHold(
+                    'existing visual attestation contradicts persisted media binding')
+            existing[role] = _uuid(attestation_id)
+        # End the read-only transaction BEFORE any object fetch.
+        conn.rollback()
+        missing = [role for role in ROLES if role not in existing]
+        if not missing:
+            return {'attestation_ids': existing, 'row_revision': row_revision,
+                    'tenant_key': tenant, 'appended': [], 'recovered': False}
+        cache = {}
+        observations = [_observe_role(conn, tenant, lineage_id, row_revision, role,
+                                      urls[role], receipt_by_role[role], read_bytes, cache)
+                        for role in missing]
+        for url, observed in cache.items():
+            if _read(url, read_bytes) != observed:
+                raise ForwardMediaVerificationHold('observed media object changed bytes')
+        with conn.cursor() as cur:
+            appended = {}
+            for role, url, receipt, sha, md5, length, phash in observations:
+                cur.execute(_ATTEST_INSERT,
+                            (tenant, url, role, sha, md5, length,
+                             PHASH_VERSION, phash, row_revision, lineage_id, receipt))
+                appended[role] = str(cur.fetchone()[0])
+        conn.commit()
+        return {'attestation_ids': {**existing, **appended}, 'row_revision': row_revision,
+                'tenant_key': tenant, 'appended': missing, 'recovered': True}
     except Exception as exc:
         try:
             conn.rollback()

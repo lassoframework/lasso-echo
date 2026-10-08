@@ -390,12 +390,43 @@ def production_callbacks(conn, calendar_row_id, *, expected_revision):
             or not isinstance(provenance.get('manifest'), dict)):
         raise ForwardMediaVerificationHold('narrow trusted provenance lookup unavailable')
     original, manifest = provenance['original'], provenance['manifest']
+    verifier = make_original_verifier(
+        lambda tenant, asset: original if (original.get('tenant_id') == tenant
+                                           and original.get('source_asset_id') == asset) else None,
+        expected_revision=expected_revision)
+    renderer = make_controlled_renderer(
+        lambda digest, tenant: manifest if (manifest.get('manifest_digest') == digest
+                                            and manifest.get('tenant_id') == tenant) else None)
+    if 'staged_alias_binding' not in provenance:
+        return verifier, renderer
+
+    # Only the narrow authenticated RPC may supply this bridge. Its staged
+    # membership, alias mapping, source ownership and signed-photo checks have
+    # already passed. Keep the raw signed registry/manifest intact and translate
+    # ONLY this exact captured canonical snapshot for the existing verifiers.
+    binding = provenance['staged_alias_binding']
+    if not isinstance(binding, dict) or set(binding) != {'authority_tenant_id', 'snapshot'}:
+        raise ForwardMediaVerificationHold('staged alias authority binding unavailable')
+    raw_tenant = _require_text(binding.get('authority_tenant_id'), 'alias authority tenant')
+    captured = binding.get('snapshot')
+    if (not isinstance(captured, dict)
+            or captured.get('calendar_row_id') != _uuid(calendar_row_id)
+            or captured.get('revision') != expected_revision
+            or not isinstance(captured.get('gym_id'), str)
+            or captured['gym_id'].strip() != raw_tenant
+            or not isinstance(captured.get('tenant_id'), str)
+            or not captured['tenant_id'].strip()
+            or captured['tenant_id'] == raw_tenant
+            or original.get('tenant_id') != raw_tenant
+            or manifest.get('tenant_id') != raw_tenant):
+        raise ForwardMediaVerificationHold('staged alias authority binding mismatch')
+
+    def authority_snapshot(snapshot):
+        if not isinstance(snapshot, dict) or snapshot != captured:
+            raise ForwardMediaVerificationHold('staged alias snapshot changed')
+        return dict(snapshot, tenant_id=raw_tenant)
+
     return (
-        make_original_verifier(
-            lambda tenant, asset: original if (original.get('tenant_id') == tenant
-                                               and original.get('source_asset_id') == asset) else None,
-            expected_revision=expected_revision),
-        make_controlled_renderer(
-            lambda digest, tenant: manifest if (manifest.get('manifest_digest') == digest
-                                                and manifest.get('tenant_id') == tenant) else None),
+        lambda snapshot, source_bytes: verifier(authority_snapshot(snapshot), source_bytes),
+        lambda source_bytes, snapshot: renderer(source_bytes, authority_snapshot(snapshot)),
     )
