@@ -1131,11 +1131,77 @@ def _as_records(raw):
     return [r for r in val if isinstance(r, dict)]
 
 
-def stamp_use(asset, gym_id, post_date, *, store=None, now=None):
+def _stamp_use_remote(asset, gym_id, post_date, *, use_id, asset_row, source_row):
+    """Armed remote-CAS stamp (AGENT_REMOTE_DRIVE_USE_CAS_ENABLED=true).
+
+    Requires a CALLER-PROVIDED stable use UUID and the caller's complete exact
+    asset + source row snapshots; this lane never mints a fresh UUID (an
+    uncertain attempt may only be re-read with the same identity) and never
+    guesses a snapshot from a re-read. The atomic PG use apply+receipt runs
+    OUTSIDE the local flock (remote_drive_use.apply owns that discipline) and
+    raises MutationHold on ANY unknown remote/local outcome BEFORE the local
+    use bookkeeping below — a caller that persists the card after this raises
+    is violating the lane contract. The remote apply is authoritative for the
+    counters, so the ID-only media_source_store.update_asset form is never
+    used here; the local kv record preserves the receipt identity (use_id and
+    the receipt-stamped last_used_at) alongside the legacy bookkeeping shape.
+    Coach exclusion, moderation and the global visual-history gates are
+    unchanged: they gate the pick long before this stamp runs."""
+    from pathlib import Path
+    from . import local_inventory_mutation as lim
+    from . import remote_drive_use as rdu
+    base = base_gym_key(gym_id)
+    if (not use_id or not isinstance(asset_row, dict)
+            or not isinstance(source_row, dict)
+            or str(asset_row.get("id") or "") != str((asset or {}).get("id"))):
+        raise lim.MutationHold("remote_drive_use_snapshot_required")
+    if isinstance(post_date, datetime):
+        day = post_date.date().isoformat()
+    elif isinstance(post_date, date):
+        day = post_date.isoformat()
+    else:
+        day = str(post_date or "").strip()
+    from . import config as agent_config
+    cfg = lim.configured(base, Path(agent_config.LIBRARY_PATH) / base)
+    request = rdu.request_for(dict(asset_row), dict(source_row), gym_id=base,
+                              epoch_id=cfg.epoch_id, post_date=day,
+                              use_id=str(use_id))
+    authority = rdu.DriveUseAuthority.from_environment()
+    try:
+        receipt = rdu.apply(cfg, authority, request)
+    finally:
+        authority.close()
+    after = receipt["asset_after"]
+    from . import db
+    key = _USE_KEY.format(base, day)
+    records = [r for r in _as_records(db.kv_get(key, ""))
+               if r.get("asset_id") != request["asset_id"]]
+    records.append({
+        "asset_id": request["asset_id"],
+        "gym_id": base,
+        "use_id": request["use_id"],
+        "prev_used_count": request["asset_before"]["used_count"],
+        "prev_last_used_at": request["asset_before"]["last_used_at"],
+        "staged_at": after["last_used_at"],
+        "rolled_back": False,
+    })
+    db.kv_set(key, json.dumps(records))
+
+
+def stamp_use(asset, gym_id, post_date, *, store=None, now=None,
+              use_id=None, asset_row=None, source_row=None):
     """Stamp used_count += 1 and last_used_at = now — called ONLY when the slot is
     actually STAGED (the builder, after the PENDING row is assembled). The stamp is
     PERMANENT: a coach deny or a media swap settles the kv record (rollback_use) but
     never restores the counters, so a staged asset is never offered again.
+
+    REMOTE DRIVE USE CAS (AGENT_REMOTE_DRIVE_USE_CAS_ENABLED, default OFF): when
+    armed, the stamp is the atomic PG use apply+durable receipt from
+    agent.remote_drive_use, requiring the caller's stable `use_id` and exact
+    `asset_row`/`source_row` snapshots, and any uncertain outcome raises
+    MutationHold before the local use bookkeeping lands. Callers that cannot
+    supply a stable use UUID and exact snapshots leave armed mode fail-closed.
+    When the flag is OFF the legacy path below is byte-for-byte unchanged.
 
     APPENDS to the date's record list rather than replacing it: at 2x two assets are
     staged on one date, and the old single-record write meant the PM stamp clobbered
@@ -1145,6 +1211,11 @@ def stamp_use(asset, gym_id, post_date, *, store=None, now=None):
     rollback cannot double-restore). NOTE it is not fully idempotent: the second stamp
     records the already-incremented count as `prev_used_count`, so a later rollback
     leaves a residual +1. Pre-existing; callers stamp once per staged slot."""
+    from . import remote_drive_use
+    if remote_drive_use.enabled():
+        _stamp_use_remote(asset, gym_id, post_date, use_id=use_id,
+                          asset_row=asset_row, source_row=source_row)
+        return
     base = base_gym_key(gym_id)
     store = store or _idx.default_store()
     now = _now_utc(now)
@@ -1195,7 +1266,10 @@ def rollback_use(gym_id, post_date, *, store=None, asset_id=None,
     touch the record of the asset's earlier PUBLISHED post. Published history is
     never rewritten: the stamped counters stay exactly as stage time left them.
     restore_unstaged is only for a draft abandoned before any calendar row was
-    persisted or shown. A coach deny, swap or rebuild never sets it."""
+    persisted or shown. A coach deny, swap or rebuild never sets it. Under the
+    remote Drive-use CAS flag restore_unstaged is unsupported and HOLDS
+    (remote_drive_never_landed_release_unavailable) until a proven
+    never-landed release protocol exists."""
     from . import db
     base = base_gym_key(gym_id)
     key = _USE_KEY.format(base, post_date)
@@ -1203,6 +1277,12 @@ def rollback_use(gym_id, post_date, *, store=None, asset_id=None,
     if not records or all(r.get("rolled_back") for r in records):
         return False
     if restore_unstaged:
+        # REMOTE DRIVE USE CAS: an armed stamp lives in the atomic PG apply;
+        # no proven never-landed release protocol exists, so restoring a
+        # consumed asset is unsupported — hold instead of re-offering it.
+        from . import remote_drive_use
+        if remote_drive_use.enabled():
+            remote_drive_use.release_never_landed()
         store = store or _idx.default_store()
         if not store.available():
             return False
