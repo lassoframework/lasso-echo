@@ -2437,6 +2437,15 @@ def slack_convo_identity_enabled(identity: str) -> bool:
     return _truthy(os.environ.get(f"SLACK_CONVO_{identity.upper()}_ENABLED", "false"))
 
 
+def slack_convo_echo_current_notice_enabled() -> bool:
+    """SLACK_CONVO_ECHO_CURRENT_NOTICE_ENABLED — exact current notice delivery.
+
+    OFF until the paired portal RPC/migration contract is live and verified.
+    This flag does not authorize publishing or client replies on its own.
+    """
+    return _truthy(os.environ.get("SLACK_CONVO_ECHO_CURRENT_NOTICE_ENABLED", "false"))
+
+
 def slack_convo_client_reply_armed(identity: str) -> bool:
     """SLACK_CONVO_<IDENTITY>_CLIENT_REPLY — may this bot post a reply to a CLIENT on its
     own? OFF by default ("staff first"). Off = every client-facing reply, including the

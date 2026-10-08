@@ -251,6 +251,8 @@ def _strip_llm_scaffold(text):
     return out
 
 
+import re as _re_hook
+
 _HOOK_MAX_CHARS = 125
 
 
@@ -268,7 +270,14 @@ def _bound_opening_hook(text, max_chars=_HOOK_MAX_CHARS):
             continue
         if len(line) <= max_chars:
             return text
-        cut = line.rfind(" ", 0, max_chars + 1)
+        # Prefer the LAST sentence boundary inside the limit so the hook line is a
+        # complete sentence (2026-10-07: the word-boundary cut split "we don't
+        # expect you to / figure it out alone" across two lines).
+        cut = -1
+        for m in _re_hook.finditer(r"[.!?][\"'\u201d\u2019)]*(?=\s)", line[:max_chars + 1]):
+            cut = m.end()
+        if cut <= 0:
+            cut = line.rfind(" ", 0, max_chars + 1)
         if cut <= 0:
             cut = max_chars
         head, tail = line[:cut].rstrip(), line[cut:].lstrip()
@@ -532,6 +541,13 @@ def _hint_free(creative):
     return clean
 
 
+def _is_meta_reply(text):
+    """True when generated text is the model talking to the operator (a clarification
+    request or meta comment) rather than a caption. Single source: copy_gate."""
+    from . import copy_gate
+    return copy_gate.is_meta_reply(text)
+
+
 def _note_sb7_fallback(account_key, reason):
     """OBSERVABILITY for the template fallback (audit 2026-08-25): count each SB7->template
     fallback per gym per day (kv) and ALERT a human ONCE per gym/day when a build storms
@@ -672,6 +688,9 @@ class StoryBrandGenerator:
         "- Draw ONLY from the brand voice doc and client note provided. No invented "
         "facts, stats, prices, or offers.\n"
         "- No em dashes, en dashes, or hyphens used as punctuation dashes.\n"
+        "- Consumer copy law: use NO hyphens at all (write '30 minute', 'semi private', "
+        "'well being'), NO colons, and NO semicolons anywhere in the caption. Use "
+        "periods and commas instead.\n"
         "- Keep the customer's problem central, but VARY the ENTRY POINT. Do not open "
         "every caption the same way. Rotate how you begin: sometimes the problem, "
         "sometimes the outcome they want, sometimes a question, sometimes a scene or "
@@ -1017,6 +1036,26 @@ class StoryBrandGenerator:
                     "not their age or a generic descriptor.\n\n")
                 if retry and not _dropped_name_for_age(client_note, retry):
                     body = retry
+            # META REPLY GATE (Bolton Club, 2026-10-07): the model sometimes answers
+            # the PROMPT instead of writing the post ("You said the photo shows 'DSC'...
+            # Can you tell me what the image shows?"). That is never copy. Retry ONCE
+            # with an explicit instruction to write the caption from the voice doc and
+            # client note alone; a second meta reply falls back to the template. The
+            # figure gate below still runs on whichever body survives.
+            if _is_meta_reply(body):
+                retry = _compose(
+                    "IMPORTANT: your previous attempt asked a question or commented on the "
+                    "request instead of writing the caption. Write the finished caption "
+                    "now. Never ask a question back, never mention the photo, its "
+                    "description, the request, or yourself. If the scene hint is unclear, "
+                    "ignore it and write from the brand voice doc and client note alone.\n\n")
+                if retry and not _is_meta_reply(retry):
+                    body = retry
+                else:
+                    print("[sb7] output was a clarification or meta reply, not a caption; "
+                          "falling back to template")
+                    _note_sb7_fallback(getattr(account, "key", "") or "", "meta_reply")
+                    return TemplateGenerator().build(voice, _hint_free(creative))
             # OUTPUT FABRICATION GATE (deterministic, never skipped): every figure
             # (stat, price, count) in the generated caption MUST trace to an approved
             # input (the client note or the voice doc). A caption carrying a number
@@ -1034,8 +1073,14 @@ class StoryBrandGenerator:
                     "the approved source. Rewrite the caption with NO digits or "
                     "numeric claims at all; spell out nothing that implies a stat, "
                     "price, or count that is not verbatim in the source.\n\n")
-                if retry and _output_claims_cleared(retry, voice, client_note) \
-                        and not openings_collide(retry, avoid_list):
+                # Opening variety is a soft preference, never a publication gate. The
+                # retry may honestly converge on a recent opening when a thin source leaves
+                # few ways to remove the invented figure. Rejecting that figure-clean copy
+                # here made an opening collision look like a figure-gate failure and dumped
+                # the approved source into the calendar verbatim. Keep any retry that clears
+                # the deterministic figure gate; the harder no-fabrication rule still runs
+                # unchanged.
+                if retry and _output_claims_cleared(retry, voice, client_note):
                     body = retry
                 else:
                     print("[sb7] output carried a number not in the approved sources; "

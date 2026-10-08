@@ -44,6 +44,10 @@ class FakePersistence:
 
 @pytest.fixture(autouse=True)
 def owner_env(monkeypatch):
+    import os
+    from agent.forward_media_owner import forbidden_credential_names
+    for name in forbidden_credential_names(os.environ):
+        monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv('FORWARD_MEDIA_OWNER_DSN', 'postgresql://owner@localhost/db')
     monkeypatch.setenv('FORWARD_MEDIA_OWNER_ROLE', 'forward_media_owner_20261006')
 
@@ -355,3 +359,17 @@ def test_output_never_contains_urls_dsn_or_packet_data(tmp_path):
     for secret in (SRC_URL, IMG_URL, THUMB_URL, 'postgresql', 'tenant-a',
                    'asset-1', 'receipt', 'audit'):
         assert secret not in line
+
+
+@pytest.fixture(autouse=True)
+def isolated_process_environment(monkeypatch):
+    # Pytest injects PYTEST_CURRENT_TEST after fixture setup. This test-only
+    # process view excludes that harness marker; production accepts no such name.
+    import os
+    class ProcessEnvironment:
+        @property
+        def environ(self):
+            return {k: v for k, v in os.environ.items() if k != 'PYTEST_CURRENT_TEST'}
+        getenv = staticmethod(os.getenv)
+    from agent import forward_media_owner
+    monkeypatch.setattr(forward_media_owner, 'os', ProcessEnvironment())

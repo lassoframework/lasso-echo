@@ -66,7 +66,7 @@ def main():
        'create role photo_auditor login;grant fixer_forward_media_photo_auditor_20261007 to photo_auditor;'
        'grant select,insert,update,delete on content_calendar to service_role;')
    for name in list(os.environ):
-    if owner._FORBIDDEN_ENV_NAME.search(name):os.environ.pop(name)
+    if name in owner.forbidden_credential_names(os.environ):os.environ.pop(name)
    os.environ['FORWARD_MEDIA_OWNER_DSN']=dsn('photo_owner')
    os.environ['FORWARD_MEDIA_OWNER_ROLE']='photo_owner'
    source_bytes=png('blue');drive=Drive();drive.data=source_bytes
@@ -209,6 +209,7 @@ def main():
      denied(lambda:wrong.execute('select fixer_prepare_owner_photo_20261007(%s,%s::jsonb,%s::jsonb)',(packet['payload']['audit_id'],json.dumps(verified_source.original.row()),json.dumps(prepared.manifest.row()))))
    sql("insert into fixer_forward_media_claim_gate_20261006 values('gym',true)")
    media_host.config.S3_PUBLIC_BASE_URL='https://media.example.test'
+   os.environ['AGENT_S3_PUBLIC_BASE_URL']='https://media.example.test'
    def ready_claim(row_id,day='2026-10-10'):
     with lane('service_role') as service:assert service.execute('select fixer_bind_forward_media_manifest_20261006(%s)',(row_id,)).fetchone()[0]
     token=str(uuid.uuid4());sql("update content_calendar set status='publishing',publish_claim_token=%s,publish_reservation_day=%s where id=%s",(token,day,row_id))
@@ -317,6 +318,8 @@ def main():
    # Network work must retain no transaction; final authority revalidates.
    from agent import visual_writer_prepare
    sql('alter role '+guard.ROLE+' login')
+   from agent.forward_media_lane import unknown_environment_names
+   prior_owner_env={name:os.environ.pop(name) for name in unknown_environment_names(os.environ,'attester')}
    prior_attester_env={name:os.environ.get(name) for name in (
     'AGENT_FORWARD_MEDIA_GUARD','AGENT_FORWARD_MEDIA_ATTESTER_DSN','AGENT_FORWARD_MEDIA_ATTESTER_ROLE')}
    os.environ['AGENT_FORWARD_MEDIA_GUARD']='true'
@@ -336,7 +339,7 @@ def main():
     assert remote_release.wait(timeout=8),'production attester remote phase was not released'
     return hosted.read(url)
    try:
-    with patch.object(visual_writer_prepare,'_bytes_for_url',side_effect=paused_production_bytes),concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+    with patch.object(guard,'read_public_object',side_effect=paused_production_bytes),concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
      production_attest=pool.submit(guard.attest,production_row,production_revision)
      assert remote_entered.wait(timeout=5),'real production_callbacks did not reach object read'
      assert sql("select count(*) from pg_stat_activity where usename=%s and state='idle' and xact_start is null",(guard.ROLE,))[0][0]==1
@@ -351,7 +354,7 @@ def main():
      changed_row,changed_revision=fresh_production_attestation_row()
      remote_entered.clear();remote_release.clear()
      unknown_id=None
-     with patch.object(visual_writer_prepare,'_bytes_for_url',side_effect=paused_production_bytes),concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+     with patch.object(guard,'read_public_object',side_effect=paused_production_bytes),concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
       changed_attest=pool.submit(guard.attest,changed_row,changed_revision)
       assert remote_entered.wait(timeout=5)
       assert sql("select count(*) from pg_stat_activity where usename=%s and state='idle' and xact_start is null",(guard.ROLE,))[0][0]==1
@@ -374,7 +377,7 @@ def main():
     reverse_row,reverse_revision=fresh_production_attestation_row()
     held_claim=lane('service_role')
     assert held_claim.execute('select fixer_claim_forward_media_20261006(%s,%s,%s,%s)',third).fetchone()[0] is True
-    with patch.object(visual_writer_prepare,'_bytes_for_url',side_effect=hosted.read),concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+    with patch.object(guard,'read_public_object',side_effect=hosted.read),concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
      waiting_attester=pool.submit(guard.attest,reverse_row,reverse_revision)
      deadline=time.monotonic()+5
      while time.monotonic()<deadline:
@@ -395,6 +398,7 @@ def main():
     for name,value in prior_attester_env.items():
      if value is None:os.environ.pop(name,None)
      else:os.environ[name]=value
+   os.environ.update(prior_owner_env)
    # A fresh independent certificate after prior sends has reviewed the now
    # reserved/published visuals. Real production run_once discovers it, commits
    # durable admission before remote readers, and atomically persists outcome.
@@ -551,6 +555,10 @@ def main():
    for name in ('feed_autofit_4x5','story_photo'):
     row_id,prepared_now,cert_now=signed_rendition(name,name)
     counts=sql('select (select count(*) from fixer_owner_photo_reservation_20261007),(select count(*) from fixer_forward_media_render_manifest_20261006)')[0]
+    # Story runtime filenames mix case and underscores. The signed Python
+    # codepoint order must match SQL even on an en_US database locale.
+    canonical_sql=sql('select fixer_owner_photo_canonical_20261007(%s::jsonb)',(json.dumps(prepared_now.manifest.render_recipe),))[0][0]
+    assert canonical_sql==json.dumps(prepared_now.manifest.render_recipe,sort_keys=True,separators=(',',':'),ensure_ascii=False)
     staged=stage_prepared_photo(p,prepared_now)
     assert staged['registry']==verified_source.original.row(),staged
     assert staged['clearance']==result['clearance'],staged

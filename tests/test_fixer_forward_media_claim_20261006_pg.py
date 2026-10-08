@@ -219,6 +219,36 @@ def main():
             sql(f"update fixer_forward_media_claim_gate_20261006 set enabled=true where tenant_id='{tenant}';")
             assert claim(first) == 't'
             assert claim(first) == 't'
+            # A committed exact retry retains its frozen byte reservation even
+            # when another tenant later appends benign render ancestry for the
+            # same delivered bytes. The retry must not create new occupancy.
+            replay_pair,replay_tenant,replay_group,replay_url,replay_fp=seed()
+            assert claim(replay_pair)=='t'
+            replay_receipt=sql(f"select to_jsonb(c)::text from fixer_forward_media_claim_receipt_20261006 c where claim_token='{replay_pair[1]}';")
+            later_fp='md5:'+uuid.uuid4().hex
+            later_tenant='later_edge_'+uuid.uuid4().hex
+            later_url='https://scratch.example/'+uuid.uuid4().hex
+            attest(row(later_tenant,'later_group',later_url,
+                       image='https://scratch.example/'+uuid.uuid4().hex),
+                   later_fp,image_fp=replay_fp,operation='render')
+            assert claim(replay_pair)=='t'
+            assert sql(f"select to_jsonb(c)::text from fixer_forward_media_claim_receipt_20261006 c where claim_token='{replay_pair[1]}';")==replay_receipt
+            assert sql(f"select count(*) from fixer_forward_media_use_20261006 where fingerprint='{later_fp}';")=='0'
+            assert 'owner attested' in claim((replay_pair[0],replay_pair[1],str(uuid.uuid4())),ok=False)
+            assert 'outgoing media revision changed' in claim(replay_pair,ok=False,expected_revision='changed-request')
+            # Newly discovered consumed ancestry remains unsafe on an exact
+            # retry. It cannot be ignored merely because the receipt predates it.
+            later_consumed,*_=seed(fp=later_fp)
+            assert claim(later_consumed)=='t'
+            assert 'another tenant/date/group' in claim(replay_pair,ok=False)
+            # A later negative historical decision on that added ancestor also
+            # holds the exact retry, without rewriting its immutable receipt.
+            later_hold=row('later_hold','hold_group','https://scratch.example/'+uuid.uuid4().hex)
+            later_asset,_=prepare(later_hold,later_fp,clearance=False)
+            later_hold_url=sql(f"select source_media_url from content_calendar where id='{later_hold[0]}';")
+            sql(raw_clearance(later_hold,later_fp,later_asset,'later_hold',later_hold_url,'hold_uncertain'))
+            assert 'original or rendition historical eligibility held' in claim(replay_pair,ok=False)
+            assert sql(f"select to_jsonb(c)::text from fixer_forward_media_claim_receipt_20261006 c where claim_token='{replay_pair[1]}';")==replay_receipt
             sibling = attest(row(tenant,group,url),fp)
             assert claim(sibling) == 't'
             other = attest(row(tenant,group,url,'2026-10-11'),fp)
@@ -494,7 +524,7 @@ def main():
             sql(f"update content_calendar set publish_claim_token=null,status='published' where id='{brid}';")
             assert 'unsent active row' in bind(brid,ok=False)
             print('PASS: self-contained draft; global cross-gym/cross-date concurrency one-winner; '
-                  'same-group idempotency; catch-up reservation; immutable complete source/image/thumbnail '
+                  'same-group idempotency; frozen-receipt retry after benign later ancestry; later consumed/negative ancestry retry hold; catch-up reservation; immutable complete source/image/thumbnail '
                   'evidence; narrow attester auth; forged/missing/stale evidence hold; deletion permanence; '
                   'derivative source reuse denial; atomic rollback; default OFF; sent-row/outage hold; '
                   'attester-vs-claim graph race denial and isolation hold; authoritative original registry and '
