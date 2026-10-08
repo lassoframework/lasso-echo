@@ -890,6 +890,22 @@ def _process_client_body(client, r2, poster, converter, phash, moderator):
 
             data, name = converter(raw, name)
 
+            # A guarded receipt owns provenance by library basename. Two
+            # different source objects that convert to that same basename
+            # cannot safely share the media/sidecar pair: updating either one
+            # would replace the other's accepted bytes or source binding. Hold
+            # the receipt before any archive, dedupe disposition, or library
+            # write; the incoming source remains available for reconciliation.
+            if _active_mutation.get() is not None:
+                conflicting = any(
+                    record.get("status") == "accepted"
+                    and record.get("filename") == name
+                    and record.get("source_fingerprint") != src_fp
+                    for record in manifest["asset_provenance"].values()
+                )
+                if conflicting:
+                    raise _mutation.MutationHold("intake_basename_collision")
+
             sha = hashlib.sha256(data).hexdigest()
             ph = phash(data, name)
             if sha in manifest["sha256"]:

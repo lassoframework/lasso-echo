@@ -788,6 +788,31 @@ def test_guarded_confirmed_missing_manifest_initializes_inside_receipt(
         "intake/gyma/incoming/20260702T100000Z_photo.jpg"]
 
 
+def test_guarded_different_sources_cannot_overwrite_same_converted_basename(
+        monkeypatch, tmp_path):
+    auth = FakeAuthority()
+    receipts = _arm_fence(monkeypatch, tmp_path, auth)
+    r2 = FakeR2()
+    _seed(r2, name="20260702T100000Z_photo.heic", data=b"HEIC-SOURCE")
+    assert _run(r2)["gyma"]["accepted"] == 1
+    media = tmp_path / "library/gyma/20260702T100000Z_photo.jpg"
+    original_media = media.read_bytes()
+    original_provenance = json.loads(
+        r2.objects["intake/gyma/manifest.json"])["asset_provenance"]
+
+    _seed(r2, name="20260702T100000Z_photo.jpg", data=b"DIFFERENT-JPEG")
+    incoming = "intake/gyma/incoming/20260702T100000Z_photo.jpg"
+    result = _run(r2)
+
+    assert "error" in result["gyma"]
+    assert r2.objects[incoming] == b"DIFFERENT-JPEG"
+    assert media.read_bytes() == original_media
+    manifest = json.loads(r2.objects["intake/gyma/manifest.json"])
+    assert manifest["asset_provenance"] == original_provenance
+    assert any(record["local_state"] == "pending"
+               for record in _journals(receipts))
+
+
 @pytest.mark.parametrize("failure", ["write", "readback"])
 def test_guarded_manifest_persistence_precedes_source_delete(
         monkeypatch, tmp_path, failure):
