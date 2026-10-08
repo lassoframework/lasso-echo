@@ -83,10 +83,12 @@ def parse_allowlist(raw):
 
 
 def parse_max_gyms(raw):
+    if raw is None:
+        return _DEFAULT_MAX_GYMS
     try:
         value = int(raw)
     except (TypeError, ValueError):
-        return _DEFAULT_MAX_GYMS
+        return None
     return max(1, min(_HARD_MAX_GYMS, value))
 
 
@@ -125,6 +127,9 @@ def run_job(environ=None, *, http=None, identity_http=None, apify_client=None,
         log('held: scheduled day must be YYYY-MM-DD')
         return _hold('scheduled_day_invalid')
     limit = parse_max_gyms(env.get(_MAX_GYMS_ENV))
+    if limit is None:
+        log('held: max gyms must be an integer')
+        return _hold('max_gyms_invalid')
 
     if _runner is None:
         try:

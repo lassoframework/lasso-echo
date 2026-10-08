@@ -9,7 +9,7 @@ import pytest
 
 from agent.source_brand_ingest import CaptureIngestError
 from agent.source_brand_capture_job import (durable_request_id, main,
-    parse_allowlist, run_job)
+    parse_allowlist, parse_max_gyms, run_job)
 
 import re as _re  # noqa: E402  (used by test_cli_exit_codes default arg)
 from test_source_brand_capture_runner import GYM, environment, setup
@@ -84,6 +84,27 @@ def test_allowlist_missing_or_invalid_holds_without_io(tmp_path, monkeypatch):
         assert receipt['hold'] == 'tenant_allowlist_required'
     assert parse_allowlist(GYM) == (GYM,)
     assert parse_allowlist(f' {GYM} , {OTHER_GYM} ') == (GYM, OTHER_GYM)
+    assert not list(tmp_path.iterdir())
+
+
+def test_max_gyms_defaults_only_when_unset_and_holds_malformed_before_io(
+        tmp_path, monkeypatch):
+    assert parse_max_gyms(None) == 50
+    assert parse_max_gyms('14') == 14
+    for raw in ('', '  ', 'many', '1.5'):
+        assert parse_max_gyms(raw) is None
+
+    def _boom(*a, **k):
+        raise AssertionError('malformed max gyms must hold before composition')
+    monkeypatch.setattr('agent.source_brand_capture_job.initialize_source_capture', _boom)
+    env = dict(environment(), ECHO_SOURCE_CAPTURE_JOB_ENABLED='true',
+               ECHO_SOURCE_CAPTURE_JOB_ALLOWLIST=GYM,
+               ECHO_SOURCE_CAPTURE_JOURNAL_DIR=str(tmp_path))
+    for raw in ('', '  ', 'many', '1.5'):
+        receipt = run_job(environ=dict(env,
+            ECHO_SOURCE_CAPTURE_JOB_MAX_GYMS=raw))
+        assert receipt['state'] == 'held'
+        assert receipt['hold'] == 'max_gyms_invalid'
     assert not list(tmp_path.iterdir())
 
 
