@@ -5,6 +5,7 @@ Run as a standalone script with PostgreSQL 17 tools and existing psycopg.
 Evidence is local SQL-contract behavior, not live provider/palette parity.
 """
 import json
+import hashlib
 from pathlib import Path
 import random
 import shutil
@@ -19,19 +20,30 @@ MIGRATION = ROOT / "migrations/DRAFT_generated_source_palette_authority_20261007
 PG = Path("/opt/homebrew/opt/postgresql@17/bin")
 
 
+def digest(data):
+    return 'sha256:' + hashlib.sha256(data).hexdigest()
+
+
+def provenance():
+    return dict(origin_ref='intake:doc-1', intake_revision='r1', intake_sha256=digest(b'original intake'))
+
+
 def source_op(source_id, text="exact source text"):
-    return {"op": "source_upsert", "source_id": source_id, "category": "drive_folder",
-            "exact_text": text, "citation": "citation:doc-1"}
+    return {"op": "source_upsert", "source_id": source_id, "category": "educational",
+            "exact_text": text, "citation": "citation:doc-1",
+            "content_sha256": digest(text.encode()), **provenance()}
 
 
-def approval_op(source_id, revision=1, mode="explicit", evidence="approval:receipt-1"):
+def approval_op(source_id, revision=1, mode="explicit", evidence="approval:receipt-1", text="exact source text"):
     return {"op": "source_approve", "source_id": source_id, "revision": revision,
-            "approval_mode": mode, "approval_evidence": evidence}
+            "approval_mode": mode, "approval_evidence": evidence, "approval_actor": "human:coach-1",
+            "content_sha256": digest(text.encode()), "intake_sha256": provenance()["intake_sha256"]}
 
 
 def palette_op(key="brand", colors=("#112233", "#aabbcc"), evidence="sha256:file-revision-1"):
     return {"op": "palette_upsert", "palette_key": key, "colors": list(colors),
-            "verification_evidence": evidence}
+            "verification_evidence": evidence, "file_sha256": digest(evidence.encode()),
+            "file_revision": evidence, "approval_mode": "explicit", "approval_actor": "human:coach-1", **provenance()}
 
 
 def main():
@@ -128,6 +140,14 @@ def main():
                         approval_op("src-1", mode=""), approval_op("src-1", evidence=" "),
                         approval_op("src-1", mode="auto", evidence=None)]:
                 denied(lambda bad=bad: write(service, "gym-a", 1, [bad]))
+            denied(lambda: write(service, "gym-a", 1, [dict(source_op("src-1"), origin_ref='other:origin')]), "origin is immutable")
+            denied(lambda: write(service, "gym-a", 1, [dict(palette_op(), origin_ref='other:origin')]), "origin is immutable")
+            denied(lambda: write(service, "gym-a", 1, [approval_op("src-1", mode="auto")]), "explicit")
+            denied(lambda: write(service, "gym-a", 1, [dict(approval_op("src-1"), content_sha256=digest(b'forged'))]), "exact digests")
+            denied(lambda: write(service, "gym-a", 1, [dict(source_op("bad-digest"), content_sha256=digest(b'forged'))]))
+            denied(lambda: write(service, "gym-a", 1, [dict(source_op("bad-intake"), intake_sha256=digest(b'different'))]), "immutable")
+            denied(lambda: write(service, "gym-a", 1, [dict(palette_op(), file_sha256=digest(b'different'))]), "immutable")
+            denied(lambda: write(service, "gym-a", 1, [dict(palette_op(), approval_mode='auto')]))
             assert write(service, "gym-a", 1, [dict(approval_op("src-1"), actor="forged-human")]) == 2
             row = snapshot(owner, "gym-a")["sources"][0]
             assert row["approval_revision"] == row["revision"] == 1
@@ -136,11 +156,10 @@ def main():
             assert write(service, "gym-a", 2, [source_op("src-1", text="v2 text")]) == 3
             row = snapshot(owner, "gym-a")["sources"][0]
             assert row["revision"] == 2 and row["status"] == "pending"
-            assert all(row[k] is None for k in ("approval_revision", "approval_mode", "approval_evidence", "approved_by"))
+            assert all(row[k] is None for k in ("approval_revision", "approval_mode", "approval_evidence", "approval_actor", "approved_by"))
             denied(lambda: write(service, "gym-a", 3, [approval_op("src-1", revision=1)]), "stale source approval")
-            assert write(service, "gym-a", 3, [approval_op("src-1", revision=2, mode="auto",
-                         evidence="armed-intake-flag:trusted-receipt")]) == 4
-            assert snapshot(owner, "gym-a")["sources"][0]["approval_mode"] == "auto"
+            assert write(service, "gym-a", 3, [approval_op("src-1", revision=2, text="v2 text")]) == 4
+            assert snapshot(owner, "gym-a")["sources"][0]["approval_mode"] == "explicit"
             denied(lambda: validate(publisher, "gym-a", 4, ["src-1"], [1]), "stale approval/revision")
             assert validate(publisher, "gym-a", 4, ["src-1"], [2])["validated"]
 
