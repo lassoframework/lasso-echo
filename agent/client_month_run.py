@@ -638,6 +638,19 @@ def _row_from_draft(base_key, draft):
                     "invalid pre-stamped logical_post_id on draft "
                     f"{getattr(draft, 'draft_id', '?')}: {logical_post_id!r}") from exc
             row["logical_post_id"] = logical_post_id
+    # Forward schedule reservation (DRAFT, 2026-10-08): the Drive builder's
+    # byte-bound screening proof rides the draft object. Fold it into row
+    # metadata (never a content_calendar column; insert_rows validates and
+    # strips it). An invalid proof object is not "absent": fail closed BEFORE
+    # _apply's delete, exactly like the logical_post_id validation above.
+    proof = getattr(draft, "_reservation_proof", None)
+    if proof is not None:
+        from . import portal_calendar_store as _pcs
+        if not _pcs.valid_reservation_proof(proof):
+            raise ValueError(
+                "invalid forward reservation proof on draft "
+                f"{getattr(draft, 'draft_id', '?')}; refusing the row")
+        row[_pcs.RESERVATION_PROOF] = proof
     return row
 
 
@@ -739,6 +752,13 @@ def _finish_feed_with_story(account, feed, library_path, log, *, day_key="",
     # identity explicitly on the Story clone.
     if config.logical_post_id_enabled():
         story.logical_post_id = feed.logical_post_id
+    # dataclasses.replace also drops the reservation screening proof; the
+    # paired Story is the same source bytes, so it shares the feed's proof.
+    if getattr(feed, "_reservation_proof", None) is not None:
+        try:
+            story._reservation_proof = feed._reservation_proof
+        except Exception:  # noqa: BLE001 - a frozen/edge draft never blocks the build
+            pass
     # The story must NOT carry the feed's 4:5 autofit reframe: restore the pre-autofit
     # media (story-format ON rebuilds a fresh 1080x1920; this keeps it correct when OFF).
     if getattr(story, "creative_public_url", "") != _pre_autofit_url:
@@ -3056,6 +3076,41 @@ def _apply(base_key, rows, start, days, store, log, locked_days=(),
                     "reason": "cta self-question gate: banned or self-question CTA",
                     "cta_gate_violations": [v.message() for v in exc.violations],
                     "upserted": 0, "inserted": 0, "deleted": 0, "months": months}
+
+        # FORWARD SCHEDULE RESERVATION GATE (DRAFT, 2026-10-08; default OFF).
+        # Same fail-closed shape as the day-shape assertion: with the draft
+        # gate armed, every row about to be inserted must carry its validated
+        # logical_post_id AND the planner's byte-bound screening proof, or the
+        # whole pass refuses BEFORE the first delete. An ambiguous flag value
+        # is unreadable gate state and refuses identically. Flag OFF: inert.
+        from . import portal_calendar_store as _pcs
+        reservation_flag = _pcs.forward_reservation_flag()
+        if reservation_flag is not False:
+            def _reservation_bound(r):
+                try:
+                    uuid.UUID(str((r or {}).get("logical_post_id") or ""))
+                except (AttributeError, TypeError, ValueError):
+                    return False
+                return _pcs.valid_reservation_proof(
+                    (r or {}).get(_pcs.RESERVATION_PROOF))
+            if reservation_flag is None:
+                log(f"{base_key}: forward reservation gate is unreadable; "
+                    "aborted before any delete")
+                return {"ok": False,
+                        "reason": "forward reservation gate unreadable; aborted "
+                                  "before any delete",
+                        "upserted": 0, "inserted": 0, "deleted": 0,
+                        "months": months}
+            unbound = [r for r in clean_rows if not _reservation_bound(r)]
+            if unbound:
+                log(f"{base_key}: {len(unbound)} row(s) lack a forward "
+                    "reservation binding; aborted before any delete")
+                return {"ok": False,
+                        "reason": "forward reservation binding missing; aborted "
+                                  "before any delete",
+                        "unbound_rows": len(unbound),
+                        "upserted": 0, "inserted": 0, "deleted": 0,
+                        "months": months}
         # NEVER SHRINK (TopFuel 2026-08-25): a grow-to-cap rebuild must only GROW, never
         # replace a good calendar with a SMALLER one. The grow-guard can re-trigger a build
         # for a gym that is already built out (build_target counts photo clusters, some of

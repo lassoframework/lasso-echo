@@ -355,6 +355,102 @@ class ReceiptSelectionError(ReceiptStoreError):
     Definite no-write, and it will fail identically on replay."""
 
 
+# ---- forward schedule reservation (DRAFT, flag-gated, 2026-10-08) ------------
+#
+# Backing contract (Child 1, landed): migrations/
+# DRAFT_fixer_forward_schedule_reservation_20261008.sql and
+# docs/FORWARD_SCHEDULE_RESERVATION_20261008.md. A durable reservation binds
+# one attested source proof to exactly one (tenant, post_date, logical_post_id)
+# future slot via the SECURITY DEFINER RPCs reserve_forward_slot_20261008 /
+# release_forward_slot_20261008 / revoke_source_reservations_20261008 /
+# check_reservation_conflicts_20261008 / forward_reservation_proof_20261008.
+# Every wrapper here is RPC-only: this client NEVER touches the reservation
+# table directly. Gate: AGENT_FORWARD_SCHEDULE_RESERVATION (default OFF). The
+# flag is tri-state: an unrecognized non-empty value is AMBIGUOUS and fails
+# closed -- an armed-but-unreadable gate must never silently behave like the
+# legacy delete-then-insert path. With the flag OFF none of these are invoked.
+#
+# SQLSTATE mapping (the draft's own codes): 23514 -> validation/conflict/hold
+# (definite no-write; the unique-index backstop's 23505 is mapped here too),
+# 22023 -> malformed arguments (definite no-write), 55000 -> the DB gate is
+# OFF (definite no-write). Anything else, a transport failure, or an
+# unparseable/foreign response is UNKNOWN: fail closed, never guess.
+FORWARD_RESERVATION_FLAG_ENV = "AGENT_FORWARD_SCHEDULE_RESERVATION"
+
+#: Row metadata key carrying the planner's byte-bound screening proof
+#: (source_sha256 + phash_v1 + source_media_asset_id of the ACTUAL served
+#: bytes). Never a content_calendar column; insert_rows strips it before any
+#: write and only consults it for fail-closed pre-insert validation.
+RESERVATION_PROOF = "_reservation_proof"
+
+_RESERVE_RPC = "reserve_forward_slot_20261008"
+_RELEASE_RPC = "release_forward_slot_20261008"
+_REVOKE_RPC = "revoke_source_reservations_20261008"
+_CHECK_RPC = "check_reservation_conflicts_20261008"
+_PROOF_RPC = "forward_reservation_proof_20261008"
+_SNAPSHOT_RPC = "fixer_forward_media_attestation_request_20261006"
+_LINEAGE_TABLE = "fixer_forward_media_lineage_20261006"
+
+
+def forward_reservation_flag():
+    """Tri-state read of AGENT_FORWARD_SCHEDULE_RESERVATION: True (on), False
+    (off or unset), None (ambiguous value -- fail closed). Same truthy set as
+    the other visual flags; anything else is not a silent default."""
+    import os
+    raw = (os.environ.get(FORWARD_RESERVATION_FLAG_ENV, "") or "").strip().lower()
+    if raw in ("1", "true", "yes", "on"):
+        return True
+    if raw in ("", "0", "false", "no", "off"):
+        return False
+    return None
+
+
+class ReservationStoreError(PortalStoreError):
+    """A reservation RPC failed or returned something that fails strict
+    parsing. The reservation outcome is UNKNOWN: fail closed."""
+
+
+class ReservationHoldError(ReservationStoreError):
+    """SQLSTATE 23514 (or the unique-index backstop's 23505): the candidate
+    failed validation, conflicts with committed or reserved occupancy, and the
+    slot is HELD. Definite: nothing was written."""
+
+
+class ReservationGateError(ReservationHoldError):
+    """SQLSTATE 55000: the DB reservation gate is OFF. Definite no-write."""
+
+
+class ReservationArgumentError(ReservationStoreError):
+    """SQLSTATE 22023: the reservation arguments failed the server allowlist.
+    Definite no-write, and it will fail identically on replay."""
+
+
+_CONFLICT_KINDS = ("negative", "committed_claim", "active_reservation",
+                   "phash_block", "phash_review")
+_SHA256_RE = _re.compile(r"[0-9a-f]{64}")
+_DATE_RE = _re.compile(r"\d{4}-\d{2}-\d{2}")
+
+
+def valid_reservation_proof(proof):
+    """True only for a complete, well-formed byte-bound screening proof.
+
+    The proof binds the ACTUAL served source/rendition bytes the planner
+    screened: source_sha256 (64 lowercase hex, required), phash_v1 (signed
+    bigint, required -- the advisory conflict RPC refuses a null pHash and an
+    undecodable candidate holds upstream), and a non-empty
+    source_media_asset_id. Anything less fails closed."""
+    if not isinstance(proof, dict):
+        return False
+    sha = proof.get("source_sha256")
+    phash = proof.get("phash_v1")
+    asset = proof.get("source_media_asset_id")
+    if not isinstance(sha, str) or not _SHA256_RE.fullmatch(sha):
+        return False
+    if type(phash) is not int:
+        return False
+    return isinstance(asset, str) and bool(asset.strip())
+
+
 # The learning-lever columns patch_pending_plan is allowed to re-stamp when a
 # repair changes a caption. An explicit allowlist, so this lane can never be
 # used to write an arbitrary column.
@@ -1206,6 +1302,258 @@ class SupabaseCalendarStore:
              "p_request_fingerprint": str(fingerprint),
              "p_prepared": dict(prepared or {})},
             account_key, action_id, expect_fingerprint=fingerprint, timeout=60)
+
+    # ---- forward schedule reservation RPC wrappers (DRAFT, flag-gated) ------
+    # Wire contract: docs/FORWARD_SCHEDULE_RESERVATION_20261008.md. Every
+    # wrapper fails closed: a transport failure, an unexpected SQLSTATE or an
+    # unparseable/foreign response is NEVER treated as free or reserved.
+
+    def _reservation_rpc(self, fn, args, timeout=60):
+        """POST one reservation RPC and map SQLSTATEs onto typed errors.
+
+        Never tenant-parses here (each wrapper validates its own shape); this
+        only enforces transport + error-code discipline."""
+        try:
+            r = self._client().post(
+                self._rest(f"rpc/{fn}"),
+                headers=self._headers({"Content-Type": "application/json"}),
+                json=args, timeout=timeout)
+        except Exception as exc:  # noqa: BLE001 - transport failure: unknown outcome
+            raise ReservationStoreError(0, f"rpc {fn} transport: {type(exc).__name__}")
+        if r.status_code >= 400:
+            code, message = "", ""
+            try:
+                err = r.json()
+                if isinstance(err, dict):
+                    code = str(err.get("code") or "")
+                    message = str(err.get("message") or "")
+            except Exception:  # noqa: BLE001 - fall through to generic below
+                pass
+            detail = _scrub((message or r.text or "")[:200])
+            if code in ("23505", "23514"):
+                # 23514 is the draft's validation/conflict/hold code; 23505 is
+                # the partial unique index backstop firing on a lost race. Both
+                # are definite no-writes (the RPC transaction rolled back).
+                raise ReservationHoldError(r.status_code, detail)
+            if code == "22023":
+                raise ReservationArgumentError(r.status_code, detail)
+            if code == "55000":
+                raise ReservationGateError(r.status_code, detail)
+            raise ReservationStoreError(r.status_code, detail)
+        try:
+            return r.json()
+        except Exception as exc:  # noqa: BLE001
+            raise ReservationStoreError(
+                r.status_code, f"rpc {fn} unparseable response: {type(exc).__name__}")
+
+    @staticmethod
+    def _reservation_uuid(value, field):
+        try:
+            import uuid as _uuid_mod
+            return str(_uuid_mod.UUID(str(value)))
+        except (ValueError, AttributeError, TypeError):
+            raise ReservationArgumentError(422, f"{field} must be a uuid")
+
+    def reserve_forward_slot(self, calendar_row_id, logical_post_id,
+                             expected_revision, attestation_ids, *,
+                             expected_reservation_id=None):
+        """Create (or idempotently return) the active reservation for the slot
+        of one PERSISTED, unsent calendar row.
+
+        The server re-validates everything from the persisted row: tenant,
+        local date, the validated logical_post_id column, the exact outgoing
+        media revision, current owner/history clearance, the three role
+        attestations bound to one lineage, negatives, committed claims and
+        existing reservations. Returns the reservation uuid as a string. Raises
+        ReservationGateError (DB gate OFF), ReservationHoldError (held or
+        conflict), ReservationArgumentError (bad args) or ReservationStoreError
+        (unknown outcome)."""
+        row_id = self._reservation_uuid(calendar_row_id, "calendar_row_id")
+        logical = self._reservation_uuid(logical_post_id, "logical_post_id")
+        revision = str(expected_revision or "")
+        if not revision.strip():
+            raise ReservationArgumentError(422, "expected_revision is required")
+        if (not isinstance(attestation_ids, (list, tuple))
+                or len(attestation_ids) != 3
+                or len({str(a) for a in attestation_ids}) != 3):
+            raise ReservationArgumentError(
+                422, "attestation_ids must be exactly three distinct ids")
+        ids = [self._reservation_uuid(a, "attestation_id") for a in attestation_ids]
+        args = {"p_calendar_row_id": row_id, "p_logical_post_id": logical,
+                "p_expected_revision": revision, "p_attestation_ids": ids}
+        if expected_reservation_id is not None:
+            args["p_expected_reservation_id"] = self._reservation_uuid(
+                expected_reservation_id, "expected_reservation_id")
+        data = self._reservation_rpc(_RESERVE_RPC, args, timeout=60)
+        # PostgREST returns a scalar uuid as a plain JSON string.
+        if not isinstance(data, str) or not _UUID_RE.fullmatch(data):
+            raise ReservationStoreError(502, "reserve_forward_slot response malformed")
+        return data
+
+    def release_forward_slot(self, reservation_id, reason):
+        """Transition one reservation active -> released, freeing its slot.
+        Idempotent on terminal rows; literal true only. Callable while OFF."""
+        rid = self._reservation_uuid(reservation_id, "reservation_id")
+        if not str(reason or "").strip():
+            raise ReservationArgumentError(422, "a release reason is required")
+        data = self._reservation_rpc(_RELEASE_RPC, {
+            "p_reservation_id": rid, "p_reason": str(reason)}, timeout=30)
+        if data is not True:
+            raise ReservationStoreError(502, "release_forward_slot did not return literal true")
+        return True
+
+    def revoke_source_reservations(self, tenant_id, source_sha256, reason):
+        """Terminally revoke every active reservation this tenant holds for
+        these exact source bytes. Returns the revoked count (0 allowed).
+        Callable while the gate is OFF."""
+        tenant = str(tenant_id or "").strip()
+        if not tenant:
+            raise ReservationArgumentError(422, "tenant_id is required")
+        if not isinstance(source_sha256, str) or not _SHA256_RE.fullmatch(source_sha256):
+            raise ReservationArgumentError(422, "source_sha256 must be 64 hex")
+        if not str(reason or "").strip():
+            raise ReservationArgumentError(422, "a revocation reason is required")
+        data = self._reservation_rpc(_REVOKE_RPC, {
+            "p_tenant_id": tenant, "p_source_sha256": source_sha256,
+            "p_reason": str(reason)}, timeout=30)
+        if type(data) is not int or data < 0:
+            raise ReservationStoreError(502, "revoke_source_reservations response malformed")
+        return data
+
+    def check_reservation_conflicts(self, tenant_id, *, post_date,
+                                    logical_post_id, source_sha256, phash_v1):
+        """Read-only ADVISORY candidate screen: {"allowed": bool, "conflicts":
+        [...]}. Takes no locks and grants no authority -- only
+        reserve_forward_slot admits occupancy. ANY failure raises; unknown
+        occupancy is never treated as free."""
+        tenant = str(tenant_id or "").strip()
+        if not tenant:
+            raise ReservationArgumentError(422, "tenant_id is required")
+        day = str(post_date or "")[:10]
+        if not _DATE_RE.fullmatch(day):
+            raise ReservationArgumentError(422, "post_date must be YYYY-MM-DD")
+        logical = self._reservation_uuid(logical_post_id, "logical_post_id")
+        if not isinstance(source_sha256, str) or not _SHA256_RE.fullmatch(source_sha256):
+            raise ReservationArgumentError(422, "source_sha256 must be 64 hex")
+        if type(phash_v1) is not int:
+            raise ReservationArgumentError(422, "phash_v1 must be a signed bigint")
+        data = self._reservation_rpc(_CHECK_RPC, {
+            "p_tenant_id": tenant, "p_post_date": day,
+            "p_logical_post_id": logical, "p_source_sha256": source_sha256,
+            "p_phash_v1": phash_v1}, timeout=30)
+        if (not isinstance(data, dict) or type(data.get("allowed")) is not bool
+                or not isinstance(data.get("conflicts"), list)):
+            raise ReservationStoreError(502, "check_reservation_conflicts response malformed")
+        for conflict in data["conflicts"]:
+            if (not isinstance(conflict, dict)
+                    or conflict.get("kind") not in _CONFLICT_KINDS):
+                raise ReservationStoreError(
+                    502, "check_reservation_conflicts returned an unreadable row")
+        return data
+
+    def forward_reservation_proof(self, calendar_row_id, source_sha256):
+        """Consult the EXACT active reservation for one persisted row + source
+        bytes (final publication path). Returns the strictly parsed proof dict;
+        raises on any mismatch, terminal state or failure."""
+        row_id = self._reservation_uuid(calendar_row_id, "calendar_row_id")
+        if not isinstance(source_sha256, str) or not _SHA256_RE.fullmatch(source_sha256):
+            raise ReservationArgumentError(422, "source_sha256 must be 64 hex")
+        data = self._reservation_rpc(_PROOF_RPC, {
+            "p_calendar_row_id": row_id, "p_source_sha256": source_sha256},
+            timeout=30)
+        if not isinstance(data, dict):
+            raise ReservationStoreError(502, "forward_reservation_proof response malformed")
+        if (not _UUID_RE.fullmatch(str(data.get("reservation_id") or ""))
+                or not str(data.get("tenant_id") or "").strip()
+                or not _DATE_RE.fullmatch(str(data.get("post_date") or "")[:10])
+                or not _UUID_RE.fullmatch(str(data.get("logical_post_id") or ""))
+                or data.get("source_sha256") != source_sha256
+                or not str(data.get("row_revision") or "").strip()
+                or not isinstance(data.get("attestation_ids"), list)
+                or len(data["attestation_ids"]) != 3
+                or any(not _UUID_RE.fullmatch(str(a or ""))
+                       for a in data["attestation_ids"])):
+            raise ReservationStoreError(502, "forward_reservation_proof returned a foreign proof")
+        return data
+
+    def _reservation_snapshot_revision(self, calendar_row_id):
+        """The exact persisted outgoing media revision for one row (the same
+        snapshot RPC the publisher consults). Any failure is UNKNOWN."""
+        data = self._reservation_rpc(_SNAPSHOT_RPC, {
+            "p_calendar_row_id": self._reservation_uuid(
+                calendar_row_id, "calendar_row_id")}, timeout=30)
+        if (not isinstance(data, dict)
+                or not str(data.get("revision") or "").strip()):
+            raise ReservationStoreError(502, "media snapshot revision unavailable")
+        return str(data["revision"])
+
+    def _reservation_lineage_evidence(self, calendar_row_id, revision):
+        """The persisted owner lineage evidence id for (row, revision), the
+        same read the publisher performs before its claim."""
+        try:
+            r = self._client().get(
+                self._rest(_LINEAGE_TABLE),
+                params={"calendar_row_id": "eq." + self._reservation_uuid(
+                            calendar_row_id, "calendar_row_id"),
+                        "row_revision": "eq." + str(revision),
+                        "select": "evidence_id",
+                        "order": "verified_at.desc", "limit": "1"},
+                headers=self._headers(), timeout=30)
+            rows = r.json()
+        except Exception as exc:  # noqa: BLE001 - transport failure: unknown
+            raise ReservationStoreError(0, f"lineage read transport: {type(exc).__name__}")
+        if (r.status_code >= 400 or not isinstance(rows, list) or len(rows) != 1
+                or not isinstance(rows[0], dict)):
+            raise ReservationStoreError(
+                r.status_code if r.status_code >= 400 else 502,
+                "persisted trusted media evidence unavailable")
+        return self._reservation_uuid(rows[0].get("evidence_id"), "evidence_id")
+
+    def _stage_inserted_reservations(self, account_key, inserted):
+        """Stage the durable reservation for every logical-post group of the
+        rows THIS insert call persisted. Runs AFTER the owner observation
+        manifest/lineage persisted (the attestations bind to it).
+
+        Per sibling row: read the exact persisted media revision, read the
+        lineage evidence, append the three role attestations through the
+        trusted attester lane, then reserve the slot. Sibling rows of one
+        logical post MUST share one post_date and resolve to the SAME
+        reservation id (the RPC's idempotent same-slot retry); same
+        tenant/date under a DIFFERENT logical_post_id is a conflict, never a
+        share. Any failure raises; the caller removes the just-inserted rows
+        and reports a definite pre-insert refusal."""
+        from . import forward_media_visual_index as visual_index
+        if not visual_index.enabled():
+            raise ReservationHoldError(
+                503, "visual index lane is OFF; reservation cannot stage")
+        groups = {}
+        for row in inserted:
+            if not isinstance(row, dict):
+                raise ReservationStoreError(502, "inserted row unreadable")
+            groups.setdefault(str(row.get("logical_post_id") or ""), []).append(row)
+        for logical_post_id, group in groups.items():
+            logical = self._reservation_uuid(logical_post_id, "logical_post_id")
+            days = {str(row.get("post_date") or "")[:10] for row in group}
+            if len(days) != 1 or not _DATE_RE.fullmatch(next(iter(days))):
+                raise ReservationStoreError(
+                    502, "a logical post's sibling rows span or lack a post_date")
+            reservation_id = None
+            for row in group:
+                row_id = self._reservation_uuid(row.get("id"), "calendar_row_id")
+                revision = self._reservation_snapshot_revision(row_id)
+                evidence_id = self._reservation_lineage_evidence(row_id, revision)
+                prepared = visual_index.attest(
+                    row_id, revision, evidence_id,
+                    gym_key=str(account_key), content_date=row.get("post_date"))
+                ids = ((prepared or {}).get("attestation_ids") or {})
+                attestation_ids = [ids.get(role) for role in visual_index.ROLES]
+                rid = self.reserve_forward_slot(
+                    row_id, logical, revision, attestation_ids)
+                if reservation_id is None:
+                    reservation_id = rid
+                elif rid != reservation_id:
+                    raise ReservationStoreError(
+                        502, "sibling rows resolved different reservations")
 
     def list_active_logical_post_rows(self, account_key, logical_post_id):
         """Every own-tenant active content_calendar row of one logical post,
@@ -3803,11 +4151,18 @@ class SupabaseCalendarStore:
         from . import forward_media_observation_bridge as _observation_bridge
         observation_bridge_on = _observation_bridge.enabled()
         observations_by_id = {}
+        # Forward schedule reservation (DRAFT): the planner's per-candidate
+        # screening proof rides the row as metadata and is STRIPPED here, never
+        # written to content_calendar. Collected per logical-post group so the
+        # armed pre-insert gate below can require one consistent byte identity
+        # per group before any row is staged.
+        reservation_proofs = {}
         payload = []
         from .copy_gate import bound_opening_hook, format_caption
         for row in (rows or []):
             clean = {k: v for k, v in dict(row or {}).items()
-                     if k not in ("id", "scene_candidate", _observation_bridge.METADATA)}
+                     if k not in ("id", "scene_candidate",
+                                  _observation_bridge.METADATA, RESERVATION_PROOF)}
             if "caption" in clean and clean["caption"] is not None:
                 # Every calendar-building lane converges here. Prompts and individual
                 # generators can miss the hook limit, so enforce the grader's exact
@@ -3862,6 +4217,26 @@ class SupabaseCalendarStore:
                     raise ValueError(
                         "logical_post_id must be a UUID shared by the sibling "
                         f"post group; got {clean['logical_post_id']!r}")
+            if RESERVATION_PROOF in (row or {}):
+                # A proof object that fails strict validation is not "no
+                # proof": a caller TRIED to bind bytes and produced garbage.
+                # Fail the whole batch before any write, armed or not.
+                proof = (row or {}).get(RESERVATION_PROOF)
+                if not valid_reservation_proof(proof):
+                    raise ValueError(
+                        "invalid forward reservation proof on row for "
+                        f"{clean.get('post_date')}; refusing the batch")
+                group = clean.get("logical_post_id")
+                if group is None:
+                    raise ValueError(
+                        "a forward reservation proof requires the row's "
+                        "logical_post_id; refusing the batch")
+                prior = reservation_proofs.setdefault(group, proof)
+                if (prior["source_sha256"] != proof["source_sha256"]
+                        or prior["phash_v1"] != proof["phash_v1"]):
+                    raise ValueError(
+                        "sibling rows of one logical post carry different "
+                        "reservation byte proofs; refusing the batch")
             payload.append(clean)
         # STAGE-TIME BELTS (report-card build, 2026-08-28; both flags default OFF,
         # account-agnostic — LASSO and gyms share the bug class):
@@ -3998,6 +4373,40 @@ class SupabaseCalendarStore:
             import uuid
             for row in payload:
                 row.setdefault("id", str(uuid.uuid4()))
+        # FORWARD SCHEDULE RESERVATION GATE (DRAFT, 2026-10-08; default OFF).
+        # Read ONCE per batch, before the POST, so an unreadable gate can never
+        # silently take the legacy path and an armed gate refuses rows that
+        # could never reserve BEFORE anything is written. With the flag OFF
+        # this block is inert and the legacy path is byte-identical.
+        reservation_flag = forward_reservation_flag()
+        if reservation_flag is None:
+            raise CalendarInsertNotStartedError(
+                503, "forward reservation gate is unreadable; refusing the "
+                "calendar insert before any write")
+        if reservation_flag:
+            seen_slot_bytes = {}
+            for row in payload:
+                if (not _UUID_RE.match(str(row.get("logical_post_id") or ""))
+                        or row.get("logical_post_id") not in reservation_proofs):
+                    raise CalendarInsertNotStartedError(
+                        422, "forward reservation requires every staged row to "
+                        "carry a logical_post_id and its planner screening "
+                        "proof; refusing before any write")
+                # Contract correction (2026-10-08): same tenant/date alone is
+                # NOT reuse authority -- only siblings of ONE validated
+                # logical_post_id may share a visual. Refuse a batch that
+                # stages the same source bytes under two different logical
+                # posts on one date before anything is written.
+                proof = reservation_proofs[row["logical_post_id"]]
+                slot_bytes = (str(row.get("post_date") or "")[:10],
+                              proof["source_sha256"])
+                prior = seen_slot_bytes.setdefault(
+                    slot_bytes, row["logical_post_id"])
+                if prior != row["logical_post_id"]:
+                    raise CalendarInsertNotStartedError(
+                        422, "the same source bytes are staged for two "
+                        "different logical posts on one date; refusing before "
+                        "any write")
         all_keys = set()
         for r in payload:
             all_keys.update(r.keys())
@@ -4035,6 +4444,36 @@ class SupabaseCalendarStore:
             _observation_bridge.persist_inserted(
                 self, payload, out, observation_candidates)
         inserted = [x for x in out if str(x.get("gym_id")) == str(account_key)]
+        if reservation_flag and inserted:
+            # DRAFT reservation staging (armed only): bind every inserted
+            # logical-post group to its durable (tenant, post_date,
+            # logical_post_id) reservation via the trusted attester lane +
+            # reserve RPC. This runs AFTER the owner lineage persisted above
+            # (the attestations bind to it) and BEFORE the batch is reported
+            # staged. ANY failure is fail-closed: remove exactly the rows THIS
+            # call inserted, then report a definite pre-insert refusal so the
+            # caller's restore path brings the prior calendar back. If the
+            # cleanup itself fails the outcome is UNKNOWN -- raise
+            # ReservationStoreError instead so nothing is guessed.
+            try:
+                self._stage_inserted_reservations(account_key, inserted)
+            except Exception as exc:  # noqa: BLE001 - hold/conflict/gate/unknown all refuse
+                staged_ids = [str(x["id"]) for x in inserted if x.get("id")]
+                try:
+                    removed = self.delete_rows(account_key, staged_ids)
+                except Exception as cleanup_exc:  # noqa: BLE001
+                    raise ReservationStoreError(
+                        502, "reservation staging failed and the inserted rows "
+                        f"could not be removed: {type(exc).__name__} then "
+                        f"{type(cleanup_exc).__name__}") from exc
+                if removed != len(staged_ids):
+                    raise ReservationStoreError(
+                        502, "reservation staging failed and only "
+                        f"{removed}/{len(staged_ids)} inserted rows were "
+                        "removed; outcome unknown") from exc
+                raise CalendarInsertNotStartedError(
+                    409, f"forward reservation staging refused the insert: "
+                    f"{type(exc).__name__}") from exc
         _record_confirmed_story_holds(account_key, inserted)
         # Wave 3 (AGENT_CAPTION_COOLDOWN): stamp each successfully staged row in
         # the caption ledger so future planner runs see the cooldown. Failure is

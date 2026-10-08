@@ -41,6 +41,10 @@ from . import gym_media_selector as _sel
 from .drafter import Draft, DraftStatus
 
 _MAX_ASSET_ATTEMPTS = 3      # validation/vision failures try the next asset, bounded
+# With the forward reservation draft armed, a byte-level conflict is a normal
+# rejection, not an exhaustion signal: keep walking the pool (bounded) so one
+# reserved photo never holds a slot the pool could still fill.
+_MAX_RESERVATION_ASSET_ATTEMPTS = 25
 
 # MEDIA MIX (John Weeks / Tough Temple, 2026-09-10). This lane used to map every
 # pillar to kind_preference="photo" (_SLOT_KIND), and pick_media hard-filters on kind,
@@ -85,6 +89,60 @@ def kinds_for_slot(pool_kinds, day_key, slot_index=0):
     # preference only when no pickable photo remains; it must never bypass an
     # available client photo in the same Drive pool.
     return [_idx.KIND_PHOTO, _idx.KIND_VIDEO]
+
+
+def _screen_reservation_candidate(source_bytes, *, gym_base, day_key, asset_id):
+    """Advisory forward-reservation screen of the EXACT source bytes (DRAFT).
+
+    ``source_bytes`` are the downloaded original Drive object -- the same bytes
+    the trusted attester lane hashes for the 'original' role, whose SHA256 the
+    reservation binds. Returns the byte-bound screening proof dict when the
+    candidate is clear, the string "conflict" when the advisory check names a
+    conflict (the caller tries the NEXT asset), or None to HOLD the slot (an
+    undecodable still with no pHash v1, or an unknown check outcome -- fail
+    closed, never treated as free and never counted as pool exhaustion).
+
+    The screen is advisory only: reserve_forward_slot_20261008 at insert time
+    remains the sole occupancy authority. logical_post_id does not exist yet at
+    selection time (client_month_run mints it), so a fresh random uuid is
+    passed -- the RPC's own-slot exclusion matches nothing, so ANY same-source
+    or pHash-near occupancy under a DIFFERENT logical post is reported as a
+    conflict: a committed claim or active reservation on the same tenant and
+    same date is NOT reusable here (contract correction 2026-10-08: only exact
+    same-logical_post_id siblings may share a visual), which is exactly the
+    semantics of screening a brand-new logical post."""
+    import hashlib
+    import uuid as _uuid_mod
+    from . import portal_calendar_store as pcs
+    from . import forward_media_visual_index as visual_index
+    sha = hashlib.sha256(source_bytes).hexdigest()
+    phash = visual_index.phash_v1(source_bytes)
+    if phash is None:
+        # The reservation contract requires a pHash v1; an undecodable still
+        # cannot produce one and HOLDS while the draft gate is armed (the
+        # trusted attester lane would hold the same bytes).
+        print(f"[gym-media-builder] reservation screen: asset {asset_id} has no "
+              "decodable pHash v1; holding the slot while the reservation draft "
+              "is armed")
+        return None
+    try:
+        screen = pcs.SupabaseCalendarStore().check_reservation_conflicts(
+            gym_base, post_date=day_key,
+            logical_post_id=str(_uuid_mod.uuid4()),
+            source_sha256=sha, phash_v1=phash)
+    except Exception as exc:  # noqa: BLE001 - unknown occupancy never clears
+        print(f"[gym-media-builder] reservation conflict check unavailable for "
+              f"{gym_base} {day_key} ({type(exc).__name__}); holding the slot")
+        return None
+    if not screen.get("allowed"):
+        kinds = sorted({str(c.get("kind")) for c in screen.get("conflicts", [])
+                        if isinstance(c, dict)})
+        print(f"[gym-media-builder] asset {asset_id} conflicts with "
+              f"{'/'.join(kinds) or 'reservation'} occupancy for {day_key}; "
+              "trying the next asset")
+        return "conflict"
+    return {"source_sha256": sha, "phash_v1": phash,
+            "source_media_asset_id": str(asset_id)}
 
 
 def _vision_alert(msg):
@@ -161,6 +219,16 @@ def build_gym_media_draft(account, day_key, pillar, voice, source, *, store=None
               f"{gym_base} ({type(e).__name__}); holding the slot (fail closed)")
         return None
 
+    # FORWARD SCHEDULE RESERVATION (DRAFT, 2026-10-08; default OFF). Read the
+    # tri-state gate ONCE per build: an ambiguous value fails closed (the slot
+    # holds) rather than silently taking the legacy unscreened path.
+    from . import portal_calendar_store as _pcs
+    reservation_flag = _pcs.forward_reservation_flag()
+    if reservation_flag is None:
+        print("[gym-media-builder] forward reservation gate is unreadable; "
+              "holding the slot (fail closed)")
+        return None
+
     lib = Path(library_dir or tempfile.mkdtemp(prefix="gymmedia_"))
     lib.mkdir(parents=True, exist_ok=True)
 
@@ -194,7 +262,9 @@ def build_gym_media_draft(account, day_key, pillar, voice, source, *, store=None
                                now=now, exclude_ids=excl)
 
     tried = []
-    for _attempt in range(_MAX_ASSET_ATTEMPTS):
+    max_attempts = (_MAX_RESERVATION_ASSET_ATTEMPTS if reservation_flag
+                    else _MAX_ASSET_ATTEMPTS)
+    for _attempt in range(max_attempts):
         asset = None
         for kind_pref in (kind_prefs or [None]):
             asset = _pick(kind_pref, tuple(caller_excludes) + tuple(tried))
@@ -222,6 +292,7 @@ def build_gym_media_draft(account, day_key, pillar, voice, source, *, store=None
         media_observations = [] if writer_prep_enabled() else None
         source_observation_bytes = None
         source_observation_hold = ""
+        reservation_proof = None
         try:
             try:
                 drive.download(asset["id"], tmp_path)
@@ -421,6 +492,35 @@ def build_gym_media_draft(account, day_key, pillar, voice, source, *, store=None
                     except Exception:
                         media_observations.append({"provenance_status": "unverified",
                                                    "hold_reasons": ["original_hosted_readback_unverified"]})
+
+            # FORWARD SCHEDULE RESERVATION SCREEN (DRAFT; default OFF). With the
+            # gate armed, screen the EXACT downloaded source bytes against
+            # committed claims, negatives and existing reservations BEFORE the
+            # asset is claimed/stamped. A conflict tries the next asset; an
+            # unknown or unprovable outcome HOLDS the slot -- unknown inventory
+            # never counts as clearance or exhaustion.
+            if reservation_flag:
+                if asset.get("kind") == _idx.KIND_VIDEO:
+                    # No decodable still pHash v1 exists for video bytes; the
+                    # reservation contract requires one, so video slots hold
+                    # while this draft gate is armed.
+                    print(f"[gym-media-builder] reservation draft armed: video "
+                          f"{asset['id']} cannot carry a pHash v1; holding the slot")
+                    return None
+                try:
+                    reservation_bytes = tmp_path.read_bytes()
+                except OSError:
+                    print(f"[gym-media-builder] reservation screen lost the local "
+                          f"source for {asset['id']}; holding the slot")
+                    return None
+                reservation_proof = _screen_reservation_candidate(
+                    reservation_bytes, gym_base=gym_base, day_key=day_key,
+                    asset_id=asset["id"])
+                if reservation_proof == "conflict":
+                    reservation_proof = None
+                    continue
+                if reservation_proof is None:
+                    return None
         finally:
             _cleanup(lib)
 
@@ -444,6 +544,11 @@ def build_gym_media_draft(account, day_key, pillar, voice, source, *, store=None
             # sweep can flip this PENDING post back to needs_media (§4, §8).
             source_media_asset_id=str(asset["id"]),
         )
+        # The reservation screening proof rides the draft (never a
+        # content_calendar column): _row_from_draft folds it into the row's
+        # _reservation_proof metadata and insert_rows validates + strips it.
+        if reservation_proof is not None:
+            draft._reservation_proof = reservation_proof
         # Keep the hosted original as provenance when it is also the served media.
         # A rendition URL is a transformed delivery asset, not the raw source.
         if not public_override:

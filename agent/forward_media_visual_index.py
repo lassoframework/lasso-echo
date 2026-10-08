@@ -224,13 +224,69 @@ def attest(calendar_row_id, expected_revision, lineage_receipt_id, *,
             pass
 
 
+def _reservation_proof_for_claim(store, calendar_row_id, source_sha256):
+    """Consult the EXACT active forward reservation for this row + source bytes
+    (DRAFT, 2026-10-08; only consulted when the reservation gate is armed or
+    unreadable -- fail closed either way).
+
+    Returns the strictly parsed proof dict. Any hold, mismatch or failure
+    raises ForwardMediaVerificationHold: a publication that cannot prove its
+    reservation never proceeds while the gate is anything but cleanly OFF."""
+    from .portal_calendar_store import forward_reservation_flag
+    flag = forward_reservation_flag()
+    if flag is False:
+        return None
+    if flag is None:
+        raise ForwardMediaVerificationHold(
+            'forward reservation gate unreadable; claim held')
+    if store is None:
+        raise ForwardMediaVerificationHold('reservation proof store required')
+    if not isinstance(source_sha256, str) or not source_sha256:
+        # The publisher integration that passes the exact source bytes is a
+        # separate handoff; without them the exact reservation cannot resolve.
+        raise ForwardMediaVerificationHold(
+            'exact source bytes required to consult the reservation proof')
+    try:
+        response = store._client().post(
+            store._rest('rpc/forward_reservation_proof_20261008'),
+            headers=store._headers({'Content-Type': 'application/json'}),
+            json={'p_calendar_row_id': _uuid(calendar_row_id),
+                  'p_source_sha256': source_sha256}, timeout=30)
+        proof = response.json()
+    except ForwardMediaVerificationHold:
+        raise
+    except Exception as exc:
+        raise ForwardMediaVerificationHold(
+            'persisted reservation proof unavailable') from exc
+    if (not 200 <= response.status_code < 300 or not isinstance(proof, dict)
+            or proof.get('source_sha256') != source_sha256
+            or not isinstance(proof.get('reservation_id'), str)
+            or not proof['reservation_id']
+            or not isinstance(proof.get('tenant_id'), str)
+            or not proof['tenant_id']
+            or not isinstance(proof.get('row_revision'), str)
+            or not proof['row_revision']
+            or not isinstance(proof.get('attestation_ids'), list)
+            or len(proof['attestation_ids']) != 3):
+        raise ForwardMediaVerificationHold(
+            'persisted reservation proof unavailable')
+    return {'reservation_id': _uuid(proof['reservation_id']),
+            'tenant_id': proof['tenant_id'],
+            'post_date': str(proof.get('post_date') or ''),
+            'logical_post_id': _uuid(proof.get('logical_post_id')),
+            'row_revision': proof['row_revision'],
+            'attestation_ids': [_uuid(a) for a in proof['attestation_ids']]}
+
+
 def before_claim(calendar_row_id, expected_revision, lineage_receipt_id, *, store=None,
-                 claim_token=None):
+                 claim_token=None, source_sha256=None):
     """Publisher reads persisted proof; no attester credentials or object I/O.
 
     The isolated trusted lane calls ``attest`` ahead of publication. Missing
     proof holds; final SQL atomically rechecks the exact proof and occupancy.
-    """
+    When the forward reservation draft gate is armed, the exact active
+    reservation for this row + source bytes must also resolve
+    (``forward_reservation_proof_20261008``); anything less holds."""
     if not enabled():
         return None
     if store is None or claim_token is None:
@@ -250,7 +306,12 @@ def before_claim(calendar_row_id, expected_revision, lineage_receipt_id, *, stor
         ids = proof.get('attestation_ids')
         if not isinstance(ids, list) or len(ids) != 3 or len(set(ids)) != 3:
             raise ForwardMediaVerificationHold('persisted visual claim proof unavailable')
-        return {'attestation_ids': [_uuid(ident) for ident in ids]}
+        result = {'attestation_ids': [_uuid(ident) for ident in ids]}
+        reservation = _reservation_proof_for_claim(
+            store, calendar_row_id, source_sha256)
+        if reservation is not None:
+            result['reservation'] = reservation
+        return result
     except ForwardMediaVerificationHold:
         raise
     except Exception as exc:
