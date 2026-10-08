@@ -345,6 +345,110 @@ class ApifyClient:
             raise ApifyError("apify returned a non-list dataset")
         return items
 
+    def fetch_posts_raw(self, handle, newer_than_days,
+                        results_limit=RESULTS_LIMIT, max_bytes=None):
+        """ADDITIVE (2026-10-07, social source capture): the same run-sync call
+        as fetch_posts, but returns the exact raw response bytes BEFORE any
+        JSON parsing, so a capture can be stored byte-for-byte (reconstructed
+        JSON is never the stored artifact).
+
+        Returns (raw_bytes, provider_response_id_or_None): raw_bytes is the
+        original entity byte stream (read via response.raw.stream with
+        decode_content=False, so a gzipped response is captured COMPRESSED,
+        exactly as served — never decoded, never a text-encode
+        reconstruction); the provider response identity is the Apify
+        run/dataset header when present. The size cap is enforced BEFORE the
+        body is fully materialized (Content-Length check, then bounded
+        streaming); an oversize response raises ApifyError and yields
+        nothing, and a response with no raw stream fails closed. Existing
+        fetch_posts behavior is unchanged. Raises ApifyError on any failure;
+        the token never appears in the error."""
+        tok = self.token()
+        if not tok:
+            raise ApifyError("APIFY_TOKEN not set")
+        handle = str(handle or "").strip().lstrip("@")
+        if not handle:
+            raise ApifyError("empty instagram handle")
+        cap = int(max_bytes if max_bytes is not None else 2_000_000)
+        if cap < 1:
+            raise ApifyError("max_bytes must be at least 1")
+        payload = {
+            "username": [handle],
+            "resultsLimit": int(results_limit),
+            "skipPinnedPosts": True,
+            "onlyPostsNewerThan": f"{int(newer_than_days)} days",
+            "dataDetailLevel": "detailedData",
+        }
+        r = self._client().post(
+            APIFY_RUN_SYNC_URL,
+            params={"token": tok},
+            json=payload,
+            timeout=600,
+            stream=True,
+        )
+        if r.status_code >= 400:
+            detail = str(getattr(r, "text", "") or "")[:200].replace(tok, "***")
+            raise ApifyError(f"apify {r.status_code}: {detail}")
+        return _bounded_response_bytes(r, cap)
+
+
+def _bounded_response_bytes(response, cap):
+    """The EXACT original response entity bytes, bounded by cap.
+
+    The bytes come from ``response.raw.stream(..., decode_content=False)``:
+    requests' ``iter_content``/``content`` DECOMPRESS gzip/deflate, which
+    would store decoded bytes instead of the original entity bytes the
+    capture contract requires. When no raw stream is available (a
+    non-streaming response or a transport without ``.raw``) this FAILS
+    CLOSED — it never falls back to decoded content and never reconstructs
+    from text.
+
+    The cap is enforced BEFORE the body is fully materialized: an advertised
+    Content-Length over the cap fails without reading the body, and the
+    streaming read stops and fails the moment the cap is exceeded (the
+    stream is closed on every path).
+    Returns (raw_bytes, provider_response_id_or_None)."""
+    headers = getattr(response, "headers", None) or {}
+    try:
+        content_length = int(headers.get("content-length")
+                             or headers.get("Content-Length") or 0)
+    except (TypeError, ValueError):
+        content_length = 0
+    if content_length > cap:
+        raise ApifyError(
+            f"apify response exceeds size cap ({content_length} > {cap} bytes)")
+
+    raw_stream = getattr(getattr(response, "raw", None), "stream", None)
+    if not callable(raw_stream):
+        raise ApifyError(
+            "apify response has no raw byte stream; refusing to substitute "
+            "decoded content for the original entity bytes")
+    chunks, total = [], 0
+    try:
+        for chunk in raw_stream(65536, decode_content=False):
+            if not isinstance(chunk, (bytes, bytearray, memoryview)):
+                raise ApifyError(
+                    "apify raw stream chunk is not bytes; refusing")
+            total += len(chunk)
+            if total > cap:
+                raise ApifyError(
+                    f"apify response exceeds size cap (>{cap} bytes)")
+            chunks.append(bytes(chunk))
+    finally:
+        close = getattr(response, "close", None)
+        if callable(close):
+            close()
+    raw = b"".join(chunks)
+
+    response_id = None
+    for key in ("x-apify-act-run-id", "x-apify-dataset-id",
+                "x-apify-resource-id"):
+        v = headers.get(key) or headers.get(key.title())
+        if v and str(v).strip():
+            response_id = str(v).strip()
+            break
+    return raw, response_id
+
 
 # ---------------------------------------------------------------------------
 # baseline storage (Supabase social_baseline, PostgREST)
