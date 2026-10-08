@@ -163,12 +163,22 @@ def test_ambiguous_reservation_flag_never_runs(monkeypatch):
     assert not fake.posts
 
 
-def test_isolated_lane_credentials_hold_before_any_call(monkeypatch):
-    monkeypatch.setenv('AGENT_FORWARD_MEDIA_ATTESTER_DSN', SECRET)
+@pytest.mark.parametrize('credential', [
+    'AGENT_FORWARD_MEDIA_ATTESTER_DSN',
+    'FORWARD_MEDIA_OWNER_DSN',
+    'FORWARD_MEDIA_OWNER_DRIVE_SA_JSON',
+])
+def test_isolated_lane_credentials_hold_before_any_call(monkeypatch, credential):
+    monkeypatch.setenv(credential, SECRET)
     result = run(FakeHttp())
     assert result['status'] == 'hold'
     assert result['reason'] == 'isolated_lane_credentials_present'
     assert SECRET not in json.dumps(result)
+
+
+def test_service_role_credential_remains_allowed(monkeypatch):
+    monkeypatch.setenv('SUPABASE_SERVICE_ROLE_KEY', SECRET)
+    assert finalizer.settings_from_environment().tenants == (TENANT,)
 
 
 def test_happy_path_finalizes_once_with_persisted_membership_and_old_snapshots():
