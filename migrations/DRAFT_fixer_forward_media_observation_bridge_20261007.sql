@@ -77,6 +77,10 @@ begin
       or (observation->>'delivered_byte_length')::bigint>134217728 then
     raise exception 'unverified observation contract invalid' using errcode='23514';
   end if;
+  -- Observations never mutate graph authority. Take the final shared graph
+  -- mode, then census authority, before locking the exact calendar revision.
+  perform pg_advisory_xact_lock_shared(hashtextextended('fixer_forward_graph_20261006',0));
+  perform pg_advisory_xact_lock(hashtextextended('fixer_forward_photo_census_20261007',0));
   select * into r from public.content_calendar where id=p_calendar_row_id for update;
   if not found then
     raise exception 'exact inserted calendar row unavailable' using errcode='23514';
