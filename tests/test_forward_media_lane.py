@@ -239,9 +239,10 @@ def test_direct_attester_clean_connection_keeps_exact_role_check(monkeypatch):
 
 
 def test_staged_preparation_flags_allowed_only_in_their_own_lanes():
-    owner_flag = {'AGENT_FORWARD_MEDIA_OWNER_STAGED_WORKER': 'true'}
+    owner_flag = {'AGENT_FORWARD_MEDIA_OWNER_STAGED_WORKER': 'true',
+                  'AGENT_FORWARD_MEDIA_OWNER_INTERVAL_SECONDS': '5'}
     attester_flag = {'AGENT_FORWARD_MEDIA_VISUAL_INDEX': 'true'}
     owner.check_environment({**OWNER, **owner_flag})
     assert worker.settings_from_environment({**ATTESTER, **attester_flag}).tenants == ('pierce',)
     assert lane.unknown_environment_names({**OWNER, **attester_flag}, 'owner') == list(attester_flag)
-    assert lane.unknown_environment_names({**ATTESTER, **owner_flag}, 'attester') == list(owner_flag)
+    assert lane.unknown_environment_names({**ATTESTER, **owner_flag}, 'attester') == sorted(owner_flag)

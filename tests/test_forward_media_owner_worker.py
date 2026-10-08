@@ -551,3 +551,46 @@ def test_main_loop_is_default_off(monkeypatch, capsys):
     monkeypatch.delenv(worker.WORKER_ENV, raising=False)
     assert worker.main(['--loop']) == 0
     assert json.loads(capsys.readouterr().out)['status'] == 'disabled'
+
+
+@pytest.mark.parametrize('staged,photo', [(False, False), (True, False), (False, True), (True, True)])
+def test_exact_owner_interval_settings_reach_connection_gate(monkeypatch, staged, photo):
+    from types import SimpleNamespace
+    env = {
+        'FORWARD_MEDIA_OWNER_DSN': 'postgresql://dedicated-owner/db',
+        'FORWARD_MEDIA_OWNER_ROLE': 'isolated_owner',
+        worker.WORKER_ENV: 'true', worker.TENANTS_ENV: 'gym',
+        worker.STAGED_ENV: str(staged).lower(),
+        worker.PHOTO_CLEARANCE_ENV: str(photo).lower(),
+        'AGENT_FORWARD_MEDIA_OWNER_INTERVAL_SECONDS': '5',
+    }
+    process = SimpleNamespace(environ=env, getenv=env.get)
+    monkeypatch.setattr(owner, 'os', process)
+    monkeypatch.setattr(worker, 'os', process)
+    calls = []
+    def connection_gate(*, reader):
+        calls.append(reader)
+        raise worker.OwnerWorkerHold('owner_manual_reconciliation_required')
+    monkeypatch.setattr(owner.ForwardMediaOwnerPersistence, 'connect_from_environment', connection_gate)
+    assert worker.settings_from_environment() == (('gym',), 25)
+    assert worker.run_once() == {'status': 'hold', 'reason': 'owner_manual_reconciliation_required', 'rows': []}
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize('unknown', ['AGENT_FORWARD_MEDIA_OWNER_INTERVAL_SECONDS_ALIAS',
+                                     'AGENT_FORWARD_MEDIA_ATTESTER_DSN'])
+def test_owner_interval_still_rejects_unknown_and_opposite_lane_before_connection(monkeypatch, unknown):
+    from types import SimpleNamespace
+    env = {
+        'FORWARD_MEDIA_OWNER_DSN': 'postgresql://dedicated-owner/db',
+        'FORWARD_MEDIA_OWNER_ROLE': 'isolated_owner',
+        worker.WORKER_ENV: 'true', worker.TENANTS_ENV: 'gym',
+        worker.STAGED_ENV: 'true', worker.PHOTO_CLEARANCE_ENV: 'true',
+        'AGENT_FORWARD_MEDIA_OWNER_INTERVAL_SECONDS': '5', unknown: '',
+    }
+    process = SimpleNamespace(environ=env, getenv=env.get)
+    monkeypatch.setattr(owner, 'os', process)
+    monkeypatch.setattr(worker, 'os', process)
+    monkeypatch.setattr(owner.ForwardMediaOwnerPersistence, 'connect_from_environment',
+                        lambda **kwargs: pytest.fail('invalid environment must not connect'))
+    assert worker.run_once() == {'status': 'hold', 'reason': 'owner_environment_invalid', 'rows': []}
