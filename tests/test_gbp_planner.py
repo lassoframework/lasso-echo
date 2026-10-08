@@ -956,3 +956,117 @@ def test_transformed_evidence_uses_real_bytes_not_invented(monkeypatch, tmp_path
     src.write_bytes(b"s")
     assert gp._render_evidence_dict("https://r2/a", "https://r2/b",
                                     src, tmp_path / "missing") is None
+
+
+# ---- guarded local reservation release (binding propagation) ----------------------
+class _MutationAuthority:
+    """In-memory mutation authority; mirrors tests/test_rotation_inventory_mutation."""
+
+    def __init__(self):
+        self.events = []
+
+    def begin(self, request):
+        self.events.append("begin")
+        self.receipt = dict(request, state="pending", generation=1,
+                            result_digest=None, begun_at="now")
+        return dict(self.receipt)
+
+    def complete(self, request, result_digest):
+        self.events.append("complete")
+        return dict(self.receipt, state="complete", result_digest=result_digest,
+                    completed_at="later")
+
+    def close(self):
+        pass
+
+
+def _arm_local_mutation(monkeypatch, tmp_path, gym="gymx"):
+    """Arm the local-inventory mutation fence with one real gym library photo."""
+    import uuid
+    from agent import config, db, local_inventory_mutation as mutation
+    library = tmp_path / "library"
+    gym_dir = library / gym
+    gym_dir.mkdir(parents=True)
+    monkeypatch.setattr(config, "LIBRARY_PATH", str(library))
+    monkeypatch.setenv("AGENT_LOCAL_INVENTORY_MUTATIONS_ENABLED", "true")
+    monkeypatch.setenv("AGENT_DB_PATH", str(tmp_path / "mutation.db"))
+    monkeypatch.setenv("AGENT_ROTATION_STATE_DIR", str(tmp_path))
+    monkeypatch.setenv("LOCAL_INVENTORY_MUTATION_EPOCH", str(uuid.uuid4()))
+    db.connect().close()
+    asset = gym_dir / "class.jpg"
+    asset.write_bytes(b"gbp local photo bytes")
+    auth = _MutationAuthority()
+    monkeypatch.setattr(mutation.MutationAuthority, "from_environment", lambda: auth)
+    return asset
+
+
+def _plan_one_local_row(monkeypatch, store, asset):
+    """Plan a single-slot GBP month whose one row reserves the armed local photo."""
+    from types import SimpleNamespace
+    _seed("gymx_ig")
+    monkeypatch.delenv("AGENT_VISUAL_GLOBAL_WRITER_PREP", raising=False)
+    monkeypatch.setattr(gp, "_drive_photo_candidate", lambda *a, **k: None)
+    monkeypatch.setattr(gp.client_content, "pick_image",
+                        lambda *a, **k: SimpleNamespace(path=str(asset),
+                                                        media_type="image"))
+    monkeypatch.setattr(gp, "_cropped_image_url",
+                        lambda *a, **k: "https://r2/gbp-class.jpg")
+    return gp.plan_gbp_month(
+        "gymx", "gymx_ig", voice=_voice(), library_path=str(asset.parent.parent),
+        city="Carmel", store=store, start=date(2026, 9, 1), days=1,
+        offer=None, events=[], caption_fn=_cap)
+
+
+def test_gbp_guarded_release_with_complete_binding(monkeypatch, tmp_path):
+    """Mutation fence ON: a proven never-landed row (the store durably inserted
+    zero rows) releases its reservation with the full reserve-time binding, and
+    the exact served row is deleted."""
+    from agent import rotation
+    asset = _arm_local_mutation(monkeypatch, tmp_path)
+
+    class ZeroStore:
+        def insert_rows(self, _key, _rows):
+            return []
+
+    out = _plan_one_local_row(monkeypatch, ZeroStore(), asset)
+
+    assert out["ok"] is False and out["reason"] == "store inserted zero rows"
+    assert rotation.load_served_strict().get("gymx_gbp", []) == []
+
+
+def test_gbp_guarded_release_wrong_hash_holds_and_retains(monkeypatch, tmp_path):
+    """When the reserved file's bytes no longer match the reserve-time SHA-256,
+    the guarded release cannot prove the row: it holds and the reservation is
+    retained even though the calendar insert durably landed nothing."""
+    from agent import rotation
+    asset = _arm_local_mutation(monkeypatch, tmp_path)
+
+    class TamperingZeroStore:
+        def insert_rows(self, _key, _rows):
+            asset.write_bytes(b"different bytes after the reservation")
+            return []
+
+    out = _plan_one_local_row(monkeypatch, TamperingZeroStore(), asset)
+
+    assert out["ok"] is False
+    served = rotation.load_served_strict().get("gymx_gbp", [])
+    assert len(served) == 1, "a hash-mismatched release must retain the reservation"
+
+
+def test_gbp_unknown_insert_outcome_retains_local_reservation(monkeypatch, tmp_path):
+    """Insert raised and the authoritative readback is unreadable: the write may
+    have committed, so no reservation is released."""
+    from agent import rotation
+    asset = _arm_local_mutation(monkeypatch, tmp_path)
+
+    class UnknownStore:
+        def insert_rows(self, _key, _rows):
+            raise TimeoutError("insert response lost")
+
+        def authoritative_rows_for_keys(self, _key, _rows):
+            return None
+
+    with pytest.raises(TimeoutError, match="response lost"):
+        _plan_one_local_row(monkeypatch, UnknownStore(), asset)
+    served = rotation.load_served_strict().get("gymx_gbp", [])
+    assert len(served) == 1, "an unknown insert outcome retains the reservation"
