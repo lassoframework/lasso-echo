@@ -373,6 +373,20 @@ def _daily_paired_story_recovery_armed(account_key):
         return False
 
 
+def _canonical_owned_source_platforms(drafts, account_key, account, source_only):
+    # The real owned Page builder uses its provider platform. Normalize only
+    # that verified source-only seam; shared Account configuration stays intact.
+    platform = getattr(account, "platform", None)
+    if (source_only and account_key == "lasso_fb"
+            and getattr(account, "key", None) == "lasso_fb"
+            and getattr(platform, "value", platform) == "facebook_page"):
+        for draft in drafts:
+            raw = getattr(draft, "platform", None)
+            if getattr(raw, "value", raw) == "facebook_page":
+                draft.platform = "facebook"
+    return drafts
+
+
 def plan_and_build(account_key, start_date, days=30, *, book_dates=None,
                    summit_day_fn=None, welcome_dates=None, account=None, logger=None,
                    sprint_day_fn=None, sprint_feed_count_fn=None, sprint_manifest=None,
@@ -449,8 +463,9 @@ def plan_and_build(account_key, start_date, days=30, *, book_dates=None,
     builders, story_builder, sprint_feed, sprint_story = wrap_builders(
         acct if acct is not None else account_key, builders, story_builder,
         sprint_feed, sprint_story)
-    return _rmp.build_month_drafts(plan, builders, story_builder=story_builder,
+    drafts = _rmp.build_month_drafts(plan, builders, story_builder=story_builder,
                                    account=(acct if source_only else _base), logger=logger,
                                    sprint_builder=sprint_feed,
                                    sprint_story_builder=sprint_story,
                                    **({"source_only": True} if source_only else {}))
+    return _canonical_owned_source_platforms(drafts, account_key, acct, source_only)

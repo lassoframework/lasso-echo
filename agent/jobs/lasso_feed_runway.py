@@ -120,7 +120,8 @@ def run(*, account_key, now=None, store=None, artifact_store=None,
     first = instant.date().isoformat()
     last = (instant.date() + timedelta(days=horizon_days - 1)).isoformat()
     grade_last = (instant.date() + timedelta(days=29)).isoformat()
-    holder = "lasso-runway:" + str(uuid.uuid4())
+    artifact_owner = str(uuid.uuid4())
+    holder = "lasso-runway:" + artifact_owner
     if not build_lock.acquire("lasso", holder=holder):
         return dict(out, reason="LASSO build lock occupied")
     heartbeat = build_lock.start_heartbeat("lasso", holder=holder)
@@ -184,7 +185,7 @@ def run(*, account_key, now=None, store=None, artifact_store=None,
         source_id = f"content_calendar:{row['id']}:caption"
         source_hash = hashlib.sha256(caption.encode()).hexdigest()
         cache_key = "held-feed:" + hashlib.sha256(f"{source_id}:{source_hash}".encode()).hexdigest()
-        claimed = artifacts.claim(account_key, cache_key, holder)
+        claimed = artifacts.claim(account_key, cache_key, artifact_owner)
         if not claimed:
             return dict(out, blocked=out["blocked"] + 1, reason="source artifact lease or cooldown")
         reviewed = repair._reviewed_artifact_record(store, source_id, source_hash, account_key)
@@ -230,6 +231,6 @@ def run(*, account_key, now=None, store=None, artifact_store=None,
         return dict(out, blocked=out["blocked"] + 1, reason=f"runway failed: {type(exc).__name__}: {exc}")
     finally:
         if claimed:
-            artifacts.release(account_key, cache_key, holder)
+            artifacts.release(account_key, cache_key, artifact_owner)
         heartbeat.stop()
         build_lock.release("lasso", holder=holder)
