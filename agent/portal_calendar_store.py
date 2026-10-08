@@ -5456,6 +5456,13 @@ class SupabaseCalendarStore:
                 if encoded is None:
                     return None
                 params[column] = encoded
+            if "pillar" in expected_row:
+                # A complete owned source snapshot pins its topic too. Older
+                # callers omitting this field retain their existing CAS shape.
+                encoded = _eq_filter(expected_row["pillar"])
+                if encoded is None:
+                    return None
+                params["pillar"] = encoded
             params["status"] = f"eq.{expected_row['status']}"
             params["variant_status"] = "eq.active"
         r = self._client().patch(

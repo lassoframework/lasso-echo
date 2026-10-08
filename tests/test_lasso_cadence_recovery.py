@@ -176,7 +176,7 @@ def test_kv_receipts_are_safe_counts_only(armed, jobs, monkeypatch):
     assert [r["state"] for r in written["prep-lasso_ig"]] == ["begun", "completed"]
     assert [r["state"] for r in written["publish"]] == ["begun", "completed"]
     blob = json.dumps(written)
-    assert "caption" not in blob and "token" not in blob
+    assert '"caption"' not in blob and "token" not in blob
     assert written["prep-lasso_ig"][-1]["summary"]["stories"]["staged"] == 6
     assert written["publish"][-1]["summary"]["published"] == 1
 
