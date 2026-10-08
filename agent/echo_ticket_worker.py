@@ -40,6 +40,7 @@ import json
 import os
 import re
 import time
+import uuid
 
 from . import config
 from .slack_convo import adapter as _a
@@ -230,80 +231,245 @@ def _promises_follow_up(body):
 # Slack delivery alone. The gate below is deliberately CONSERVATIVE: it fires only
 # on an explicit ask directed at the client for a concrete information object --
 # never on a complete grounded answer that merely mentions the same words.
-_NEEDS_INFO_VERB = (
-    r"\b(?:send|share|provide|attach|give|upload|forward|paste|grant|confirm|"
-    r"reply|take|capture|"
-    r"clarify|let\s+(?:us|me)\s+know|tell\s+(?:us|me))\b")
-_NEEDS_INFO_OBJECT = (
-    r"\b(?:screenshots?|screen\s?shots?|photos?|pictures?|pics?|images?|"
-    r"links?|urls?|post\s+links?|dates?|times?|timeframes?|deadlines?|"
-    r"schedules?|details?|credentials?|login|logins|passwords?|access|"
-    r"account\s+(?:name|id|details?)|phone\s+numbers?|email\s+addresses?|"
-    r"error\s+messages?|error\s+codes?|messages?|which\s+account)\b")
+# Match the direction of the request, rather than a noun list: clients can be
+# asked when a problem started or to reconnect without naming a "detail".
+_CLIENT_REQUEST_VERBS = (
+    r"(?:send|share|provide|attach|give|upload|forward|paste|grant|confirm|"
+    r"reply|take|capture|clarify|reconnect|connect|disconnect|authorize|"
+    r"reauthorize|try|retry|check|open|click|select|sign|log|enable|disable|"
+    r"tell|let|describe|explain)")
 _NEEDS_INFO_ASK = re.compile(
-    # (a) conventional client-directed requests, including "please share X" and
-    # "let me know which account". Require a concrete missing object.
-    rf"(?:\b(?:can|could|would|will)\s+you\b[^.?!]{{0,60}}?{_NEEDS_INFO_VERB}"
-    rf"|\bplease\s+{_NEEDS_INFO_VERB}[^.?!]{{0,30}}?{_NEEDS_INFO_OBJECT}"
-    rf"|\b{_NEEDS_INFO_VERB}[^.?!]{{0,20}}?which\s+(?:account|post|date|day|time|link|photo|image|gym|location)\b"
-    # (b) a bare imperative "<verb> (us) <object>", or
-    rf"|\b{_NEEDS_INFO_VERB}[^.?!]{{0,30}}?{_NEEDS_INFO_OBJECT}"
-    # (c) a direct client-directed question naming the missing object.
-    rf"|\b(?:which|what)\s+(?:post|date|day|time|link|photo|image|account|"
-    rf"gym|location)\b[^.?!]{{0,50}}?\?)",
+    r"\b(?:can|could|would|will)\s+you\b"
+    r"|\b(?:we|i)\s+need\s+you\s+to\b"
+    r"|\byou\s+(?:need|have)\s+to\b"
+    rf"|\bplease\s+(?:(?:could|can|would|will)\s+you\s+)?{_CLIENT_REQUEST_VERBS}\b"
+    # Bare imperatives must start a sentence/clause. "I can confirm" is a statement.
+    rf"|(?:^|[.!?;]\s*|\n\s*){_CLIENT_REQUEST_VERBS}\b"
+    r"|\b(?:which|what|when|where|how|why)\b[^.?!]{0,160}\?",
     re.IGNORECASE)
 
 
 def _needs_more_information(body):
-    """True when the answer asks the CLIENT for missing details or an action needed
-    to obtain the answer. Such a delivery must NOT resolve the ticket."""
+    """An explicit client request/question is not a completed answer."""
     return bool(_NEEDS_INFO_ASK.search(body or ""))
 
 
 CLIENT_DETAILS_MARKER = "client_details_requested"
+_CLIENT_DETAILS_PENDING = "client_details_card_pending"
+_CARD_IDENTITY = ("product", "source", "client_id", "bot_identity", "slack_user_id")
+
+
+def _client_details_card_id(ticket):
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, "lasso:client-details:" + json.dumps(
+        [ticket["id"], ticket["request_version"],
+         *[ticket.get(field) for field in _CARD_IDENTITY]], separators=(",", ":"))))
+
+
+def _ensure_client_details_card(bus, ticket, *, log=print):
+    """Retry a durable pending route without sending another client answer."""
+    fresh = bus.ticket(ticket["id"])
+    hold = ((fresh or {}).get("verification_after") or {}).get("hold") or {}
+    expected = hold.get("card_request") or {}
+    if (not fresh or fresh.get("status") != "hold"
+            or hold.get("reason") != _CLIENT_DETAILS_PENDING
+            or type(fresh.get("request_version")) is not int
+            or fresh.get("request_version") != expected.get("request_version")
+            or any(not fresh.get(field) or fresh.get(field) != expected.get(field)
+                   for field in _CARD_IDENTITY)):
+        return False
+    mid = _client_details_card_id(fresh)
+    meta = {"identity": hold["identity"], "surface": hold["surface"],
+            "recipient_kind": hold["recipient_kind"], "client_details_requested": True,
+            "card_request": expected,
+            "delivery_identity_fence": True,
+            "delivery_expected_status": fresh["status"],
+            "delivery_expected_classification": fresh.get("classification"),
+            **{f"delivery_expected_{k}": fresh[k] for k in _DELIVERY_IDENTITY}}
+    card_body = (
+        f"CLIENT DETAILS REQUESTED: investigate internally; keep ticket open\n"
+        f"BOT: {hold['identity']}   TICKET: {fresh['id']}\n"
+        f"The client was asked for additional details or an action. Investigate internally, "
+        f"keep this request open, and do not treat a human follow-up as promised.\n\n"
+        f"{hold['answer_body']}")[:8000]
+    lookup = getattr(bus, "message", None)
+    if not callable(lookup):
+        return False
+    row = lookup(mid)
+    if row is None:
+        try:
+            bus.record_outbound(
+                ticket_id=fresh["id"], author_type="system", body=card_body,
+                delivery_status="ready", kind=_a.KIND_ESCALATION,
+                expected_request_version=fresh["request_version"],
+                message_id=mid, meta=meta)
+        except Exception as exc:  # Lost INSERT responses are reconciled by exact ID.
+            log(f"[echo-ticket-worker] client-details card insert ticket={fresh['id']}: "
+                f"{type(exc).__name__}")
+        row = lookup(mid)
+    att = (row or {}).get("attachments") or {}
+    if (not row or row.get("id") != mid or row.get("ticket_id") != fresh["id"]
+            or row.get("author_type") != "system" or row.get("body") != card_body
+            or row.get("delivery_request_version") != fresh["request_version"]
+            or any(att.get(k) != v for k, v in
+                   {"kind": _a.KIND_ESCALATION, **meta}.items())
+            or row.get("delivery_status") not in ("ready", "posting", "posted", "held")):
+        return False
+    # Re-read after INSERT and use a current-ticket CAS. A newer request/tenant
+    # cannot inherit the old route's completed marker.
+    current = bus.ticket(fresh["id"])
+    if (not current or any(current.get(k) != fresh.get(k) for k in
+                          (*_CARD_IDENTITY, "request_version", "status", "classification"))
+            or current.get("verification_after") != fresh.get("verification_after")):
+        return False
+    prior = current.get("verification_after") or {}
+    done = {**hold, "reason": CLIENT_DETAILS_MARKER, "staff_card_id": mid}
+    updated = _patch_current_ticket(
+        bus, current, log=log, verification_after={**prior, "hold": done})
+    return updated is not None
+
+
+def _recover_delivered_client_details(bus, ticket, *, identity_name, log=print):
+    """A posted, fenced notice is durable intent even if the first hold CAS failed."""
+    fresh = bus.ticket(ticket["id"])
+    if (not fresh or fresh.get("status") != "verification"
+            or fresh.get("classification") != _cls.QUESTION
+            or type(fresh.get("request_version")) is not int
+            or any(not fresh.get(k) for k in _CARD_IDENTITY)
+            or fresh.get("bot_identity") != identity_name):
+        return False
+    rows = bus._get("support_messages", {
+        "ticket_id": f"eq.{fresh['id']}", "direction": "eq.outbound",
+        "delivery_status": "eq.posted",
+        "delivery_request_version": f"eq.{fresh['request_version']}",
+        "attachments->>client_details_delivery_intent": "eq.true",
+        "select": "*", "order": "created_at.desc", "limit": "20"})
+    for row in rows:
+        att = row.get("attachments") or {}
+        if (row.get("ticket_id") != fresh["id"]
+                or row.get("delivery_status") != "posted" or not row.get("slack_ts")
+                or row.get("delivery_request_version") != fresh["request_version"]
+                or row.get("author_type") != identity_name
+                or att.get("kind") != _a.KIND_ACK
+                or att.get("client_details_delivery_intent") is not True
+                or att.get("client_details_request_source") != fresh["source"]
+                or att.get("outreach") is not True
+                or att.get("recipient_kind") != "client"
+                or att.get("delivery_identity_fence") is not True
+                or att.get("delivery_expected_status") != "verification"
+                or att.get("delivery_expected_classification") != _cls.QUESTION
+                or any(att.get(f"delivery_expected_{k}") != fresh.get(k)
+                       for k in _DELIVERY_IDENTITY)
+                or not _needs_more_information(row.get("body"))
+                or _promises_follow_up(row.get("body"))):
+            continue
+        return _route_client_details_request(
+            bus, fresh, expected_snapshot=fresh, ident_name=identity_name,
+            body=row["body"], recipient_kind="client",
+            surface="portal_ticket_bridge", log=log)
+    return False
+
+
+def _client_details_recovery_page(bus, params, *, leg, cursor_path, log=print):
+    """Bounded fair keyset window; failed/ineligible rows never pin the next poll."""
+    cursors = _load_intake_cursors(cursor_path)
+    cursor = cursors.get(leg)
+    now = _intake_now()
+    started = (cursor or {}).get("_sweep_started_at", now)
+    if not isinstance(started, (int, float)) or now - started >= _INTAKE_MAX_SWEEP_SECONDS:
+        cursor = None
+        started = now
+    query = dict(params)
+    if cursor:
+        ts = cursor["created_at"].replace('"', "")
+        tid = cursor["id"].replace('"', "")
+        query["or"] = (f'(created_at.gt."{ts}",'
+                       f'and(created_at.eq."{ts}",id.gt."{tid}"))')
+    rows = bus._get("support_tickets", query)
+    if not rows and cursor:
+        # Reach the tail, then resume failed rows at the top on this poll.
+        started = now
+        rows = bus._get("support_tickets", params)
+    if (len(rows) == int(params["limit"]) and rows[-1].get("created_at")
+            and rows[-1].get("id")):
+        cursors[leg] = {"created_at": str(rows[-1]["created_at"]),
+                        "id": str(rows[-1]["id"]), "_sweep_started_at": started}
+    else:
+        cursors.pop(leg, None)
+    # Advance even when processing fails. That row is retried on the next sweep.
+    _save_intake_cursors(cursor_path, cursors, log=log)
+    return rows
+
+
+def _retry_client_details_cards(bus, *, product, source, identity_name,
+                                cursor_path=None, log=print):
+    """Recover only pending routes for this worker's exact product/source/bot leg."""
+    get = getattr(bus, "_get", None)
+    if not callable(get):
+        return
+    path = cursor_path or _intake_cursor_path()
+    leg = _intake_leg_key(product, source, identity_name) + "|client-details"
+    rows = _client_details_recovery_page(bus, {
+        "product": f"eq.{product}", "source": f"eq.{source}",
+        "bot_identity": f"eq.{identity_name}", "status": "eq.hold",
+        "verification_after->hold->>reason": f"eq.{_CLIENT_DETAILS_PENDING}",
+        "is_test": "eq.false", "select": "*", "limit": "20",
+        "order": "created_at.asc,id.asc"}, leg=leg + "|pending", cursor_path=path, log=log)
+    # The original delivery row carries intent before Slack is posted. Recovery
+    # can therefore find a delivered ask even when no ticket marker was persisted.
+    unmarked = _client_details_recovery_page(bus, {
+        "product": f"eq.{product}", "source": f"eq.{source}",
+        "bot_identity": f"eq.{identity_name}", "status": "eq.verification",
+        "classification": f"eq.{_cls.QUESTION}",
+        "is_test": "eq.false", "select": "*", "limit": "20",
+        "order": "created_at.asc,id.asc"}, leg=leg + "|unmarked", cursor_path=path, log=log)
+    for ticket in unmarked:
+        try:
+            _recover_delivered_client_details(bus, ticket, identity_name=identity_name, log=log)
+        except Exception as exc:
+            log(f"[echo-ticket-worker] delivered client-details recovery "
+                f"ticket={ticket.get('id')}: {type(exc).__name__}")
+    for ticket in rows:
+        try:
+            _ensure_client_details_card(bus, ticket, log=log)
+        except Exception as exc:
+            log(f"[echo-ticket-worker] client-details retry ticket={ticket.get('id')}: "
+                f"{type(exc).__name__}")
 
 
 def _route_client_details_request(bus, ticket, *, expected_snapshot, ident_name, body,
                                   recipient_kind="client", surface="", log=print):
-    """Keep an answered information request open and hand staff the missing-details
-    task. CAS against this exact request cycle; its own marker avoids misreporting a
-    human follow-up promise. Repeated callers see the marker and do not duplicate."""
+    """Persist recovery intent first; mark routing complete only after card readback."""
     if recipient_kind in ("staff", "coach"):
         return False
-    fresh = bus.ticket(ticket["id"]) or ticket
-    if (fresh.get("request_version") != expected_snapshot.get("request_version")
-            or fresh.get("status") != expected_snapshot.get("status")
-            or fresh.get("classification") != expected_snapshot.get("classification")
-            or fresh.get("raw_text") != expected_snapshot.get("raw_text")
-            or any(fresh.get(field) != expected_snapshot.get(field)
-                   for field in ("product", "client_id", "bot_identity", "slack_user_id"))):
-        log(f"[echo-ticket-worker] stale client-details route refused ticket={ticket['id']}")
+    fresh = bus.ticket(ticket["id"])
+    if not fresh:
         return False
     prior = fresh.get("verification_after") if isinstance(fresh.get("verification_after"), dict) else {}
     prior_hold = prior.get("hold") if isinstance(prior.get("hold"), dict) else {}
+    expected = {k: expected_snapshot.get(k) for k in (*_CARD_IDENTITY, "request_version")}
+    if (type(expected.get("request_version")) is not int
+            or any(not expected.get(field) for field in _CARD_IDENTITY)
+            or any(fresh.get(k) != v for k, v in expected.items())):
+        return False
+    if prior_hold.get("reason") == _CLIENT_DETAILS_PENDING:
+        if prior_hold.get("card_request") != expected:
+            return False
+        return _ensure_client_details_card(bus, fresh, log=log)
     if prior_hold.get("reason") == CLIENT_DETAILS_MARKER:
         return False
-    hold = {"tier": "client_details", "reason": CLIENT_DETAILS_MARKER,
-            "rule": "client_details_requested", "answer_posted": True}
+    if any(fresh.get(k) != expected_snapshot.get(k)
+           for k in ("status", "classification", "raw_text")):
+        return False
+    hold = {"tier": "client_details", "reason": _CLIENT_DETAILS_PENDING,
+            "rule": CLIENT_DETAILS_MARKER, "answer_posted": True,
+            "card_request": expected, "identity": ident_name, "surface": surface,
+            "recipient_kind": recipient_kind, "answer_body": body or ""}
     updated = _patch_current_ticket(
         bus, fresh, log=log, status="hold", escalated=True, hold_tier="routine",
         classification=None, verification_after={**prior, "hold": hold})
     if updated is None:
         return False
-    bus.record_outbound(
-        ticket_id=fresh["id"], author_type="system",
-        body=(f"CLIENT DETAILS REQUESTED: investigate internally; keep ticket open\n"
-              f"BOT: {ident_name}   TICKET: {fresh['id']}\n"
-              f"The client was asked for additional details. Investigate internally, "
-              f"keep this request open, and do not treat a human follow-up as promised.\n\n"
-              f"{body or ''}"),
-        delivery_status="ready", kind=_a.KIND_ESCALATION,
-        expected_request_version=fresh.get("request_version"),
-        meta={"identity": ident_name, "surface": surface,
-              "recipient_kind": recipient_kind, "client_details_requested": True})
-    log(f"[echo-ticket-worker] ticket={fresh['id']} client details requested; "
-        "routed for internal investigation and kept open")
-    return True
+    return _ensure_client_details_card(bus, updated, log=log)
 
 
 def _patch_current_ticket(bus, ticket, *, log=print, **fields):
@@ -453,6 +619,11 @@ def intake_pass(bus, *, slack_lookup_email, slack_user_info, portal_lookup, open
     still-'new' failures get their next attempt."""
     if not config.portal_echo_tickets_enabled():
         return {"processed": 0}
+    try:
+        _retry_client_details_cards(bus, product=product, source=source,
+                                   identity_name=identity_name, cursor_path=cursor_path, log=log)
+    except Exception as exc:
+        log(f"[echo-ticket-worker] client-details recovery unavailable: {type(exc).__name__}")
     ident = _ids.IDENTITIES[identity_name]
     path = cursor_path or _intake_cursor_path()
     leg = _intake_leg_key(product, source, identity_name)
@@ -658,6 +829,11 @@ def _intake_one(bus, ticket, *, slack_lookup_email, slack_user_info, portal_look
 
             def record_attempt_outbound(**kwargs):
                 nonlocal current_attempt_notice
+                if (_needs_more_information(answer["body"])
+                        and not _promises_follow_up(answer["body"])):
+                    kwargs["meta"] = {**(kwargs.get("meta") or {}),
+                                      "client_details_delivery_intent": True,
+                                      "client_details_request_source": snapshot["source"]}
                 row = bus.record_outbound(**kwargs)
                 meta = kwargs.get("meta") or {}
                 if (meta.get("fixer_current_attempt_token")
