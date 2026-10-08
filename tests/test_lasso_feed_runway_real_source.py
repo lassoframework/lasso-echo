@@ -10,7 +10,7 @@ and the REAL to_calendar_rows offline (approved local source docs only; no
 credentials, no network, no mutation) to prove the seam now resolves.
 """
 from copy import deepcopy
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 import uuid
@@ -129,3 +129,25 @@ def test_real_artifact_lease_uses_uuid_owner_for_claim_and_release(armed_real_so
     assert len(calls) == 2
     assert calls[0][0] == "claim" and calls[1][0] == "release"
     assert calls[0][1:] == calls[1][1:]
+
+
+@pytest.mark.parametrize("shift, accepted", [(0, True), (60, False)])
+def test_postgrest_utc_readback_preserves_exact_scheduled_instant(armed_real_source, shift, accepted):
+    class PostgrestStore(Store):
+        def get_row(self, gym, row_id):
+            row = super().get_row(gym, row_id)
+            when = datetime.fromisoformat(row["scheduled_at"]).astimezone(timezone.utc)
+            row["scheduled_at"] = (when + timedelta(seconds=shift)).isoformat()
+            return row
+    store = PostgrestStore([feed("facebook", 0)])
+    result = job.run(account_key="lasso_fb", now=NOW, store=store,
+                     artifact_store=Artifacts(), horizon_days=2)
+    assert result["ok"] is accepted
+    assert len(store.staged) == 1
+    if not accepted:
+        assert result["reason"] == "insert readback mismatch"
+
+
+@pytest.mark.parametrize("saved", [None, "not-a-time", "2026-10-27T18:30:00"])
+def test_missing_invalid_or_naive_readback_is_not_certified(saved):
+    assert not job._same_scheduled_instant(saved, "2026-10-27T18:30:00-04:00")

@@ -6,7 +6,7 @@ exact-caption reviewed media and the DB empty-slot insert arbitrate staging.
 import hashlib
 import os
 import uuid
-from datetime import timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from agent import config, copy_gate, infographic_evidence, real_month_planner, real_month_run
@@ -36,6 +36,15 @@ def _source_snapshot():
     root = Path(__file__).resolve().parents[2] / "brand_voice"
     return {p.name: hashlib.sha256(p.read_bytes()).hexdigest()
             for p in sorted(root.glob("lasso*")) if p.is_file()}
+
+
+def _same_scheduled_instant(saved, expected):
+    try:
+        left = datetime.fromisoformat(str(saved).replace("Z", "+00:00"))
+        right = datetime.fromisoformat(str(expected).replace("Z", "+00:00"))
+        return left.tzinfo is not None and right.tzinfo is not None and left == right
+    except (TypeError, ValueError):
+        return False
 
 
 def _coverage(rows, first, last):
@@ -221,7 +230,8 @@ def run(*, account_key, now=None, store=None, artifact_store=None,
         saved = store.get_row("lasso", row["id"])
         if not isinstance(saved, dict) or any(saved.get(k) != row[k] for k in
                 ("id", "gym_id", "account", "post_date", "slot_index", "format", "caption",
-                 "image_url", "status", "variant_status", "logical_post_id", "scheduled_at")):
+                "image_url", "status", "variant_status", "logical_post_id")) or not _same_scheduled_instant(
+                    saved.get("scheduled_at"), row["scheduled_at"]):
             return dict(out, blocked=out["blocked"] + 1, reason="insert readback mismatch")
         after = store.rows_in_range_complete("lasso", first, grade_last, all_statuses=True)
         if [r for r in after if str(r.get("id")) != row["id"]] != existing:
