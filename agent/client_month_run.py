@@ -648,6 +648,11 @@ def _record_feed_served(account, feed, day_key):
             getattr(feed, "category", "") or "", day_key, path=path)
         if reservation_id:
             setattr(feed, "_served_reservation_id", reservation_id)
+            # Keep the exact reservation identity beside the id so a later
+            # release can prove the tenant and asset it is un-claiming.
+            setattr(feed, "_served_reservation_binding", {
+                "account_key": account.key, "key": dam.rotation_key(path),
+                "path": path, "content_hash": rotation.local_content_hash(path)})
         return bool(reservation_id)
     except Exception as e:  # noqa: BLE001
         print(f"[client-month] served-record failed for {day_key}: {type(e).__name__}: {e}")
@@ -698,22 +703,47 @@ def _release_unlanded_reservations(drafts, retained=()):
     """Release exact served rows for drafts that never became calendar rows."""
     from . import rotation
     keep = {int(r) for r in (retained or ()) if r}
+    drafts = list(drafts or ())
     seen = set()
-    for draft in drafts or ():
+    for draft in drafts:
         rid = getattr(draft, "_served_reservation_id", None)
         if not rid or int(rid) in keep or int(rid) in seen:
             continue
-        seen.add(int(rid))
-        rotation.release_served(rid)
+        reservation_id = int(rid)
+        seen.add(reservation_id)
+        binding = getattr(draft, "_served_reservation_binding", None)
+        if not isinstance(binding, dict) or not all(
+                binding.get(k) for k in ("account_key", "key", "path")):
+            # Without the original tenant/asset identity no release can prove
+            # what it un-claims: hold the reservation and report the gap.
+            print(f"[client-month] reservation {rid} held: missing release "
+                  "identity binding")
+            continue
+        released = rotation.release_served(
+            rid, account_key=binding["account_key"], key=binding["key"],
+            path=binding["path"], content_hash=binding.get("content_hash") or "")
+        if released:
+            # Several drafts (for example a feed and its Story) can carry the
+            # same reservation. Clear every copy only after authority confirms
+            # the release, so a later cleanup pass cannot release it again.
+            for related in drafts:
+                try:
+                    same_reservation = int(getattr(
+                        related, "_served_reservation_id", 0) or 0) == reservation_id
+                except (TypeError, ValueError):
+                    same_reservation = False
+                if not same_reservation:
+                    continue
+                for attr in ("_served_reservation_id", "_served_reservation_binding"):
+                    try:
+                        delattr(related, attr)
+                    except (AttributeError, TypeError):
+                        pass
 
 
 def _release_feed_reservation(feed):
     """Release one feed reserved before finishing could add it to ``drafts``."""
     _release_unlanded_reservations([feed])
-    try:
-        delattr(feed, "_served_reservation_id")
-    except (AttributeError, TypeError):
-        pass
 
 
 def _finish_feed_with_story(account, feed, library_path, log, *, day_key="",

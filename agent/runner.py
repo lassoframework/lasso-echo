@@ -798,10 +798,15 @@ def draft_for_new_upload(tenant_key, filed_assets, poster=None, store=None,
             draft = draft_post(account, creative, when, voice=voice)
             draft.force_approval = force_card
             reservation = None
+            reservation_binding = None
             if draft.status != DraftStatus.BLOCKED:
                 from . import dam, rotation
+                key = dam.rotation_key(path)
+                reservation_binding = {
+                    "account_key": account.key, "key": key, "path": path,
+                    "content_hash": rotation.local_content_hash(path)}
                 reservation = rotation.reserve_local_media_once(
-                    account.key, dam.rotation_key(path),
+                    account.key, key,
                     getattr(draft, "category", "") or "upload", str(when)[:10],
                     path=path)
                 if reservation is None:
@@ -812,7 +817,7 @@ def draft_for_new_upload(tenant_key, filed_assets, poster=None, store=None,
                 # A visible card, durable row, or ambiguous external outcome
                 # consumes the bytes. Only proven absence can undo the claim.
                 if reservation and not _drive_draft_landed_or_uncertain(draft, store):
-                    rotation.release_served(reservation)
+                    rotation.release_served(reservation, **reservation_binding)
             produced.append(draft)
         except Exception as e:
             # One bad asset never blocks the rest, and never crashes ingest.
@@ -852,13 +857,16 @@ def _client_library_fallback(account, day_key, voice, library_path):
         path=creative.path)
     if reservation is None:
         return None
+    binding = {"account_key": account.key, "key": dam.rotation_key(creative.path),
+               "path": creative.path,
+               "content_hash": rotation.local_content_hash(creative.path)}
     try:
         draft = draft_post(account, creative, schedule.scheduled_for(day_key), voice=voice)
     except Exception:
-        rotation.release_served(reservation)
+        rotation.release_served(reservation, **binding)
         raise
     if draft is None or draft.status == DraftStatus.BLOCKED:
-        rotation.release_served(reservation)
+        rotation.release_served(reservation, **binding)
     return draft
 
 

@@ -217,6 +217,39 @@ def test_upload_releases_only_definitive_no_card_no_row(monkeypatch, tmp_path):
         dam.rotation_key(asset[0]), "gymx_ig", "2026-10-04", path=asset[0])
 
 
+def test_upload_release_passes_exact_reservation_identity(monkeypatch, tmp_path):
+    """The unlanded upload release must prove the original account_key/key/path/hash."""
+    from agent import dam, rotation
+    _arm(monkeypatch)
+    monkeypatch.setenv("AGENT_DB_PATH", str(tmp_path / "echo.db"))
+    voice_file = tmp_path / "voice.md"
+    voice_file.write_text(VOICE, encoding="utf-8")
+    monkeypatch.setattr(runner, "_generation_account_for",
+                        lambda t: _acct(voice_doc=str(voice_file)))
+    asset = _asset(tmp_path, "release.jpg", "Coached class.")
+    releases = []
+    real_release = rotation.release_served
+    monkeypatch.setattr(
+        rotation, "release_served",
+        lambda rid, **kw: releases.append((rid, kw)) or real_release(rid, **kw))
+
+    def absent(_draft, _store, _poster, _idempotent):
+        raise OSError("before card")
+
+    monkeypatch.setattr(runner, "_post_and_save", absent)
+    assert runner.draft_for_new_upload(
+        "gymx", [asset], store=PendingStore(path=str(tmp_path / "s.json")),
+        poster=FakePoster()) == []
+    assert len(releases) == 1
+    rid, kw = releases[0]
+    assert rid
+    assert kw == {"account_key": "gymx_ig", "key": dam.rotation_key(asset[0]),
+                  "path": asset[0],
+                  "content_hash": rotation.local_content_hash(asset[0])}
+    assert not rotation.local_photo_served(
+        dam.rotation_key(asset[0]), "gymx_ig", "2026-10-04", path=asset[0])
+
+
 # ---- CRITICAL gate: a client upload must NEVER auto-publish -------------------
 
 def test_client_upload_never_auto_publishes_when_autoapprove_armed(monkeypatch, tmp_path):
