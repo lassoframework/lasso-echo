@@ -231,3 +231,31 @@ def test_unreadable_strict_caption_reservation_stops_before_render_or_write(arme
                   horizon_days=2, planner=planner)
     assert "ledger receipt unreadable" in out["reason"]
     assert not store.staged and not artifacts.claims
+
+
+def test_pending_inventory_changes_during_render_refuse_fresh_grade(armed, monkeypatch, tmp_path):
+    from pathlib import Path
+    from agent import calendar_grade, social_proof
+    voice = tmp_path / "brand_voice"
+    (voice / "knowledge").mkdir(parents=True)
+    pending = voice / "knowledge/03_social_proof_pending.md"
+    original = Path(__file__).resolve().parents[1] / "brand_voice/knowledge/03_social_proof_pending.md"
+    pending.write_bytes(original.read_bytes())
+    monkeypatch.delenv("AGENT_SOCIAL_PROOF_PATH", raising=False)
+    monkeypatch.setattr(config, "SOCIAL_PROOF_PATH", "brand_voice/social_proof.md")
+    monkeypatch.setattr(calendar_grade, "_proof_inventory_root", lambda: tmp_path)
+    monkeypatch.setattr(social_proof, "source_path", lambda _: voice / "social_proof.md")
+    monkeypatch.setattr(job, "_grade", lambda existing, candidate:
+        calendar_grade._lasso_zero_mention_inventory([candidate]) is not None)
+    rendered = []
+    monkeypatch.setattr(job.repair, "_reviewed_artifact_record", lambda *a:
+        {"image_url": "https://cdn.example/reviewed.png"} if rendered else None)
+    def render(row, account):
+        rendered.append(row["id"])
+        pending.write_bytes(pending.read_bytes() + b"\nsource changed while rendering")
+        return {"ok": True, "image_url": "https://cdn.example/reviewed.png"}
+    store = Store([])
+    out = job.run(account_key="lasso_fb", now=NOW, store=store,
+                  artifact_store=Artifacts(), horizon_days=2, planner=planner, render=render)
+    assert out["reason"] == "fresh existing plus candidate calendar grade"
+    assert out["generated"] == 1 and not store.staged

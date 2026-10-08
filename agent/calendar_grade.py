@@ -165,6 +165,7 @@ class CalendarGrade:
     scores: dict           # leg -> points
     defects: list = field(default_factory=list)   # (leg, row_ref, reason)
     exempt: dict = field(default_factory=dict)    # rule -> posts explicitly exempted
+    exemption_evidence: dict = field(default_factory=dict)
 
 
 def posts_of(rows):
@@ -205,14 +206,17 @@ def _eligible_posts(rows, exempt, rule):
 
 
 def grade_month(rows, profile="GYM", quotas=None) -> CalendarGrade:
-    scores, defects, exempt = {}, [], {}
+    scores, defects, exempt, source_evidence = {}, [], {}, {}
     scores["consistency"]    = _consistency(rows, defects)
     scores["content_mix"]    = _content_mix(rows, profile, quotas, defects,
                                             exempt=exempt)
     scores["caption_craft"]  = _caption_craft(rows, defects, exempt=exempt)
     if profile == "B2B":
-        # B2B grades proof numbers under the visual_match leg (unchanged).
-        scores["visual_match"] = _proof_numbers(rows, defects)
+        # B2B keeps numeric/mixed proof checks. Only an evidenced zero
+        # owned-LASSO mention inventory can make its mention quota inapplicable.
+        scores["visual_match"] = _proof_numbers(
+            rows, defects, exempt=exempt, source_evidence=source_evidence,
+            allow_lasso_inventory=True)
     # GYM: NO visual_match leg. Clients upload their own media; Echo controls
     # captions and mix only, so image quality is never graded (Blake, 2026-08-27).
     scores["right_audience"] = _right_audience(rows, profile, defects,
@@ -236,7 +240,7 @@ def grade_month(rows, profile="GYM", quotas=None) -> CalendarGrade:
         total = min(total, 59)
 
     letter = next(l for floor, l in BANDS if total >= floor)
-    return CalendarGrade(total, letter, scores, defects, exempt)
+    return CalendarGrade(total, letter, scores, defects, exempt, source_evidence)
 
 
 # ---------------------------------------------------------------------------
@@ -495,7 +499,88 @@ def _visual_match(rows, defects) -> int:
 # Leg: proof_numbers (max 15, B2B profile)
 # ---------------------------------------------------------------------------
 
-def _proof_numbers(rows, defects) -> int:
+_LASSO_PENDING_PROOF_SHA256 = "0589045cee43c4240aa5054f84b948d976b6ca7c64d7aa7e1a8bad3203c62385"
+
+
+def _proof_inventory_root():
+    from pathlib import Path
+    return Path(__file__).resolve().parents[1]
+
+
+def _confirmed_absent_proof_source(path):
+    """Absence is evidence only under a readable existing directory.
+
+    lstat refuses dangling links and every existing object (including empty or
+    unreadable files); source_path's isfile fallback cannot establish absence.
+    """
+    import os
+    try:
+        parent = path.parent
+        if not parent.is_dir() or not os.access(parent, os.R_OK | os.X_OK):
+            return False
+        # Confirm directory enumeration also succeeds; stat alone is not a
+        # readable-parent receipt and some mounts report access optimistically.
+        tuple(parent.iterdir())
+        try:
+            path.lstat()
+        except FileNotFoundError:
+            return True
+    except OSError:
+        return False
+    return False
+
+
+def _lasso_zero_mention_inventory(rows):
+    """Exact verified pending inventory is the only supported zero-proof case.
+
+    Unknown, changed, missing or configured proof inventory keeps the ordinary
+    quota. This helper never loads permission-pending entries as approved copy.
+    """
+    import hashlib
+    import os
+    from pathlib import Path
+    from . import config, social_proof
+    if (not rows or any(not isinstance(r, dict) or r.get("gym_id") != "lasso"
+                        or r.get("account") not in ("instagram", "facebook") for r in rows)
+            or "AGENT_SOCIAL_PROOF_PATH" in os.environ
+            or config.SOCIAL_PROOF_PATH != "brand_voice/social_proof.md"):
+        return None
+    try:
+        root = _proof_inventory_root()
+        base = root / "brand_voice/social_proof.md"
+        # Inspect both per-account candidates explicitly: source_path's isfile
+        # can otherwise hide an unreadable object or dangling symlink.
+        candidates = [base, base.with_name("social_proof.lasso_ig.md"),
+                      base.with_name("social_proof.lasso_fb.md")]
+        actual = []
+        for account in ("lasso_ig", "lasso_fb"):
+            path = Path(social_proof.source_path(account))
+            actual.append(path if path.is_absolute() else root / path)
+        if any(path not in candidates for path in actual):
+            return None
+        if not all(_confirmed_absent_proof_source(path) for path in candidates + actual):
+            return None
+        pending = root / "brand_voice/knowledge/03_social_proof_pending.md"
+        raw = pending.read_bytes()
+        digest = hashlib.sha256(raw).hexdigest()
+        if digest != _LASSO_PENDING_PROOF_SHA256:
+            return None
+        text = raw.decode("utf-8")
+        return {
+            "reason": "no approved client mention inventory; authoritative entries are pending permission",
+            "approved_entries": 0,
+            "pending_entries": len(re.findall(r"(?m)^(?:\d+\.|- PushPress:)", text)),
+            "pending_sha256": digest,
+            "confirmed_absent_accounts": ["lasso_ig", "lasso_fb"],
+            "source_paths": [str(path) for path in actual],
+            "pending_path": str(pending),
+        }
+    except (OSError, UnicodeError, ValueError):
+        return None
+
+
+def _proof_numbers(rows, defects, *, exempt=None, source_evidence=None,
+                   allow_lasso_inventory=False) -> int:
     score = 15
 
     n = len(rows)
@@ -515,7 +600,14 @@ def _proof_numbers(rows, defects) -> int:
     rows_with_mention = sum(
         1 for r in rows if _MENTION_RE.search(r.get("caption") or "")
     )
-    missing_mentions = max(0, want - rows_with_mention)
+    inventory = _lasso_zero_mention_inventory(rows) if allow_lasso_inventory else None
+    mention_target = 0 if inventory is not None else want
+    if inventory is not None:
+        if exempt is not None:
+            exempt["visual_match: client mention quota inapplicable with verified zero approved inventory"] = want
+        if source_evidence is not None:
+            source_evidence["client_mentions"] = inventory
+    missing_mentions = max(0, mention_target - rows_with_mention)
     for _ in range(missing_mentions):
         score -= 1
     if missing_mentions:

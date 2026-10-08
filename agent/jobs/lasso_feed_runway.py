@@ -198,6 +198,8 @@ def run(*, account_key, now=None, store=None, artifact_store=None,
         # current artifact policy/Brain PASS and an empty target feed+Story slot.
         if not _gates(account_key, store, artifacts) or not variant_regen.enabled():
             return dict(out, blocked=out["blocked"] + 1, reason="fresh insert gate closed")
+        if not _grade(fresh, row):
+            return dict(out, blocked=out["blocked"] + 1, reason="fresh existing plus candidate calendar grade")
         result = store.stage_lasso_runway_feed(row, policy_version=infographic_evidence.POLICY_VERSION,
                                                brain_snapshot=infographic_evidence.brain_snapshot())
         if result.get("result") not in ("inserted", "idempotent"):
