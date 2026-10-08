@@ -102,13 +102,27 @@ class Zernio:
         self.accounts = accounts
         self.calls = []
         self.extra = {}
+        self.health_rows = None
+
+    @staticmethod
+    def _health_row(a):
+        # Complete /v1/accounts/health envelope: one healthy row per connected
+        # account, always owned by the exact stored profile.
+        return {'accountId': a['_id'], 'profileId': PROFILE, 'platform': a['platform'],
+                'username': a['metadata']['profileData']['username'], 'status': 'healthy',
+                'tokenValid': True, 'needsReconnect': False, 'canPost': True}
 
     def get(self, url, **kw):
         self.calls.append((url, kw))
-        assert url == 'https://api.zernio.com/v1/accounts'
-        assert kw['params'] == {'profileId': PROFILE}
         assert kw['headers']['Authorization'] == 'Bearer zernio_fixture_secret'
         assert kw['allow_redirects'] is False
+        if url == 'https://api.zernio.com/v1/accounts/health':
+            rows = (self.health_rows if self.health_rows is not None
+                    else [self._health_row(a) for a in self.accounts])
+            raw = json.dumps({'accounts': rows}, indent=2).encode()
+            return SimpleNamespace(status_code=200, content=raw)
+        assert url == 'https://api.zernio.com/v1/accounts'
+        assert kw['params'] == {'profileId': PROFILE}
         raw = json.dumps({'accounts': self.accounts, **self.extra}, indent=2).encode()
         return SimpleNamespace(status_code=200, content=raw)
 
@@ -192,18 +206,39 @@ def test_real_apify_ingest_restart_replay_and_observation_hook(tmp_path):
     assert websites == [URL]
 
 
-def test_website_only_fresh_negative_accepts_disconnected_null_handle(tmp_path):
-    runner, storage, zernio, apify, _ = setup(tmp_path, connected=False)
-    result = runner.capture(GYM, 'website-only')
-    assert result['source_policy'] == 'website_only'
-    assert len(result['captures']) == 1 and not apify.calls
-    assert storage.attestations[-1]['attestation']['instagram'] == {
-        'connected': False, 'account_id': None, 'platform_user_id': None, 'handle': None}
+@pytest.mark.parametrize('changes', [None, {'status': 'disconnected'},
+    {'tokenValid': False}, {'needsReconnect': True}, {'canPost': False}])
+def test_missing_or_unhealthy_health_never_permits_website_only_capture(tmp_path, changes):
+    runner, storage, zernio, apify, websites = setup(tmp_path, connected=False)
+    zernio.accounts = [account()]
+    zernio.health_rows = ([] if changes is None
+                          else [dict(zernio._health_row(account()), **changes)])
+    with pytest.raises(CaptureIngestError,
+                       match='authenticated_social_status_unavailable_or_incomplete'):
+        runner.capture(GYM, 'website-only-held')
+    assert not websites and not apify.calls and not storage.rows
+    assert len(zernio.calls) == 1  # no accounts or capture request after health hold
+    latest = storage.attestations[-1]['attestation']
+    assert latest['lookup_status'] == 'partial' and latest['instagram'] is None
+
+
+def test_populated_profile_object_supports_capture_and_complete_receipt(tmp_path):
+    runner, storage, zernio, apify, websites = setup(tmp_path)
+    zernio.accounts = [account(profileId={'_id': PROFILE,
+                                        'name': 'Synthetic profile display name'})]
+    result = runner.capture(GYM, 'populated-profile')
+    assert result['source_policy'] == 'website_and_instagram'
+    assert len(result['captures']) == len(storage.rows) == 2
+    assert websites == [URL] and [m for m, _ in apify.calls].count('POST') == 1
+    latest = storage.attestations[-1]['attestation']
+    assert latest['lookup_status'] == 'complete'
+    assert latest['instagram']['platform_user_id'] == OWNER
 
 
 @pytest.mark.parametrize('changes', [
     {'platformUserId': None}, {'platformUserId': 'internalAccount123'},
-    {'platformUserId': True}, {'profileId': 'other'}, {'_id': None},
+    {'platformUserId': True}, {'profileId': 'other'},
+    {'profileId': {'_id': 'other', 'name': 'Synthetic profile display name'}}, {'_id': None},
     {'metadata': {'profileData': {'username': 'other'}}, 'username': HANDLE},
 ])
 def test_authenticated_identity_never_uses_scraped_or_ambiguous_ids(tmp_path, changes):
@@ -217,7 +252,7 @@ def test_authenticated_identity_never_uses_scraped_or_ambiguous_ids(tmp_path, ch
 
 
 def test_partial_provider_list_is_hold_never_negative(tmp_path):
-    runner, storage, zernio, apify, websites = setup(tmp_path, connected=False)
+    runner, storage, zernio, apify, websites = setup(tmp_path)
     zernio.extra = {'pagination': {'hasMore': True}}
     with pytest.raises(CaptureIngestError, match='authenticated_social_status_unavailable_or_incomplete'):
         runner.capture(GYM, 'partial')
@@ -242,7 +277,7 @@ def test_wrong_apify_owner_holds_with_no_social_storage_or_receipt(tmp_path):
 
 
 def test_storage_readback_mismatch_never_authenticates_prepared_receipt(tmp_path):
-    runner, storage, _, _, _ = setup(tmp_path, connected=False)
+    runner, storage, _, _, _ = setup(tmp_path)
     storage.corrupt_capture = True
     with pytest.raises(CaptureIngestError, match='capture_readback_digest_mismatch'):
         runner.capture(GYM, 'bad-storage')
@@ -255,10 +290,10 @@ def test_storage_readback_mismatch_never_authenticates_prepared_receipt(tmp_path
 
 
 def test_uncertain_insert_reconciles_and_repeat_request_cannot_change_mapping(tmp_path):
-    runner, storage, _, _, websites = setup(tmp_path, connected=False)
+    runner, storage, _, _, websites = setup(tmp_path)
     storage.timeout_after_write = True
     runner.capture(GYM, 'uncertain-insert')
-    assert len(storage.rows) == 1
+    assert len(storage.rows) == 2
     entry = runner.collector._resolve._approved[GYM]
     runner.collector._resolve._approved[GYM] = replace(entry, approval_receipt='new-approval')
     with pytest.raises(CaptureIngestError, match='capture_request_binding_changed'):
@@ -345,20 +380,20 @@ def test_collection_receipts_drive_real_observation_producer(tmp_path):
 
 
 def test_maximum_request_length_and_changed_entire_source_set_are_fenced(tmp_path):
-    runner, storage, _, _, _ = setup(tmp_path, connected=False)
+    runner, storage, _, _, _ = setup(tmp_path)
     request = 'x' * 256
     runner.capture(GYM, request)
     entry = runner.collector._resolve._approved[GYM]
     runner.collector._resolve._approved[GYM] = replace(entry, website_urls=('https://other.example/',))
     with pytest.raises(CaptureIngestError, match='capture_request_binding_changed'):
         runner.capture(GYM, request)
-    assert len(storage.rows) == 1
+    assert len(storage.rows) == 2
 
 
-def test_authenticated_negative_does_not_override_connected_cache_and_provider_positive_needs_approval(tmp_path):
+def test_missing_health_holds_and_provider_positive_needs_approval(tmp_path):
     runner, storage, zernio, apify, websites = setup(tmp_path)
     zernio.accounts = []
-    with pytest.raises(CaptureIngestError, match='current_social_mapping_mismatch'):
+    with pytest.raises(CaptureIngestError, match='authenticated_social_status_unavailable_or_incomplete'):
         runner.capture(GYM, 'cache-disagreement')
     assert not websites and not apify.calls
     runner, storage, zernio, apify, websites = setup(tmp_path, connected=False)
@@ -372,22 +407,22 @@ def test_authenticated_negative_does_not_override_connected_cache_and_provider_p
     ([{'gym_id': GYM, 'zernio_profile_id': None}], False),
     ([{'gym_id': GYM, 'zernio_profile_id': PROFILE}] * 2, False),
     (None, True)])
-def test_missing_or_failed_profile_invalidates_previous_fresh_negative(tmp_path, rows, error):
-    runner, storage, zernio, apify, websites = setup(tmp_path, connected=False)
-    runner.capture(GYM, 'previous-negative')
+def test_missing_or_failed_profile_invalidates_previous_fresh_identity(tmp_path, rows, error):
+    runner, storage, zernio, apify, websites = setup(tmp_path)
+    runner.capture(GYM, 'previous-identity')
     assert storage.attestations[-1]['attestation']['lookup_status'] == 'complete'
-    before = len(zernio.calls), len(websites)
+    before = len(zernio.calls), len(websites), len(apify.calls)
     storage.profile_rows, storage.profile_read_error = rows, error
     with pytest.raises(CaptureIngestError, match='exact_zernio_profile_mapping_required'):
         runner.capture(GYM, 'failed-profile')
     latest = storage.attestations[-1]['attestation']
     assert latest['lookup_status'] == 'unavailable' and latest['profile_id'] is None
     assert latest['instagram'] is None and latest['authenticated'] is False
-    assert (len(zernio.calls), len(websites)) == before and not apify.calls
+    assert (len(zernio.calls), len(websites), len(apify.calls)) == before
 
 
-def test_missing_credentials_invalidate_previous_fresh_negative(tmp_path):
-    runner, storage, zernio, _, websites = setup(tmp_path, connected=False)
+def test_missing_credentials_invalidate_previous_fresh_identity(tmp_path):
+    runner, storage, zernio, _, websites = setup(tmp_path)
     runner.capture(GYM, 'first')
     runner.collector._env['ZERNIO_API_KEY'] = ''
     with pytest.raises(CaptureIngestError, match='authenticated_social_status_unavailable_or_incomplete'):

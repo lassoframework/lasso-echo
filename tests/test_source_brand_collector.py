@@ -270,3 +270,290 @@ def test_disconnected_portal_row_without_approved_handle_is_website_mapping():
     mapping = r(GYM)
     assert mapping.website_response_urls == (URL,)
     assert mapping.social_locators == () and mapping.provider_account_id is None
+
+
+# --- AuthenticatedZernioIdentityReader: health endpoint is the profile authority.
+
+from agent.source_brand_collector import AuthenticatedZernioIdentityReader
+
+ZPROFILE = '6a95fae1cd41729a65136d46'
+ZACCOUNT = 'zernio-internal-account'
+ZOWNER = '28269859779341790'
+ZHANDLE = 'swiftrivercrossfit'
+
+
+def zhealth(**changes):
+    row = {'accountId': ZACCOUNT, 'profileId': ZPROFILE, 'platform': 'instagram',
+           'username': ZHANDLE, 'status': 'healthy', 'tokenValid': True,
+           'needsReconnect': False, 'canPost': True}
+    row.update(changes)
+    return row
+
+
+def zaccount(**changes):
+    # Missing profileId remains supported through the health stable-ID join.
+    row = {'_id': ZACCOUNT, 'platform': 'instagram',
+           'platformUserId': ZOWNER, 'username': ZHANDLE}
+    row.update(changes)
+    return row
+
+
+class IdentityReadRows:
+    def __init__(self, health):
+        self.health = health
+        self.attestations = []
+
+    def __call__(self, table, params):
+        assert table == 'echo_gym_settings'
+        assert params == {'gym_id': 'eq.' + GYM, 'select': 'gym_id,zernio_profile_id'}
+        return [{'gym_id': GYM, 'zernio_profile_id': ZPROFILE}]
+
+    def attest_provider(self, status, request_id):
+        self.attestations.append((status, request_id))
+
+
+class IdentityHttp:
+    def __init__(self, health, accounts):
+        import json as _json
+        self.health_raw = _json.dumps({'accounts': health}, separators=(',', ':')).encode()
+        self.accounts_raw = _json.dumps({'accounts': accounts}, separators=(',', ':')).encode()
+        self.calls = []
+
+    def get(self, url, **kwargs):
+        self.calls.append(url)
+        if url == 'https://api.zernio.com/v1/accounts/health':
+            return SimpleNamespace(status_code=200, content=self.health_raw)
+        return SimpleNamespace(status_code=200, content=self.accounts_raw)
+
+
+def zreader(http, rows=None):
+    return AuthenticatedZernioIdentityReader(read_rows=rows or IdentityReadRows(None),
+        environ={'ECHO_SOURCE_COLLECTOR_ENABLED': 'true', 'ZERNIO_API_KEY': 'synthetic-secret'},
+        http=http, now=lambda: NOW)
+
+
+def test_identity_reader_health_authority_pairs_account_list():
+    rows = IdentityReadRows(None)
+    http = IdentityHttp([zhealth()], [zaccount()])
+    result = zreader(http, rows)(GYM, KEY)
+    assert result['connected'] is True and result['account_id'] == ZACCOUNT
+    assert result['platform_user_id'] == ZOWNER and result['handle'] == ZHANDLE
+    assert http.calls == ['https://api.zernio.com/v1/accounts/health',
+                          'https://api.zernio.com/v1/accounts']
+    assert len(rows.attestations) == 1
+
+
+def test_identity_reader_selects_single_instagram_among_sibling_platform_rows():
+    # Live Swift Zernio profile shape: one Facebook, one Google Business and
+    # one Instagram row for the exact same profile must not be ambiguous.
+    rows = IdentityReadRows(None)
+    health = [zhealth(accountId='facebook-account', platform='facebook'),
+              zhealth(accountId='gbp-account', platform='google'),
+              zhealth()]
+    http = IdentityHttp(health, [zaccount()])
+    result = zreader(http, rows)(GYM, KEY)
+    assert result['connected'] is True and result['account_id'] == ZACCOUNT
+    assert result['platform_user_id'] == ZOWNER and result['handle'] == ZHANDLE
+    assert http.calls == ['https://api.zernio.com/v1/accounts/health',
+                          'https://api.zernio.com/v1/accounts']
+
+
+@pytest.mark.parametrize('profile_id', [ZPROFILE,
+    {'_id': ZPROFILE, 'name': 'Synthetic profile display name'}])
+def test_identity_reader_accepts_exact_scalar_or_populated_account_profile(profile_id):
+    rows = IdentityReadRows(None)
+    accounts = [zaccount(profileId=profile_id),
+                zaccount(_id='facebook-account', platform='facebook', profileId=profile_id),
+                zaccount(_id='gbp-account', platform='googlebusiness', profileId=profile_id)]
+    result = zreader(IdentityHttp([zhealth()], accounts), rows)(GYM, KEY)
+    assert result['connected'] is True and result['account_id'] == ZACCOUNT
+    assert result['profile_id'] == ZPROFILE and result['platform_user_id'] == ZOWNER
+    assert rows.attestations[0][0]['lookup_status'] == 'complete'
+
+
+@pytest.mark.parametrize('profile_id', [
+    {'_id': 'wrong-profile', 'name': 'Synthetic profile display name'},
+    {}, {'name': ZPROFILE}, {'_id': None}, {'_id': 123},
+    {'_id': {'_id': ZPROFILE}}, [], None, False,
+])
+def test_identity_reader_conflicting_or_malformed_account_profile_holds(profile_id):
+    rows = IdentityReadRows(None)
+    http = IdentityHttp([zhealth()], [zaccount(profileId=profile_id)])
+    with pytest.raises(CaptureIngestError,
+                       match='authenticated_social_status_unavailable_or_incomplete'):
+        zreader(http, rows)(GYM, KEY)
+    status = rows.attestations[0][0]
+    assert status['lookup_status'] == 'partial' and status['instagram'] is None
+    assert status['response_sha256'] == hashlib.sha256(http.health_raw).hexdigest()
+
+
+def test_identity_reader_duplicate_populated_profile_keys_hold():
+    import json
+    rows = IdentityReadRows(None)
+    http = IdentityHttp([zhealth()], [zaccount(profileId={'_id': ZPROFILE})])
+    exact = json.dumps({'_id': ZPROFILE}, separators=(',', ':')).encode()
+    duplicate = b'{"_id":"wrong-profile","_id":"' + ZPROFILE.encode() + b'"}'
+    http.accounts_raw = http.accounts_raw.replace(exact, duplicate)
+    with pytest.raises(CaptureIngestError,
+                       match='authenticated_social_status_unavailable_or_incomplete'):
+        zreader(http, rows)(GYM, KEY)
+    assert rows.attestations[0][0]['lookup_status'] == 'partial'
+    assert rows.attestations[0][0]['instagram'] is None
+
+
+def test_identity_reader_unrelated_malformed_rows_do_not_hold_requested_profile():
+    # A row for another exact profile may carry malformed non-identity fields;
+    # it cannot hold this gym's ownership decision.
+    rows = IdentityReadRows(None)
+    unrelated = {'accountId': '', 'profileId': 'other-exact-profile',
+                 'platform': '!!!not-a-platform', 'username': 123, 'status': None,
+                 'tokenValid': 'yes', 'needsReconnect': 1, 'canPost': {}}
+    http = IdentityHttp([unrelated, zhealth()], [zaccount()])
+    result = zreader(http, rows)(GYM, KEY)
+    assert result['connected'] is True and result['account_id'] == ZACCOUNT
+    assert rows.attestations[0][0]['lookup_status'] == 'complete'
+
+
+@pytest.mark.parametrize('unrelated_account_id', [[], {}])
+def test_identity_reader_unrelated_unhashable_account_id_is_ignored(unrelated_account_id):
+    rows = IdentityReadRows(None)
+    unrelated = zhealth(profileId='other-exact-profile', accountId=unrelated_account_id)
+    result = zreader(IdentityHttp([unrelated, zhealth()], [zaccount()]), rows)(GYM, KEY)
+    assert result['connected'] is True and result['account_id'] == ZACCOUNT
+    assert rows.attestations[0][0]['lookup_status'] == 'complete'
+
+
+def test_identity_reader_matched_malformed_row_holds():
+    rows = IdentityReadRows(None)
+    http = IdentityHttp([zhealth(tokenValid='yes')], [zaccount()])
+    with pytest.raises(CaptureIngestError,
+                       match='authenticated_social_status_unavailable_or_incomplete'):
+        zreader(http, rows)(GYM, KEY)
+    assert len(rows.attestations) == 1
+
+
+@pytest.mark.parametrize('profile_id', [None, 123, ''])
+def test_identity_reader_unreadable_profile_identity_holds(profile_id):
+    # Absent or non-string profileId could refer to the requested profile, so
+    # it fails closed at the profile-identity check even when every other
+    # field looks well-formed (including the account ID).
+    rows = IdentityReadRows(None)
+    http = IdentityHttp([zhealth(profileId=profile_id)], [zaccount()])
+    with pytest.raises(CaptureIngestError,
+                       match='authenticated_social_status_unavailable_or_incomplete'):
+        zreader(http, rows)(GYM, KEY)
+    assert len(rows.attestations) == 1
+
+
+def test_identity_reader_cross_profile_reuse_of_target_account_holds():
+    # The target account ID appearing on another profile's row is conflicting
+    # ownership evidence and fails closed, even when that row is otherwise
+    # well-formed.
+    rows = IdentityReadRows(None)
+    http = IdentityHttp(
+        [zhealth(), zhealth(profileId='other-exact-profile')], [zaccount()])
+    with pytest.raises(CaptureIngestError,
+                       match='authenticated_social_status_unavailable_or_incomplete'):
+        zreader(http, rows)(GYM, KEY)
+    assert len(rows.attestations) == 1
+
+
+def test_identity_reader_duplicate_matched_instagram_rows_hold():
+    rows = IdentityReadRows(None)
+    health = [zhealth(), zhealth(accountId='second-ig-account')]
+    http = IdentityHttp(health, [zaccount()])
+    with pytest.raises(CaptureIngestError,
+                       match='authenticated_social_status_unavailable_or_incomplete'):
+        zreader(http, rows)(GYM, KEY)
+    assert len(rows.attestations) == 1
+
+
+def test_identity_reader_duplicate_instagram_rows_still_hold():
+    rows = IdentityReadRows(None)
+    health = [zhealth(accountId='facebook-account', platform='facebook'),
+              zhealth(), zhealth(accountId='second-ig-account')]
+    http = IdentityHttp(health, [zaccount()])
+    with pytest.raises(CaptureIngestError,
+                       match='authenticated_social_status_unavailable_or_incomplete'):
+        zreader(http, rows)(GYM, KEY)
+    assert len(rows.attestations) == 1
+
+
+@pytest.mark.parametrize('health', [
+    [], [zhealth(platform='facebook')], [zhealth(status='disconnected')],
+    [zhealth(tokenValid=False)], [zhealth(needsReconnect=True)],
+    [zhealth(canPost=False)],
+])
+def test_identity_reader_missing_or_unhealthy_profile_is_partial_hold(health):
+    rows = IdentityReadRows(None)
+    http = IdentityHttp(health, [zaccount()])
+    with pytest.raises(CaptureIngestError,
+                       match='authenticated_social_status_unavailable_or_incomplete'):
+        zreader(http, rows)(GYM, KEY)
+    assert http.calls == ['https://api.zernio.com/v1/accounts/health']
+    assert len(rows.attestations) == 1
+    status = rows.attestations[0][0]
+    assert status['lookup_status'] == 'partial' and status['instagram'] is None
+    assert status['authenticated'] is True
+    assert status['response_sha256'] == hashlib.sha256(http.health_raw).hexdigest()
+
+
+def test_identity_reader_complete_digest_binds_both_original_responses():
+    def receipt(http):
+        rows = IdentityReadRows(None)
+        zreader(http, rows)(GYM, KEY)
+        return rows.attestations[0][0]
+
+    http = IdentityHttp([zhealth()], [zaccount()])
+    original = receipt(http)
+    framed = (b'echo:zernio:identity-responses:v1\0'
+              + b'/v1/accounts/health\0' + len(http.health_raw).to_bytes(8, 'big') + http.health_raw
+              + b'/v1/accounts\0' + len(http.accounts_raw).to_bytes(8, 'big') + http.accounts_raw)
+    assert original['response_sha256'] == hashlib.sha256(framed).hexdigest()
+    assert original == receipt(IdentityHttp([zhealth()], [zaccount()]))
+    # A different healthy authority response and a different numeric owner ID
+    # each change the complete receipt while preserving valid identity shape.
+    assert receipt(IdentityHttp([zhealth(providerNote='changed')], [zaccount()]))[
+        'response_sha256'] != original['response_sha256']
+    assert receipt(IdentityHttp([zhealth()], [zaccount(platformUserId='99999')]))[
+        'response_sha256'] != original['response_sha256']
+    # Exact bytes, including JSON whitespace, are evidence.
+    http.health_raw += b'\n'
+    assert receipt(http)['response_sha256'] != original['response_sha256']
+
+
+def test_identity_reader_account_failure_preserves_partial_health_digest():
+    rows = IdentityReadRows(None)
+    http = IdentityHttp([zhealth()], [zaccount(platformUserId='not-numeric')])
+    with pytest.raises(CaptureIngestError,
+                       match='authenticated_social_status_unavailable_or_incomplete'):
+        zreader(http, rows)(GYM, KEY)
+    status = rows.attestations[0][0]
+    assert status['lookup_status'] == 'partial' and status['instagram'] is None
+    assert status['response_sha256'] == hashlib.sha256(http.health_raw).hexdigest()
+
+
+def test_identity_response_digest_frames_boundaries_and_response_roles():
+    from agent.source_brand_collector import _zernio_identity_response_sha256
+    # The concatenated bytes are identical; endpoint-specific length framing
+    # must still bind which exact bytes came from which response.
+    assert _zernio_identity_response_sha256(b'a', b'bc') != (
+        _zernio_identity_response_sha256(b'ab', b'c'))
+    assert _zernio_identity_response_sha256(b'a', b'b') != (
+        _zernio_identity_response_sha256(b'b', b'a'))
+
+
+@pytest.mark.parametrize('health,accounts', [
+    ([zhealth(), zhealth(accountId='second-account')], [zaccount()]),
+    ([zhealth()], [zaccount(), zaccount()]),
+    ([zhealth()], [zaccount(username='someone-else')]),
+    ([zhealth()], []),
+    ([{'accountId': ZACCOUNT}], [zaccount()]),
+])
+def test_identity_reader_ambiguous_or_mismatched_holds(health, accounts):
+    rows = IdentityReadRows(None)
+    http = IdentityHttp(health, accounts)
+    with pytest.raises(CaptureIngestError,
+                       match='authenticated_social_status_unavailable_or_incomplete'):
+        zreader(http, rows)(GYM, KEY)
+    assert len(rows.attestations) == 1
