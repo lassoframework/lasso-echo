@@ -167,6 +167,9 @@ begin
  if current_setting('transaction_isolation')<>'read committed' then
   raise exception 'owner photo authority requires read committed' using errcode='25000'; end if;
  perform pg_advisory_xact_lock(hashtextextended('fixer_forward_graph_20261006',0));
+ -- Final exclusive graph mode precedes census and all state/calendar locks.
+ -- Reconciliation re-enters this order through preparation.
+ perform pg_advisory_xact_lock(hashtextextended('fixer_forward_photo_census_20261007',0));
  select * into state from public.fixer_forward_media_photo_state_20261007 where singleton for share;
  if not state.enabled or nullif(btrim(state.routes_reconciled_ref),'') is null then
   raise exception 'owner photo policy OFF or unreconciled' using errcode='55000'; end if;

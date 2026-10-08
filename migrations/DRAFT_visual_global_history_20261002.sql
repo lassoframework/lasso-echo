@@ -1442,7 +1442,12 @@ begin
     raise exception 'global history import requires calendar barrier before writer locks'
       using errcode='55P03';
   end if;
-  lock table public.content_calendar in share row exclusive mode;
+  -- Nonblocking barrier: an owner holding the shared/exclusive G/C guards
+  -- while queued on ROW EXCLUSIVE for this table would otherwise complete a
+  -- deadlock cycle against this lock (40P01). Refuse with 55P03
+  -- (lock_not_available) instead and roll back; the caller retries the whole
+  -- import in a fresh transaction.
+  lock table public.content_calendar in share row exclusive mode nowait;
   lock table public.visual_group_usage_ledger, public.visual_group_alias,
     public.visual_global_identity, public.visual_group_scene_link,
     public.visual_group_usage_sibling, public.visual_group_member_event,
