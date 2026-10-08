@@ -179,3 +179,15 @@ def test_tough_temple_live_reasons_say_different_photo_not_review():
     assert [r["reason"] for r in fact["reasons"]] == [al._HOLD_REPEAT_TEXT]
     assert "review" not in json.dumps(fact["reasons"]).lower()
 
+
+def test_different_photo_wording_states_no_cause():
+    """The different-photo sentence covers repeats AND cross-gym source holds (Tough Temple
+    fa939a9a is legacy igfill media, not a repeat), so it must not claim a repeat as cause."""
+    assert al._HOLD_REPEAT_TEXT == "needs a different photo or video"
+    for reason in ("cross_gym_media_source_mismatch_review_required",
+                   "Cross-day exact image URL repeat review 2026-10-05",
+                   "cross_date_media_repeat_needs_new_visual"):
+        text = al._hold_text(reason)
+        assert text == al._HOLD_REPEAT_TEXT
+        assert "two different days" not in text and "because" not in text
+
