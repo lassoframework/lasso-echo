@@ -259,3 +259,37 @@ def test_pending_inventory_changes_during_render_refuse_fresh_grade(armed, monke
                   artifact_store=Artifacts(), horizon_days=2, planner=planner, render=render)
     assert out["reason"] == "fresh existing plus candidate calendar grade"
     assert out["generated"] == 1 and not store.staged
+
+
+@pytest.mark.parametrize("key", ["lasso_ig", "lasso_fb"])
+def test_source_only_repeated_primary_uses_owned_gym_ledger_and_fresh_fallback(monkeypatch, key):
+    from agent.drafter import Draft, DraftStatus
+    account = SimpleNamespace(key=key, platform="instagram" if key.endswith("ig") else "facebook")
+    monkeypatch.setattr(config, "caption_cooldown_enabled", lambda: True)
+    monkeypatch.setattr(config, "logical_post_id_enabled", lambda: True)
+    calls = []
+    def check(gym, caption, day):
+        calls.append((gym, caption))
+        return caption == "Repeated approved primary"
+    monkeypatch.setattr(caption_ledger, "is_blocked", check)
+    def build(caption):
+        return lambda target, day: Draft(draft_id="source", account_key=key,
+            platform=account.platform, caption=caption, hashtags=[], scheduled_for=DAY, status=DraftStatus.PENDING,
+            source_fragments=[caption], creative_path="", creative_public_url="")
+    slot = real_month_planner.PlanSlot(post_date=DAY, category="book", fmt="feed", cadence_slot=0)
+    drafts = real_month_planner.build_month_drafts([slot], {
+        "book": build("Repeated approved primary"), "doctrine": build("Fresh approved fallback")},
+        account=account, source_only=True, logger=lambda m: None)
+    assert len(drafts) == 1 and drafts[0].caption == "Fresh approved fallback"
+    assert calls and {gym for gym, caption in calls} == {"lasso"}
+    assert not drafts[0].creative_public_url
+
+
+def test_normal_account_target_cooldown_scope_remains_unchanged(monkeypatch):
+    calls = []
+    monkeypatch.setattr(caption_ledger, "is_blocked", lambda gym, cap, day:
+        calls.append(gym) or False)
+    draft = SimpleNamespace(caption="Fresh approved copy")
+    assert real_month_planner._cooldown_checked(draft, lambda *a: draft,
+        SimpleNamespace(key="lasso_ig"), DAY, "book", lambda m: None) is draft
+    assert calls == ["lasso_ig"]
