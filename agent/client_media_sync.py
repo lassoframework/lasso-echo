@@ -56,13 +56,15 @@ THREE KEYS (do not conflate): the tenant BASE ("gritx") is echo_social_intake
 _ig account ("gritx_ig") is the generation/source key; the _fb account is the mirror.
 """
 
+import hashlib
 import json
 import os
 import subprocess
 import unicodedata
 from collections import defaultdict
 
-from . import burst_spacing, config, visual_fingerprint
+from . import (burst_spacing, config, local_inventory_mutation as _mutation,
+               visual_fingerprint)
 
 # Media extensions we sync (mirror client_month_run._MEDIA_EXTS: the same set that
 # counts as a gym having uploaded usable creative).
@@ -391,6 +393,184 @@ def _list_prefixes_once(r2, prefixes, log, gym_label):
     return listed
 
 
+# ---- inventory mutation receipt guard (DRAFT, default OFF) -------------------
+# When AGENT_LOCAL_INVENTORY_MUTATIONS_ENABLED=true (agent/local_inventory_mutation.py,
+# the same protocol agent/intake_web.py and agent/intake_ingest.py already use),
+# every R2-to-local mutation in this module (downloaded media bytes + their
+# sidecar, in BOTH sync_uploads and the sync_hosted_media recovery lane) is fenced
+# by one begin/complete mutation receipt per file: the exact source digest is
+# bound to the request BEFORE any byte lands, the write is atomic and
+# symlink-safe, the landed bytes and sidecar are read back and verified, and any
+# uncertain effect keeps the exact mutation pending for reconciliation. Armed
+# mode FAILS CLOSED on: missing/unreadable R2 source bytes, a conflicting or
+# unreadable local destination/sidecar (a different source with the same
+# basename is NEVER overwritten), malformed sidecar provenance, a symlinked
+# path, or an incomplete/unsettled receipt (a prior pending mutation blocks
+# retries until reconciled). A hold is surfaced honestly as {"held": code} and
+# an unverified write is never counted as synced. Flag OFF (default) is
+# byte-for-byte the legacy path.
+
+
+def _sha256_bytes(data):
+    return hashlib.sha256(data).hexdigest()
+
+
+def _existing_target_identity(target):
+    """(sha256 hex, ok) for an existing local destination. ok=False when the
+    path is a symlink or cannot be read: armed mode fails closed rather than
+    overwriting a destination it cannot identify."""
+    if os.path.islink(target):
+        return "", False
+    try:
+        with open(target, "rb") as fh:
+            return _sha256_bytes(fh.read()), True
+    except OSError:
+        return "", False
+
+
+def _require_source_bytes(r2, key, base_key, log):
+    """Armed-mode source read: missing/unreadable R2 bytes fail closed."""
+    try:
+        data = r2.get_bytes(key)
+    except Exception as exc:  # noqa: BLE001
+        log(f"{base_key}: download failed for one object: {type(exc).__name__}")
+        raise _mutation.MutationHold("r2_source_unreadable") from None
+    if not data:
+        raise _mutation.MutationHold("r2_source_bytes_missing")
+    return data
+
+
+def _armed_mutation_setup(base_key, lib_dir, log):
+    """(cfg, authority) for one armed sync pass, or (None, None) when the fence
+    is OFF (default). Raises MutationHold when armed-but-unsettled: a prior
+    pending mutation for this gym blocks the whole pass BEFORE any byte moves,
+    and a misconfigured binding (no epoch, no durable paths, a library path
+    that is not the canonical content_library/<base>) fails closed too."""
+    if not _mutation.enabled():
+        return None, None
+    from pathlib import Path
+    cfg = _mutation.configured(base_key, Path(lib_dir).absolute())
+    _mutation.assert_settled(cfg)
+    return cfg, _mutation.MutationAuthority.from_environment()
+
+
+def _check_sidecar_strict(lib_dir, media_name, source_fingerprint):
+    """Pre-fence sidecar validation for armed mode: surface a specific hold code
+    BEFORE any byte moves (and before a receipt is begun) when the existing
+    sidecar is symlinked, unreadable, malformed, or bound to a DIFFERENT source
+    fingerprint. _write_sidecar(strict=True) repeats these checks inside the
+    fence so a race still fails closed (as a pending mutation)."""
+    stem = os.path.splitext(media_name)[0]
+    side_path = os.path.join(lib_dir, stem + ".json")
+    if os.path.islink(side_path):
+        raise _mutation.MutationHold("local_sidecar_path_invalid")
+    if not os.path.lexists(side_path):
+        return {}
+    try:
+        with open(side_path, encoding="utf-8") as fh:
+            existing = json.load(fh)
+    except (OSError, ValueError):
+        raise _mutation.MutationHold("local_sidecar_unreadable") from None
+    if not isinstance(existing, dict):
+        raise _mutation.MutationHold("local_sidecar_provenance_malformed")
+    fp = visual_fingerprint.normalize(source_fingerprint)
+    existing_fp = visual_fingerprint.normalize(existing.get("source_fingerprint"))
+    if fp and existing_fp and existing_fp != fp:
+        raise _mutation.MutationHold("local_sidecar_provenance_conflict")
+    return existing
+
+
+def _guarded_intake_metadata(cfg, authority, name, r2_key, data,
+                             intake_sequence):
+    """Fence metadata backfills on existing assets without changing review fields."""
+    from pathlib import Path
+    target = cfg.asset_path(cfg.library_path / name)
+    side_path = cfg.library_path / (os.path.splitext(name)[0] + ".json")
+    existing = _check_sidecar_strict(str(cfg.library_path), name,
+                                    visual_fingerprint.source_aliases(data)[0])
+    cfg.asset_path(side_path)
+    trusted = burst_spacing.normalize_intake_metadata(intake_sequence)
+    payload = dict(existing)
+    if trusted is not None:
+        for field in burst_spacing.INTAKE_METADATA_FIELDS:
+            payload.pop(field, None)
+        payload.update(trusted)
+    if payload == existing:
+        return False
+    sha = _sha256_bytes(data)
+
+    def _apply(conn):
+        cfg.asset_path(Path(target))
+        actual_sha, ok = _existing_target_identity(target)
+        if not ok or actual_sha != sha:
+            raise _mutation.MutationHold("local_destination_conflict")
+        current = _check_sidecar_strict(str(cfg.library_path), name,
+                                       visual_fingerprint.source_aliases(data)[0])
+        if current != existing:
+            raise _mutation.MutationHold("local_sidecar_changed")
+        _mutation.atomic_write_json(side_path, payload)
+        settled = _check_sidecar_strict(str(cfg.library_path), name,
+                                       visual_fingerprint.source_aliases(data)[0])
+        if settled != payload:
+            raise _mutation.MutationHold("local_sidecar_readback_mismatch")
+        return {"name": name, "r2_key": r2_key, "sha256": sha,
+                "sidecar": settled}
+
+    _mutation.run(cfg, authority, "client_media_intake_metadata",
+                  {"name": name, "r2_key": r2_key, "sha256": sha,
+                   "before": existing, "after": payload}, _apply)
+    return True
+
+
+def _guarded_media_write(cfg, authority, kind, name, r2_key, data,
+                         sidecar_kwargs, log):
+    """One mutation receipt fencing target bytes + sidecar for one synced file.
+
+    Armed-only path (the caller holds cfg/authority from _armed_mutation_setup).
+    Returns True when the write settled under a COMPLETE receipt, False when the
+    local destination already holds byte-identical content (idempotent replay;
+    nothing written, no new receipt). Raises MutationHold on every fail-closed
+    condition: a conflicting destination (same basename, DIFFERENT bytes — never
+    overwritten), an unreadable/symlinked destination or sidecar, malformed
+    sidecar provenance, a readback identity mismatch, or an unsettled receipt."""
+    target = os.path.join(str(cfg.library_path), name)
+    sha = _sha256_bytes(data)
+    # DAM consent writes open a separate receipt/SQLite transaction. Until that
+    # audit can share this fence, do not land bytes or claim recorded consent.
+    if sidecar_kwargs.get("consent"):
+        raise _mutation.MutationHold("local_consent_transaction_binding_unavailable")
+    if os.path.lexists(target):
+        existing_sha, ok = _existing_target_identity(target)
+        if not ok:
+            raise _mutation.MutationHold("local_destination_unreadable")
+        if existing_sha != sha:
+            raise _mutation.MutationHold("local_destination_conflict")
+        return False
+    from pathlib import Path
+    cfg.asset_path(Path(target).absolute())
+    _check_sidecar_strict(str(cfg.library_path), name,
+                          sidecar_kwargs.get("source_fingerprint", ""))
+
+    def _apply(conn):
+        if os.path.lexists(target):
+            # appeared between the listing and the fenced write: never overwrite
+            raise _mutation.MutationHold("local_destination_conflict")
+        _mutation.atomic_write_bytes(target, data)   # symlink-safe, fsynced
+        with open(target, "rb") as fh:
+            actual = fh.read()
+        if _sha256_bytes(actual) != sha:
+            raise _mutation.MutationHold("local_readback_identity_mismatch")
+        sidecar = _write_sidecar(str(cfg.library_path), name, r2_key, log=log,
+                                 strict=True, **sidecar_kwargs)
+        return {"name": name, "r2_key": r2_key, "bytes": len(data),
+                "sha256": sha, "sidecar": sidecar}
+
+    _mutation.run(cfg, authority, kind,
+                  {"base": cfg.gym_id, "name": name, "r2_key": r2_key,
+                   "bytes": len(data), "sha256": sha}, _apply)
+    return True
+
+
 def sync_uploads(base_key, *, r2=None, out_dir=None, logger=None):
     """List the gym's uploaded media in R2 and download the NEW files into the gym's
     content library, writing a .json sidecar (public_url + the gym's caption) per file.
@@ -409,7 +589,13 @@ def sync_uploads(base_key, *, r2=None, out_dir=None, logger=None):
     processed form under pending_caption/incoming wins over the raw originals/ copy).
     Only image/video extensions are pulled; thumbnails, *.json sidecars, and
     manifest.json are never synced as media. Never raises out: a per-file error is
-    logged and the rest continue."""
+    logged and the rest continue.
+
+    Armed mutation-receipt mode (AGENT_LOCAL_INVENTORY_MUTATIONS_ENABLED, default
+    OFF — see the guard block below): each file's bytes+sidecar land under one
+    verified begin/complete receipt; a hold fails closed and the result carries
+    {"held": code} with only already-verified writes counted, never a certified
+    success for an unsettled effect."""
     log = logger or (lambda m: print(f"[client-media-sync] {m}"))
     base_key = (base_key or "").strip()
     if not base_key:
@@ -460,45 +646,100 @@ def sync_uploads(base_key, *, r2=None, out_dir=None, logger=None):
     contexts, consents = _read_context_consent(r2, prefixes, log, keys=listed)   # §8
     intake_sequences = _read_intake_sequences(r2, prefixes, keys=listed)
 
+    try:
+        cfg, authority = _armed_mutation_setup(base_key, lib_dir, log)
+    except _mutation.MutationHold as hold:
+        # FAIL CLOSED (armed only): an unsettled prior mutation or a broken
+        # binding holds the whole pass before any byte moves.
+        log(f"{base_key}: sync HELD: {hold}")
+        return {"synced": 0, "skipped": 0, "held": str(hold)}
+
     synced = 0
     skipped = 0
     accepted = []
-    for name in sorted(chosen):
-        key = chosen[name]
-        target = os.path.join(lib_dir, name)
-        # IDEMPOTENT: already in the library -> never re-download.
-        if os.path.exists(target):
-            _merge_intake_metadata(
-                lib_dir, name, _intake_sequence_for(intake_sequences, name), log)
-            skipped += 1
+    held = None
+    try:
+        for name in sorted(chosen):
+            key = chosen[name]
+            target = os.path.join(lib_dir, name)
+            # IDEMPOTENT: already in the library -> never re-download (legacy).
+            # Armed: a present local file replays as settled ONLY when it is
+            # byte-identical to this source; a same-basename DIFFERENT source
+            # is a conflict and fails closed, never overwritten.
+            if os.path.exists(target):
+                if cfg is not None:
+                    data = _require_source_bytes(r2, key, base_key, log)
+                    existing_sha, ok = _existing_target_identity(target)
+                    if not ok:
+                        raise _mutation.MutationHold("local_destination_unreadable")
+                    if existing_sha != _sha256_bytes(data):
+                        raise _mutation.MutationHold("local_destination_conflict")
+                    _guarded_intake_metadata(
+                        cfg, authority, name, key, data,
+                        _intake_sequence_for(intake_sequences, name))
+                else:
+                    _merge_intake_metadata(
+                        lib_dir, name, _intake_sequence_for(intake_sequences, name), log)
+                skipped += 1
+                if _valid_media_file(target):
+                    accepted.append(key)
+                continue
+            if cfg is not None:
+                data = _require_source_bytes(r2, key, base_key, log)
+                aliases = visual_fingerprint.source_aliases(data)
+                wrote = _guarded_media_write(
+                    cfg, authority, "client_media_sync", name, key, data,
+                    {"caption": captions.get(name, ""),
+                     "client_context": contexts.get(name, ""),
+                     "consent": bool(consents.get(name)),
+                     "source_fingerprint": aliases[0],
+                     "source_fingerprint_aliases": aliases[1:],
+                     "intake_sequence": _intake_sequence_for(
+                         intake_sequences, name)},
+                    log)
+                if wrote:
+                    synced += 1
+                else:
+                    skipped += 1
+                if _valid_media_file(target):
+                    accepted.append(key)
+                continue
+            try:
+                data = r2.get_bytes(key)
+            except Exception as exc:  # noqa: BLE001
+                log(f"{base_key}: download failed for one object: {type(exc).__name__}")
+                continue
+            if not data:
+                continue
+            try:
+                with open(target, "wb") as fh:
+                    fh.write(data)
+            except OSError as exc:
+                log(f"{base_key}: write failed for one object: {type(exc).__name__}")
+                continue
+            # Source identity comes from bytes, with strong SHA-256 authoritative
+            # and Drive-compatible MD5 retained only as an explicit alias.
+            aliases = visual_fingerprint.source_aliases(data)
+            _write_sidecar(lib_dir, name, key, captions.get(name, ""), log,
+                           client_context=contexts.get(name, ""),
+                           consent=bool(consents.get(name)),
+                           source_fingerprint=aliases[0],
+                           source_fingerprint_aliases=aliases[1:],
+                           intake_sequence=_intake_sequence_for(intake_sequences, name))
+            synced += 1
             if _valid_media_file(target):
                 accepted.append(key)
-            continue
-        try:
-            data = r2.get_bytes(key)
-        except Exception as exc:  # noqa: BLE001
-            log(f"{base_key}: download failed for one object: {type(exc).__name__}")
-            continue
-        if not data:
-            continue
-        try:
-            with open(target, "wb") as fh:
-                fh.write(data)
-        except OSError as exc:
-            log(f"{base_key}: write failed for one object: {type(exc).__name__}")
-            continue
-        # Source identity comes from bytes, with strong SHA-256 authoritative
-        # and Drive-compatible MD5 retained only as an explicit alias.
-        aliases = visual_fingerprint.source_aliases(data)
-        _write_sidecar(lib_dir, name, key, captions.get(name, ""), log,
-                       client_context=contexts.get(name, ""),
-                       consent=bool(consents.get(name)),
-                       source_fingerprint=aliases[0],
-                       source_fingerprint_aliases=aliases[1:],
-                       intake_sequence=_intake_sequence_for(intake_sequences, name))
-        synced += 1
-        if _valid_media_file(target):
-            accepted.append(key)
+    except _mutation.MutationHold as hold:
+        held = str(hold)
+        log(f"{base_key}: sync HELD on one object: {hold}")
+    finally:
+        if authority is not None:
+            authority.close()
+
+    if held is not None:
+        # FAIL CLOSED: only already-verified writes count; no rearm, no vision
+        # sweep, and the hold code is surfaced honestly to the caller.
+        return {"synced": synced, "skipped": skipped, "held": held}
 
     if synced or skipped:
         log(f"{base_key}: synced {synced} new media, skipped {skipped} already present")
@@ -562,7 +803,10 @@ def sync_hosted_media(base_key, *, r2=None, out_dir=None, logger=None):
     an already-recovered file is skipped, never re-downloaded.
 
     Returns {"recovered": n_new, "skipped": n_already_present}. Never raises: a
-    listing/HTTP failure or per-file error is logged and the rest continue."""
+    listing/HTTP failure or per-file error is logged and the rest continue.
+    Armed mutation-receipt mode (default OFF) fences each recovered file's
+    bytes+sidecar under one verified receipt and fails closed with {"held":
+    code} on any unsettled effect — the same protocol as sync_uploads."""
     log = logger or (lambda m: print(f"[client-media-sync] {m}"))
     base_key = (base_key or "").strip()
     if not base_key:
@@ -594,54 +838,99 @@ def sync_hosted_media(base_key, *, r2=None, out_dir=None, logger=None):
     intake_sequences = _read_intake_sequences(
         r2, intake_prefixes, keys=intake_listed)
 
+    try:
+        cfg, authority = _armed_mutation_setup(base_key, lib_dir, log)
+    except _mutation.MutationHold as hold:
+        log(f"{base_key}: hosted-media recovery HELD: {hold}")
+        return {"recovered": 0, "skipped": 0, "held": str(hold)}
+
     recovered = 0
     skipped = 0
-    for key in keys:
-        if not _is_media_key(key):
-            continue
-        # echo/<base>/<sha1-16>/<filename> — need the key id segment + filename.
-        # That segment is part of the object's LOCATION. It is NOT source
-        # identity and is never recorded as one: the only source identity here
-        # is the md5 fingerprint of the downloaded bytes, computed below.
-        parts = key.split("/")
-        if len(parts) < 4:
-            continue
-        key_id = parts[2]
-        filename = parts[-1]
-        local_name = f"{key_id}_{filename}"
-        target = os.path.join(lib_dir, local_name)
-        if os.path.exists(target):
-            _merge_intake_metadata(
-                lib_dir, local_name,
-                _intake_sequence_for(intake_sequences, filename), log)
-            skipped += 1
-            continue
-        try:
-            data = r2.get_bytes(key)
-        except Exception as exc:  # noqa: BLE001
-            log(f"{base_key}: hosted-media download failed for one object: "
-                f"{type(exc).__name__}")
-            continue
-        if not data:
-            continue
-        try:
-            with open(target, "wb") as fh:
-                fh.write(data)
-        except OSError as exc:
-            log(f"{base_key}: hosted-media write failed for one object: {type(exc).__name__}")
-            continue
-        # The photo is ALREADY hosted at this exact key: the sidecar's public_url is
-        # known outright (no re-hosting, no fresh upload). No client note/caption is
-        # recoverable from the hosted object alone, so none is fabricated here.
-        # Source identity comes from the BYTES alone (fail closed: empty bytes were
-        # skipped above, so a fingerprint here always attests real source bytes).
-        aliases = visual_fingerprint.source_aliases(data)
-        _write_sidecar(lib_dir, local_name, key, "", log,
-                       source_fingerprint=aliases[0],
-                       source_fingerprint_aliases=aliases[1:],
-                       intake_sequence=_intake_sequence_for(
-                           intake_sequences, filename))
-        recovered += 1
+    held = None
+    try:
+        for key in keys:
+            if not _is_media_key(key):
+                continue
+            # echo/<base>/<sha1-16>/<filename> — need the key id segment + filename.
+            # That segment is part of the object's LOCATION. It is NOT source
+            # identity and is never recorded as one: the only source identity here
+            # is the md5 fingerprint of the downloaded bytes, computed below.
+            parts = key.split("/")
+            if len(parts) < 4:
+                continue
+            key_id = parts[2]
+            filename = parts[-1]
+            local_name = f"{key_id}_{filename}"
+            target = os.path.join(lib_dir, local_name)
+            if os.path.exists(target):
+                if cfg is not None:
+                    data = _require_source_bytes(r2, key, base_key, log)
+                    existing_sha, ok = _existing_target_identity(target)
+                    if not ok:
+                        raise _mutation.MutationHold("local_destination_unreadable")
+                    if existing_sha != _sha256_bytes(data):
+                        raise _mutation.MutationHold("local_destination_conflict")
+                    _guarded_intake_metadata(
+                        cfg, authority, local_name, key, data,
+                        _intake_sequence_for(intake_sequences, filename))
+                else:
+                    _merge_intake_metadata(
+                        lib_dir, local_name,
+                        _intake_sequence_for(intake_sequences, filename), log)
+                skipped += 1
+                continue
+            if cfg is not None:
+                data = _require_source_bytes(r2, key, base_key, log)
+                aliases = visual_fingerprint.source_aliases(data)
+                wrote = _guarded_media_write(
+                    cfg, authority, "client_media_recovery", local_name, key,
+                    data,
+                    {"caption": "",
+                     "source_fingerprint": aliases[0],
+                     "source_fingerprint_aliases": aliases[1:],
+                     "intake_sequence": _intake_sequence_for(
+                         intake_sequences, filename)},
+                    log)
+                if wrote:
+                    recovered += 1
+                else:
+                    skipped += 1
+                continue
+            try:
+                data = r2.get_bytes(key)
+            except Exception as exc:  # noqa: BLE001
+                log(f"{base_key}: hosted-media download failed for one object: "
+                    f"{type(exc).__name__}")
+                continue
+            if not data:
+                continue
+            try:
+                with open(target, "wb") as fh:
+                    fh.write(data)
+            except OSError as exc:
+                log(f"{base_key}: hosted-media write failed for one object: {type(exc).__name__}")
+                continue
+            # The photo is ALREADY hosted at this exact key: the sidecar's public_url is
+            # known outright (no re-hosting, no fresh upload). No client note/caption is
+            # recoverable from the hosted object alone, so none is fabricated here.
+            # Source identity comes from the BYTES alone (fail closed: empty bytes were
+            # skipped above, so a fingerprint here always attests real source bytes).
+            aliases = visual_fingerprint.source_aliases(data)
+            _write_sidecar(lib_dir, local_name, key, "", log,
+                           source_fingerprint=aliases[0],
+                           source_fingerprint_aliases=aliases[1:],
+                           intake_sequence=_intake_sequence_for(
+                               intake_sequences, filename))
+            recovered += 1
+    except _mutation.MutationHold as hold:
+        held = str(hold)
+        log(f"{base_key}: hosted-media recovery HELD on one object: {hold}")
+    finally:
+        if authority is not None:
+            authority.close()
+
+    if held is not None:
+        return {"recovered": recovered, "skipped": skipped, "held": held}
 
     if recovered or skipped:
         log(f"{base_key}: recovered {recovered} hosted photo(s) missing locally, "
@@ -810,12 +1099,22 @@ def _merge_intake_metadata(lib_dir, media_name, intake_sequence, log):
 
 def _write_sidecar(lib_dir, media_name, r2_key, caption, log, client_context="",
                    consent=False, source_fingerprint="",
-                   source_fingerprint_aliases=None, intake_sequence=None):
+                   source_fingerprint_aliases=None, intake_sequence=None,
+                   strict=False):
     """Write the .json sidecar library._load_sidecar reads: public_url makes the
     downloaded photo a portal-ready real-photo card; the gym's own one line about the
     photo goes in the "note" key (the EXACT key library._load_sidecar reads into
     client_note, never fabricated). Idempotent: an existing sidecar (a reviewed note)
     is never clobbered.
+
+    strict (armed mutation-receipt mode only): fail closed instead of tolerating
+    a hostile or broken local state — a symlinked sidecar, an unreadable or
+    non-dict existing sidecar, or an existing sidecar whose provenance binds a
+    DIFFERENT source fingerprint all raise MutationHold; the write is atomic
+    (symlink-safe, fsynced) and read back and verified. Returns the settled
+    payload dict (legacy callers ignore it). Checkbox consent holds in strict
+    mode until the DAM audit can share the inventory transaction; no consent
+    marker or media write may certify that unbound audit.
 
     §8: client_context (the gym's free-text about this photo) is stored as RAW MATERIAL
     under "client_context" (never verbatim output — the caption gate + policy screen govern
@@ -824,15 +1123,24 @@ def _write_sidecar(lib_dir, media_name, r2_key, caption, log, client_context="",
     consent guard. Consent is NEVER inferred from the presence of context text."""
     stem = os.path.splitext(media_name)[0]
     side_path = os.path.join(lib_dir, stem + ".json")
+    if strict and consent:
+        raise _mutation.MutationHold("local_consent_transaction_binding_unavailable")
+    if strict and os.path.islink(side_path):
+        raise _mutation.MutationHold("local_sidecar_path_invalid")
     # MERGE, don't skip (audit B4): an existing sidecar's reviewed note/context is never
     # clobbered, but a pre-existing sidecar must not swallow this upload's consent + context.
     existing = {}
     if os.path.exists(side_path):
         try:
             with open(side_path, encoding="utf-8") as fh:
-                existing = json.load(fh) or {}
+                loaded = json.load(fh)
+                existing = loaded if strict else (loaded or {})
         except (OSError, ValueError):
+            if strict:
+                raise _mutation.MutationHold("local_sidecar_unreadable") from None
             existing = {}
+        if strict and not isinstance(existing, dict):
+            raise _mutation.MutationHold("local_sidecar_provenance_malformed")
     payload = dict(existing)
     payload.setdefault("public_url", _public_url_for_key(r2_key))
     # library._load_sidecar reads data["note"] into Creative.client_note, so the gym's
@@ -857,6 +1165,9 @@ def _write_sidecar(lib_dir, media_name, r2_key, caption, log, client_context="",
     # slot. Unknown source remains absent rather than being inferred from a key.
     fp = visual_fingerprint.normalize(source_fingerprint)
     existing_fp = visual_fingerprint.normalize(payload.get("source_fingerprint"))
+    if strict and fp and existing_fp and existing_fp != fp:
+        # Provenance binds this sidecar to a DIFFERENT source: never rebind it.
+        raise _mutation.MutationHold("local_sidecar_provenance_conflict")
     if fp and not existing_fp:
         payload["source_fingerprint"] = fp
     aliases = []
@@ -876,11 +1187,22 @@ def _write_sidecar(lib_dir, media_name, r2_key, caption, log, client_context="",
     if record_consent:
         payload["consent_recorded"] = True
     if payload != existing:
-        try:
-            with open(side_path, "w", encoding="utf-8") as fh:
-                json.dump(payload, fh)
-        except OSError as exc:
-            log(f"sidecar write failed: {type(exc).__name__}")
+        if strict:
+            _mutation.atomic_write_json(side_path, payload)
+            try:
+                with open(side_path, encoding="utf-8") as fh:
+                    settled = json.load(fh)
+            except (OSError, ValueError):
+                raise _mutation.MutationHold(
+                    "local_sidecar_readback_failed") from None
+            if settled != payload:
+                raise _mutation.MutationHold("local_sidecar_readback_mismatch")
+        else:
+            try:
+                with open(side_path, "w", encoding="utf-8") as fh:
+                    json.dump(payload, fh)
+            except OSError as exc:
+                log(f"sidecar write failed: {type(exc).__name__}")
     if record_consent:
         try:
             from . import dam
@@ -888,6 +1210,7 @@ def _write_sidecar(lib_dir, media_name, r2_key, caption, log, client_context="",
                             granted_by="client_upload_checkbox")
         except Exception as exc:  # noqa: BLE001 - consent audit must never fail the sync
             log(f"consent record failed: {type(exc).__name__}")
+    return payload
 
 
 # ---- scan + generate: sync media, then draft the month for gyms newly ready --------
