@@ -41,6 +41,15 @@ def test_exact_runtime_ca_names_allowed():
     assert not lane.unknown_environment_names({**ATTESTER, **runtime}, 'attester')
 
 
+def test_exact_owner_worker_configuration_allowed_only_for_owner():
+    settings = {'AGENT_FORWARD_MEDIA_OWNER_WORKER': 'true',
+                'AGENT_FORWARD_MEDIA_OWNER_TENANTS': 'pierce',
+                'AGENT_FORWARD_MEDIA_OWNER_BATCH_SIZE': '25',
+                'AGENT_FORWARD_MEDIA_OWNER_PHOTO_CLEARANCE': 'false'}
+    owner.check_environment({**OWNER, **settings})
+    assert lane.unknown_environment_names({**ATTESTER, **settings}, 'attester') == sorted(settings)
+
+
 @pytest.mark.parametrize('name', ['GOOGLE_DRIVE_SA_JSON', 'PGPASSWORD', 'UNKNOWN',
                                 'FORWARD_MEDIA_OWNER_DSN'])
 def test_direct_attester_connection_checks_before_driver(monkeypatch, name):

@@ -252,6 +252,10 @@ def _real_row(account_key, draft, caption=None):
     logical = _logical_post_id(draft)
     if logical:
         row["logical_post_id"] = logical
+    # Private writer side channel, never a calendar column or owner authority.
+    # insert_rows strips it and binds it only to the exact returned inserted UUID.
+    from . import forward_media_observation_bridge
+    row.update(forward_media_observation_bridge.draft_metadata(draft))
     return row
 
 
@@ -436,6 +440,13 @@ def mirror_to_supabase(account_key, store, sb_store):
         # PRESERVE APPROVALS: never overwrite a slot a human already approved/published.
         from .portal_calendar_store import preserve_and_prune
         real_rows, _locked = preserve_and_prune(sb_store, account_key, months, real_rows)
+        # insert_rows validates observation packets, but this lane deletes first.
+        # A cached rendition has only an untrusted placeholder packet; reject it
+        # (and schema refusal) while the existing month is still intact. The
+        # writer retains its final-payload and exact returned-UUID checks.
+        from . import forward_media_observation_bridge
+        forward_media_observation_bridge.preflight_replacement(
+            sb_store, account_key, real_rows)
         delete_month = getattr(sb_store, "delete_month", None)
         for month in months:
             if delete_month is not None:

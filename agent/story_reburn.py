@@ -19,7 +19,7 @@ import shutil
 import tempfile
 import hashlib
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from urllib.parse import urlsplit
 
 from . import config
@@ -119,6 +119,7 @@ class ReburnEvidence:
     evidence_ref: str = ""
     observed_by: str = "story_reburn"
     rendered_by: str = "story_reburn"
+    materialization_observation: dict = field(default_factory=dict)
 
     def as_dict(self):
         return vars(self).copy()
@@ -127,8 +128,9 @@ class ReburnEvidence:
 def _reburn(source_media_url, caption, gym_name, tenant, *, logger=None, evidence=False):
     """Burn `caption` onto fresh media from source_media_url and host it. Returns the new
     hosted url, or None on any failure. Evidence mode returns a URL and byte
-    observations only after reading both stored objects and checking the
-    rendered file against the hosted output. Never raises."""
+    observations only after verifying the render input against the fetched
+    source bytes and the rendered file against the hosted output readback.
+    Never raises."""
     log = logger or (lambda m: print(f"[story-reburn] {m}"))
     if not (source_media_url and caption):
         return None
@@ -142,6 +144,17 @@ def _reburn(source_media_url, caption, gym_name, tenant, *, logger=None, evidenc
     try:
         from . import story_image, media_host
         is_video = src.lower().endswith(_VIDEO_EXTS)
+        fetched_source = None
+        if evidence:
+            # _download already read the exact source object once. Hold those
+            # bytes locally rather than re-fetching the same object after the
+            # render; the post-render comparison below still proves the burn
+            # ran on exactly the fetched source bytes.
+            from . import visual_writer_prepare
+            with open(src, "rb") as fh:
+                fetched_source = fh.read()
+            if not fetched_source or len(fetched_source) > visual_writer_prepare.MAX_VISUAL_BYTES:
+                return None
         # A shared /tmp/reels cache survives edits and renderer fixes. Re-render
         # each requested Story in its own scratch library so old pixels cannot be
         # returned for the current caption and silently kept on the calendar.
@@ -155,16 +168,14 @@ def _reburn(source_media_url, caption, gym_name, tenant, *, logger=None, evidenc
         if not asset:
             return None
         if evidence:
-            from . import visual_writer_prepare
             if os.path.getsize(asset) > visual_writer_prepare.MAX_VISUAL_BYTES:
                 return None
             with open(src, "rb") as fh:
                 source_bytes = fh.read()
             with open(asset, "rb") as fh:
                 rendered_bytes = fh.read()
-            if (not source_bytes or not rendered_bytes or
-                    visual_writer_prepare._bytes_for_url(source_media_url) != source_bytes):
-                log("story re-burn: source object readback did not match render input")
+            if not source_bytes or not rendered_bytes or source_bytes != fetched_source:
+                log("story re-burn: render input did not match the fetched source object")
                 return None
         url = media_host.host_media(asset, tenant)
         if not url or not evidence:
@@ -180,6 +191,9 @@ def _reburn(source_media_url, caption, gym_name, tenant, *, logger=None, evidenc
             source_byte_length=len(source_bytes),
             delivered_byte_length=len(delivered_bytes),
             evidence_ref="story_reburn:" + str(uuid.uuid4()),
+            materialization_observation=_reburn_observation(
+                source_bytes, rendered_bytes, delivered_bytes, source_media_url, url,
+                caption, gym_name, tenant, is_video),
         )
     except Exception as exc:  # noqa: BLE001 - a re-burn must never fail the saved edit
         log(f"story re-burn failed ({type(exc).__name__})")
@@ -191,6 +205,29 @@ def _reburn(source_media_url, caption, gym_name, tenant, *, logger=None, evidenc
             os.remove(src)
         except OSError:
             pass
+
+
+def _reburn_observation(source_bytes, rendered_bytes, delivered_bytes, source_url,
+                        delivered_url, caption, gym_name, tenant, is_video):
+    from . import gym_media_index, story_image
+    # The exact text inputs matter; the short filename caption key is not a
+    # recipe identity. Fonts/toolchain and original authority are still unknown.
+    recipe = {"name": "story_video" if is_video else "story_image",
+              "version": 1, "caption_input": caption, "gym_name_input": gym_name,
+              "onscreen_caption": story_image.story_caption(caption),
+              "width": story_image.W, "height": story_image.H,
+              "runtime_verified": False}
+    if is_video:
+        recipe["caption_filter"] = story_image._story_video_drawtext(caption, gym_name)
+    # Both objects were already read and verified this call (source at download
+    # and pre/post-render, delivered at the hosted readback). Serve those
+    # verified bytes to the observation so it still performs its exact-byte
+    # comparisons without re-fetching either remote object.
+    verified = {source_url: source_bytes, delivered_url: delivered_bytes}
+    return gym_media_index.materialization_observation(
+        source_bytes, rendered_bytes, delivered_url, tenant=tenant,
+        source_url=source_url, recipe=recipe,
+        bytes_fn=lambda url: verified.get(url))
 
 
 def reburn(source_media_url, caption, gym_name, tenant, *, logger=None):

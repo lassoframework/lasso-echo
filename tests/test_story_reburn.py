@@ -349,3 +349,85 @@ def test_stamp_source_media_never_touches_a_feed_draft(monkeypatch):
     feed = _pending_feed_draft()
     story_reburn.stamp_source_media(feed)
     assert not getattr(feed, "source_media_url", "")
+
+
+def test_reburn_evidence_has_exact_recipe_inputs_and_no_original_certificate(monkeypatch, tmp_path):
+    from agent import story_image, media_host, visual_writer_prepare
+    source_url = "https://media.example/echo/gritx/raw/source.jpg"
+    output_url = "https://media.example/echo/gritx/out/story.jpg"
+    src = tmp_path / "source.jpg"
+    src.write_bytes(b"source")
+    render_libraries = []
+    monkeypatch.setattr(story_reburn.config, "hosting_enabled", lambda: True)
+    monkeypatch.setattr(story_reburn, "_download", lambda *_: str(src))
+    monkeypatch.setattr(visual_writer_prepare, "_bytes_for_url",
+                        lambda u: {source_url: b"source", output_url: b"output"}.get(u))
+    def render(path, caption, gym_name, lib, **kwargs):
+        render_libraries.append(lib)
+        out = os.path.join(lib, "story.jpg")
+        with open(out, "wb") as fh:
+            fh.write(b"output")
+        return out
+    monkeypatch.setattr(story_image, "get_or_make_story_image", render)
+    monkeypatch.setattr(media_host, "host_media", lambda *_: output_url)
+    url, evidence = story_reburn.reburn_with_evidence(
+        source_url, "New caption", "GritX", "gritx")
+    assert url == output_url
+    record = evidence.as_dict()["materialization_observation"]
+    assert record["recipe"]["caption_input"] == "New caption"
+    assert record["recipe"]["gym_name_input"] == "GritX"
+    assert record["provenance_status"] == "unverified"
+    assert "authoritative_original_registry_receipt_required" in record["hold_reasons"]
+    assert not os.path.exists(render_libraries[0])
+    assert not src.exists()
+
+
+def test_reburn_evidence_never_refetches_the_source_object(monkeypatch, tmp_path):
+    # _download already read the exact source object once; the observation phase
+    # must reuse those bytes and only read back the freshly hosted output.
+    from agent import story_image, media_host, visual_writer_prepare
+    source_url = "https://media.example/echo/gritx/raw/source.jpg"
+    output_url = "https://media.example/echo/gritx/out/story.jpg"
+    src = tmp_path / "source.jpg"
+    src.write_bytes(b"source")
+    out = tmp_path / "burned.jpg"
+    out.write_bytes(b"output")
+    monkeypatch.setattr(story_reburn.config, "hosting_enabled", lambda: True)
+    monkeypatch.setattr(story_reburn, "_download", lambda *_: str(src))
+    monkeypatch.setattr(story_image, "get_or_make_story_image", lambda *a, **k: str(out))
+    monkeypatch.setattr(media_host, "host_media", lambda *_: output_url)
+    remote_reads = []
+    monkeypatch.setattr(visual_writer_prepare, "_bytes_for_url",
+                        lambda u: remote_reads.append(u) or
+                        {source_url: b"source", output_url: b"output"}.get(u))
+    url, evidence = story_reburn.reburn_with_evidence(
+        source_url, "cap", "GritX", "gritx")
+    assert url == output_url
+    assert remote_reads == [output_url]      # one readback: the hosted output only
+    assert evidence.source_byte_length == len(b"source")
+
+
+def test_reburn_evidence_fails_closed_when_render_input_drifts(monkeypatch, tmp_path):
+    # A renderer that rewrites the source temp file must not produce evidence
+    # claiming the burn ran on the fetched source object bytes.
+    from agent import story_image, media_host, visual_writer_prepare
+    source_url = "https://media.example/echo/gritx/raw/source.jpg"
+    output_url = "https://media.example/echo/gritx/out/story.jpg"
+    src = tmp_path / "source.jpg"
+    src.write_bytes(b"source")
+    monkeypatch.setattr(story_reburn.config, "hosting_enabled", lambda: True)
+    monkeypatch.setattr(story_reburn, "_download", lambda *_: str(src))
+    monkeypatch.setattr(media_host, "host_media", lambda *_: output_url)
+    monkeypatch.setattr(visual_writer_prepare, "_bytes_for_url", lambda u: b"output")
+
+    def tampering_render(path, caption, gym_name, lib, **kwargs):
+        with open(path, "wb") as fh:
+            fh.write(b"swapped")
+        out = os.path.join(lib, "story.jpg")
+        with open(out, "wb") as fh:
+            fh.write(b"output")
+        return out
+
+    monkeypatch.setattr(story_image, "get_or_make_story_image", tampering_render)
+    assert story_reburn.reburn_with_evidence(
+        source_url, "cap", "GritX", "gritx", logger=lambda m: None) is None

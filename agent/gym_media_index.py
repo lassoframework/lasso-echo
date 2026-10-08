@@ -28,6 +28,7 @@ gated rows and, on demand, produces a playable/serveable rendition.
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import subprocess
 import tempfile
@@ -454,7 +455,8 @@ def rendition_key(gym_id, content_hash, ext):
 
 def ensure_rendition(asset, src_path, *, store=None, host_fn=None, exists_fn=None,
                      public_url_fn=None, heic_fn=None, hevc_fn=None, probe_fn=None,
-                     probe_info=None, budget=None, timeout=RENDITION_TIMEOUT_SEC):
+                     probe_info=None, budget=None, timeout=RENDITION_TIMEOUT_SEC,
+                     observation_sink=None, bytes_fn=None):
     """Produce (or reuse) a playable/serveable rendition for a HEIC photo or an
     HEVC / odd-container video and return its public url. Cache is keyed by
     content_hash under gym_id/... in Echo's bucket, so a SECOND use is a pure cache
@@ -489,6 +491,9 @@ def ensure_rendition(asset, src_path, *, store=None, host_fn=None, exists_fn=Non
 
     # Already cached? Reuse without any decode/transcode.
     if asset.get("rendition_url"):
+        if observation_sink is not None:
+            observation_sink.append({"provenance_status": "unverified",
+                                     "hold_reasons": ["cached_rendition_manifest_unavailable"]})
         return asset["rendition_url"], False
 
     info = probe_info
@@ -505,6 +510,9 @@ def ensure_rendition(asset, src_path, *, store=None, host_fn=None, exists_fn=Non
         if exists_fn(key):
             url = public_url_fn(key)
             _persist_rendition(store, asset, key, url)
+            if observation_sink is not None:
+                observation_sink.append({"provenance_status": "unverified",
+                                         "hold_reasons": ["cached_rendition_manifest_unavailable"]})
             return url, False
     except Exception:  # noqa: BLE001 - a cache probe failure just re-converts
         pass
@@ -527,6 +535,25 @@ def ensure_rendition(asset, src_path, *, store=None, host_fn=None, exists_fn=Non
         if not url:
             print(f"[gym-media] rendition upload returned no url for {title!r}")
             return None, False
+        if observation_sink is not None:
+            try:
+                recipe = {"name": "heic_to_jpeg" if needs_heic else "hevc_to_h264",
+                          "version": 1, "runtime_verified": False}
+                if needs_heic:
+                    recipe.update({"mode": "RGB", "format": "JPEG", "quality": 90})
+                else:
+                    recipe.update({"codec": "libx264", "preset": "veryfast",
+                                   "crf": 23, "pix_fmt": "yuv420p",
+                                   "audio_codec": "aac", "faststart": True,
+                                   "max_long_edge": RENDITION_MAX_LONG_EDGE})
+                observation_sink.append(materialization_observation(
+                    bounded_materialization_bytes(src_path),
+                    bounded_materialization_bytes(out_path), url, tenant=gym_id,
+                    source_asset_id=asset.get("id"), recipe=recipe, bytes_fn=bytes_fn))
+            except Exception as exc:
+                observation_sink.append({"provenance_status": "unverified",
+                                         "hold_reasons": ["rendition_readback_unverified"],
+                                         "error_type": type(exc).__name__})
         # Persist the REAL object key the host wrote (echo/<tenant>/<sha1>/<name>),
         # not the content-hash lookup key (audit R-D1: rendition_key held a key that
         # did not exist in R2).
@@ -540,6 +567,64 @@ def ensure_rendition(asset, src_path, *, store=None, host_fn=None, exists_fn=Non
             os.rmdir(tmp_dir)
         except OSError:
             pass
+
+
+def materialization_observation(source_bytes, rendered_bytes, delivered_url, *,
+                                tenant, source_asset_id="", source_url="",
+                                recipe=None, bytes_fn=None):
+    """Byte observations only, NEVER an original-registry or manifest certificate.
+
+    A Drive id supplied by a draft is not authority. The trusted ingest/registry
+    owner must independently bind these hashes to that id and tenant. A recipe
+    describes observed inputs; unknown runtime/font versions remain a hold.
+    """
+    from . import visual_writer_prepare
+    if not source_bytes or not rendered_bytes:
+        raise ValueError("materialization bytes missing")
+    if max(len(source_bytes), len(rendered_bytes)) > visual_writer_prepare.MAX_VISUAL_BYTES:
+        raise ValueError("materialization bytes exceed observation limit")
+    reader = bytes_fn or visual_writer_prepare._bytes_for_url
+    delivered = visual_writer_prepare._exact_bytes(delivered_url, reader, "delivered")
+    if delivered != rendered_bytes:
+        raise ValueError("hosted readback differs from rendered bytes")
+    if source_url:
+        observed_source = visual_writer_prepare._exact_bytes(source_url, reader, "source")
+        if observed_source != source_bytes:
+            raise ValueError("hosted source differs from render input")
+    record = {
+        "schema_version": 1, "tenant": str(tenant or ""),
+        "source_asset_id": str(source_asset_id or ""),
+        "source_exact_url": str(source_url or ""),
+        "delivered_exact_url": delivered_url,
+        "source_sha256": hashlib.sha256(source_bytes).hexdigest(),
+        "delivered_sha256": hashlib.sha256(delivered).hexdigest(),
+        "source_byte_length": len(source_bytes),
+        "delivered_byte_length": len(delivered),
+        "recipe": recipe or {},
+        "provenance_status": "unverified",
+        "hold_reasons": ["authoritative_original_registry_receipt_required",
+                         "authoritative_render_manifest_receipt_required"],
+    }
+    if not source_url:
+        record["hold_reasons"].append("hosted_original_url_unobserved")
+    if not recipe or not recipe.get("runtime_verified"):
+        record["hold_reasons"].append("renderer_runtime_or_recipe_unverified")
+    canonical = json.dumps(record, sort_keys=True, separators=(",", ":"),
+                           ensure_ascii=False).encode("utf-8")
+    # This is deliberately not content_calendar.render_manifest_digest: the
+    # latter can only identify an authoritative immutable DB manifest.
+    record["observation_digest"] = hashlib.sha256(canonical).hexdigest()
+    return record
+
+
+def bounded_materialization_bytes(path):
+    """Read a local object within the same limit as hosted readback."""
+    from . import visual_writer_prepare
+    with open(path, "rb") as fh:
+        data = fh.read(visual_writer_prepare.MAX_VISUAL_BYTES + 1)
+    if not data or len(data) > visual_writer_prepare.MAX_VISUAL_BYTES:
+        raise ValueError("materialization object empty or too large")
+    return data
 
 
 def _persist_rendition(store, asset, key, url):

@@ -1,0 +1,212 @@
+{
+  "project_id": "ooqcvmcjspeltuuhcvlh",
+  "captured_at_utc": "2026-10-08",
+  "scope": "read-only public function catalog candidates mentioning content_calendar, media_asset or media_source; name/hash/pattern flags only",
+  "query": "select proname, md5(prosrc) as body_md5, (position('for update' in lower(prosrc))>0) as has_for_update, (position('pg_advisory_xact_lock' in lower(prosrc))>0) as has_advisory_lock from pg_proc p join pg_namespace n on n.oid=p.pronamespace where n.nspname='public' and (p.prosrc ilike '%content_calendar%' or p.prosrc ilike '%media_asset%' or p.prosrc ilike '%media_source%') order by proname;",
+  "rows": [
+    {
+      "proname": "approve_calendar_row_if_media_ready",
+      "body_md5": "1670c2099e1fa3cea0df22c786980790",
+      "has_for_update": false,
+      "has_advisory_lock": false
+    },
+    {
+      "proname": "calendar_approval_digest",
+      "body_md5": "e980d80fc1eb56e2bffabe6711d92d85",
+      "has_for_update": false,
+      "has_advisory_lock": false
+    },
+    {
+      "proname": "calendar_patch_caption_autonomous_clean",
+      "body_md5": "52fac209620734e6ba3a3c4a53c0f6a7",
+      "has_for_update": false,
+      "has_advisory_lock": true
+    },
+    {
+      "proname": "calendar_patch_caption_manual_format",
+      "body_md5": "72534b54f79b5ae419562963dbf55ba0",
+      "has_for_update": false,
+      "has_advisory_lock": true
+    },
+    {
+      "proname": "calendar_recover_unproved_approval",
+      "body_md5": "7c509400fe0322d87f8c39b2d0254edd",
+      "has_for_update": true,
+      "has_advisory_lock": false
+    },
+    {
+      "proname": "calendar_stamp_verified_approval",
+      "body_md5": "704fb687d1126d6904dd4cfcaa6fe2ce",
+      "has_for_update": true,
+      "has_advisory_lock": false
+    },
+    {
+      "proname": "claim_calendar_gbp_publish_owned",
+      "body_md5": "5dc70ca074016626f32af9772696b241",
+      "has_for_update": true,
+      "has_advisory_lock": true
+    },
+    {
+      "proname": "claim_calendar_gbp_publish_with_mode_owned",
+      "body_md5": "528dcc3c13a98f705cf3c021d0a60dae",
+      "has_for_update": false,
+      "has_advisory_lock": false
+    },
+    {
+      "proname": "claim_calendar_publish_slot",
+      "body_md5": "166a4f2df64047a0449ec708027f861d",
+      "has_for_update": true,
+      "has_advisory_lock": true
+    },
+    {
+      "proname": "claim_calendar_publish_slot_owned",
+      "body_md5": "db59bf4d6d0be4c42e5e49ab0b5a8b4f",
+      "has_for_update": true,
+      "has_advisory_lock": true
+    },
+    {
+      "proname": "claim_calendar_publish_slot_proven_owned",
+      "body_md5": "c36ca7a901a9a84c772dad34c1c439b2",
+      "has_for_update": false,
+      "has_advisory_lock": false
+    },
+    {
+      "proname": "claim_gym_media_sync",
+      "body_md5": "f218677db408370afc141b3163767cb6",
+      "has_for_update": true,
+      "has_advisory_lock": false
+    },
+    {
+      "proname": "content_calendar_swap_variant",
+      "body_md5": "548886200ea1a64ad6147f7504ec4e00",
+      "has_for_update": true,
+      "has_advisory_lock": false
+    },
+    {
+      "proname": "create_fixer_business_ticket_with_seed",
+      "body_md5": "4c057742ba9a5cd31e793221423c2b0b",
+      "has_for_update": false,
+      "has_advisory_lock": false
+    },
+    {
+      "proname": "finish_gym_media_sync",
+      "body_md5": "7b98042e5e057b97821789b62e6d89d2",
+      "has_for_update": false,
+      "has_advisory_lock": false
+    },
+    {
+      "proname": "fixer_cas_staff_swap_pointer",
+      "body_md5": "d02bd742bbc748220d15cea152951e23",
+      "has_for_update": true,
+      "has_advisory_lock": false
+    },
+    {
+      "proname": "lasso_paired_story_ready_for_feed",
+      "body_md5": "8ce574572bc8997119e5b6da0c6f4525",
+      "has_for_update": false,
+      "has_advisory_lock": false
+    },
+    {
+      "proname": "lasso_story_current_source",
+      "body_md5": "3fb9a1b7812b8a84c8f94c9ca163282d",
+      "has_for_update": false,
+      "has_advisory_lock": false
+    },
+    {
+      "proname": "lasso_story_legacy_slot_guard",
+      "body_md5": "bbdc29e3f61b0cc24a9f30812eada136",
+      "has_for_update": false,
+      "has_advisory_lock": true
+    },
+    {
+      "proname": "lasso_story_publish_source_guard",
+      "body_md5": "8d53c6bff04f9e8b0177619e439fe14c",
+      "has_for_update": false,
+      "has_advisory_lock": false
+    },
+    {
+      "proname": "lasso_story_review_matches",
+      "body_md5": "06a80c1d2e8bb6a95c7ad36f78b212e9",
+      "has_for_update": false,
+      "has_advisory_lock": false
+    },
+    {
+      "proname": "lasso_unrelated_published_story",
+      "body_md5": "d0cb5bebcb319df9403f7529db6b2554",
+      "has_for_update": false,
+      "has_advisory_lock": false
+    },
+    {
+      "proname": "portal_action_receipt_apply",
+      "body_md5": "832506e101c49f4c39ff7b016cefa4e3",
+      "has_for_update": true,
+      "has_advisory_lock": false
+    },
+    {
+      "proname": "portal_action_receipt_begin",
+      "body_md5": "8f77330dc8cb84a2f1e60d96544c4337",
+      "has_for_update": true,
+      "has_advisory_lock": false
+    },
+    {
+      "proname": "portal_action_receipt_claim_selection",
+      "body_md5": "d7e91f2feee4ae48b307272f55279c5e",
+      "has_for_update": true,
+      "has_advisory_lock": false
+    },
+    {
+      "proname": "portal_swap_reserve",
+      "body_md5": "2c364b58ccdcfac899f2d361639f5c74",
+      "has_for_update": true,
+      "has_advisory_lock": false
+    },
+    {
+      "proname": "record_gym_media_review",
+      "body_md5": "626aedcebdd94728ead0475897246004",
+      "has_for_update": true,
+      "has_advisory_lock": false
+    },
+    {
+      "proname": "release_lasso_backlog_feed_hold",
+      "body_md5": "064c5ab91745ed8fca62eccc5d98937c",
+      "has_for_update": true,
+      "has_advisory_lock": true
+    },
+    {
+      "proname": "release_lasso_paired_story_hold",
+      "body_md5": "3e8cc9923f8ba4c715bf2d8468c97e86",
+      "has_for_update": true,
+      "has_advisory_lock": true
+    },
+    {
+      "proname": "repair_lasso_paired_story",
+      "body_md5": "016c1f1d7f72f73b510b4e48c43eea08",
+      "has_for_update": true,
+      "has_advisory_lock": true
+    },
+    {
+      "proname": "request_gym_media_sync",
+      "body_md5": "12b2084799cf8c5f9084096f62ef3f3b",
+      "has_for_update": false,
+      "has_advisory_lock": false
+    },
+    {
+      "proname": "stage_lasso_campaign_row",
+      "body_md5": "2c0dadddcffee17506675c0bdb11b59f",
+      "has_for_update": false,
+      "has_advisory_lock": false
+    },
+    {
+      "proname": "stage_lasso_paired_story",
+      "body_md5": "c151abbe81bdca29e9dee9ddf22a6089",
+      "has_for_update": true,
+      "has_advisory_lock": true
+    },
+    {
+      "proname": "stage_lasso_third_story",
+      "body_md5": "37872cec68ee59dda43344a0442855d2",
+      "has_for_update": true,
+      "has_advisory_lock": true
+    }
+  ]
+}
