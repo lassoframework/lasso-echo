@@ -101,7 +101,115 @@ def default_fetch_state(ticket, who):
         facts["calendar_this_month"] = by or {"unavailable": "no rows"}
     except Exception as e:  # noqa: BLE001
         facts["calendar_this_month"] = {"unavailable": type(e).__name__}
+    try:
+        facts["posts_on_hold"] = posts_on_hold_fact(st, who.account_key)
+    except Exception as e:  # noqa: BLE001
+        facts["posts_on_hold"] = {"unavailable": type(e).__name__}
     return facts
+
+
+# Posts on hold (2026-10-08, Tough Temple ticket effb834f): the portal labels a post
+# "On hold" whenever its calendar row carries a media_not_ready_reason, but the FACTS
+# block only counted rows by status. "Why is my account on hold?" therefore had nothing
+# to ground on, the model correctly said NO_ANSWER, and the bridge escalated the ticket
+# as question_not_groundable with no owner. This fact mirrors the portal's own predicate
+# (lasso-ops-portal isMediaHeldPost: a nonterminal row with a nonblank reason) over the
+# rows the owner can actually see (portal_visibility.client_visible, so coach_review rows
+# stay private), from the gym's own local today through the end of next month. The window
+# end is stated explicitly so a zero is never read as "nothing held, ever".
+# Reason wording: only reasons whose cause is known get a specific sentence. Repeat-visual
+# reasons say a different visual is needed; reasons that name a review say LASSO is
+# reviewing; everything else gets a cause-neutral "not ready" so the answer never invents
+# a review that is not happening. Internal reason strings never enter the facts.
+_HOLD_TERMINAL = frozenset({"published", "denied", "killed", "failed", "deleted"})
+_HOLD_REPEAT_REASONS = frozenset({"cross_date_media_repeat_needs_new_visual",
+                                  "global_cross_date_media_repeat"})
+_HOLD_REPEAT_TEXT = ("needs a different photo or video, because the same visual can not "
+                     "run on two different days")
+_HOLD_CAPTION_CHANGED_TEXT = ("needs a new photo or video to match its updated caption")
+_HOLD_PAIRED_STORY_TEXT = ("is a Story waiting for the photo or video of the feed post it "
+                           "goes with")
+_HOLD_REVIEW_TEXT = ("held while LASSO reviews its photo or video; it will not publish "
+                     "until that review is complete")
+_HOLD_NOT_READY_TEXT = ("its photo or video is not ready to publish yet; it will not "
+                        "publish until it is")
+_HOLD_TEXT_BY_REASON = {
+    "caption_changed_needs_new_visual": _HOLD_CAPTION_CHANGED_TEXT,
+    "paired_feed_not_ready": _HOLD_PAIRED_STORY_TEXT,
+}
+_HOLD_SCOPE_TEXT = ("A hold applies to individual posts on the content calendar. Each held "
+                    "post shows On hold in the portal and does not publish while held.")
+_HOLD_WINDOW_NOTE = ("Only posts dated from 'from' through 'through' were checked; posts "
+                     "dated later are not included in this count.")
+_HOLD_MAX_DATES = 10
+
+
+def _next_month(month):
+    year, mon = int(month[:4]), int(month[5:7])
+    return f"{year + 1}-01" if mon == 12 else f"{year}-{mon + 1:02d}"
+
+
+def _month_end(month):
+    import calendar
+    year, mon = int(month[:4]), int(month[5:7])
+    return f"{month}-{calendar.monthrange(year, mon)[1]:02d}"
+
+
+def _gym_today(account_key):
+    """The gym's own local date (config.posting_timezone_for), so a post dated on the
+    gym's current day still counts after UTC midnight. Falls back to the server date."""
+    from datetime import date, datetime
+    try:
+        from zoneinfo import ZoneInfo
+        from .. import config
+        return datetime.now(ZoneInfo(config.posting_timezone_for(account_key))).date()
+    except Exception:  # noqa: BLE001
+        return date.today()
+
+
+def _hold_text(reason):
+    if reason in _HOLD_REPEAT_REASONS:
+        return _HOLD_REPEAT_TEXT
+    if reason in _HOLD_TEXT_BY_REASON:
+        return _HOLD_TEXT_BY_REASON[reason]
+    if "review" in reason.lower():
+        return _HOLD_REVIEW_TEXT
+    return _HOLD_NOT_READY_TEXT
+
+
+def posts_on_hold_fact(store, account_key, today=None):
+    """Client-safe summary of the account's client-visible held posts from the gym's
+    today through the end of next month. Raises on a failed read so the caller records
+    the seam as unavailable."""
+    from ..portal_visibility import client_visible
+    day = today or _gym_today(account_key)
+    month = day.strftime("%Y-%m")
+    next_month = _next_month(month)
+    today_iso = day.isoformat()
+    window = {"from": today_iso, "through": _month_end(next_month),
+              "note": _HOLD_WINDOW_NOTE}
+    rows = list(store.list_month(account_key, month) or [])
+    rows += list(store.list_month(account_key, next_month) or [])
+    groups = {}
+    for r in client_visible(rows):
+        if (r.get("status") or "") in _HOLD_TERMINAL:
+            continue
+        reason = (r.get("media_not_ready_reason") or "").strip()
+        when = str(r.get("post_date") or "")[:10]
+        if not reason or not when or when < today_iso:
+            continue
+        groups.setdefault(_hold_text(reason), []).append(when)
+    total = sum(len(v) for v in groups.values())
+    if not total:
+        return {"count": 0, "window": window, "scope": _HOLD_SCOPE_TEXT}
+    return {
+        "count": total,
+        "window": window,
+        "scope": _HOLD_SCOPE_TEXT,
+        "reasons": [{"reason": text, "count": len(days),
+                     "post_dates": sorted(set(days))[:_HOLD_MAX_DATES]}
+                    for text, days in sorted(groups.items(), key=lambda kv: -len(kv[1]))],
+    }
 
 
 def default_llm(system, user, *, model=None):
