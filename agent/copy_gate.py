@@ -290,11 +290,13 @@ def captions_presentation_equivalent(left, right) -> bool:
 
 
 def format_caption(text: str, *, reject_ambiguous_lists: bool = False) -> str:
-    """Keep every caption sentence on its own paragraph, with one blank line.
+    """Keep every caption sentence on its own line, with idea breaks between groups.
 
     This is a presentation rule for generated and edited calendar copy. It leaves
     the words and punctuation intact, and is idempotent so repeated staging cannot
-    add extra blank lines. Hashtag and URL lines are kept as standalone blocks.
+    add extra breaks. Captions that already show both break levels keep their idea
+    groups; other inputs retain the legacy sentence-per-paragraph layout. Hashtag
+    and URL lines are kept as standalone blocks.
     At publication, reject ambiguous inline ordinals: a quantity ending a
     sentence can look exactly like the next list marker. Explicit list items
     on separate lines remain safe. Draft callers retain their existing behavior.
@@ -309,43 +311,76 @@ def format_caption(text: str, *, reject_ambiguous_lists: bool = False) -> str:
     cleaned = "".join(chunks)
     if ";" in cleaned:
         raise ValueError("caption contains a semicolon in a protected URL")
-    blocks = []
-    for line in cleaned.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        if line.startswith("#") or line.startswith("http"):
-            blocks.append(line)
-            continue
-        start = 0
-        next_list_number = None
-        for match in _CAPTION_SENTENCE_END.finditer(line):
-            part = line[start:match.end(1)].strip()
-            last_word = part.split()[-1].lower() if part.split() else ""
-            if last_word in _CAPTION_ABBREVIATIONS:
-                continue
-            next_text = line[match.end():].lstrip()
-            if _CAPTION_LIST_NUMBER.fullmatch(last_word):
-                prefix = line[start:match.start() - len(last_word[:-1])].strip()
-                number = int(last_word[:-1])
-                if (reject_ambiguous_lists and next_list_number is not None
-                        and prefix and not prefix.endswith(":")):
-                    raise ValueError("ambiguous numbered list: put each item on its own line")
-                if number == next_list_number or not prefix or prefix.endswith(":"):
-                    next_list_number = number + 1
+    paragraphs = [p for p in re.split(r"\n\s*\n+", cleaned.strip()) if p.strip()]
+    def already_sentence_per_line(paragraph: str) -> bool:
+        lines = [line.strip() for line in paragraph.splitlines()
+                 if line.strip() and not line.strip().startswith(("#", "http"))]
+        if len(lines) < 2:
+            return False
+        for line in lines:
+            start = 0
+            for match in _CAPTION_SENTENCE_END.finditer(line):
+                part = line[start:match.end(1)].strip()
+                last_word = part.split()[-1].lower() if part.split() else ""
+                if last_word in _CAPTION_ABBREVIATIONS:
                     continue
-            if last_word.rstrip("\"'”’)]").endswith("..."):
+                next_text = line[match.end():].lstrip()
+                if (last_word in _CAPTION_CONTEXT_ABBREVIATIONS and next_text
+                        and (next_text[0].islower() or next_text[0].isdigit())):
+                    continue
+                if last_word.rstrip("\"'”’)]").endswith("..."):
+                    continue
+                return False
+        return True
+
+    has_single_break = any(already_sentence_per_line(p) for p in paragraphs)
+    has_idea_break = len(paragraphs) > 1
+    preserve_groups = has_single_break and has_idea_break
+
+    def split_group(group: str) -> list[str]:
+        blocks = []
+        for line in group.splitlines():
+            line = line.strip()
+            if not line:
                 continue
-            if (last_word in _CAPTION_CONTEXT_ABBREVIATIONS and next_text
-                    and (next_text[0].islower() or next_text[0].isdigit())):
+            if line.startswith("#") or line.startswith("http"):
+                blocks.append(line)
                 continue
-            blocks.append(part)
-            start = match.end()
+            start = 0
             next_list_number = None
-        tail = line[start:].strip()
-        if tail:
-            blocks.append(tail)
-    return "\n\n".join(blocks)
+            for match in _CAPTION_SENTENCE_END.finditer(line):
+                part = line[start:match.end(1)].strip()
+                last_word = part.split()[-1].lower() if part.split() else ""
+                if last_word in _CAPTION_ABBREVIATIONS:
+                    continue
+                next_text = line[match.end():].lstrip()
+                if _CAPTION_LIST_NUMBER.fullmatch(last_word):
+                    prefix = line[start:match.start() - len(last_word[:-1])].strip()
+                    number = int(last_word[:-1])
+                    if (reject_ambiguous_lists and next_list_number is not None
+                            and prefix and not prefix.endswith(":")):
+                        raise ValueError("ambiguous numbered list: put each item on its own line")
+                    if number == next_list_number or not prefix or prefix.endswith(":"):
+                        next_list_number = number + 1
+                        continue
+                if last_word.rstrip("\"'”’)]").endswith("..."):
+                    continue
+                if (last_word in _CAPTION_CONTEXT_ABBREVIATIONS and next_text
+                        and (next_text[0].islower() or next_text[0].isdigit())):
+                    continue
+                blocks.append(part)
+                start = match.end()
+                next_list_number = None
+            tail = line[start:].strip()
+            if tail:
+                blocks.append(tail)
+        return blocks
+
+    groups = [split_group(p) for p in paragraphs]
+    separator = "\n" if preserve_groups else "\n\n"
+    if preserve_groups:
+        return "\n\n".join(separator.join(group) for group in groups if group)
+    return separator.join(block for group in groups for block in group)
 
 HOOK_MAX_CHARS = 125
 
