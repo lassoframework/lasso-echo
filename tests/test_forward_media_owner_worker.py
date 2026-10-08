@@ -80,9 +80,18 @@ class Transport(worker.OwnerTransport):
 
 @pytest.fixture
 def lane(monkeypatch):
-    for name in list(__import__('os').environ):
-        if owner._FORBIDDEN_ENV_NAME.search(name) or name in worker._FORBIDDEN:
-            monkeypatch.delenv(name)
+    import os
+    for name in owner.forbidden_credential_names(os.environ):
+        monkeypatch.delenv(name)
+    # Pytest refreshes its marker during the call phase. Only the test process
+    # view omits it; the production lane continues to reject unknown names.
+    class ProcessEnvironment:
+        @property
+        def environ(self):
+            return {k: v for k, v in os.environ.items() if k != 'PYTEST_CURRENT_TEST'}
+        getenv = staticmethod(os.getenv)
+    monkeypatch.setattr(owner, 'os', ProcessEnvironment())
+    monkeypatch.setattr(worker, 'os', ProcessEnvironment())
     monkeypatch.setenv(worker.WORKER_ENV, 'true')
     monkeypatch.setenv(worker.TENANTS_ENV, 'gym')
     monkeypatch.setenv('FORWARD_MEDIA_OWNER_DSN', 'postgres://owner@example.invalid/x')

@@ -13,6 +13,11 @@
 -- siblings may reuse bytes; another gym or content date may never reuse them.
 -- No historical import, no bypass of legacy/global/pHash or other publish holds.
 -- Rollback before use: remove new objects. After use preserve occupancy/receipts.
+-- Authority lock waits fail closed after 5s per acquisition, including RPC
+-- callers without a connection deadline. Dedicated owner/attester connections
+-- also set lock/statement deadlines BEFORE commands: a trigger's SET is restored
+-- on return and cannot bound a later wait in the outer INSERT. Setting
+-- statement_timeout inside a function does not bound its invoking statement.
 begin;
 
 -- Standalone additive provenance fields. Existing rows stay NULL/held until
@@ -88,7 +93,8 @@ create index fixer_forward_history_fingerprint_20261006
 -- Historical authority appends serialize with attestations/claims under the
 -- existing graph lock, so a waiting claim observes committed quarantine data.
 create function public.fixer_forward_history_lock_20261006()
-returns trigger language plpgsql set search_path=pg_catalog,public as $$
+returns trigger language plpgsql set search_path=pg_catalog,public
+set lock_timeout='5s' as $$
 begin
   if current_setting('transaction_isolation')<>'read committed' then
     raise exception 'forward media authority requires read committed isolation' using errcode='25000';
@@ -359,7 +365,8 @@ create function public.fixer_attest_forward_media_20261006(
   p_calendar_row_id uuid,p_expected_revision text,p_evidence_id uuid,
   p_source_fingerprint text,p_source_length bigint,p_image_fingerprint text,p_image_length bigint,
   p_thumbnail_fingerprint text,p_thumbnail_length bigint,p_operation text,p_evidence_ref text
-) returns uuid language plpgsql security definer set search_path=pg_catalog,public as $$
+) returns uuid language plpgsql security definer set search_path=pg_catalog,public
+set lock_timeout='5s' as $$
 declare
   snapshot jsonb; provenance jsonb; tenant text; urls text[]; hashes text[]; lengths bigint[];
   ids uuid[]:=array[]::uuid[]; rid uuid; i integer; old public.fixer_forward_media_object_read_20261006%rowtype;
@@ -445,7 +452,7 @@ grant execute on function public.fixer_attest_forward_media_20261006(uuid,text,u
 create function public.fixer_claim_forward_media_20261006(
   p_calendar_row_id uuid,p_claim_token uuid,p_evidence_id uuid,p_expected_revision text
 ) returns boolean language plpgsql security definer
-set search_path=pg_catalog,public as $$
+set search_path=pg_catalog,public set lock_timeout='5s' as $$
 declare
   r public.content_calendar%rowtype;
   tenant text;
@@ -454,6 +461,7 @@ declare
   evidence uuid;
   receipt public.fixer_forward_media_claim_receipt_20261006%rowtype;
   occupied public.fixer_forward_media_use_20261006%rowtype;
+  replay boolean:=false;
 begin
   if p_calendar_row_id is null or p_claim_token is null or p_evidence_id is null
       or nullif(btrim(p_expected_revision),'') is null then
@@ -525,6 +533,25 @@ begin
   if evidence is null or hashes is null or cardinality(hashes)=0 then
     raise exception 'original source and delivered bytes must be owner attested' using errcode='23514';
   end if;
+  -- Freeze replay identity before expanding the current fleet graph. The
+  -- immutable receipt proves the exact earlier reservation; benign later
+  -- lineage must not change the byte set that this token already committed.
+  perform pg_advisory_xact_lock(hashtextextended(
+    jsonb_build_array('fixer_forward_token_20261006',p_claim_token)::text,0));
+  select * into receipt from public.fixer_forward_media_claim_receipt_20261006 where claim_token=p_claim_token;
+  replay:=found;
+  if replay then
+    if receipt.calendar_row_id is distinct from r.id
+      or receipt.tenant_id is distinct from tenant or receipt.post_date is distinct from r.post_date
+      or receipt.reservation_day is distinct from r.publish_reservation_day
+      or receipt.group_key is distinct from r.visual_group_key
+      or receipt.evidence_id is distinct from evidence
+      or not (hashes <@ receipt.fingerprints)
+      or receipt.source_url is distinct from r.source_media_url
+      or receipt.image_url is distinct from r.image_url or receipt.thumbnail_url is distinct from r.thumbnail_url then
+      raise exception 'claim token receipt differs from persisted media' using errcode='23514';
+    end if;
+  end if;
   -- A previously attested derivative cannot become a fresh original by
   -- rehosting/relabeling its bytes. Follow trusted source edges fleet-wide,
   -- including thumbnail ancestry, until the complete known closure is reached.
@@ -546,30 +573,29 @@ begin
       where c.source_fingerprint=any(hashes) and c.decision<>'cleared_unused') then
     raise exception 'original or rendition historical eligibility held' using errcode='23514';
   end if;
-  -- Deterministically sorted GLOBAL byte locks. Unique fingerprint PK is the
-  -- final authority. Token lock rejects reuse across different row IDs.
-  perform pg_advisory_xact_lock(hashtextextended(
-    jsonb_build_array('fixer_forward_token_20261006',p_claim_token)::text,0));
+  -- Deterministically sorted GLOBAL byte locks. Check current ancestry for
+  -- new history holds and conflicting use, but keep replay occupancy proof
+  -- bound to the frozen receipt rather than requiring newly known bytes to
+  -- have been reserved by a transaction that preceded their discovery.
   foreach fp in array hashes loop
     perform pg_advisory_xact_lock(hashtextextended(
       jsonb_build_array('fixer_forward_byte_20261006',fp)::text,0));
   end loop;
-  select * into receipt from public.fixer_forward_media_claim_receipt_20261006 where claim_token=p_claim_token;
-  if found then
-    if receipt.calendar_row_id is distinct from r.id
-      or receipt.tenant_id is distinct from tenant or receipt.post_date is distinct from r.post_date
-      or receipt.reservation_day is distinct from r.publish_reservation_day
-      or receipt.group_key is distinct from r.visual_group_key
-      or receipt.evidence_id is distinct from evidence or receipt.fingerprints is distinct from hashes
-      or receipt.source_url is distinct from r.source_media_url
-      or receipt.image_url is distinct from r.image_url or receipt.thumbnail_url is distinct from r.thumbnail_url then
-      raise exception 'claim token receipt differs from persisted media' using errcode='23514';
-    end if;
-    foreach fp in array hashes loop
+  if replay then
+    foreach fp in array receipt.fingerprints loop
       select * into occupied from public.fixer_forward_media_use_20261006 where fingerprint=fp;
       if not found or occupied.tenant_id is distinct from tenant
           or occupied.post_date is distinct from r.post_date or occupied.group_key is distinct from r.visual_group_key then
         raise exception 'claim receipt occupancy unavailable or inconsistent' using errcode='23514';
+      end if;
+    end loop;
+    -- A later edge with no conflicting use is harmless. Newly discovered
+    -- consumed ancestry still holds the send boundary, including exact retries.
+    foreach fp in array hashes loop
+      select * into occupied from public.fixer_forward_media_use_20261006 where fingerprint=fp;
+      if found and (occupied.tenant_id is distinct from tenant
+          or occupied.post_date is distinct from r.post_date or occupied.group_key is distinct from r.visual_group_key) then
+        raise exception 'source or rendition already consumed by another tenant/date/group' using errcode='23514';
       end if;
     end loop;
     return true;
@@ -606,7 +632,8 @@ grant execute on function public.fixer_claim_forward_media_20261006(uuid,uuid,uu
 -- never writes owner authority, never sends, and never touches approval or
 -- status. Fail closed on missing or ambiguous persisted binding.
 create function public.fixer_bind_forward_media_manifest_20261006(p_calendar_row_id uuid)
-returns boolean language plpgsql security definer set search_path=pg_catalog,public as $$
+returns boolean language plpgsql security definer set search_path=pg_catalog,public
+set lock_timeout='5s' as $$
 declare
   r public.content_calendar%rowtype; tenant text; digest text; matches integer;
   original public.fixer_forward_media_original_registry_20261006%rowtype;
