@@ -19,7 +19,7 @@ import shutil
 import tempfile
 import hashlib
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from urllib.parse import urlsplit
 
 from . import config
@@ -119,6 +119,7 @@ class ReburnEvidence:
     evidence_ref: str = ""
     observed_by: str = "story_reburn"
     rendered_by: str = "story_reburn"
+    materialization_observation: dict = field(default_factory=dict)
 
     def as_dict(self):
         return vars(self).copy()
@@ -180,6 +181,9 @@ def _reburn(source_media_url, caption, gym_name, tenant, *, logger=None, evidenc
             source_byte_length=len(source_bytes),
             delivered_byte_length=len(delivered_bytes),
             evidence_ref="story_reburn:" + str(uuid.uuid4()),
+            materialization_observation=_reburn_observation(
+                source_bytes, rendered_bytes, source_media_url, url,
+                caption, gym_name, tenant, is_video),
         )
     except Exception as exc:  # noqa: BLE001 - a re-burn must never fail the saved edit
         log(f"story re-burn failed ({type(exc).__name__})")
@@ -191,6 +195,23 @@ def _reburn(source_media_url, caption, gym_name, tenant, *, logger=None, evidenc
             os.remove(src)
         except OSError:
             pass
+
+
+def _reburn_observation(source_bytes, rendered_bytes, source_url, delivered_url,
+                        caption, gym_name, tenant, is_video):
+    from . import gym_media_index, story_image
+    # The exact text inputs matter; the short filename caption key is not a
+    # recipe identity. Fonts/toolchain and original authority are still unknown.
+    recipe = {"name": "story_video" if is_video else "story_image",
+              "version": 1, "caption_input": caption, "gym_name_input": gym_name,
+              "onscreen_caption": story_image.story_caption(caption),
+              "width": story_image.W, "height": story_image.H,
+              "runtime_verified": False}
+    if is_video:
+        recipe["caption_filter"] = story_image._story_video_drawtext(caption, gym_name)
+    return gym_media_index.materialization_observation(
+        source_bytes, rendered_bytes, delivered_url, tenant=tenant,
+        source_url=source_url, recipe=recipe)
 
 
 def reburn(source_media_url, caption, gym_name, tenant, *, logger=None):

@@ -301,6 +301,7 @@ def test_release_publishing_claim_is_token_scoped():
     call = http.calls[0]
     assert call["params"]["publish_claim_token"] == "eq.tok-1"
     assert call["json"]["publish_claim_token"] is None
+    assert call["json"]["publish_reservation_day"] is None
     # no match -> None, no exception, nothing overwritten
     s2 = GbpStore(base=_Base(_Http([_Resp([])])))
     assert s2.release_publishing_claim("r1", "tok-1", "approved") is None

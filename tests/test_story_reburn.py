@@ -349,3 +349,34 @@ def test_stamp_source_media_never_touches_a_feed_draft(monkeypatch):
     feed = _pending_feed_draft()
     story_reburn.stamp_source_media(feed)
     assert not getattr(feed, "source_media_url", "")
+
+
+def test_reburn_evidence_has_exact_recipe_inputs_and_no_original_certificate(monkeypatch, tmp_path):
+    from agent import story_image, media_host, visual_writer_prepare
+    source_url = "https://media.example/echo/gritx/raw/source.jpg"
+    output_url = "https://media.example/echo/gritx/out/story.jpg"
+    src = tmp_path / "source.jpg"
+    src.write_bytes(b"source")
+    render_libraries = []
+    monkeypatch.setattr(story_reburn.config, "hosting_enabled", lambda: True)
+    monkeypatch.setattr(story_reburn, "_download", lambda *_: str(src))
+    monkeypatch.setattr(visual_writer_prepare, "_bytes_for_url",
+                        lambda u: {source_url: b"source", output_url: b"output"}.get(u))
+    def render(path, caption, gym_name, lib, **kwargs):
+        render_libraries.append(lib)
+        out = os.path.join(lib, "story.jpg")
+        with open(out, "wb") as fh:
+            fh.write(b"output")
+        return out
+    monkeypatch.setattr(story_image, "get_or_make_story_image", render)
+    monkeypatch.setattr(media_host, "host_media", lambda *_: output_url)
+    url, evidence = story_reburn.reburn_with_evidence(
+        source_url, "New caption", "GritX", "gritx")
+    assert url == output_url
+    record = evidence.as_dict()["materialization_observation"]
+    assert record["recipe"]["caption_input"] == "New caption"
+    assert record["recipe"]["gym_name_input"] == "GritX"
+    assert record["provenance_status"] == "unverified"
+    assert "authoritative_original_registry_receipt_required" in record["hold_reasons"]
+    assert not os.path.exists(render_libraries[0])
+    assert not src.exists()

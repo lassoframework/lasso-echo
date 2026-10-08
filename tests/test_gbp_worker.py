@@ -1474,3 +1474,70 @@ def test_flag_off_claim_exception_stays_silent_and_sends_nothing(monkeypatch):
                              draft=False, alert=alerts.append)
     assert client.calls == [] and alerts == []
     assert out["published"] == 0 and out["failed"] == 0
+
+
+@pytest.mark.parametrize("photo", [False, True])
+@pytest.mark.parametrize("kind", ["verification", "duplicate"])
+def test_forward_media_boundary_holds_without_provider(monkeypatch, photo, kind):
+    from agent import forward_media_guard as guard, forward_media_publish as bridge
+    monkeypatch.setenv("AGENT_FORWARD_MEDIA_GUARD", "true")
+    monkeypatch.setattr("agent.publish_billing_gate.publishing_blocked", lambda _: False)
+    monkeypatch.setattr(gw, "_media_reuse_hold", lambda *a, **kw: "")
+    def refuse(*args):
+        exc = guard.ForwardMediaDuplicateHold if kind == "duplicate" else guard.ForwardMediaVerificationHold
+        raise exc("evidence missing")
+    monkeypatch.setattr(bridge, "authorize", refuse)
+    client = _FakeClient()
+    client.create_gmb_media = lambda *a, **kw: pytest.fail("provider upload reached")
+    fn = gw.publish_photo_drop if photo else gw.publish_gbp_row
+    out = fn(_row(), _conn(), client=client, draft=False)
+    assert out["held"] == "forward_media_" + kind
+    assert out["status"] == "approved" and client.calls == []
+
+
+@pytest.mark.parametrize("kind", ["verification", "duplicate"])
+def test_forward_media_scheduler_releases_owned_lease(monkeypatch, kind):
+    from agent import forward_media_guard as guard, forward_media_publish as bridge
+    monkeypatch.setenv("AGENT_FORWARD_MEDIA_GUARD", "true")
+    monkeypatch.setattr(gw, "_media_reuse_hold", lambda *a, **kw: "")
+    def refuse(*args):
+        exc = guard.ForwardMediaDuplicateHold if kind == "duplicate" else guard.ForwardMediaVerificationHold
+        raise exc("missing evidence")
+    monkeypatch.setattr(bridge, "authorize", refuse)
+    row = dict(_row(), id="r1", gym_id="lasso")
+    store = _TokenStore([row], {"lasso": [_c()]})
+    client = _KeyClient()
+    out = gw.publish_due_gbp(store, client, run_date="2026-09-01", draft=False)
+    assert out["held"] == 1 and client.calls == 0
+    assert store.released == [("r1", "approved")] and store.tokens == {}
+
+
+def test_forward_media_authorized_ambiguous_send_retains_lease(monkeypatch):
+    from agent import forward_media_publish as bridge
+    monkeypatch.setenv("AGENT_FORWARD_MEDIA_GUARD", "true")
+    monkeypatch.setattr(bridge, "authorize", lambda *a: True)
+    monkeypatch.setattr(gw, "_atomic_gbp_send_hold", lambda *a: None)
+    row = dict(_row(), id="r1", gym_id="lasso", account="googlebusiness",
+               gbp_location_id="locations/1")
+    store = _TokenStore([row], {"lasso": [dict(_c(), portal_gym_key="lasso")]})
+    client = _KeyClient(exc=TimeoutError("response lost"))
+    out = gw.publish_due_gbp(store, client, run_date="2026-09-01", draft=False)
+    assert out["held"] == 1 and client.calls == 1
+    assert store.tokens and store.released == []
+
+
+def test_forward_media_actual_gbp_payload_mismatch_never_claims_or_sends(monkeypatch):
+    from agent import forward_media_publish as bridge
+    monkeypatch.setenv("AGENT_FORWARD_MEDIA_GUARD", "true")
+    monkeypatch.setattr("agent.publish_billing_gate.publishing_blocked", lambda _: False)
+    monkeypatch.setattr(gw, "_media_reuse_hold", lambda *a, **kw: "")
+    original = gw.build_gbp_payload_for_row
+    def changed(row, conn):
+        payload = original(row, conn)
+        payload["mediaItems"][0]["url"] = "https://changed/media"
+        return payload
+    monkeypatch.setattr(gw, "build_gbp_payload_for_row", changed)
+    monkeypatch.setattr(bridge, "authorize", lambda *a: pytest.fail("changed payload reached authority"))
+    client = _FakeClient()
+    out = gw.publish_gbp_row(_row(), _conn(), client=client, draft=False)
+    assert client.calls == [] and out["held"] == "forward_media_verification"

@@ -1,6 +1,7 @@
 requests>=2.31
 slack_bolt>=1.18
 boto3>=1.34
+psycopg[binary]>=3.2,<4  # Isolated forward-media owner and attester roles; imported lazily
 google-genai>=2.0  # Creative Studio (Gemini image gen); imported lazily in creative_studio.py
 pypdf>=4.0  # Document intake PDF text extraction; imported lazily in doc_intake.py
 Pillow>=10.0  # Intake ingest image convert/orientation/phash; imported lazily in intake_ingest.py

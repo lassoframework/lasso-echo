@@ -90,6 +90,12 @@ class _S3Client:
     def put(self, key, local_path):
         self._s3.upload_file(local_path, self._bucket, key)
 
+    def put_if_absent(self, key, local_path):
+        """Create once; R2 supports S3 PutObject's If-None-Match condition."""
+        with open(local_path, "rb") as body:
+            self._s3.put_object(Bucket=self._bucket, Key=key, Body=body,
+                                IfNoneMatch="*")
+
     def get_bytes(self, key):
         """Fetch one object's bytes, or None if absent/unreadable."""
         try:
@@ -169,6 +175,46 @@ def host_media(local_path, tenant, client=None):
     key = _build_key(local_path, tenant)
     url = _public_url(key)
 
+    # Forward media authority requires stable hosted bytes. A HEAD check is
+    # insufficient: another writer can create the key before our upload. Keep
+    # this path fail-closed until every configured storage client supports an
+    # atomic create and exact readback. Flag-OFF behavior remains unchanged.
+    from . import forward_media_guard
+    if forward_media_guard.enabled():
+        if os.path.getsize(local_path) > forward_media_guard.MAX_BYTES:
+            _fail("media hosting failed: object exceeds forward authority byte limit")
+            return None
+        if not callable(getattr(client, "put_if_absent", None)) or not callable(
+                getattr(client, "get_bytes", None)):
+            _fail("media hosting failed: create-once storage authority unavailable")
+            return None
+        max_retries = max(1, int(config.S3_MAX_RETRIES))
+        for attempt in range(max_retries):
+            write_error = None
+            try:
+                client.put_if_absent(key, local_path)
+            except Exception as exc:
+                # A failed conditional PUT may mean an identical object was
+                # already present, or the outcome was ambiguous. Exact readback
+                # below decides whether this URL can safely be returned.
+                write_error = type(exc).__name__
+            try:
+                remote = client.get_bytes(key)
+                if (isinstance(remote, bytes) and len(remote) <= forward_media_guard.MAX_BYTES
+                        and remote == _local_bytes(local_path)):
+                    return url
+                if isinstance(remote, bytes):
+                    _fail("media hosting failed: existing object differs from local bytes")
+                    return None
+            except Exception:
+                pass
+            if attempt == max_retries - 1:
+                _fail("media hosting failed: create-once object unavailable"
+                      + (f" ({write_error})" if write_error else ""))
+                return None
+            time.sleep(min(2 ** attempt, 4))
+        return None
+
     # Dedupe: an identical file (same tenant, same bytes) is already hosted.
     try:
         if client.exists(key):
@@ -190,6 +236,11 @@ def host_media(local_path, tenant, client=None):
                 return None
             time.sleep(min(2 ** attempt, 4))  # 1s, 2s, 4s capped
     return None
+
+
+def _local_bytes(path):
+    with open(path, "rb") as fh:
+        return fh.read()
 
 
 def _key_from_public_url(url):

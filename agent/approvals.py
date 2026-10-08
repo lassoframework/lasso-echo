@@ -231,6 +231,10 @@ def handle_action(action, draft, actor_slack_id, note="",
                             detail="Revised; re-posted for approval.", redraft=new_draft)
 
     if action == "approve":
+        from . import forward_media_guard as _fmg
+        if _fmg.enabled():
+            return ActionResult(ok=False, action="approve", draft_id=draft.draft_id,
+                                detail="Held: forward_media_verification. Publish through the calendar with persisted media authority.")
         acct = account or get_account(draft.account_key)
         if acct is None:
             return ActionResult(ok=False, action="approve", draft_id=draft.draft_id,
