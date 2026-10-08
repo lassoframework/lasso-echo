@@ -901,6 +901,16 @@ def _restore_released_drive_assets(base_key, released, log):
     return None
 
 
+def _safe_log(log, message):
+    """Logging must never sink apply-outcome reporting: a log() failure after an
+    armed write attempt would otherwise drop the unknown-outcome result and the
+    outer cleanup would misread it as a prewrite planning failure."""
+    try:
+        log(message)
+    except Exception:  # noqa: BLE001 - a logger failure is never build-fatal
+        pass
+
+
 def _rollback_new_drive_drafts(drafts, log):
     """The build wrote nothing, so every Drive draft it built (and stamped at build
     time) never landed: return those assets to the pool."""
@@ -911,6 +921,45 @@ def _rollback_new_drive_drafts(drafts, log):
         if aid and day and (aid, day) not in seen:
             seen.add((aid, day))
             _rollback_drive_asset(d, day, log)
+
+
+def _forward_staged_batch_landed(result):
+    """True when the apply result carries a durable staged/preparing receipt.
+
+    A validated `staged` receipt means the batch (and its candidate rows plus
+    unverified observations) is PERSISTED: for Drive-media ownership those
+    rows landed, so this build's Drive picks must NOT be rolled back even
+    though `inserted` is 0 (nothing is activated yet). Release is allowed
+    only through the guarded terminal cancel/failure path; see
+    staged_batch_media_release_allowed."""
+    return bool(isinstance(result, dict)
+                and result.get("preparing") is True
+                and result.get("state") == "preparing"
+                and str(result.get("batch_id") or "").strip())
+
+
+def staged_batch_media_release_allowed(store, attempt):
+    """Guarded release check for Drive media owned by a staged batch.
+
+    True ONLY when the batch status RPC -- bound to the exact attempt
+    identity (batch id, tenant, request digest, member set and old-row set) --
+    proves a guarded TERMINAL cancel/failure for this exact batch. `staged`
+    and `finalized` are never release authority, any readback failure or
+    identity mismatch fails closed, and no release may happen without the
+    bound readback. The current stage/finalize contract has no cancel/failure
+    state (the isolated finalizer package owns introducing one), so this
+    returns False for every state the SQL authority can emit today."""
+    if not isinstance(attempt, dict) or not attempt.get("batch_id"):
+        return False
+    try:
+        status = store.forward_schedule_batch_status(
+            attempt["batch_id"], tenant_id=attempt.get("tenant_id"),
+            request_digest=attempt.get("request_digest"),
+            member_row_ids=attempt.get("member_row_ids"),
+            old_row_ids=attempt.get("old_row_ids"))
+    except Exception:
+        return False
+    return status.get("state") in ("cancelled", "failed")
 
 
 def _fill_uncovered_days(account, base_key, voice, library_path, banned_words, log, *,
@@ -1609,20 +1658,42 @@ def build_client_month(account, base_key, start_date, days=30, *, voice,
     finally:
         _res = _applied["result"] or {}
         if _applied["result"] is None:
-            # _apply catches remote write failures; an exception escaping the
-            # build before a result is returned is a prewrite planning failure.
-            _release_unlanded_reservations(drafts)
-            _rollback_new_drive_drafts(drafts, log)
-            # apply_state records the result immediately after _apply returns,
-            # before any post-write reporting can raise, so result-is-None means
-            # NO calendar write happened: the OLD wipeable rows survive, and
-            # their released Drive assets must be stamped again (an
-            # InvalidLogicalPostIdentity prewrite abort previously stranded them).
-            _restore_released_drive_assets(base_key, released_drive, log)
-        wrote = bool(_res.get("inserted"))
+            if _applied.get("stage_rpc_attempted"):
+                # An armed stage RPC was issued but its outcome never reached
+                # this process (e.g. a lost HTTP response followed by any
+                # post-attempt failure, such as the logger raising). The batch
+                # may be durable and own this build's Drive media: preserve the
+                # assets. Release is authorized ONLY by the guarded terminal
+                # readback bound to the exact attempt identity -- never by
+                # mutable calendar rows, never on an unknown outcome.
+                attempt = getattr(store, "last_forward_stage_attempt", None)
+                if staged_batch_media_release_allowed(store, attempt):
+                    _release_unlanded_reservations(drafts)
+                    _rollback_new_drive_drafts(drafts, log)
+                    _restore_released_drive_assets(base_key, released_drive, log)
+                else:
+                    _safe_log(log, f"{base_key}: stage RPC outcome unknown; "
+                                   "preserving Drive assets owned by the "
+                                   "possible staged batch (no release without "
+                                   "a bound terminal readback)")
+            else:
+                # _apply catches remote write failures; an exception escaping the
+                # build before a result is returned is a prewrite planning failure.
+                _release_unlanded_reservations(drafts)
+                _rollback_new_drive_drafts(drafts, log)
+                # apply_state records the result immediately after _apply returns,
+                # before any post-write reporting can raise, so result-is-None means
+                # NO calendar write happened: the OLD wipeable rows survive, and
+                # their released Drive assets must be stamped again (an
+                # InvalidLogicalPostIdentity prewrite abort previously stranded them).
+                _restore_released_drive_assets(base_key, released_drive, log)
+        wrote = bool(_res.get("inserted")) or _forward_staged_batch_landed(_res)
         if not wrote and _applied["result"] is not None and not _res.get("insert_outcome_unknown"):
             # Nothing landed (a no-op, a gate refusal, or a definite pre-insert
-            # failure): this build's own Drive picks never became rows.
+            # failure): this build's own Drive picks never became rows. A durable
+            # staged/preparing batch receipt COUNTS as landed (its Drive media is
+            # owned by the persisted batch until a guarded terminal cancel/failure),
+            # and an unknown outcome never authorizes a rollback.
             _rollback_new_drive_drafts(drafts, log)
             if (_res.get("rollback_restored")
                     or not _res.get("deleted_total", _res.get("deleted"))):
@@ -2176,11 +2247,16 @@ def _build_client_month_body(account, base_key, start, days, *, voice, library_p
                         locked_days=locked_feed_days, allow_reshape=allow_reshape,
                         poster_render_evidence_by_url=_poster_render_evidence_by_url(
                             drafts),
-                        render_evidence_by_url=_gbp_render_evidence or None)
+                        render_evidence_by_url=_gbp_render_evidence or None,
+                        apply_state=apply_state)
     except Exception:
         # _apply catches remote write failures and returns their unknown-outcome
-        # flag. An exception escaping its contract is a prewrite planning failure.
-        _release_unlanded_reservations(drafts)
+        # flag. An exception escaping its contract is a prewrite planning failure
+        # UNLESS an armed stage RPC was already attempted: then the batch outcome
+        # is unknown and the drafts' reservations must stay fail-closed (the
+        # outer cleanup preserves Drive assets the same way).
+        if not (apply_state or {}).get("stage_rpc_attempted"):
+            _release_unlanded_reservations(drafts)
         raise
     if (result.get("noop_empty") and _empty_fill_has_unmet_slots(
             store, base_key, start, days, slots_per_day, locked_feed_days)):
@@ -2916,12 +2992,16 @@ def _forward_replacement_rows(store, base_key, months, first, last, locked_days)
 
 def _apply(base_key, rows, start, days, store, log, locked_days=(),
            allow_reshape=False, poster_render_evidence_by_url=None,
-           render_evidence_by_url=None):
-    """Gym-scoped replacement: armed reservations use inactive prepare/atomic finalize.
+           render_evidence_by_url=None, apply_state=None):
+    """Gym-scoped replacement: armed reservations stage one immutable inactive batch.
 
-    With the reservation gate OFF, delete-then-insert across every month PLUS the full
-    planned span. Rows are inserted WITHOUT an id (DB mints the uuid). Mirrors
-    apply_month_plan. Refuses the demo gym id. Never raises out.
+    With the reservation gate armed, this lane NEVER deletes and never claims a
+    replacement: ONE atomic stage RPC registers the batch and its inactive
+    candidates, and the result reports `state: preparing` with the exact batch
+    receipt. Isolated preparation workers and the service-role finalizer own
+    activation. With the gate OFF, delete-then-insert across every month PLUS
+    the full planned span. Rows are inserted WITHOUT an id (DB mints the uuid).
+    Mirrors apply_month_plan. Refuses the demo gym id. Never raises out.
 
     Result counts: "deleted" is the SPAN-SCOPED claim (rows the delete removed
     inside the planned day-span, see _span_scoped_delete_claim) so the
@@ -3264,23 +3344,46 @@ def _apply(base_key, rows, start, days, store, log, locked_days=(),
                 raise _pcs.CalendarInsertNotStartedError(503, "atomic schedule store unavailable")
             store_rows = [{k: v for k, v in row.items()
                            if k != "_served_reservation_id"} for row in clean_rows]
-            # No delete_month call is allowed in this lane. The transaction
-            # replaces only the frozen old manifest after reserving ALL rows.
+            # No delete_month call is allowed in this lane. ONE atomic stage RPC
+            # registers the immutable batch and creates inactive candidates; the
+            # old calendar stays active and visible until a later attested
+            # finalization transaction replaces exactly the frozen old manifest.
             if not store_rows:
                 return {"ok": True, "upserted": 0, "inserted": 0,
                         "deleted": 0, "months": months}
+            if apply_state is not None:
+                # Record the armed stage attempt BEFORE the RPC is issued: once
+                # it is on the wire its outcome can be lost with the HTTP
+                # response, and the outer cleanup must then preserve Drive
+                # assets (no release on an unknown outcome).
+                apply_state["stage_rpc_attempted"] = True
             insert_started = True
-            inserted_rows = _insert_rows_with_poster_evidence(
+            staged_rows = _insert_rows_with_poster_evidence(
                 insert_rows, base_key, store_rows, poster_render_evidence_by_url,
                 render_evidence_by_url=render_evidence_by_url,
                 required_feed_slots=new_feed_slots,
                 prevalidated_cadence=cadence_prevalidated,
                 expected_old_rows=old_rows) or []
-            if (len(inserted_rows) != len(store_rows)
-                    or _instagram_feed_slots(inserted_rows) != new_feed_slots):
-                raise _pcs.ReservationStoreError(502, "atomic batch result incomplete; outcome unknown")
-            return {"ok": True, "upserted": len(inserted_rows), "inserted": len(inserted_rows),
-                    "deleted": 0, "deleted_total": 0, "superseded": len(old_rows), "months": months,
+            if (len(staged_rows) != len(store_rows)
+                    or _instagram_feed_slots(staged_rows) != new_feed_slots):
+                raise _pcs.ReservationStoreError(502, "staged batch result incomplete; outcome unknown")
+            receipt = getattr(store, "last_forward_stage", None)
+            if (not isinstance(receipt, dict)
+                    or receipt.get("state") != "staged"
+                    or not str(receipt.get("batch_id") or "")):
+                raise _pcs.ReservationStoreError(502, "stage receipt unavailable; outcome unknown")
+            # PREPARING -- never an immediate replacement. The isolated
+            # preparation workers and the service-role finalizer own the rest;
+            # old approved/published rows are untouched and still visible. The
+            # durable receipt keeps this build's Drive media owned by the batch
+            # (release only via a guarded terminal cancel/failure).
+            return {"ok": True, "state": "preparing", "preparing": True,
+                    "batch_id": receipt["batch_id"], "forward_batch": receipt,
+                    "forward_batch_attempt": getattr(
+                        store, "last_forward_stage_attempt", None),
+                    "staged": len(staged_rows),
+                    "upserted": 0, "inserted": 0, "deleted": 0, "deleted_total": 0,
+                    "superseded": 0, "months": months,
                     "retained_reservation_ids": sorted(planned_reservation_ids)}
         delete_preserve = _out_of_span_preserve_dates(
             months, span_first, span_last, preserve_dates=locked_days)
@@ -3350,11 +3453,20 @@ def _apply(base_key, rows, start, days, store, log, locked_days=(),
             definite_refusal = known_pre_post_refusal or isinstance(
                 exc, (ReservationHoldError, ReservationArgumentError, ReservationGateError,
                       ReservationStagingError))
-            log(f"atomic schedule write refused: {type(exc).__name__}")
+            # _safe_log: a log() failure here must not escape with the
+            # unknown-outcome state unreported (the outer cleanup would read
+            # result=None as a prewrite failure and release Drive assets a
+            # committed staged batch may own).
+            _safe_log(log, f"atomic schedule write refused: {type(exc).__name__}")
             return {"ok": False, "reason": f"atomic schedule write failed: {type(exc).__name__}",
                     "upserted": 0, "inserted": 0, "deleted": 0 if definite_refusal else None,
                     "deleted_total": 0 if definite_refusal else None, "months": months,
                     "old_calendar_preserved": bool(not insert_started or definite_refusal),
+                    # The exact batch attempt (batch_id + digest) is the ONLY
+                    # handle for resolving an unknown outcome -- through the
+                    # batch status RPC, never calendar row readback.
+                    "forward_batch_attempt": getattr(
+                        store, "last_forward_stage_attempt", None),
                     "retained_reservation_ids": sorted(planned_reservation_ids) if insert_started else [],
                     "insert_outcome_unknown": bool(insert_started and not definite_refusal)}
         restore = getattr(store, "restore_deleted_rows", None)
@@ -3366,12 +3478,12 @@ def _apply(base_key, rows, start, days, store, log, locked_days=(),
             try:
                 restored = restore(base_key, deleted_row_snapshots) or []
                 rollback_ok = len(restored) == len(deleted_row_snapshots)
-                log(f"{base_key}: cadence changed after preflight; restored "
-                    f"{len(restored)}/{len(deleted_row_snapshots)} deleted row(s)")
+                _safe_log(log, f"{base_key}: cadence changed after preflight; restored "
+                               f"{len(restored)}/{len(deleted_row_snapshots)} deleted row(s)")
             except Exception as rollback_exc:  # noqa: BLE001
-                log(f"{base_key}: calendar rollback failed: "
-                    f"{type(rollback_exc).__name__}")
-        log(f"store write failed: {type(exc).__name__}")
+                _safe_log(log, f"{base_key}: calendar rollback failed: "
+                               f"{type(rollback_exc).__name__}")
+        _safe_log(log, f"store write failed: {type(exc).__name__}")
         return {"ok": False, "reason": f"store write failed: {type(exc).__name__}",
                 "upserted": inserted, "deleted": deleted, "months": months,
                 "deleted_total": deleted,

@@ -10,6 +10,7 @@ unreadable gates and malformed responses never count as free or reserved.
 import os
 import sys
 import uuid
+from copy import deepcopy
 
 import pytest
 
@@ -265,28 +266,37 @@ def test_insert_rows_invalid_proof_refuses_even_when_flag_off(monkeypatch):
         _store(_HTTP()).insert_rows("lasso", rows)
 
 
-def _armed_http(rows, *, reserve_resp=None):
-    inserted = []
-    def stage(payload):
-        inserted[:] = [dict(row) for row in payload]
-        return _Resp(201, inserted)
-    def finalize(args):
-        if reserve_resp is not None:
-            return reserve_resp(args) if callable(reserve_resp) else reserve_resp
-        return _Resp(200, {"row_ids": [c["calendar_row_id"] for c in args["p_candidates"]],
-                           "reservation_ids": [RID] * len(args["p_candidates"])})
-    posts = {"content_calendar": stage,
-             pcs._SNAPSHOT_RPC: _Resp(200, {"revision": "rev-1"}),
-             pcs._FINALIZE_RPC: finalize}
-    lineage = [{"evidence_id": str(uuid.uuid4())}]
-    return http_with(posts, lineage, inserted), inserted
+def _stage_members(args):
+    import json
+    request = json.loads(args["p_request"])
+    return request["members"]
 
 
-class http_with(_HTTP):
-    def __init__(self, posts, lineage, deleted):
-        super().__init__(posts=posts,
-                         gets={pcs._LINEAGE_TABLE: _Resp(200, lineage)},
-                         delete_payload=deleted)
+def _stage_old_rows(args):
+    import json
+    request = json.loads(args["p_request"])
+    return request.get("old_rows", [])
+
+
+def _stage_receipt(args):
+    members = _stage_members(args)
+    return _Resp(200, {
+        "batch_id": args["p_batch_id"], "tenant_id": args["p_tenant_id"],
+        "request_digest": args["p_request_digest"], "state": "staged",
+        "member_row_ids": [m["row"]["id"] for m in members],
+        "observation_row_ids": [m["row"]["id"] for m in members if m.get("observation")],
+        "old_row_ids": [o["id"] for o in _stage_old_rows(args)],
+        "finalize_receipt": None})
+
+
+def _armed_http(rows, *, stage_resp=None):
+    staged = {}
+    def stage(args):
+        staged.update(args)
+        if stage_resp is not None:
+            return stage_resp(args) if callable(stage_resp) else stage_resp
+        return _stage_receipt(args)
+    return _HTTP(posts={pcs._STAGE_RPC: stage}), staged
 
 
 def _arm_attester(monkeypatch):
@@ -295,39 +305,114 @@ def _arm_attester(monkeypatch):
         "attestation_ids": dict(zip(visual_index.ROLES, ATT_IDS))})
 
 
-def test_insert_rows_armed_stages_reservation(monkeypatch):
+def test_insert_rows_armed_stages_one_atomic_preparing_batch(monkeypatch):
     monkeypatch.setenv(pcs.FORWARD_RESERVATION_FLAG_ENV, "1")
-    _arm_attester(monkeypatch)
     rows = _group_rows()
-    http, inserted = _armed_http(rows)
-    out = _store(http).insert_rows("lasso", rows)
+    http, staged = _armed_http(rows)
+    store = _store(http)
+    out = store.insert_rows("lasso", rows)
     assert len(out) == 3
     posts = [c for c in http.calls if c[0] == "post"]
-    finalizations = [c for c in posts if c[1].endswith(pcs._FINALIZE_RPC)]
-    assert len(finalizations) == 1, "one atomic finalization for the entire batch"
-    assert not [c for c in posts if c[1].endswith(pcs._RESERVE_RPC)]
-    candidates = finalizations[0][2]["p_candidates"]
-    assert len(candidates) == 3
-    for candidate in candidates:
-        assert candidate["logical_post_id"] == LPID
-        assert candidate["expected_revision"] == "rev-1"
-        assert len(candidate["attestation_ids"]) == 3
-    assert all(row["variant_status"] == "active" for row in out)
-    # The proof metadata never reaches content_calendar.
-    calendar_post = [c for c in posts if c[1].endswith("content_calendar")][0]
-    assert all(pcs.RESERVATION_PROOF not in row for row in calendar_post[2])
+    stage_calls = [c for c in posts if c[1].endswith(pcs._STAGE_RPC)]
+    assert len(stage_calls) == 1, "one atomic stage RPC for the entire batch"
+    assert not [c for c in posts if c[1].endswith("content_calendar")], \
+        "the planner never writes content_calendar directly when armed"
+    assert not [c for c in posts if c[1].endswith((pcs._RESERVE_RPC, pcs._FINALIZE_RPC))], \
+        "staging never reserves or finalizes inline"
+    args = stage_calls[0][2]
+    assert args["p_tenant_id"] == "lasso"
+    members = _stage_members(args)
+    assert len(members) == 3
+    import hashlib
+    assert args["p_request_digest"] == hashlib.sha256(
+        args["p_request"].encode("utf-8")).hexdigest(), \
+        "the persisted digest covers the exact request bytes"
+    for member in members:
+        row = member["row"]
+        assert row["logical_post_id"] == LPID
+        # The planner sends UNMARKED rows; the SQL authority stamps the
+        # inactive candidate identity itself.
+        assert row.get("media_not_ready_reason") is None
+        assert row.get("variant_status") in (None, "candidate")
+        assert pcs.RESERVATION_PROOF not in row
+        assert "observation" not in row
+    # The returned rows are STAGED INACTIVE candidates, never an active
+    # replacement, and the staged receipt is the only outcome handle.
+    assert all(row["variant_status"] == "candidate" for row in out)
+    assert all(row["media_not_ready_reason"] == "forward_reservation_staged" for row in out)
+    receipt = store.last_forward_stage
+    assert receipt["state"] == "staged"
+    assert receipt["batch_id"] == args["p_batch_id"]
+    assert receipt["member_row_ids"] == [m["row"]["id"] for m in members]
+    assert receipt["finalize_receipt"] is None
 
 
-def test_insert_rows_armed_finalize_hold_preserves_old_and_inactive_rows(monkeypatch):
+def test_insert_rows_armed_retry_replays_same_batch_identity(monkeypatch):
     monkeypatch.setenv(pcs.FORWARD_RESERVATION_FLAG_ENV, "1")
-    _arm_attester(monkeypatch)
     rows = _group_rows()
-    http, inserted = _armed_http(rows, reserve_resp=_err("23514", "slot conflict"))
+    attempts = []
+    def stage(args):
+        attempts.append(args)
+        return _stage_receipt(args)
+    first = _store(_HTTP(posts={pcs._STAGE_RPC: stage})).insert_rows("lasso", _group_rows())
+    second = _store(_HTTP(posts={pcs._STAGE_RPC: stage})).insert_rows("lasso", _group_rows())
+    assert len(attempts) == 2
+    assert attempts[0]["p_batch_id"] == attempts[1]["p_batch_id"], \
+        "an identical retry after a lost response resumes the same batch"
+    assert attempts[0]["p_request_digest"] == attempts[1]["p_request_digest"]
+    assert attempts[0]["p_request"] == attempts[1]["p_request"], \
+        "deterministic row identity -- no random ids on the armed lane"
+    assert first == second
+
+
+def test_insert_rows_armed_changed_request_is_a_different_batch(monkeypatch):
+    monkeypatch.setenv(pcs.FORWARD_RESERVATION_FLAG_ENV, "1")
+    attempts = []
+    def stage(args):
+        attempts.append(args)
+        return _stage_receipt(args)
+    store = _store(_HTTP(posts={pcs._STAGE_RPC: stage}))
+    store.insert_rows("lasso", _group_rows())
+    changed = _group_rows()
+    changed[0]["caption"] = "a different caption"
+    store.insert_rows("lasso", changed)
+    assert len(attempts) == 2
+    assert attempts[0]["p_request_digest"] != attempts[1]["p_request_digest"]
+    assert attempts[0]["p_batch_id"] != attempts[1]["p_batch_id"]
+
+
+def test_insert_rows_armed_stage_hold_is_definite_and_writes_nothing(monkeypatch):
+    monkeypatch.setenv(pcs.FORWARD_RESERVATION_FLAG_ENV, "1")
+    rows = _group_rows()
+    http, _ = _armed_http(rows, stage_resp=_err("23514", "slot conflict"))
     with pytest.raises(pcs.ReservationHoldError):
         _store(http).insert_rows("lasso", rows)
     assert not [c for c in http.calls if c[0] == "delete"]
-    assert all(row["variant_status"] == "candidate" for row in inserted)
-    assert all(row["media_not_ready_reason"] == "forward_reservation_staged" for row in inserted)
+    assert not [c for c in http.calls
+                if c[0] == "post" and c[1].endswith("content_calendar")]
+
+
+def test_insert_rows_armed_changed_digest_same_batch_holds(monkeypatch):
+    """The SQL authority refuses a reused batch id carrying a new digest."""
+    monkeypatch.setenv(pcs.FORWARD_RESERVATION_FLAG_ENV, "1")
+    seen = {}
+    def stage(args):
+        prior = seen.setdefault(args["p_batch_id"], args["p_request_digest"])
+        if prior != args["p_request_digest"]:
+            return _err("23514", "stage batch request changed")
+        return _stage_receipt(args)
+    http = _HTTP(posts={pcs._STAGE_RPC: stage})
+    _store(http).insert_rows("lasso", _group_rows())
+    first_batch_id = [c for c in http.calls
+                      if c[1].endswith(pcs._STAGE_RPC)][0][2]["p_batch_id"]
+    changed = _group_rows()
+    changed[1]["caption"] = "changed after the first attempt"
+    # A changed request derives a new batch id; force the collision the SQL
+    # guard exists for by pinning the identity helper to the first batch id.
+    monkeypatch.setattr(pcs, "forward_batch_identity",
+                        lambda tenant, digest: first_batch_id)
+    with pytest.raises(pcs.ReservationHoldError):
+        _store(http).insert_rows("lasso", changed)
 
 
 def test_insert_rows_flag_off_legacy_path_unchanged(monkeypatch):
@@ -359,31 +444,242 @@ def test_insert_rows_armed_refuses_cross_lpid_same_date_same_source(monkeypatch)
     assert not [c for c in http.calls if c[0] == "post"], "no POST may happen"
 
 
-def test_insert_rows_armed_sibling_reservation_mismatch_is_unknown(monkeypatch):
-    """An invalid receipt never justifies deleting possibly activated rows."""
+def test_insert_rows_armed_receipt_mismatch_is_unknown_never_readback(monkeypatch):
+    """A malformed stage receipt never justifies cleanup, calendar readback or
+    success inference; the batch attempt is the only resolution handle."""
     monkeypatch.setenv(pcs.FORWARD_RESERVATION_FLAG_ENV, "1")
-    _arm_attester(monkeypatch)
     rows = _group_rows()
-    def mismatch(args):
-        return _Resp(200, {"row_ids": [c["calendar_row_id"] for c in args["p_candidates"]],
-                           "reservation_ids": [RID, str(uuid.uuid4()), RID]})
-    http, inserted = _armed_http(rows, reserve_resp=mismatch)
+    bad = _Resp(200, {"batch_id": "x", "state": "staged"})
+    http, _ = _armed_http(rows, stage_resp=bad)
+    store = _store(http)
     with pytest.raises(pcs.ReservationStoreError):
-        _store(http).insert_rows("lasso", rows)
+        store.insert_rows("lasso", rows)
     assert not [c for c in http.calls if c[0] == "delete"]
+    stage_at = next(i for i, c in enumerate(http.calls) if c[1].endswith(pcs._STAGE_RPC))
+    assert not [c for c in http.calls[stage_at:] if c[0] == "get"], \
+        "no calendar readback after the ambiguous response may infer the outcome"
+    attempt = store.last_forward_stage_attempt
+    assert attempt and attempt["batch_id"] and attempt["request_digest"]
+    assert store.last_forward_stage is None
 
 
-def test_insert_rows_armed_siblings_share_one_atomic_reservation(monkeypatch):
+def test_insert_rows_armed_finalized_replay_is_not_claimed_as_staged(monkeypatch):
+    """A replay that lands on an already-finalized batch is NOT this lane's
+    outcome: never report staged rows from it; resolve via the status RPC."""
     monkeypatch.setenv(pcs.FORWARD_RESERVATION_FLAG_ENV, "1")
-    _arm_attester(monkeypatch)
     rows = _group_rows()
-    http, _inserted_rows = _armed_http(rows)
+    def finalized(args):
+        receipt = _stage_receipt(args)._payload
+        receipt["state"] = "finalized"
+        receipt["finalize_receipt"] = {
+            "batch_id": args["p_batch_id"], "state": "finalized",
+            "row_ids": receipt["member_row_ids"],
+            "reservation_ids": [RID] * len(receipt["member_row_ids"]),
+            "archived_old_row_ids": []}
+        return _Resp(200, receipt)
+    http, _ = _armed_http(rows, stage_resp=finalized)
+    store = _store(http)
+    with pytest.raises(pcs.ReservationStoreError):
+        store.insert_rows("lasso", rows)
+    assert store.last_forward_stage is None
+
+
+def test_insert_rows_armed_siblings_share_one_batch(monkeypatch):
+    monkeypatch.setenv(pcs.FORWARD_RESERVATION_FLAG_ENV, "1")
+    rows = _group_rows()
+    http, _ = _armed_http(rows)
     out = _store(http).insert_rows("lasso", rows)
     assert len(out) == 3
-    finalizations = [c for c in http.calls
-                    if c[0] == "post" and c[1].endswith(pcs._FINALIZE_RPC)]
-    assert len(finalizations) == 1
-    assert {c["logical_post_id"] for c in finalizations[0][2]["p_candidates"]} == {LPID}
+    stage_calls = [c for c in http.calls
+                   if c[0] == "post" and c[1].endswith(pcs._STAGE_RPC)]
+    assert len(stage_calls) == 1
+    members = _stage_members(stage_calls[0][2])
+    assert {m["row"]["logical_post_id"] for m in members} == {LPID}
+
+
+def _observation_for(row, tenant="lasso"):
+    import hashlib
+    import json
+    obs = {"schema_version": 1, "provenance_status": "unverified", "tenant": tenant,
+           "source_asset_id": row["source_media_asset_id"],
+           "source_exact_url": row["source_media_url"],
+           "delivered_exact_url": row["image_url"],
+           "recipe": {"op": "copy"}, "hold_reasons": [],
+           "source_sha256": SHA, "delivered_sha256": SHA_B,
+           "source_byte_length": 100, "delivered_byte_length": 100}
+    encoded = json.dumps(obs, sort_keys=True, separators=(",", ":"),
+                         ensure_ascii=False, allow_nan=False)
+    obs["observation_digest"] = hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+    return obs
+
+
+def test_insert_rows_armed_stages_observations_atomically(monkeypatch):
+    """Unverified observations ride the SAME atomic stage request; the row
+    payload stays clean and the receipt reports exact observed membership."""
+    monkeypatch.setenv(pcs.FORWARD_RESERVATION_FLAG_ENV, "1")
+    monkeypatch.setenv("AGENT_FORWARD_MEDIA_OBSERVATION_BRIDGE", "1")
+    rows = _group_rows()
+    for row in rows:
+        row["source_media_asset_id"] = "asset-1"
+        row["source_media_url"] = "https://x/source.jpg"
+        row["_forward_media_observations"] = [_observation_for(row)]
+    http, _ = _armed_http(rows)
+    http.posts["fixer_forward_media_observation_bridge_ready_20261007"] = _Resp(200, True)
+    store = _store(http)
+    out = store.insert_rows("lasso", rows)
+    assert len(out) == 3
+    stage_calls = [c for c in http.calls if c[1].endswith(pcs._STAGE_RPC)]
+    assert len(stage_calls) == 1
+    members = _stage_members(stage_calls[0][2])
+    assert all(member.get("observation") for member in members), \
+        "every observed row's packet rides the same atomic request"
+    for member in members:
+        assert "observation" not in member["row"], \
+            "the observation packet is never a calendar column"
+        packet = member["observation"]
+        assert packet["observation_json"] and packet["digest_input"]
+    receipt = store.last_forward_stage
+    assert receipt["observation_row_ids"] == receipt["member_row_ids"]
+    # Retry stability: identical observations keep the same batch identity.
+    attempts = []
+    def stage(args):
+        attempts.append(args)
+        return _stage_receipt(args)
+    http2 = _HTTP(posts={pcs._STAGE_RPC: stage,
+                         "fixer_forward_media_observation_bridge_ready_20261007": _Resp(200, True)})
+    _store(http2).insert_rows("lasso", [dict(r) for r in rows])
+    assert attempts[0]["p_request_digest"] == stage_calls[0][2]["p_request_digest"]
+
+
+# ---- batch status + preparation eligibility bindings ----------------------------
+
+def test_forward_schedule_batch_status_strict():
+    batch_id = str(uuid.uuid4())
+    staged = {"batch_id": batch_id, "tenant_id": "lasso", "state": "staged",
+              "request_digest": "c" * 64, "member_row_ids": [ROW_ID],
+              "observation_row_ids": [ROW_ID], "old_row_ids": [RID],
+              "finalize_receipt": None}
+    http = _HTTP(posts={pcs._BATCH_STATUS_RPC: _Resp(200, staged)})
+    assert _store(http).forward_schedule_batch_status(batch_id) == staged
+    finalized = dict(staged, state="finalized", finalize_receipt={
+        "batch_id": batch_id, "state": "finalized", "tenant_id": "lasso",
+        "request_digest": "c" * 64,
+        "row_ids": [ROW_ID], "reservation_ids": [RID],
+        "archived_old_row_ids": [RID]})
+    store = _store(_HTTP(posts={pcs._BATCH_STATUS_RPC: _Resp(200, finalized)}))
+    assert store.forward_schedule_batch_status(batch_id)["state"] == "finalized"
+    # Finalized without its complete terminal proof is malformed: unknown.
+    for broken in (dict(staged, state="finalized", finalize_receipt=None),
+                   dict(finalized, finalize_receipt={
+                       **finalized["finalize_receipt"], "tenant_id": "other"}),
+                   dict(finalized, finalize_receipt={
+                       **finalized["finalize_receipt"], "request_digest": "d" * 64}),
+                   dict(finalized, finalize_receipt={
+                       k: v for k, v in finalized["finalize_receipt"].items()
+                       if k != "archived_old_row_ids"}),
+                   dict(finalized, finalize_receipt={
+                       **finalized["finalize_receipt"],
+                       "archived_old_row_ids": []}),
+                   dict(finalized, finalize_receipt={
+                       **finalized["finalize_receipt"],
+                       "row_ids": [ROW_ID, ROW_ID],
+                       "reservation_ids": [RID, str(uuid.uuid4())]}),
+                   dict(finalized, finalize_receipt={
+                       **finalized["finalize_receipt"],
+                       "archived_old_row_ids": [RID, RID]}),
+                   dict(staged, member_row_ids=[ROW_ID, ROW_ID]),
+                   dict(staged, observation_row_ids=[ROW_ID, ROW_ID]),
+                   dict(staged, old_row_ids=[RID, RID])):
+        store = _store(_HTTP(posts={pcs._BATCH_STATUS_RPC: _Resp(200, broken)}))
+        with pytest.raises(pcs.ReservationStoreError):
+            store.forward_schedule_batch_status(batch_id)
+    # An observation row outside the membership is malformed.
+    bogus = dict(staged, observation_row_ids=[str(uuid.uuid4())])
+    store = _store(_HTTP(posts={pcs._BATCH_STATUS_RPC: _Resp(200, bogus)}))
+    with pytest.raises(pcs.ReservationStoreError):
+        store.forward_schedule_batch_status(batch_id)
+    # An old row overlapping the membership is malformed.
+    bogus = dict(staged, old_row_ids=[ROW_ID])
+    store = _store(_HTTP(posts={pcs._BATCH_STATUS_RPC: _Resp(200, bogus)}))
+    with pytest.raises(pcs.ReservationStoreError):
+        store.forward_schedule_batch_status(batch_id)
+    # Missing tenant or digest binding is malformed.
+    for missing in ("tenant_id", "request_digest", "old_row_ids"):
+        bogus = {k: v for k, v in staged.items() if k != missing}
+        store = _store(_HTTP(posts={pcs._BATCH_STATUS_RPC: _Resp(200, bogus)}))
+        with pytest.raises(pcs.ReservationStoreError):
+            store.forward_schedule_batch_status(batch_id)
+    foreign = dict(staged, batch_id=str(uuid.uuid4()))
+    store = _store(_HTTP(posts={pcs._BATCH_STATUS_RPC: _Resp(200, foreign)}))
+    with pytest.raises(pcs.ReservationStoreError):
+        store.forward_schedule_batch_status(batch_id)
+    # A batch that does not exist is a definite SQL hold, never a success.
+    store = _store(_HTTP(posts={pcs._BATCH_STATUS_RPC: _err("23514", "schedule batch unavailable")}))
+    with pytest.raises(pcs.ReservationHoldError):
+        store.forward_schedule_batch_status(batch_id)
+
+
+def test_batch_status_bound_readback_rejects_mismatched_identity():
+    """Ambiguous recovery resolves ONLY through a readback bound to the exact
+    batch id, tenant, request digest, member set and old-row set."""
+    batch_id = str(uuid.uuid4())
+    old_id = str(uuid.uuid4())
+    staged = {"batch_id": batch_id, "tenant_id": "lasso", "state": "staged",
+              "request_digest": "c" * 64, "member_row_ids": [ROW_ID],
+              "observation_row_ids": [], "old_row_ids": [old_id],
+              "finalize_receipt": None}
+    store = _store(_HTTP(posts={pcs._BATCH_STATUS_RPC: _Resp(200, staged)}))
+    bound = dict(tenant_id="lasso", request_digest="c" * 64,
+                 member_row_ids=[ROW_ID], old_row_ids=[old_id])
+    assert store.forward_schedule_batch_status(batch_id, **bound) == staged
+    for mismatch in (dict(bound, tenant_id="other"),
+                     dict(bound, request_digest="d" * 64),
+                     dict(bound, member_row_ids=[str(uuid.uuid4())]),
+                     dict(bound, member_row_ids=[ROW_ID, str(uuid.uuid4())]),
+                     dict(bound, old_row_ids=[]),
+                     dict(bound, old_row_ids=[str(uuid.uuid4())])):
+        with pytest.raises(pcs.ReservationStoreError):
+            store.forward_schedule_batch_status(batch_id, **mismatch)
+
+
+def test_resolve_forward_stage_attempt_uses_exact_bound_identity():
+    batch_id = str(uuid.uuid4())
+    old_id = str(uuid.uuid4())
+    staged = {"batch_id": batch_id, "tenant_id": "lasso", "state": "staged",
+              "request_digest": "c" * 64, "member_row_ids": [ROW_ID],
+              "observation_row_ids": [], "old_row_ids": [old_id],
+              "finalize_receipt": None}
+    store = _store(_HTTP(posts={pcs._BATCH_STATUS_RPC: _Resp(200, staged)}))
+    store.last_forward_stage_attempt = {
+        "batch_id": batch_id, "tenant_id": "lasso", "request_digest": "c" * 64,
+        "member_row_ids": [ROW_ID], "old_row_ids": [old_id]}
+    assert store.resolve_forward_stage_attempt() == staged
+    store.last_forward_stage_attempt["request_digest"] = "d" * 64
+    with pytest.raises(pcs.ReservationStoreError):
+        store.resolve_forward_stage_attempt()
+    store.last_forward_stage_attempt = None
+    with pytest.raises(pcs.ReservationStoreError):
+        store.resolve_forward_stage_attempt()
+
+
+def test_forward_preparation_eligible_strict():
+    eligible = {"eligible": True, "mode": "staged", "tenant_id": "lasso",
+                "batch_id": RID, "reason": None}
+    http = _HTTP(posts={pcs._PREPARATION_ELIGIBLE_RPC: _Resp(200, eligible)})
+    assert _store(http).forward_preparation_eligible(ROW_ID) == eligible
+    assert http.calls[0][2] == {"p_calendar_row_id": ROW_ID}
+    ineligible = {"eligible": False, "mode": None, "tenant_id": "lasso",
+                  "batch_id": None, "reason": "unregistered staged row"}
+    http = _HTTP(posts={pcs._PREPARATION_ELIGIBLE_RPC: _Resp(200, ineligible)})
+    assert _store(http).forward_preparation_eligible(ROW_ID)["eligible"] is False
+    # Anything incoherent fails closed.
+    for bogus in (True, "true", None, [],
+                  {"eligible": True, "mode": None},
+                  {"eligible": False, "mode": "staged"},
+                  {"eligible": "yes", "mode": "active"}):
+        store = _store(_HTTP(posts={pcs._PREPARATION_ELIGIBLE_RPC: _Resp(200, bogus)}))
+        with pytest.raises(pcs.ReservationStoreError):
+            store.forward_preparation_eligible(ROW_ID)
 
 
 # ---- planner advisory screen (gym_media_builder) -------------------------------
@@ -451,6 +747,8 @@ class _ApplyStore:
     def __init__(self):
         self.deleted = []
         self.inserted = []
+        self.last_forward_stage = None
+        self.last_forward_stage_attempt = None
 
     def list_month(self, base_key, month):
         return []
@@ -462,6 +760,18 @@ class _ApplyStore:
     def insert_rows(self, base_key, rows, *, expected_old_rows=None, **kwargs):
         self.expected_old_rows = expected_old_rows
         self.inserted.extend(rows)
+        batch_id = pcs.forward_batch_identity(base_key, "d" * 64)
+        self.last_forward_stage_attempt = {"batch_id": batch_id,
+                                           "tenant_id": base_key,
+                                           "request_digest": "d" * 64,
+                                           "member_row_ids": [],
+                                           "old_row_ids": []}
+        self.last_forward_stage = {
+            "batch_id": batch_id, "tenant_id": base_key,
+            "request_digest": "d" * 64, "state": "staged",
+            "member_row_ids": [str(uuid.uuid4()) for _ in rows],
+            "observation_row_ids": [], "old_row_ids": [],
+            "finalize_receipt": None}
         return rows
 
 
@@ -505,9 +815,34 @@ def test_apply_armed_bound_rows_proceed(monkeypatch):
     res = cmr._apply("gritx", _apply_rows(with_proofs=True),
                      date(2026, 10, 20), 1, store, lambda m: None)
     assert res["ok"] is True, res
-    assert store.inserted, "bound rows proceed to the insert"
+    assert store.inserted, "bound rows proceed to the stage"
     assert store.deleted == [], "armed apply never calls delete_month"
     assert store.expected_old_rows == []
+    # PREPARING, never an immediate replacement claim.
+    assert res["state"] == "preparing" and res["preparing"] is True
+    assert res["batch_id"] == store.last_forward_stage["batch_id"]
+    assert res["staged"] == len(store.inserted)
+    assert res["upserted"] == 0 and res["inserted"] == 0
+    assert res["deleted"] == 0 and res["superseded"] == 0
+
+
+def test_apply_armed_missing_stage_receipt_is_unknown(monkeypatch):
+    from datetime import date
+    from agent import client_month_run as cmr
+    monkeypatch.setenv(pcs.FORWARD_RESERVATION_FLAG_ENV, "1")
+    store = _ApplyStore()
+    store.last_forward_stage = None
+    original = store.insert_rows
+    def no_receipt(base_key, rows, *, expected_old_rows=None, **kwargs):
+        out = original(base_key, rows, expected_old_rows=expected_old_rows, **kwargs)
+        store.last_forward_stage = None
+        return out
+    store.insert_rows = no_receipt
+    res = cmr._apply("gritx", _apply_rows(with_proofs=True),
+                     date(2026, 10, 20), 1, store, lambda m: None)
+    assert res["ok"] is False
+    assert res["insert_outcome_unknown"] is True
+    assert res["forward_batch_attempt"] == store.last_forward_stage_attempt
 
 
 # ---- before_claim reservation consult ------------------------------------------
@@ -580,3 +915,153 @@ def test_before_claim_flag_off_never_consults_reservation(monkeypatch):
                                        claim_token=str(uuid.uuid4()))
     assert result == {"attestation_ids": ATT_IDS}
     assert not [c for c in http.calls if pcs._PROOF_RPC in c[1]]
+
+
+# ---- frozen old-row snapshot in the staged request (phase 3) -------------------
+
+def _old_rows():
+    return [{"id": str(uuid.uuid4()), "gym_id": "lasso", "post_date": DAY,
+             "account": "instagram", "format": "feed", "status": "pending",
+             "variant_status": "active", "caption": "old",
+             "image_url": "https://x/old.jpg", "retained_null": None}]
+
+
+def test_stage_request_binds_frozen_old_row_snapshot(monkeypatch):
+    """The exact old-row snapshot (every column, NULLs included) is frozen ONCE
+    at stage time, rides the request, and is covered by the immutable digest.
+    The finalizer never refreezes it."""
+    monkeypatch.setenv(pcs.FORWARD_RESERVATION_FLAG_ENV, "1")
+    old = _old_rows()
+    http, staged = _armed_http(_group_rows())
+    store = _store(http)
+    store.insert_rows("lasso", _group_rows(), expected_old_rows=old)
+    args = staged
+    import hashlib
+    import json
+    request = json.loads(args["p_request"])
+    assert request["old_rows"][0]["id"] == old[0]["id"]
+    assert "retained_null" in request["old_rows"][0], "NULL columns survive"
+    assert args["p_request_digest"] == hashlib.sha256(
+        args["p_request"].encode("utf-8")).hexdigest()
+    attempt = store.last_forward_stage_attempt
+    assert attempt["old_row_ids"] == [old[0]["id"]]
+    assert attempt["tenant_id"] == "lasso"
+    assert attempt["member_row_ids"]
+    # Freezing is a snapshot: mutating the caller's manifest afterwards can
+    # never change what this batch is bound to.
+    old[0]["caption"] = "mutated after staging"
+    old.clear()
+    assert json.loads(args["p_request"])["old_rows"][0]["caption"] == "old"
+    # The receipt must echo the exact frozen old-row set.
+    assert store.last_forward_stage["old_row_ids"] == [request["old_rows"][0]["id"]]
+
+
+def test_stage_old_row_change_is_a_different_batch(monkeypatch):
+    """A changed old-row manifest changes the digest and the batch identity --
+    a retry can never substitute a different replacement set under one batch."""
+    monkeypatch.setenv(pcs.FORWARD_RESERVATION_FLAG_ENV, "1")
+    attempts = []
+    def stage(args):
+        attempts.append(args)
+        return _stage_receipt(args)
+    store = _store(_HTTP(posts={pcs._STAGE_RPC: stage}))
+    old = _old_rows()
+    store.insert_rows("lasso", _group_rows(), expected_old_rows=deepcopy(old))
+    changed = deepcopy(old)
+    changed[0]["caption"] = "old row changed after staging"
+    store.insert_rows("lasso", _group_rows(), expected_old_rows=changed)
+    assert attempts[0]["p_request_digest"] != attempts[1]["p_request_digest"]
+    assert attempts[0]["p_batch_id"] != attempts[1]["p_batch_id"]
+    same = _store(_HTTP(posts={pcs._STAGE_RPC: stage}))
+    same.insert_rows("lasso", _group_rows(), expected_old_rows=deepcopy(old))
+    # An identical retry (same content AND same old snapshot) replays the batch.
+    assert attempts[2]["p_batch_id"] == attempts[0]["p_batch_id"]
+
+
+def test_stage_receipt_old_row_mismatch_is_unknown(monkeypatch):
+    monkeypatch.setenv(pcs.FORWARD_RESERVATION_FLAG_ENV, "1")
+    def wrong_old(args):
+        receipt = _stage_receipt(args)._payload
+        receipt["old_row_ids"] = [str(uuid.uuid4())]
+        return _Resp(200, receipt)
+    old = _old_rows()
+    http, _ = _armed_http(_group_rows(), stage_resp=wrong_old)
+    store = _store(http)
+    with pytest.raises(pcs.ReservationStoreError):
+        store.insert_rows("lasso", _group_rows(), expected_old_rows=old)
+    assert store.last_forward_stage is None
+    assert store.last_forward_stage_attempt["old_row_ids"] == [old[0]["id"]]
+    assert not [c for c in http.calls if c[0] == "delete"]
+
+
+def test_stage_refuses_foreign_or_overlapping_old_rows(monkeypatch):
+    monkeypatch.setenv(pcs.FORWARD_RESERVATION_FLAG_ENV, "1")
+    http, _ = _armed_http(_group_rows())
+    foreign = dict(_old_rows()[0], gym_id="other-gym")
+    with pytest.raises(pcs.CalendarInsertNotStartedError):
+        _store(http).insert_rows("lasso", _group_rows(), expected_old_rows=[foreign])
+    assert not [c for c in http.calls if c[1].endswith(pcs._STAGE_RPC)]
+    dup = _old_rows()
+    dup.append(dict(dup[0]))
+    with pytest.raises(pcs.CalendarInsertNotStartedError):
+        _store(http).insert_rows("lasso", _group_rows(), expected_old_rows=dup)
+    assert not [c for c in http.calls if c[1].endswith(pcs._STAGE_RPC)]
+
+
+def test_armed_lane_never_reaches_visual_prepare_or_owner_dsn(monkeypatch):
+    """Credential isolation: even with the global visual writer flag ON, the
+    armed planner lane must not run _prepare_visual_row (the trusted owner
+    receipt DSN boundary). It packages unverified observations only."""
+    monkeypatch.setenv(pcs.FORWARD_RESERVATION_FLAG_ENV, "1")
+    monkeypatch.setenv("AGENT_VISUAL_GLOBAL_WRITER_PREP", "1")
+    def forbidden(*args, **kwargs):
+        raise AssertionError("planner reached the trusted visual writer boundary")
+    monkeypatch.setattr(pcs.SupabaseCalendarStore, "_prepare_visual_row", forbidden)
+    from agent import visual_writer_prepare
+    monkeypatch.setattr(visual_writer_prepare, "prepare", forbidden)
+    from agent import visual_owner_receipts
+    monkeypatch.setattr(visual_owner_receipts, "default_writer", forbidden)
+    monkeypatch.setattr(visual_owner_receipts, "default_same_object_writer", forbidden)
+    http, _ = _armed_http(_group_rows())
+    out = _store(http).insert_rows("lasso", _group_rows(), expected_old_rows=_old_rows())
+    assert len(out) == 3
+    assert all(r["variant_status"] == "candidate" for r in out)
+
+
+def test_lost_finalize_response_resolves_only_via_bound_status_readback():
+    """A lost finalize HTTP response is unknown; resolution requires the batch
+    status readback bound to the exact batch id, tenant, digest, member set and
+    old-row set, with complete terminal proof."""
+    batch_id = str(uuid.uuid4())
+    old_id = str(uuid.uuid4())
+    candidates = [{"calendar_row_id": ROW_ID, "logical_post_id": LPID,
+                   "expected_revision": "rev", "attestation_ids": ATT_IDS}]
+    old = [{"id": old_id, "gym_id": "lasso", "status": "pending",
+            "variant_status": "active", "caption": "old"}]
+    def lost(args):
+        raise TimeoutError("finalize receipt lost")
+    store = _store(_HTTP(posts={pcs._FINALIZE_RPC: lost}))
+    with pytest.raises(pcs.ReservationStoreError):
+        store.finalize_forward_schedule_batch("lasso", batch_id, candidates, old)
+    finalized = {"batch_id": batch_id, "tenant_id": "lasso", "state": "finalized",
+                 "request_digest": "e" * 64, "member_row_ids": [ROW_ID],
+                 "observation_row_ids": [], "old_row_ids": [old_id],
+                 "finalize_receipt": {
+                     "batch_id": batch_id, "state": "finalized",
+                     "tenant_id": "lasso", "request_digest": "e" * 64,
+                     "row_ids": [ROW_ID], "reservation_ids": [RID],
+                     "archived_old_row_ids": [old_id]}}
+    store._http = _HTTP(posts={pcs._BATCH_STATUS_RPC: _Resp(200, finalized)})
+    resolved = store.forward_schedule_batch_status(
+        batch_id, tenant_id="lasso", request_digest="e" * 64,
+        member_row_ids=[ROW_ID], old_row_ids=[old_id])
+    assert resolved["state"] == "finalized"
+    # A mismatched binding (wrong tenant/digest/member/old set) never resolves.
+    for binding in (dict(tenant_id="other"), dict(request_digest="f" * 64),
+                    dict(member_row_ids=[str(uuid.uuid4())]),
+                    dict(old_row_ids=[str(uuid.uuid4())])):
+        kwargs = dict(tenant_id="lasso", request_digest="e" * 64,
+                      member_row_ids=[ROW_ID], old_row_ids=[old_id])
+        kwargs.update(binding)
+        with pytest.raises(pcs.ReservationStoreError):
+            store.forward_schedule_batch_status(batch_id, **kwargs)
