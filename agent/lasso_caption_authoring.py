@@ -71,7 +71,11 @@ def _cta(caption):
     lines = [line.strip() for line in caption.splitlines() if line.strip() and not line.strip().startswith("#")]
     if not lines:
         raise Hold("single approved CTA unavailable")
-    original = lines[-1]
+    # The closing line may hold approved body sentences followed by ONE terminal
+    # CTA sentence. Only that terminal sentence is the action; preceding
+    # sentences on the same line stay body, never a second CTA.
+    sentences = [part.strip() for part in re.split(r"(?<=[.!?])\s+", lines[-1]) if part.strip()]
+    original = sentences[-1]
     chunks, end = [], 0
     for match in copy_gate._PROTECTED_RE.finditer(original):
         chunks.extend((original[end:match.start()].replace(":", "."), match.group(0)))
@@ -84,7 +88,7 @@ def _cta(caption):
         raise Hold("CTA punctuation or URL unsafe")
     # Only the closing source CTA may contain an ask. Approved save/send/tag
     # actions are supported even though the legacy ASK_RE does not count them.
-    body = "\n".join(lines[:-1])
+    body = "\n".join(lines[:-1] + sentences[:-1])
     if copy_gate.ASK_RE.search(body):
         raise Hold("multiple original CTA actions")
     return original, canonical
@@ -122,7 +126,15 @@ def _source_packet(target):
                          topic.startswith("Summit:") if category == "summit" else
                          topic.startswith("Book:") if category == "book" else
                          not topic.startswith(("Websites:", "Echo:", "Summit:")) if category in ("doctrine", "b2b", "platform") else False)
-            if not permitted or not any(_norm(h) in _norm(original) for h in block.get("hooks", []) if h.strip()):
+            if not permitted:
+                continue
+            hook_hit = any(_norm(h) in _norm(original) for h in block.get("hooks", []) if h.strip())
+            # Book rows may carry a verbatim approved Body line as their on-image
+            # or opening copy instead of a Hook; an exact Body excerpt is the
+            # same approved FullGym authority, never the old caption as fact.
+            body_hit = (category == "book"
+                        and any(_norm(b) in _norm(original) for b in block.get("bodies", []) if b.strip()))
+            if not hook_hit and not body_hit:
                 continue
             for kind in ("hooks", "bodies"):
                 for index, quote in enumerate(block.get(kind, [])):
@@ -140,12 +152,46 @@ def _source_packet(target):
         entry = matches[0]
         approved_ctas.extend(part.strip() for part in re.split(r"(?<=[.!?])\s+", str(entry.get("caption") or ""))
                              if copy_gate.is_cta_shaped(part))
+        # The dated source declares its terminal CTA in on_image.cta. Approve
+        # only that exact dated terminal sentence (original words/URL must
+        # match it); never an arbitrary guessed action.
+        dated_sentences = [part.strip() for part in re.split(r"(?<=[.!?])\s+", str(entry.get("caption") or ""))
+                           if part.strip()]
+        declared_cta = str(entry.get("on_image", {}).get("cta") or "").strip()
+        if dated_sentences and declared_cta and _norm(declared_cta) in _norm(dated_sentences[-1]):
+            approved_ctas.append(dated_sentences[-1])
         texts = [entry.get("caption"), entry.get("on_image", {}).get("headline"),
                  *entry.get("on_image", {}).get("facts", [])]
         for index, quote in enumerate(texts):
             if isinstance(quote, str) and quote.strip():
                 facts.append({"source_id": f"summit:{target['post_date']}:{index}", "text": quote,
                               "file": str(path.relative_to(ROOT)), "file_sha256": _sha(raw), "topic": "dated Summit"})
+    if category == "book":
+        # The approved book campaign master (brand_voice/lasso_calendar_campaign.json,
+        # approved user-supplied copy per agent/lasso_campaign_assets.py) is the
+        # legitimate compiled authority for the exact book card copy and its single
+        # terminal book CTA. Match only ONE exact unique non-sprint book asset on
+        # category/slot/source caption; duplicates or mismatches are not authorized
+        # here. The manifest file is hashed fresh from current bytes (its metadata
+        # source_sha256 field is never used) and facts quote the master caption,
+        # never the old DB caption.
+        path = ROOT / "brand_voice/lasso_calendar_campaign.json"
+        raw = path.read_bytes()
+        assets = [asset for asset in json.loads(raw).get("assets", [])
+                  if asset.get("category") == "book" and not asset.get("is_sprint")
+                  and asset.get("slot_index") == target["slot_index"]
+                  and _norm(asset.get("caption") or "") == _norm(original)]
+        if len(assets) == 1:
+            files[str(path.relative_to(ROOT))] = _sha(raw)
+            asset = assets[0]
+            sentences = [part.strip() for part in re.split(r"(?<=[.!?])\s+", str(asset.get("caption") or ""))
+                         if part.strip()]
+            if len(sentences) >= 2:
+                approved_ctas.append(sentences[-1])
+                for index, quote in enumerate(sentences[:-1]):
+                    facts.append({"source_id": f"book-campaign:{asset.get('id')}:{index}", "text": quote,
+                                  "file": str(path.relative_to(ROOT)), "file_sha256": _sha(raw),
+                                  "topic": "approved book campaign master"})
     # Website/Echo CTA wording is compiled by the existing approved editorial
     # source route. Require the exact current source hook above and exact route.
     if category in ("website", "echo") and facts:

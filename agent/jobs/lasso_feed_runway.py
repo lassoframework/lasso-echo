@@ -40,6 +40,7 @@ def _source_snapshot():
 
 def _coverage(rows, first, last):
     occupied = set()
+    explicit = set()
     for row in rows:
         if not isinstance(row, dict) or row.get("gym_id") != "lasso":
             raise ValueError("calendar read out of scope")
@@ -52,18 +53,29 @@ def _coverage(rows, first, last):
             raise ValueError("ambiguous account")
         if row.get("variant_status") != "active" or row.get("format") not in ("feed", "story"):
             raise ValueError("ambiguous active row")
-        slot = row.get("slot_index")
-        if type(slot) is not int or slot not in (0, 1, 2):
-            raise ValueError("ambiguous slot")
         logical = row.get("logical_post_id")
         if logical not in (None, ""):
             try:
                 uuid.UUID(str(logical))
             except (TypeError, ValueError, AttributeError):
                 raise ValueError("malformed logical identity") from None
+        slot = row.get("slot_index")
+        if "slot_index" in row and slot is None and row["format"] == "story":
+            if "logical_post_id" not in row or logical == "":
+                raise ValueError("ambiguous logical identity")
+            # A known active owned Story with an explicit NULL slot occupies all
+            # three Story slots only on its exact account/date (wildcard). Legacy
+            # rows may also carry an explicit NULL logical identity; occupancy
+            # only, never pair inference. A missing slot_index key still refuses.
+            for s in (0, 1, 2):
+                occupied.add((row["account"], day, "story", s))
+            continue
+        if type(slot) is not int or slot not in (0, 1, 2):
+            raise ValueError("ambiguous slot")
         key = (row["account"], day, row["format"], slot)
-        if key in occupied:
+        if key in explicit:
             raise ValueError("duplicate active slot")
+        explicit.add(key)
         occupied.add(key)
     return occupied
 

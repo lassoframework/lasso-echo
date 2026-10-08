@@ -94,6 +94,106 @@ def test_summit_masks_no_regular_slots_and_only_target_account_inserts(armed):
     assert store.staged[0]["scheduled_at"] == "2026-10-08T07:30:00-04:00"
 
 
+def test_distant_null_slot_stories_do_not_block_runway(armed):
+    # Production shape: active pending instagram Stories, explicit NULL slot,
+    # valid logical id, dated Nov 1/2/4/5/6 — outside current/tomorrow.
+    stories = []
+    for d in ("2026-11-01", "2026-11-02", "2026-11-04", "2026-11-05", "2026-11-06"):
+        row = feed("instagram", None, "story")
+        row["post_date"] = d
+        stories.append(row)
+    original = deepcopy(stories)
+    store = Store(stories)
+    out = job.run(account_key="lasso_fb", now=NOW, store=store,
+                  artifact_store=Artifacts(), horizon_days=2, planner=planner)
+    assert out["ok"] and out["inserted"] == 1
+    assert out["target"] == ["facebook", DAY, 0]
+    # Every existing row retained untouched; nothing updated/deleted.
+    assert store.rows[:-1] == original and len(store.staged) == 1
+
+
+def test_null_slot_story_wildcard_blocks_all_three_story_slots_same_account(armed):
+    wildcard = feed("facebook", None, "story")
+    coverage = job._coverage([wildcard], DAY, DAY)
+    assert {("facebook", DAY, "story", s) for s in (0, 1, 2)} <= coverage
+    def forbidden(*a, **k):
+        raise AssertionError("must never build a feed under a wildcard Story")
+    day2 = []
+    for s in (0, 1, 2):
+        row = feed("facebook", s)
+        row["post_date"] = "2026-10-09"
+        day2.append(row)
+    store = Store([wildcard] + day2)
+    out = job.run(account_key="lasso_fb", now=NOW, store=store,
+                  artifact_store=Artifacts(), horizon_days=2, planner=forbidden)
+    assert not out["ok"] and out["blocked"] == 3 and not store.staged
+
+
+def test_null_slot_story_wildcard_is_exact_account_and_date_only(armed):
+    wildcard = feed("instagram", None, "story")
+    coverage = job._coverage([wildcard], DAY, DAY)
+    assert not any(k[0] == "facebook" or k[2] == "feed" or k[1] != DAY for k in coverage)
+    # Other account's runway proceeds normally.
+    store = Store([wildcard])
+    out = job.run(account_key="lasso_fb", now=NOW, store=store,
+                  artifact_store=Artifacts(), horizon_days=2, planner=planner)
+    assert out["ok"] and out["inserted"] == 1 and out["blocked"] == 0
+
+
+def test_wildcard_overlapping_explicit_story_slot_is_occupied_not_duplicate():
+    rows = [feed("instagram", None, "story"), feed("instagram", 1, "story")]
+    coverage = job._coverage(rows, DAY, DAY)
+    assert {("instagram", DAY, "story", s) for s in (0, 1, 2)} <= coverage
+
+
+def test_duplicate_canonical_slots_still_refuse():
+    rows = [feed("facebook", 1), feed("facebook", 1)]
+    with pytest.raises(ValueError, match="duplicate active slot"):
+        job._coverage(rows, DAY, DAY)
+
+
+def test_null_slot_story_with_malformed_logical_identity_refuses():
+    row = feed("instagram", None, "story")
+    row["logical_post_id"] = "malformed"
+    with pytest.raises(ValueError, match="malformed logical identity"):
+        job._coverage([row], DAY, DAY)
+
+
+def test_null_slot_story_missing_slot_index_key_still_refuses():
+    # Key absent is ambiguous and must refuse, unlike an explicit null.
+    row = feed("instagram", None, "story")
+    del row["slot_index"]
+    with pytest.raises(ValueError, match="ambiguous slot"):
+        job._coverage([row], DAY, DAY)
+
+
+def test_real_november_legacy_null_stories_are_wildcards_not_blockers(armed):
+    # Exact production shape: active pending owned instagram Stories dated
+    # Nov 1/2/4/5/6 with explicit NULL slot_index AND NULL logical_post_id.
+    stories = []
+    for d in ("2026-11-01", "2026-11-02", "2026-11-04", "2026-11-05", "2026-11-06"):
+        row = feed("instagram", None, "story")
+        row["post_date"] = d
+        row["logical_post_id"] = None
+        stories.append(row)
+    coverage = job._coverage(stories, DAY, "2026-11-06")
+    for d in ("2026-11-01", "2026-11-02", "2026-11-04", "2026-11-05", "2026-11-06"):
+        assert {("instagram", d, "story", s) for s in (0, 1, 2)} <= coverage
+    assert not any(k[0] == "facebook" or k[2] == "feed" for k in coverage)
+    original = deepcopy(stories)
+    store = Store(stories)
+    out = job.run(account_key="lasso_fb", now=NOW, store=store,
+                  artifact_store=Artifacts(), horizon_days=2, planner=planner)
+    assert out["ok"] and out["inserted"] == 1
+    assert out["target"] == ["facebook", DAY, 0]
+    assert store.rows[:-1] == original and len(store.staged) == 1
+
+
+def test_null_slot_feed_still_refuses():
+    with pytest.raises(ValueError, match="ambiguous slot"):
+        job._coverage([feed("instagram", None, "feed")], DAY, DAY)
+
+
 def test_orphan_story_never_gets_new_feed_underneath(armed):
     store = Store([feed("facebook", 0, "story")])
     def forbidden(*a, **k):
