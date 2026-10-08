@@ -107,6 +107,26 @@ def preflight(store):
         raise ObservationBridgeHold('observation_bridge_schema_unavailable')
 
 
+def preflight_replacement(store, account_key, rows):
+    """Reject unusable observations before a caller deletes existing rows.
+
+    This is validation only. The writer must still prepare its final payload and
+    pair the actual inserted UUID before persisting an observation. In particular,
+    cached-rendition placeholders cannot acquire provenance by passing this check.
+    """
+    if not enabled():
+        return
+    observed = False
+    for row in rows:
+        if METADATA not in row:
+            continue
+        candidate = dict(row, gym_id=account_key, id=str(uuid.uuid4()))
+        prepare(candidate, row[METADATA])
+        observed = True
+    if observed:
+        preflight(store)
+
+
 def persist_inserted(store, payload, returned, candidates):
     """Require exact UUID and payload equality for all rows before any RPC."""
     if not isinstance(returned, list) or len(returned) != len(payload):
