@@ -222,6 +222,17 @@ def test_reburn_only_story_and_render_identity_classification_hold():
 
 
 def test_default_cli_dry_run_and_mismatch_never_open_persistence(tmp_path, monkeypatch):
+    import os
+    from agent import forward_media_owner as persistence_owner
+    for name in persistence_owner.forbidden_credential_names(os.environ):
+        monkeypatch.delenv(name)
+    # Pytest refreshes its harness marker during each phase. Only this offline
+    # process view excludes it; production continues to reject unknown names.
+    class ProcessEnvironment:
+        @property
+        def environ(self):
+            return {k:v for k,v in os.environ.items() if k != 'PYTEST_CURRENT_TEST'}
+    monkeypatch.setattr(persistence_owner, 'os', ProcessEnvironment())
     monkeypatch.setenv('FORWARD_MEDIA_OWNER_DSN', 'postgresql://owner@localhost/db')
     monkeypatch.setenv('FORWARD_MEDIA_OWNER_ROLE', 'forward_media_owner_20261006')
     source = source_bytes()
