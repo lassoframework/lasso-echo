@@ -118,12 +118,19 @@ def default_fetch_state(ticket, who):
 # stay private), from the gym's own local today through the end of next month. The window
 # end is stated explicitly so a zero is never read as "nothing held, ever".
 # Reason wording: only reasons whose cause is known get a specific sentence. Repeat-visual
-# reasons say a different visual is needed; reasons that name a review say LASSO is
-# reviewing; everything else gets a cause-neutral "not ready" so the answer never invents
-# a review that is not happening. Internal reason strings never enter the facts.
+# reasons (cross_date_*, global_cross_date_*, the 2026-10-05 "Cross-day ... repeat review"
+# sweeps) and cross_gym_* source holds say a different photo or video is needed: nobody is
+# reviewing those rows, they clear when the visual is swapped. Only reasons that put a row
+# in a real human review queue (_HOLD_HUMAN_REVIEW_REASONS) say LASSO is reviewing; the word
+# "review" inside a reason string is NOT evidence that a review is underway (verifier
+# finding on #353, Tough Temple 2026-10-08). Everything else gets a cause-neutral "not
+# ready" so the answer never invents a cause. Internal reason strings never enter the facts.
 _HOLD_TERMINAL = frozenset({"published", "denied", "killed", "failed", "deleted"})
 _HOLD_REPEAT_REASONS = frozenset({"cross_date_media_repeat_needs_new_visual",
                                   "global_cross_date_media_repeat"})
+_HOLD_REPEAT_PREFIXES = ("cross_gym_", "cross-day ", "cross_day_")
+# gym_media_selector.SCENE_REVIEW_HOLD: rows routed to manual scene review, never auto-approved.
+_HOLD_HUMAN_REVIEW_REASONS = frozenset({"scene_review_hold"})
 _HOLD_REPEAT_TEXT = ("needs a different photo or video, because the same visual can not "
                      "run on two different days")
 _HOLD_CAPTION_CHANGED_TEXT = ("needs a new photo or video to match its updated caption")
@@ -168,11 +175,12 @@ def _gym_today(account_key):
 
 
 def _hold_text(reason):
-    if reason in _HOLD_REPEAT_REASONS:
+    low = reason.lower()
+    if reason in _HOLD_REPEAT_REASONS or low.startswith(_HOLD_REPEAT_PREFIXES):
         return _HOLD_REPEAT_TEXT
     if reason in _HOLD_TEXT_BY_REASON:
         return _HOLD_TEXT_BY_REASON[reason]
-    if "review" in reason.lower():
+    if reason in _HOLD_HUMAN_REVIEW_REASONS:
         return _HOLD_REVIEW_TEXT
     return _HOLD_NOT_READY_TEXT
 
