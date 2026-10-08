@@ -8,6 +8,7 @@ from dataclasses import asdict
 import copy
 import hashlib
 import json
+import os
 from pathlib import Path
 import random
 import shutil
@@ -36,9 +37,28 @@ MIGRATIONS=(
  'DRAFT_fixer_photo_historical_clearance_20261008.sql','DRAFT_fixer_prospective_still_v2_20261008.sql')
 
 
+def pg17_bin():
+ candidates=[]
+ configured=os.environ.get('PG17_BIN')
+ if configured:candidates.append(Path(configured))
+ candidates.extend((Path('/opt/homebrew/opt/postgresql@17/bin'),Path('/usr/local/opt/postgresql@17/bin')))
+ candidates.extend(Path('/usr/lib/postgresql').glob('17/bin'))
+ pg_config=shutil.which('pg_config')
+ if pg_config:
+  result=subprocess.run([pg_config,'--bindir'],capture_output=True,text=True,check=False)
+  if result.returncode==0:candidates.append(Path(result.stdout.strip()))
+ initdb=shutil.which('initdb')
+ if initdb:candidates.append(Path(initdb).resolve().parent)
+ for candidate in candidates:
+  if (candidate/'initdb').is_file() and (candidate/'pg_ctl').is_file() and (candidate/'postgres').is_file():
+   version=subprocess.run([str(candidate/'postgres'),'--version'],capture_output=True,text=True,check=False)
+   if version.returncode==0 and ' 17.' in version.stdout:return candidate
+ raise RuntimeError('PostgreSQL 17 binaries required (set PG17_BIN or install PostgreSQL 17)')
+
+
 def main():
  import psycopg
- pg=Path('/opt/homebrew/opt/postgresql@17/bin')
+ pg=pg17_bin()
  assert shutil.disk_usage('/tmp').free>5*1024**3
  with tempfile.TemporaryDirectory(prefix='still_v2_pg_',dir='/tmp') as tmp:
   work=Path(tmp); sock=work/'sock';sock.mkdir();data=work/'data';port=random.randint(41000,59000)

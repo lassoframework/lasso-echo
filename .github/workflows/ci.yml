@@ -24,7 +24,12 @@ jobs:
           cache: pip
 
       - name: Install system dependencies
-        run: sudo apt-get update -y && sudo apt-get install -y --fix-missing ffmpeg
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y --fix-missing ffmpeg postgresql-common
+          sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y
+          sudo apt-get update -y
+          sudo apt-get install -y postgresql-17
 
       - name: Install dependencies
         run: pip install -r requirements-dev.txt

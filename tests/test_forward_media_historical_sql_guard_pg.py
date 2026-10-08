@@ -30,9 +30,29 @@ from tests.test_forward_media_owner_two_phase_pg import png
 from tests.test_forward_media_photo_certificate import fixtures
 
 
+def pg17_bin():
+ candidates=[]
+ configured=os.environ.get('PG17_BIN')
+ if configured:candidates.append(Path(configured))
+ for candidate in (Path('/opt/homebrew/opt/postgresql@17/bin'),Path('/usr/local/opt/postgresql@17/bin')):
+  candidates.append(candidate)
+ candidates.extend(Path('/usr/lib/postgresql').glob('17/bin'))
+ pg_config=shutil.which('pg_config')
+ if pg_config:
+  result=subprocess.run([pg_config,'--bindir'],capture_output=True,text=True,check=False)
+  if result.returncode==0:candidates.append(Path(result.stdout.strip()))
+ initdb=shutil.which('initdb')
+ if initdb:candidates.append(Path(initdb).resolve().parent)
+ for candidate in candidates:
+  if (candidate/'initdb').is_file() and (candidate/'pg_ctl').is_file() and (candidate/'postgres').is_file():
+   version=subprocess.run([str(candidate/'postgres'),'--version'],capture_output=True,text=True,check=False)
+   if version.returncode==0 and ' 17.' in version.stdout:return candidate
+ raise RuntimeError('PostgreSQL 17 binaries required (set PG17_BIN or install PostgreSQL 17)')
+
+
 def main():
  import psycopg
- pg=Path('/opt/homebrew/opt/postgresql@17/bin')
+ pg=pg17_bin()
  assert shutil.disk_usage('/tmp').free>5*1024**3
  with tempfile.TemporaryDirectory(prefix='owner_photo_pg_',dir='/tmp') as tmp:
   root=Path(tmp);sock=root/'sock';sock.mkdir();data=root/'data';port=random.randint(41000,59000)
