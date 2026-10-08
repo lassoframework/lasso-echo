@@ -6,7 +6,7 @@ exact-caption reviewed media and the DB empty-slot insert arbitrate staging.
 import hashlib
 import os
 import uuid
-from datetime import timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from agent import config, copy_gate, infographic_evidence, real_month_planner, real_month_run
@@ -36,6 +36,15 @@ def _source_snapshot():
     root = Path(__file__).resolve().parents[2] / "brand_voice"
     return {p.name: hashlib.sha256(p.read_bytes()).hexdigest()
             for p in sorted(root.glob("lasso*")) if p.is_file()}
+
+
+def _same_scheduled_instant(saved, expected):
+    try:
+        left = datetime.fromisoformat(str(saved).replace("Z", "+00:00"))
+        right = datetime.fromisoformat(str(expected).replace("Z", "+00:00"))
+        return left.tzinfo is not None and right.tzinfo is not None and left == right
+    except (TypeError, ValueError):
+        return False
 
 
 def _coverage(rows, first, last):
@@ -120,7 +129,8 @@ def run(*, account_key, now=None, store=None, artifact_store=None,
     first = instant.date().isoformat()
     last = (instant.date() + timedelta(days=horizon_days - 1)).isoformat()
     grade_last = (instant.date() + timedelta(days=29)).isoformat()
-    holder = "lasso-runway:" + str(uuid.uuid4())
+    artifact_owner = str(uuid.uuid4())
+    holder = "lasso-runway:" + artifact_owner
     if not build_lock.acquire("lasso", holder=holder):
         return dict(out, reason="LASSO build lock occupied")
     heartbeat = build_lock.start_heartbeat("lasso", holder=holder)
@@ -184,7 +194,7 @@ def run(*, account_key, now=None, store=None, artifact_store=None,
         source_id = f"content_calendar:{row['id']}:caption"
         source_hash = hashlib.sha256(caption.encode()).hexdigest()
         cache_key = "held-feed:" + hashlib.sha256(f"{source_id}:{source_hash}".encode()).hexdigest()
-        claimed = artifacts.claim(account_key, cache_key, holder)
+        claimed = artifacts.claim(account_key, cache_key, artifact_owner)
         if not claimed:
             return dict(out, blocked=out["blocked"] + 1, reason="source artifact lease or cooldown")
         reviewed = repair._reviewed_artifact_record(store, source_id, source_hash, account_key)
@@ -220,7 +230,8 @@ def run(*, account_key, now=None, store=None, artifact_store=None,
         saved = store.get_row("lasso", row["id"])
         if not isinstance(saved, dict) or any(saved.get(k) != row[k] for k in
                 ("id", "gym_id", "account", "post_date", "slot_index", "format", "caption",
-                 "image_url", "status", "variant_status", "logical_post_id", "scheduled_at")):
+                "image_url", "status", "variant_status", "logical_post_id")) or not _same_scheduled_instant(
+                    saved.get("scheduled_at"), row["scheduled_at"]):
             return dict(out, blocked=out["blocked"] + 1, reason="insert readback mismatch")
         after = store.rows_in_range_complete("lasso", first, grade_last, all_statuses=True)
         if [r for r in after if str(r.get("id")) != row["id"]] != existing:
@@ -230,6 +241,6 @@ def run(*, account_key, now=None, store=None, artifact_store=None,
         return dict(out, blocked=out["blocked"] + 1, reason=f"runway failed: {type(exc).__name__}: {exc}")
     finally:
         if claimed:
-            artifacts.release(account_key, cache_key, holder)
+            artifacts.release(account_key, cache_key, artifact_owner)
         heartbeat.stop()
         build_lock.release("lasso", holder=holder)
