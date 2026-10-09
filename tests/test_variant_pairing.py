@@ -607,6 +607,254 @@ def test_lasso_story_variant_keeps_caption_and_story_canvas(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# _owned_story_caption_fields — owned LASSO Story copy de-duplication
+#
+# Bug being fixed: the owned Story branch rendered headline = first caption
+# line, facts = [entire caption], plus the same approved CTA again in a
+# separate CTA field, duplicating both in the rendered Story. The audited
+# target caption is seven exact paragraphs (split on '\n\n'): H=P0, body
+# P1..P5, CTA=P6. The helper must hand the engine exactly those slices and
+# reconstruct the original caption byte-for-byte; anything that does not
+# match exactly falls back to the original (headline, facts, cta) unchanged.
+# ---------------------------------------------------------------------------
+
+_STORY_H = "One clear next step for your team."
+_STORY_BODY = [
+    "Monday follow up keeps the plan moving. See https://lasso.example/growth for the full plan.",
+    "Tuesday the team reviews the numbers together.",
+    "Monday follow up keeps the plan moving. See https://lasso.example/growth for the full plan.",  # intentional repeat
+    "Thursday is for the wins worth saving #lasso #growthplan.",
+    "Friday closes the loop with one short recap.",
+]
+_STORY_CTA = "Book a growth call"
+_STORY_CAPTION = "\n\n".join([_STORY_H] + _STORY_BODY + [_STORY_CTA])
+
+
+def _story_row(caption=_STORY_CAPTION, **kw):
+    kw.setdefault("fmt", "story")
+    kw.setdefault("gym_id", "lasso")
+    return _row("lasso-story-dedup-1", caption=caption, **kw)
+
+
+def _run_story_engine(monkeypatch, row, seen):
+    """Drive the real generate_variant_image seam for an owned LASSO Story row
+    with the artifact/review dependencies faked, recording the exact fields
+    handed to the generate engine."""
+    from agent import infographic_artifacts, lasso_current_artifact
+    monkeypatch.setenv("ECHO_VARIANT_PAIRING", "true")
+    monkeypatch.setenv("AGENT_LASSO_INFOGRAPHIC_QUALITY", "true")
+    monkeypatch.setattr(lasso_current_artifact, "artifact_current", lambda *a, **k: True)
+    def save_source(self, account_key, url, path, source):
+        seen["saved_source"] = dict(source)
+        return {}
+    monkeypatch.setattr(infographic_artifacts.ArtifactStore, "save", save_source)
+    monkeypatch.setattr(vr, "_attest_reviewed_story_dimensions", lambda path: True)
+    from agent import content_planner
+    monkeypatch.setattr(content_planner, "load_source_doc", lambda: type(
+        "Doc", (), {"ctas": [_STORY_CTA]})())
+
+    def fake_generate(headline, facts, **kwargs):
+        seen.update(headline=headline, facts=list(facts), kwargs=kwargs)
+        return {"path": "/tmp/story-dedup.png", "prompt": "p"}
+
+    paired = {"feed": dict(row, format="feed"), "artifact": {"id": "a1"}}
+    out = vr.generate_variant_image(row, "lasso_ig", generate_fn=fake_generate,
+                                    paired_feed_reference=paired,
+                                    host_fn=lambda path, key: "https://cdn/story-dedup.png")
+    return out, paired
+
+
+def test_owned_story_helper_seven_paragraphs_reconstructs_caption_byte_for_byte():
+    """The actual seven-paragraph target: H=P0, body=P1..P5, CTA=P6, and
+    join('\\n\\n') of the returned fields must equal the original caption
+    byte-for-byte — every word, punctuation mark, ordering, and repeat kept."""
+    caption_hash_before = hashlib.sha256(_STORY_CAPTION.encode("utf-8")).hexdigest()
+    row = _story_row()
+    headline, new_facts, cta = vr._owned_story_caption_fields(
+        row, _STORY_H, [_STORY_CAPTION], _STORY_CTA)
+    assert headline == _STORY_H
+    assert new_facts == _STORY_BODY
+    assert cta == _STORY_CTA
+    rebuilt = "\n\n".join([headline] + list(new_facts) + [cta])
+    assert rebuilt.encode("utf-8") == _STORY_CAPTION.encode("utf-8")
+    # source identity untouched: the row dict and its caption hash never change
+    assert row["caption"] == _STORY_CAPTION
+    assert hashlib.sha256(row["caption"].encode("utf-8")).hexdigest() == caption_hash_before
+
+
+def test_owned_story_helper_preserves_intentional_body_duplicate_by_index():
+    """P1 == P3 on purpose in this caption; the body must keep BOTH, in order."""
+    _, new_facts, _ = vr._owned_story_caption_fields(
+        _story_row(), _STORY_H, [_STORY_CAPTION], _STORY_CTA)
+    assert len(new_facts) == 5
+    assert new_facts[0] == new_facts[2]
+    assert [i for i, f in enumerate(new_facts) if f == _STORY_BODY[0]] == [0, 2]
+
+
+def test_owned_story_helper_preserves_headline_and_cta_repeated_in_body():
+    caption = "\n\n".join([_STORY_H, _STORY_H, _STORY_CTA, _STORY_CTA])
+    fields = vr._owned_story_caption_fields(_story_row(caption), _STORY_H,
+                                           [caption], _STORY_CTA)
+    assert fields == (_STORY_H, [_STORY_H, _STORY_CTA], _STORY_CTA)
+    assert "\n\n".join([fields[0], *fields[1], fields[2]]) == caption
+
+
+def test_owned_story_engine_falls_back_on_repeated_blank_separator(monkeypatch):
+    caption = _STORY_CAPTION.replace("\n\n", "\n\n\n\n", 1)
+    seen = {}
+    out, _ = _run_story_engine(monkeypatch, _story_row(caption), seen)
+    assert out["ok"] is True
+    assert seen["facts"] == [caption]
+
+
+def test_owned_story_helper_keeps_narrative_urls_and_hashtags():
+    _, new_facts, _ = vr._owned_story_caption_fields(
+        _story_row(), _STORY_H, [_STORY_CAPTION], _STORY_CTA)
+    body = "\n\n".join(new_facts)
+    assert "https://lasso.example/growth" in body
+    assert "#lasso" in body and "#growthplan" in body
+
+
+@pytest.mark.parametrize("headline,facts,cta,label", [
+    # headline is not exactly P0 (drifted wording)
+    ("A different headline.", [_STORY_CAPTION], _STORY_CTA, "nonexact_headline"),
+    # headline spans more than one sentence of P0
+    ("One clear next step for your team. Extra sentence.", [_STORY_CAPTION],
+     _STORY_CTA, "multi_sentence_headline"),
+    # CTA only partially matches P6
+    (_STORY_H, [_STORY_CAPTION], "Book a growth", "partial_cta"),
+    # CTA differs only by case from P6
+    (_STORY_H, [_STORY_CAPTION], "book a growth call", "case_different_cta"),
+])
+def test_owned_story_helper_falls_back_to_original_fields(headline, facts, cta, label):
+    """Anything that is not the exact audited structure must return the
+    ORIGINAL (headline, facts, cta) untouched — never a partial slice."""
+    out = vr._owned_story_caption_fields(_story_row(), headline, facts, cta)
+    assert out == (headline, facts, cta), label
+
+
+def test_owned_story_helper_falls_back_when_only_headline_and_cta():
+    """Caption of exactly H + CTA leaves an empty residual body — conservative
+    fallback, never an empty facts list that would trip the no-fabrication gate."""
+    caption = _STORY_H + "\n\n" + _STORY_CTA
+    original = (_STORY_H, [caption], _STORY_CTA)
+    out = vr._owned_story_caption_fields(_story_row(caption=caption), *original)
+    assert out == original
+
+
+@pytest.mark.parametrize("caption,label", [
+    ("  " + _STORY_CAPTION, "leading_raw_whitespace"),
+    (_STORY_CAPTION + "\n", "trailing_raw_whitespace"),
+    ("\t" + _STORY_CAPTION + "  ", "both_sides_raw_whitespace"),
+])
+def test_owned_story_helper_falls_back_on_raw_caption_edge_whitespace(caption, label):
+    """A caption that is not exactly its own .strip() can never reconstruct
+    byte-for-byte from stripped slices — the helper must refuse and return the
+    original (headline, facts, cta) untouched."""
+    original = (_STORY_H, [caption], _STORY_CTA)
+    out = vr._owned_story_caption_fields(_story_row(caption=caption), *original)
+    assert out == original, label
+
+
+@pytest.mark.parametrize("index,padded,label", [
+    (0, " " + _STORY_H, "headline_leading_space"),
+    (2, _STORY_BODY[1] + "  ", "body_trailing_spaces"),
+    (4, " " + _STORY_BODY[3], "second_body_copy_leading_space"),
+    (6, _STORY_CTA + "\t", "cta_trailing_tab"),
+])
+def test_owned_story_helper_falls_back_when_a_paragraph_changes_under_strip(
+        index, padded, label):
+    """Any canonical paragraph carrying its own leading/trailing whitespace
+    breaks exact ordered reconstruction — conservative fallback, originals back."""
+    parts = [_STORY_H] + list(_STORY_BODY) + [_STORY_CTA]
+    parts[index] = padded
+    caption = "\n\n".join(parts)
+    original = (_STORY_H, [caption], _STORY_CTA)
+    out = vr._owned_story_caption_fields(_story_row(caption=caption), *original)
+    assert out == original, label
+
+
+def test_owned_story_engine_seam_removes_field_duplicates_and_keeps_source(monkeypatch):
+    """Through the real generate_variant_image seam, the owned Story branch hands
+    the engine headline=P0, facts=P1..P5, cta=P6 — the headline and CTA no
+    longer duplicated inside the body — while the row, its caption hash, the
+    approved footer path, and the paired feed reference all stay unchanged."""
+    seen = {}
+    row = _story_row()
+    hash_before = hashlib.sha256(row["caption"].encode("utf-8")).hexdigest()
+    out, paired = _run_story_engine(monkeypatch, row, seen)
+
+    assert out["ok"] is True
+    assert seen["headline"] == _STORY_H
+    assert seen["facts"] == _STORY_BODY
+    assert seen["kwargs"]["cta"] == _STORY_CTA
+    # exact byte reconstruction of what the renderer consumed
+    rebuilt = "\n\n".join([seen["headline"]] + seen["facts"] + [seen["kwargs"]["cta"]])
+    assert rebuilt.encode("utf-8") == _STORY_CAPTION.encode("utf-8")
+    # headline/CTA appear nowhere inside the rendered body facts
+    assert all(_STORY_H not in f for f in seen["facts"])
+    assert all(_STORY_CTA not in f for f in seen["facts"])
+    # source identity, approved footer, and paired feed reference unchanged
+    assert row["caption"] == _STORY_CAPTION
+    assert hashlib.sha256(row["caption"].encode("utf-8")).hexdigest() == hash_before
+    assert seen["kwargs"]["footer"] is None
+    assert seen["kwargs"]["paired_feed_reference"] is paired
+    assert seen["saved_source"] == {
+        "source_id": "content_calendar:" + row["id"] + ":caption",
+        "source_hash": hash_before,
+    }
+
+
+def test_lasso_feed_path_retains_complete_original_caption(monkeypatch):
+    """The feed path is not the Story de-dup path: the engine still receives the
+    ENTIRE original caption as its single fact, headline duplication included."""
+    monkeypatch.setenv("ECHO_VARIANT_PAIRING", "true")
+    monkeypatch.setenv("AGENT_LASSO_INFOGRAPHIC_QUALITY", "true")
+    from agent import infographic_artifacts
+    monkeypatch.setattr(infographic_artifacts.ArtifactStore, "save",
+                        lambda *args, **kwargs: {})
+    from agent import content_planner
+    monkeypatch.setattr(content_planner, "load_source_doc", lambda: type(
+        "Doc", (), {"ctas": [_STORY_CTA]})())
+    seen = {}
+
+    def fake_generate(headline, facts, **kwargs):
+        seen.update(headline=headline, facts=list(facts), kwargs=kwargs)
+        return {"path": "/tmp/feed.png", "prompt": "p"}
+
+    row = _row("lasso-feed-1", gym_id="lasso", fmt="feed", caption=_STORY_CAPTION)
+    out = vr.generate_variant_image(row, "lasso_ig", generate_fn=fake_generate,
+                                    host_fn=lambda path, key: "https://cdn/feed.png")
+    assert out["ok"] is True
+    assert seen["facts"] == [_STORY_CAPTION]
+    assert seen["headline"] == _STORY_H
+    assert seen["kwargs"]["cta"] == _STORY_CTA
+    assert seen["kwargs"]["footer"] is None
+    assert row["caption"] == _STORY_CAPTION
+
+
+def test_client_story_retains_legacy_inputs_and_never_allocates_owned_copy(monkeypatch):
+    monkeypatch.setenv("ECHO_VARIANT_PAIRING", "true")
+    monkeypatch.setenv("AGENT_LASSO_INFOGRAPHIC_QUALITY", "true")
+    def forbidden_allocation(*args):
+        raise AssertionError("Client Story entered owned copy allocation")
+    monkeypatch.setattr(vr, "_owned_story_caption_fields", forbidden_allocation)
+    caption = "Client hook. Client detail. Book a growth call."
+    row = _row("client-story", gym_id="eng", fmt="story", caption=caption)
+    seen = {}
+    def generate(headline, facts, **kwargs):
+        seen.update(headline=headline, facts=facts, kwargs=kwargs)
+        return {"path": "/tmp/client-story.png", "prompt": "offline"}
+    result = vr.generate_variant_image(row, "eng", generate_fn=generate,
+                                      host_fn=lambda *args: "https://cdn/client-story.png")
+    assert result["ok"] is True
+    assert seen["headline"] == row["pillar"]
+    assert seen["facts"] == ["Client hook", "Client detail", "Book a growth call."]
+    assert "cta" not in seen["kwargs"] and "paired_feed_reference" not in seen["kwargs"]
+    assert row["caption"] == caption
+
+
+# ---------------------------------------------------------------------------
 # variant_regen_brief — the human-typed "type what you want" companion
 # ---------------------------------------------------------------------------
 
