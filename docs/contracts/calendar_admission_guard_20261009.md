@@ -39,5 +39,9 @@ finalization and persisted old-row archival, null-logical inserts, ordinary and
 legacy-definer PATCH, borrowed/stale authority, cross-tenant/date source and
 derivative conflicts, concurrent refusal, capability cleanup and nonmedia
 operations. Positive platform sibling preparation/finalization remains covered
-by the preceding stack's own harness, not newly demonstrated by this module.
+by this module's focused real-PG17 harness for distinct controlled renditions
+from one source on the same tenant/day/logical post. It verifies two active
+Instagram/Facebook rows, one permanent occupancy, two exact row bindings and
+idempotent replay. Source receipts and visual attestations in the fixture are
+synthetic; external byte reads and provider delivery remain unverified.
 No production behavior, gate activation or provider delivery is claimed.
