@@ -283,6 +283,40 @@ def _upload_base_url():
     return raw.rstrip("/")
 
 
+def _attach_media_preview_urls(body, token):
+    """Return a media response with directly loadable, token-scoped thumbnails.
+
+    The thumbnail HTTP route is mounted at ``/portal/<token>/media/thumb/<id>``.
+    The media handlers cannot include that path because they intentionally receive
+    only the resolved gym identity, not the raw portal token. Their historical
+    ``/media/thumb/<id>`` value therefore pointed at a route that does not exist and,
+    when rendered by the separate portal origin, did not even reach Echo. Add the
+    authenticated absolute URL here at the transport boundary where the token is
+    already present. Both Drive images and Drive video stills use the same proxy.
+    """
+    if not isinstance(body, dict):
+        return body
+    projected = dict(body)
+    prefix = f"{_upload_base_url()}/portal/{token}/media/thumb/"
+    for collection in ("assets", "items"):
+        rows = projected.get(collection)
+        if not isinstance(rows, list):
+            continue
+        attached = []
+        for raw in rows:
+            if not isinstance(raw, dict):
+                attached.append(raw)
+                continue
+            row = dict(raw)
+            asset_id = str(row.get("id") or row.get("asset_id") or "")
+            # This is the exact character contract accepted by _media_route.
+            row["thumb_url"] = prefix + asset_id if re.fullmatch(
+                r"[A-Za-z0-9_-]+", asset_id) else ""
+            attached.append(row)
+        projected[collection] = attached
+    return projected
+
+
 def _connect_return_url(token, dest):
     """The token-scoped Echo return leg handed to Zernio as the post-OAuth redirect_url for
     Facebook / Google Business (FINALIZE FIX, Zanshin/Pete 2026-08-28).
@@ -2279,6 +2313,8 @@ def build_server(port=None):
                     return self._send_json(body, status)
                 if mt_kind == "assets":
                     status, body = _gm.handle_list_assets(account_key)
+                    if status == 200:
+                        body = _attach_media_preview_urls(body, mt_token)
                     return self._send_json(body, status)
                 # thumb: a gym-scoped image proxy (status, content_type, bytes).
                 status, ctype, data = _gm.handle_thumbnail(account_key, mt_arg)
@@ -2344,6 +2380,8 @@ def build_server(port=None):
                 if account_key is None or is_revoked(account_key):
                     return self._deny(404)
                 status, body = _ss.handle_list_sort_queue(account_key)
+                if status == 200:
+                    body = _attach_media_preview_urls(body, ss_token)
                 return self._send_json(body, status)
 
             # Story Studio READ lane (2026-09-04): GET /portal/<token>/studio/story

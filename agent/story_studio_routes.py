@@ -333,15 +333,25 @@ def _automatic_job_for_client(job):
     elif internal_status == "running":
         status = "running"
         message = "Echo is building a reel from your clips."
+    elif internal_status in ("held", "uncertain"):
+        # These are retryable processing outcomes. The worker keeps the same job and
+        # retries it up to its bounded attempt limit, so presenting either one as an
+        # exhausted job makes an in-progress reel look like a team-review error.
+        status = "running"
+        message = "Echo is retrying this reel automatically. No action is needed from you."
     elif internal_status == "waiting_pool":
         status = "waiting_pool"
         message = "Upload at least three usable raw clips in Media so Echo can build a reel."
-    else:
-        # Preserve the status value the existing portal already presents as
-        # "Needs team review", but never send the rejected overlay text, exception
-        # class, retry details or identifier that used to follow that label.
+    elif internal_status == "exhausted":
+        # Only a job that has actually used its bounded retries needs the team. Never
+        # expose the rejected overlay, exception class, counters or internal UUID.
         status = "exhausted"
         message = "Our team is reviewing this reel. No action is needed from you."
+    else:
+        # A new or malformed worker state is not evidence that retries were exhausted.
+        # Keep it distinct from team review instead of manufacturing that conclusion.
+        status = "unavailable"
+        message = "This reel's status is temporarily unavailable. No action is needed from you."
     return {
         # The current portal treats this as optional display text. An empty value
         # preserves its response shape without exposing an internal request UUID.
