@@ -251,3 +251,50 @@ def test_auto_approve_off_by_default_still_cards(monkeypatch):
     poster = RecordingPoster()
     _post_and_save(d, Store(), poster, idempotent=True)
     assert poster.cards == [d]             # card still required
+
+
+def test_generated_client_infographic_cannot_use_global_auto_approve(monkeypatch):
+    """The durable review suffix blocks the portfolio bypass even if a caller
+    forgets the transient force_approval field. It remains a normal pending card."""
+    monkeypatch.setenv("AGENT_AUTO_APPROVE_ENABLED", "true")
+    monkeypatch.delenv("AGENT_TRUST_AUTOPUBLISH", raising=False)
+    import agent.meta_publisher as mp
+    monkeypatch.setattr(mp, "publish", lambda *a, **k: (_ for _ in ()).throw(
+        AssertionError("generated client infographic reached provider publish")))
+    # This client key begins with "lasso" but its normalized base is "lassogym".
+    # Prefix matching would misclassify it as the autonomous LASSO house account.
+    draft = _draft(key="lassogym_ig")
+    draft.category = "educational::needs_client_safe_review"
+    poster = RecordingPoster()
+    store = Store()
+
+    _post_and_save(draft, store, poster, idempotent=True)
+
+    assert poster.cards == [draft]
+    assert draft.status == DraftStatus.PENDING
+    assert store.saved == [draft]
+
+
+def test_lasso_infographic_keeps_existing_auto_approve_behavior(monkeypatch):
+    """The client-card exception does not change LASSO's distinct autonomy lane."""
+    monkeypatch.setenv("AGENT_AUTO_APPROVE_ENABLED", "true")
+
+    class Result:
+        mode = "published"
+        media_id = "L1"
+
+    calls = []
+    import agent.meta_publisher as mp
+    monkeypatch.setattr(mp, "publish", lambda draft, acct: calls.append(draft) or Result())
+    monkeypatch.setattr("agent.accounts.get_account",
+                        lambda key: _acct(TrustLevel.FULL_APPROVAL, key))
+    draft = _draft()
+    draft.category = "educational::needs_client_safe_review"
+    poster = RecordingPoster()
+    store = Store()
+
+    _post_and_save(draft, store, poster, idempotent=True)
+
+    assert calls == [draft]
+    assert poster.cards == []
+    assert draft.status == DraftStatus.APPROVED
