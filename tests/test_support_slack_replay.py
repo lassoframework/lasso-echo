@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import random
+import shutil
 import subprocess
 import tempfile
 import threading
@@ -26,7 +27,27 @@ from agent.slack_convo.bus import Bus
 from tests.test_slack_convo import _deps, _ev, _who
 
 ROOT = Path(__file__).resolve().parents[1]
-PG = Path('/opt/homebrew/opt/postgresql@17/bin')
+
+
+def pg_binary(name):
+    """Find a PostgreSQL 17 executable and fail closed on another major."""
+    candidates = [
+        Path('/opt/homebrew/opt/postgresql@17/bin') / name,
+        Path('/usr/lib/postgresql/17/bin') / name,
+    ]
+    located = shutil.which(name)
+    if located:
+        candidates.append(Path(located))
+    for candidate in candidates:
+        if not candidate.is_file() or not os.access(candidate, os.X_OK):
+            continue
+        server = candidate.parent / 'postgres'
+        if not server.is_file():
+            continue
+        version = subprocess.check_output([str(server), '--version'], text=True)
+        if ' 17.' in version:
+            return str(candidate)
+    raise AssertionError(f'PostgreSQL 17 executable {name!r} not found')
 
 
 def q(value):
@@ -58,21 +79,22 @@ class Engine:
 
 @pytest.fixture(scope='session')
 def pg_engine():
-    assert PG.exists(), 'existing PostgreSQL 17 runtime required'
-    version = subprocess.check_output([str(PG/'postgres'), '--version'], text=True)
-    assert ' 17.' in version
+    initdb, pg_ctl = pg_binary('initdb'), pg_binary('pg_ctl')
+    psql, postgres = pg_binary('psql'), pg_binary('postgres')
+    version = subprocess.check_output([postgres, '--version'], text=True)
+    assert ' 17.' in version, f'PostgreSQL 17 required, got: {version.strip()}'
     with tempfile.TemporaryDirectory(prefix='slack_replay_pg_', dir='/tmp') as tmp:
         path = Path(tmp)
         sock = path/'sock'
         sock.mkdir()
         data = path/'data'
         port = random.randrange(40000, 60000)
-        subprocess.run([str(PG/'initdb'), '-D', str(data), '-U', 'postgres', '--no-sync'],
+        subprocess.run([initdb, '-D', str(data), '-U', 'postgres', '--no-sync'],
                        check=True, capture_output=True, timeout=30)
-        subprocess.run([str(PG/'pg_ctl'), '-D', str(data), '-l', str(path/'log'),
+        subprocess.run([pg_ctl, '-D', str(data), '-l', str(path/'log'),
                         '-o', f"-k {sock} -p {port} -c listen_addresses=''", '-w', 'start'],
                        check=True, capture_output=True, timeout=30)
-        engine = Engine([str(PG/'psql'), '-X', '-qAt', '-v', 'ON_ERROR_STOP=1',
+        engine = Engine([psql, '-X', '-qAt', '-v', 'ON_ERROR_STOP=1',
                          '-h', str(sock), '-p', str(port), '-U', 'postgres', '-d', 'postgres'])
         try:
             engine.sql("""
@@ -112,7 +134,7 @@ def pg_engine():
             engine.sql((ROOT/'migrations/DRAFT_support_slack_replay_20261009.sql').read_text())
             yield engine
         finally:
-            subprocess.run([str(PG/'pg_ctl'), '-D', str(data), '-m', 'fast', '-w', 'stop'],
+            subprocess.run([pg_ctl, '-D', str(data), '-m', 'fast', '-w', 'stop'],
                            capture_output=True, timeout=30, check=False)
 
 

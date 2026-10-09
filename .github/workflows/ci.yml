@@ -9,7 +9,7 @@ on:
 jobs:
   pytest:
     name: pytest
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # The full suite now exercises several real ffmpeg paths and can exceed
     # fifteen minutes on a slower hosted runner. Keep the guard meaningful by
     # allowing it to finish instead of cancelling around the 90% mark.
@@ -24,7 +24,21 @@ jobs:
           cache: pip
 
       - name: Install system dependencies
-        run: sudo apt-get update -y && sudo apt-get install -y --fix-missing ffmpeg
+        run: |
+          sudo apt-get install -y --no-install-recommends ca-certificates curl
+          sudo install -d /usr/share/postgresql-common/pgdg
+          sudo curl -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc --fail https://www.postgresql.org/media/keys/ACCC4CF8.asc
+          sudo tee /etc/apt/sources.list.d/pgdg.sources >/dev/null <<'EOF'
+          Types: deb
+          URIs: https://apt.postgresql.org/pub/repos/apt
+          Suites: noble-pgdg
+          Architectures: amd64
+          Components: main
+          Signed-By: /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc
+          EOF
+          sudo apt-get update -y
+          sudo apt-get install -y --fix-missing ffmpeg postgresql-17
+          /usr/lib/postgresql/17/bin/postgres --version | grep -E ' 17\.'
 
       - name: Install dependencies
         run: pip install -r requirements-dev.txt
