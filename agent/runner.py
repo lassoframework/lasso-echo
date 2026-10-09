@@ -1154,6 +1154,16 @@ def run_daily(poster=None, voice_path=None, library_path=None,
         # agent disarmed. say nothing publicly; just report state to the caller.
         return {"status": "disabled", "drafts": []}
 
+    # Recover on the listener's original durable journal even when planning skips
+    # existing months, lacks voice/city, or has no connected locations.
+    from .jobs.gbp_drive_use_recovery import run as _gbp_use_recovery_run
+    try:
+        recovery = _gbp_use_recovery_run()
+        if recovery.get("reason") != "disabled":
+            print(f"[gbp-drive-recovery] {recovery}")
+    except Exception as exc:
+        print(f"[gbp-drive-recovery] held: {type(exc).__name__}")
+
     # NOTE: the LASSO held-media repair + paired-Story preparation sequence
     # runs at the END of this draw (see _lasso_held_media_and_story_preparation,
     # invoked immediately before the calendar publish block below), AFTER every
