@@ -95,6 +95,7 @@ create table if not exists public.echo_source_brand_receipts (
 
 create or replace function public.echo_source_brand_immutable() returns trigger language plpgsql as $$
 begin raise exception 'append_only_evidence'; end $$;
+revoke all on function public.echo_source_brand_immutable() from public,anon,authenticated,service_role;
 do $$ declare t text; begin
   foreach t in array array['echo_source_captures','echo_source_brand_provider_status','echo_source_brand_capability_events','echo_source_brand_bundles','echo_source_brand_receipts','echo_source_brand_observations'] loop
     execute format('alter table public.%I enable row level security', t);
@@ -118,7 +119,7 @@ begin
   new.captured_at := clock_timestamp();
   return new;
 end $$;
-revoke all on function public.echo_source_capture_insert_lock() from public,anon,authenticated;
+revoke all on function public.echo_source_capture_insert_lock() from public,anon,authenticated,service_role;
 drop trigger if exists echo_source_capture_insert_lock on public.echo_source_captures;
 create trigger echo_source_capture_insert_lock before insert on public.echo_source_captures
 for each row execute function public.echo_source_capture_insert_lock();
@@ -497,6 +498,17 @@ begin
 end $$;
 revoke all on function public.echo_source_brand_grant(uuid,text,text,text,uuid) from public,anon,authenticated;
 grant execute on function public.echo_source_brand_grant(uuid,text,text,text,uuid) to service_role;
+-- Supabase default ACLs grant ALL to service_role on newly created tables.
+-- Reset the full object ACL before granting the exact adapter contract; partial
+-- DML revokes leave TRUNCATE (which bypasses row triggers) and other modes open.
+revoke all on public.echo_source_captures,public.echo_source_brand_provider_status,public.echo_source_brand_capability_events,public.echo_source_brand_bundles,public.echo_source_brand_receipts,public.echo_source_brand_observations from public,anon,authenticated,service_role;
+-- Identity values are produced only inside owner-executed RPCs. Service callers
+-- do not need nextval/setval or direct sequence readback for capture UUIDs.
+do $$ declare t text; sequence_name text; begin
+  foreach t in array array['echo_source_brand_provider_status','echo_source_brand_capability_events','echo_source_brand_receipts','echo_source_brand_observations'] loop
+    sequence_name:=pg_get_serial_sequence('public.'||t,'id');
+    execute format('revoke all on sequence %s from public,anon,authenticated,service_role',sequence_name);
+  end loop;
+end $$;
 grant select on public.echo_source_brand_provider_status,public.echo_source_captures,public.echo_source_brand_capability_events,public.echo_source_brand_bundles,public.echo_source_brand_receipts,public.echo_source_brand_observations to service_role;
 grant insert on public.echo_source_captures to service_role;
-revoke insert,update,delete on public.echo_source_brand_provider_status,public.echo_source_brand_capability_events,public.echo_source_brand_bundles,public.echo_source_brand_receipts,public.echo_source_brand_observations from service_role;

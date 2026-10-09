@@ -29,11 +29,11 @@ SEED = FIXTURES / 'generated_client_seed_20261009.py'
 SEED_SHA = 'd00b1a98c4fe413f84c859ac664682aa61fddb2a32c3d5d5a59f77b55969a4e8'
 PORTAL_SHA = 'd54a5b9e1f857d31912540f38f626b59c891296a4aebd7b3c2d55a1f4abdc705'
 HASHES = {
- '0611_echo_source_brand_bundle.verify.sql': 'c57bd51f871e1a3eef142c9f69b5a474830b47c946d449a35fdd8f135b833c54',
+ '0611_echo_source_brand_bundle.verify.sql': '4e99445cf04fff7046d8da64d13e02eb5ca875a7cc988c64cd9ad0e08a67063f',
  'DRAFT_0625_generated_client_approval.sql': 'd54a5b9e1f857d31912540f38f626b59c891296a4aebd7b3c2d55a1f4abdc705',
  'DRAFT_0625_generated_client_approval.verify.sql': '19fd8aa6b031bd9fd80aa70a64b34b737daf1ae02d03d0e04bfa6d3bf4953ee7',
  'generated_client_seed_20261009.py': 'd00b1a98c4fe413f84c859ac664682aa61fddb2a32c3d5d5a59f77b55969a4e8',
- 'portal_0611_echo_source_brand_bundle_held_20261008.sql': 'd3a3b22d62f2ebc0376f89552a994d785947eb5309dff6e3d655ebf4c0f71178',
+ 'portal_0611_echo_source_brand_bundle_held_20261008.sql': '55374ffe33677a1ef8ccbb41256c8abc9634645d0d9658f55ebc40fd1bc21dd2',
 }
 FOUNDATIONS = (
  'DRAFT_fixer_forward_media_claim_20261006.sql',
@@ -136,10 +136,10 @@ def install(db):
  apply(db,ROOT/'migrations/DRAFT_fixer_forward_corpus_atomic_cutover_20261008.sql')
  for name in GENERATED: apply(db,ROOT/'migrations'/name)
  apply(db,P0611_APPLY)
+ apply(db,P0611_VERIFY)
  for name in STAGED: apply(db,ROOT/'migrations'/name)
  apply(db,P0625/'DRAFT_0625_generated_client_approval.sql')
  for name in CONSUMER: apply(db,ROOT/'migrations'/name)
- apply(db,P0611_VERIFY)
  apply(db,P0625/'DRAFT_0625_generated_client_approval.verify.sql')
  for table in ('fixer_inventory_protocol_control_20261008','fixer_remote_drive_use_control_20261008',
   'fixer_calendar_admission_gate_20261009'):
