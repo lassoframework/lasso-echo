@@ -585,7 +585,7 @@ def automatic_reel_params_valid(params):
     return (isinstance(params, dict) and set(params) == {'request_id', 'asset_ids', 'approved_cta'}
             and isinstance(params.get('request_id'), str) and _PORTAL_GYM_ID.fullmatch(params['request_id'])
             and isinstance(params.get('approved_cta'), str) and 1 <= len(params['approved_cta']) <= 120
-            and isinstance(params.get('asset_ids'), list) and 3 <= len(params['asset_ids']) <= 10
+            and isinstance(params.get('asset_ids'), list) and 2 <= len(params['asset_ids']) <= 10
             and all(isinstance(v, str) and _MEDIA_ID.fullmatch(v) for v in params['asset_ids'])
             and len(set(params['asset_ids'])) == len(params['asset_ids']))
 

@@ -25,9 +25,11 @@ production alias are queried. Deployed descendants are verified by GitHub
 compare. The expected merge SHA and actual deployment SHAs remain distinct.
 
 `business_params` is `{request_id, asset_ids, approved_cta}`. Use the original reel
-UUID and three to ten exact gym-owned usable raw video IDs seen in the actual
+UUID and two to ten exact gym-owned usable raw video IDs seen in the actual
 picker. The CTA must still appear in the current approved gym voice. Neither
-asset IDs nor CTA expectations are treated as proof.
+asset IDs nor CTA expectations are treated as proof. Two previewable assets verify
+the picker display symptom only. Building a reel still requires at least three
+usable clips and all portrait, consent and media safety checks.
 
 The separate JSON review file has `schema_version: 1`, `ticket_id`,
 `request_version`, the freshly recomputed `request_key`, `verified: true`,

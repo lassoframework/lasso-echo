@@ -294,3 +294,24 @@ def test_adopted_client_note_digest_and_limits_are_bound_to_review_receipt():
     receipt = bus.current['verification_after']['independent_adoption']
     assert receipt['client_note_sha256'] == hashlib.sha256(review['client_note'].encode()).hexdigest()
     assert receipt['limitations'] == review['limitations']
+
+
+def test_two_real_picker_thumbnails_verify_display_with_portrait_hold():
+    bus, plan, review, receipts, deps = setup()
+    plan['business_params']['asset_ids'] = ['a1', 'a2']
+    review['business_params'] = copy.deepcopy(plan['business_params'])
+    job = bus.data['auto_reel_status'][0]['snapshot']['jobs'][0]
+    job.update(status='held', reason='Portrait framing could not verify the complete athlete', clip_count=2)
+    seen = []
+    deps['thumbnail_probe'] = lambda gym, aid: seen.append((gym, aid)) or True
+    result = adoption.adopt_release(bus, bus.ticket(TID), plan, json.dumps(review).encode(),
+        release_reader=lambda _: receipts, deps=deps, now=NOW)
+    assert result['ok'] is True
+    assert seen == [('gym', 'a1'), ('gym', 'a2')]
+    assert job['status'] == 'held' and job['clip_count'] == 2
+    assert bus.current['status'] == 'verification' and not bus.patch_calls
+
+
+def test_single_picker_asset_cannot_satisfy_display_proof_contract():
+    params = {**PARAMS, 'asset_ids':['a1']}
+    assert be.automatic_reel_params_valid(params) is False
