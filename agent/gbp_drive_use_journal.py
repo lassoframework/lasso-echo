@@ -558,3 +558,454 @@ def unsettled(*, path=None):
         raise JournalHold('journal_local_db_unavailable') from None
     finally:
         _close(conn)
+
+
+# ---- GBP forward staged-batch binding (OFF-by-default caller, 2026-10-09) ----
+#
+# Durable binding for the two-phase forward-schedule batch contract. The
+# calendar store's in-memory last_forward_stage_attempt survives only one
+# process; this journal persists the EXACT stage attempt identity (batch id,
+# canonical tenant, request digest, exact request text, member and old-row
+# sets) BEFORE the stage RPC so a lost stage/finalizer acknowledgment or a
+# restart recovers through the bound batch-status RPC -- never through
+# calendar row presence or a regenerated request.
+#
+# States (forward-only):
+#   stage_intent    attempt identity frozen durably BEFORE the stage RPC;
+#                   the stage outcome is unknown until an exact receipt binds
+#   staged_pending  exact `staged` receipt bound; the batch is INACTIVE
+#                   candidate rows only -- never a landed placement, never
+#                   remote Drive use
+#   finalized       exact terminal finalize receipt from the batch-status RPC
+#                   bound against the frozen identity; only now may the GBP
+#                   caller settle remote use for an active member readback
+#
+# A candidate row is not consumption evidence, and the current use counter is
+# never consulted here. Nothing in this section decides landing from
+# ambiguity; every transition is a guarded single-row UPDATE.
+
+STAGE_STATE_INTENT = 'stage_intent'
+STAGE_STATE_STAGED = 'staged_pending'
+STAGE_STATE_FINALIZED = 'finalized'
+
+_STAGE_SCHEMA = """
+CREATE TABLE IF NOT EXISTS gbp_forward_stage_journal (
+  batch_id TEXT PRIMARY KEY,
+  tenant_id TEXT NOT NULL,
+  request_digest TEXT NOT NULL,
+  request_text TEXT NOT NULL,
+  member_row_ids TEXT NOT NULL,
+  old_row_ids TEXT NOT NULL,
+  state TEXT NOT NULL,
+  stage_receipt TEXT,
+  finalize_receipt TEXT,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+)
+"""
+
+_STAGE_SELECT = ('batch_id,tenant_id,request_digest,request_text,member_row_ids,'
+                 'old_row_ids,state,stage_receipt,finalize_receipt,created_at,updated_at')
+
+_UUID_RE = re.compile(r'[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-'
+                      r'[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\Z')
+_SHA256_RE = re.compile(r'[0-9a-f]{64}\Z')
+
+
+def _ensure_stage_schema(conn):
+    conn.execute(_STAGE_SCHEMA)
+
+
+def _stage_row_to_entry(row):
+    (batch_id, tenant_id, request_digest, request_text, member_row_ids,
+     old_row_ids, state, stage_receipt, finalize_receipt,
+     created_at, updated_at) = row
+    return dict(
+        batch_id=batch_id, tenant_id=tenant_id, request_digest=request_digest,
+        request_text=request_text,
+        member_row_ids=json.loads(member_row_ids),
+        old_row_ids=json.loads(old_row_ids), state=state,
+        stage_receipt=json.loads(stage_receipt) if stage_receipt else None,
+        finalize_receipt=json.loads(finalize_receipt) if finalize_receipt else None,
+        created_at=created_at, updated_at=updated_at)
+
+
+def _get_stage_row(conn, batch_id):
+    return conn.execute(
+        f'SELECT {_STAGE_SELECT} FROM gbp_forward_stage_journal WHERE batch_id=?',
+        (batch_id,)).fetchone()
+
+
+def _validate_stage_attempt(attempt):
+    """Strict local shape/consistency check of one frozen stage attempt."""
+    import hashlib
+    try:
+        if type(attempt) is not dict:
+            raise ValueError
+        batch_id = attempt['batch_id']
+        tenant_id = attempt['tenant_id']
+        request_digest = attempt['request_digest']
+        request_text = attempt['request_text']
+        if (not isinstance(batch_id, str) or not _UUID_RE.fullmatch(batch_id)
+                or not isinstance(tenant_id, str) or not tenant_id.strip()
+                or len(tenant_id) > 512
+                or not isinstance(request_digest, str)
+                or not _SHA256_RE.fullmatch(request_digest)
+                or not isinstance(request_text, str) or not request_text.strip()):
+            raise ValueError
+        if hashlib.sha256(request_text.encode('utf-8')).hexdigest() != request_digest:
+            raise ValueError
+        request = json.loads(request_text)
+        if (not isinstance(request, dict) or request.get('tenant_id') != tenant_id
+                or not isinstance(request.get('members'), list)
+                or not request['members'] or len(request['members']) > 100
+                or not isinstance(request.get('old_rows'), list)):
+            raise ValueError
+        for key in ('member_row_ids', 'old_row_ids'):
+            ids = attempt[key]
+            if (not isinstance(ids, list)
+                    or any(not isinstance(i, str) or not _UUID_RE.fullmatch(i)
+                           for i in ids)
+                    or len(set(ids)) != len(ids)):
+                raise ValueError
+        members = request['members']
+        member_ids = [str((m.get('row') or {}).get('id')) for m in members
+                      if isinstance(m, dict) and isinstance(m.get('row'), dict)]
+        if (len(member_ids) != len(members)
+                or sorted(member_ids) != sorted(attempt['member_row_ids'])):
+            raise ValueError
+        old_ids = [str(o.get('id')) for o in request['old_rows']
+                   if isinstance(o, dict)]
+        if (len(old_ids) != len(request['old_rows'])
+                or sorted(old_ids) != sorted(attempt['old_row_ids'])):
+            raise ValueError
+        if set(attempt['member_row_ids']) & set(attempt['old_row_ids']):
+            raise ValueError
+    except Exception:
+        raise JournalHold('stage_attempt_invalid') from None
+
+
+def _receipt_matches_attempt(receipt, entry, state):
+    """True only when an RPC payload exactly matches the bound identity."""
+    try:
+        if (type(receipt) is not dict
+                or receipt.get('batch_id') != entry['batch_id']
+                or receipt.get('tenant_id') != entry['tenant_id']
+                or receipt.get('request_digest') != entry['request_digest']
+                or receipt.get('state') != state
+                or receipt.get('member_row_ids') != entry['member_row_ids']
+                or receipt.get('old_row_ids') != entry['old_row_ids']):
+            return False
+        observed = receipt.get('observation_row_ids')
+        if observed is not None:
+            if (not isinstance(observed, list)
+                    or any(i not in set(entry['member_row_ids']) for i in observed)):
+                return False
+        return True
+    except Exception:
+        return False
+
+
+def _terminal_receipt_matches(entry, receipt):
+    """True only for a complete exact terminal finalize receipt bound to the
+    frozen identity: same batch/tenant/digest, exactly the member set as
+    activated row ids, one reservation id per row, and exactly the frozen
+    old-row set archived. Same-day logical siblings may share a reservation;
+    group lineage is validated by the finalizer authority. Anything less is
+    unknown, never finalized."""
+    try:
+        if (type(receipt) is not dict
+                or receipt.get('batch_id') != entry['batch_id']
+                or receipt.get('state') != STAGE_STATE_FINALIZED
+                or receipt.get('tenant_id') != entry['tenant_id']
+                or receipt.get('request_digest') != entry['request_digest']):
+            return False
+        row_ids = receipt.get('row_ids')
+        reservation_ids = receipt.get('reservation_ids')
+        archived = receipt.get('archived_old_row_ids')
+        if (not isinstance(row_ids, list) or not isinstance(reservation_ids, list)
+                or not isinstance(archived, list)
+                or len(row_ids) != len(reservation_ids)
+                or len(row_ids) != len(entry['member_row_ids'])
+                or len(set(map(str, row_ids))) != len(row_ids)
+                or set(map(str, row_ids)) != set(entry['member_row_ids'])
+                or set(map(str, archived)) != set(entry['old_row_ids'])
+                or len(set(map(str, archived))) != len(archived)):
+            return False
+        for value in list(row_ids) + list(reservation_ids) + list(archived):
+            if not isinstance(value, str) or not _UUID_RE.fullmatch(value):
+                return False
+        return True
+    except Exception:
+        return False
+
+
+def _with_stage_entry(path, batch_id, fn):
+    conn = _connect(_resolve_path(path))
+    try:
+        conn.execute('BEGIN IMMEDIATE')
+        _ensure_stage_schema(conn)
+        row = _get_stage_row(conn, batch_id)
+        if row is None:
+            raise JournalHold('stage_entry_missing')
+        entry = fn(conn, row)
+        try:
+            conn.execute('COMMIT')
+            return entry
+        except Exception:
+            _rollback(conn)
+            _close(conn)
+            recovered = get_forward_stage(batch_id, path=path)
+            if recovered == entry:
+                return recovered
+            raise JournalHold('journal_commit_outcome_unknown') from None
+    except JournalHold:
+        _rollback(conn)
+        raise
+    except Exception:
+        _rollback(conn)
+        raise JournalHold('journal_local_write_failed') from None
+    finally:
+        _close(conn)
+
+
+def _stage_transition(conn, batch_id, expected, code, **sets):
+    placeholders = ','.join(f'{k}=?' for k in sets)
+    try:
+        cur = conn.execute(
+            f'UPDATE gbp_forward_stage_journal SET {placeholders},'
+            " updated_at=datetime('now') WHERE batch_id=? AND state=?",
+            (*sets.values(), batch_id, expected))
+        if cur.rowcount != 1:
+            raise JournalHold(code)
+        row = _get_stage_row(conn, batch_id)
+        if row is None or row[6] != sets.get('state', row[6]):
+            raise JournalHold(code)
+    except JournalHold:
+        raise
+    except Exception:
+        raise JournalHold('journal_local_write_failed') from None
+    return _stage_row_to_entry(row)
+
+
+def record_forward_stage_intent(attempt, *, path=None):
+    """Freeze the exact stage attempt identity durably BEFORE the stage RPC.
+
+    An exact retry (same batch id, tenant, digest, request text and member /
+    old-row sets) returns the existing entry unchanged -- restart and replay
+    safety. Any identity difference under the same batch id holds as
+    'stage_identity_conflict': the same batch id must never carry two
+    different requests."""
+    _validate_stage_attempt(attempt)
+    conn = _connect(_resolve_path(path))
+    try:
+        conn.execute('BEGIN IMMEDIATE')
+        _ensure_stage_schema(conn)
+        row = _get_stage_row(conn, attempt['batch_id'])
+        if row is not None:
+            entry = _stage_row_to_entry(row)
+            bound = {k: entry[k] for k in
+                     ('batch_id', 'tenant_id', 'request_digest', 'request_text',
+                      'member_row_ids', 'old_row_ids')}
+            if canonical_json(bound) != canonical_json({k: attempt[k] for k in bound}):
+                raise JournalHold('stage_identity_conflict')
+            _rollback(conn)
+            return entry
+        # Conflicting member ownership is rejected BEFORE the stage RPC: a
+        # calendar row id already bound to a different durable batch must
+        # never be claimed by a second attempt (cross-tenant or otherwise).
+        claimed = set()
+        for other in conn.execute(
+                f'SELECT member_row_ids FROM gbp_forward_stage_journal').fetchall():
+            claimed.update(json.loads(other[0]))
+        if claimed & set(attempt['member_row_ids']):
+            raise JournalHold('stage_member_conflict')
+        conn.execute(
+            'INSERT INTO gbp_forward_stage_journal'
+            ' (batch_id,tenant_id,request_digest,request_text,member_row_ids,'
+            ' old_row_ids,state) VALUES (?,?,?,?,?,?,?)',
+            (attempt['batch_id'], attempt['tenant_id'], attempt['request_digest'],
+             attempt['request_text'], canonical_json(attempt['member_row_ids']),
+             canonical_json(attempt['old_row_ids']), STAGE_STATE_INTENT))
+        entry = _stage_row_to_entry(_get_stage_row(conn, attempt['batch_id']))
+        try:
+            conn.execute('COMMIT')
+            return entry
+        except Exception:
+            _rollback(conn)
+            _close(conn)
+            recovered = get_forward_stage(attempt['batch_id'], path=path)
+            if recovered == entry:
+                return recovered
+            raise JournalHold('journal_commit_outcome_unknown') from None
+    except JournalHold:
+        _rollback(conn)
+        raise
+    except Exception:
+        _rollback(conn)
+        raise JournalHold('journal_local_write_failed') from None
+    finally:
+        _close(conn)
+
+
+def record_forward_stage_receipt(batch_id, receipt, *, path=None):
+    """Bind an exact validated `staged` receipt. The batch remains INACTIVE
+    candidates: this state never authorizes remote consumption."""
+    def fn(conn, row):
+        entry = _stage_row_to_entry(row)
+        if not _receipt_matches_attempt(receipt, entry, 'staged'):
+            raise JournalHold('stage_receipt_mismatch')
+        if entry['state'] == STAGE_STATE_STAGED:
+            if canonical_json(entry['stage_receipt']) != canonical_json(receipt):
+                raise JournalHold('stage_receipt_mismatch')
+            return entry
+        if entry['state'] != STAGE_STATE_INTENT:
+            raise JournalHold('stage_receipt_requires_intent')
+        return _stage_transition(conn, batch_id, STAGE_STATE_INTENT,
+                                 'stage_receipt_requires_intent',
+                                 state=STAGE_STATE_STAGED,
+                                 stage_receipt=canonical_json(receipt))
+    return _with_stage_entry(path, batch_id, fn)
+
+
+def record_forward_finalized(batch_id, status, *, path=None):
+    """Bind an exact terminal finalize receipt from the batch-status RPC.
+
+    `status` must be the strictly parsed batch-status payload (state
+    `finalized`) whose identity fields exactly match the frozen attempt and
+    whose finalize receipt carries the complete terminal proof. Any mismatch
+    holds: the entry stays staged_pending and remote use stays forbidden."""
+    def fn(conn, row):
+        entry = _stage_row_to_entry(row)
+        if entry['state'] == STAGE_STATE_FINALIZED:
+            if (isinstance(status, dict)
+                    and _terminal_receipt_matches(entry, status.get('finalize_receipt'))
+                    and _receipt_matches_attempt(status, entry, STAGE_STATE_FINALIZED)
+                    and canonical_json(entry['finalize_receipt'])
+                    == canonical_json(status['finalize_receipt'])):
+                return entry
+            raise JournalHold('stage_finalize_mismatch')
+        # Recovery: a lost stage acknowledgment followed by a lost finalizer
+        # acknowledgment leaves stage_intent; the exact terminal proof settles
+        # it directly. Anything less stays put.
+        if entry['state'] not in (STAGE_STATE_INTENT, STAGE_STATE_STAGED):
+            raise JournalHold('stage_finalize_requires_staged')
+        if (not _receipt_matches_attempt(status, entry, STAGE_STATE_FINALIZED)
+                or not _terminal_receipt_matches(entry, status.get('finalize_receipt'))):
+            raise JournalHold('stage_finalize_mismatch')
+        return _stage_transition(conn, batch_id, entry['state'],
+                                 'stage_finalize_requires_staged',
+                                 state=STAGE_STATE_FINALIZED,
+                                 finalize_receipt=canonical_json(status['finalize_receipt']))
+    return _with_stage_entry(path, batch_id, fn)
+
+
+def get_forward_stage(batch_id, *, path=None):
+    conn = _connect(_resolve_path(path))
+    try:
+        _ensure_stage_schema(conn)
+        row = _get_stage_row(conn, batch_id)
+        return _stage_row_to_entry(row) if row else None
+    except JournalHold:
+        raise
+    except Exception:
+        raise JournalHold('journal_local_db_unavailable') from None
+    finally:
+        _close(conn)
+
+
+def pending_forward_stages(tenant_id=None, *, path=None):
+    """Durable restart recovery list: non-finalized stage attempts. A lost
+    stage/finalizer acknowledgment is resolved ONLY by binding the batch
+    status RPC to these frozen identities."""
+    conn = _connect(_resolve_path(path))
+    try:
+        _ensure_stage_schema(conn)
+        if tenant_id is None:
+            rows = conn.execute(
+                f'SELECT {_STAGE_SELECT} FROM gbp_forward_stage_journal'
+                ' WHERE state IN (?,?) ORDER BY created_at',
+                (STAGE_STATE_INTENT, STAGE_STATE_STAGED)).fetchall()
+        else:
+            rows = conn.execute(
+                f'SELECT {_STAGE_SELECT} FROM gbp_forward_stage_journal'
+                ' WHERE state IN (?,?) AND tenant_id=? ORDER BY created_at',
+                (STAGE_STATE_INTENT, STAGE_STATE_STAGED, tenant_id)).fetchall()
+        return [_stage_row_to_entry(r) for r in rows]
+    except JournalHold:
+        raise
+    except Exception:
+        raise JournalHold('journal_local_db_unavailable') from None
+    finally:
+        _close(conn)
+
+
+def forward_remote_use_allowed(batch_id, *, path=None):
+    """True ONLY when the bound batch reached `finalized` with an exact
+    terminal receipt. A staged candidate, an unknown stage outcome, a missing
+    entry, or an unreadable journal is never consumption evidence."""
+    try:
+        entry = get_forward_stage(batch_id, path=path)
+    except JournalHold:
+        return False
+    return forward_finalized_proof_valid(entry)
+
+
+def forward_finalized_proof_valid(entry):
+    """Revalidate frozen identity and terminal proof at the consumption boundary.
+
+    A persisted finalized label alone is insufficient: corrupted or incomplete
+    stored JSON must never authorize remote use, even after a prior transition.
+    """
+    try:
+        _validate_stage_attempt(entry)
+        return (entry['state'] == STAGE_STATE_FINALIZED
+                and _terminal_receipt_matches(entry, entry.get('finalize_receipt')))
+    except Exception:
+        return False
+
+
+def forward_stage_for_member(member_row_id, *, path=None):
+    """The durable stage entry whose bound member set contains this exact
+    calendar row id, or None. Never trusts the row's own marker text."""
+    if not isinstance(member_row_id, str) or not _UUID_RE.fullmatch(member_row_id):
+        return None
+    conn = _connect(_resolve_path(path))
+    try:
+        _ensure_stage_schema(conn)
+        rows = conn.execute(
+            f'SELECT {_STAGE_SELECT} FROM gbp_forward_stage_journal'
+            ' ORDER BY created_at').fetchall()
+        matches = [_stage_row_to_entry(row) for row in rows
+                   if member_row_id
+                   in _stage_row_to_entry(row)['member_row_ids']]
+        if len(matches) > 1:
+            # Conflicting cross-batch ownership: never settle from the first
+            # match; the member binding is ambiguous and remote use holds.
+            raise JournalHold('stage_member_ambiguous')
+        return matches[0] if matches else None
+    except JournalHold:
+        raise
+    except Exception:
+        raise JournalHold('journal_local_db_unavailable') from None
+    finally:
+        _close(conn)
+
+
+def forward_stage_member_row(entry, member_row_id, *, path=None):
+    """The exact FROZEN member row for one bound calendar row id, from the
+    durable request text, or None. Settlement compares this frozen row --
+    never the live row's mutable marker fields -- against the readback."""
+    try:
+        if not isinstance(entry, dict):
+            return None
+        request = json.loads(entry['request_text'])
+        if not isinstance(request, dict):
+            return None
+        for member in request.get('members') or []:
+            row = member.get('row') if isinstance(member, dict) else None
+            if isinstance(row, dict) and str(row.get('id')) == str(member_row_id):
+                return row
+    except Exception:
+        return None
+    return None
