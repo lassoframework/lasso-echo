@@ -596,6 +596,12 @@ def _hold_cross_date_repeats(base, store, *, apply, start, end, today_iso, resul
     except Exception as exc:  # noqa: BLE001 - fail closed with no write
         _log(f"{base}: repeat-hold reread failed ({type(exc).__name__}); "
              "no holds written")
+        result["hold_errors"] += 1
+        # Propagate the failure under the sweep result contract: a result
+        # carrying "error" is a failed receipt (main() exits 1), same as the
+        # primary-window read failure above. Without this the nightly runner
+        # marks the sweep successful even though the hold lane never ran.
+        result["error"] = type(exc).__name__
         result["detail"].append("repeat hold: window reread failed "
                                 f"({type(exc).__name__}); fail closed, no holds")
         return
