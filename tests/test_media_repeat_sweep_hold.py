@@ -500,6 +500,30 @@ def test_reread_error_fails_closed_no_write(monkeypatch):
     assert any("fail closed" in d for d in result["detail"])
 
 
+def test_reread_error_propagates_to_sweep_result_and_receipt(monkeypatch):
+    """P2: a complete tenant reread exception must NOT let the nightly runner
+    mark the receipt successful. Driving the real sweep_gym: the result
+    carries hold_errors and the "error" key (the existing result contract
+    that makes main()/runner treat the gym as failed), and still no write
+    reached the store."""
+    store = MemoryStore([
+        _row("own", "2026-10-02", status="approved"),
+        _row("t", "2026-10-06"),
+    ])
+
+    def boom(base, start, end):
+        raise RuntimeError("window read failed")
+
+    store.rows_in_range_repeat_hold = boom
+    result = _sweep(store, apply=True, monkeypatch=monkeypatch)
+    assert result["hold_errors"] == 1
+    assert result["error"] == "RuntimeError"
+    assert result["rows_held"] == 0
+    assert store.http.patches == []
+    assert all(r["media_not_ready_reason"] is None for r in store.rows.values())
+    assert any("fail closed" in d for d in result["detail"])
+
+
 # --- multi-identity grouping (P1) -------------------------------------------
 
 def test_same_asset_different_delivered_urls_feed_no_hold(monkeypatch):
