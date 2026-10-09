@@ -130,13 +130,24 @@ def create_story(request, *, candidates=None, assets_by_id=None, analysis=None,
     if not tokens:
         from . import gym_identity
         tokens = gym_identity.tokens_for(gym_id)
+    approved_offer = ""
+    if request.get("auto_reel") and request.get("_moments_prepared"):
+        automatic_copy = request.get("_automatic_copy") or {}
+        provenance = automatic_copy.get("provenance") or {}
+        if (not automatic_copy.get("held", True)
+                and provenance.get("gym") == gym_id
+                and provenance.get("approved_cta") == automatic_copy.get("ask")
+                and request.get("ask") == automatic_copy.get("ask")
+                and (provenance.get("ask_source") or {}).get("kind")
+                    in ("approved_voice", "existing_gym_source")):
+            approved_offer = provenance["approved_cta"]
     try:
         overlay = story_overlay.build_overlay(
             grounding.text, identity_tokens=tokens,
             gym=gym_id, ask=request.get("ask") or template.ask_style,
             grounded_from=grounding.source,
             low_confidence=grounding.low_confidence,
-            enforce_ask=True)   # spec §1: the render ends with EXACTLY ONE ask frame
+            enforce_ask=True, approved_offer=approved_offer)
     except story_overlay.OverlayRejected as e:
         return _held(request_id, gym_id, f"overlay rejected: {e}", store, request,
                      tmpl_name, "")

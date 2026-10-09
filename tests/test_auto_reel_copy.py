@@ -244,3 +244,39 @@ def test_prepare_copy_enforces_font_fit_even_for_injected_writer(monkeypatch):
     monkeypatch.setattr(auto_reel_render,'fit_text',fail)
     result=make()
     assert result['held'] and result['hold_reason']=='Complete reel copy cannot fit two readable lines'
+
+
+@pytest.mark.parametrize('ask', ['No Sweat Intro', 'Free Consultation', 'Free Trial Class'])
+def test_exact_approved_offer_name_needs_no_invented_instruction(ask):
+    voice = SimpleNamespace(**{**VOICE.__dict__, 'raw':RAW.replace(VOICE.ctas[0], ask), 'ctas':[ask]})
+    result = make(GOOD.replace(VOICE.ctas[0], ask), voice=voice)
+    assert not result['held'], result
+    assert result['ask'] == ask
+    assert result['caption'].endswith(ask)
+    assert result['provenance']['approved_cta'] == ask
+    assert result['provenance']['ask_source'] == {'kind':'approved_voice'}
+
+
+@pytest.mark.parametrize('ask', ['No Sweat Intro tomorrow', '30 Day Trial', 'No Sweat Intro and Free Trial',
+                              'No Sweat Intro Free Trial',
+                              'Guaranteed Results Consultation', 'No Sweat Intro https://example.com',
+                              'A welcoming community', 'No Sweat Intro?'])
+def test_noun_offer_allowance_rejects_dated_multiple_unsafe_or_non_offer_copy(ask):
+    voice = SimpleNamespace(**{**VOICE.__dict__, 'raw':RAW.replace(VOICE.ctas[0], ask), 'ctas':[ask]})
+    assert make(GOOD.replace(VOICE.ctas[0], ask), voice=voice)['held']
+
+
+def test_offer_label_cannot_be_unapproved_duplicated_or_rewritten():
+    ask = 'No Sweat Intro'
+    voice = SimpleNamespace(**{**VOICE.__dict__, 'raw':RAW.replace(VOICE.ctas[0], ask), 'ctas':[ask]})
+    caption = GOOD.replace(VOICE.ctas[0], ask)
+    assert make(caption)['held']
+    assert make(caption + '\n\n' + ask, voice=voice)['held']
+    assert make(caption.replace(ask, 'Book a No Sweat Intro.'), voice=voice)['held']
+    assert make(caption.replace('Expert coaching.', 'Message us for help.'), voice=voice)['held']
+
+
+def test_unapproved_offer_missing_from_raw_voice_holds():
+    voice = SimpleNamespace(**{**VOICE.__dict__, 'ctas':['No Sweat Intro']})
+    assert make(GOOD.replace(VOICE.ctas[0], 'No Sweat Intro'), voice=voice,
+                ask_resolver=lambda gym:None)['held']

@@ -319,9 +319,9 @@ def _automatic_job_for_client(job):
 
     ``auto_reels.gym_status`` deliberately retains request UUIDs, retry counters and
     exact validator failures so an operator can diagnose a render. None of those are
-    useful instructions for a gym owner. In particular, an overlay-gate failure is an
-    internal team task, not an error the owner can fix. Keep the operational snapshot
-    intact and redact it only at this portal boundary.
+    useful instructions for a gym owner. Report whether building stopped or a retry
+    is queued without promising a team review. Keep the operational snapshot intact
+    and redact it only at this portal boundary.
     """
     job = job if isinstance(job, dict) else {}
     internal_status = str(job.get("status") or "").strip().lower()
@@ -336,12 +336,14 @@ def _automatic_job_for_client(job):
     elif internal_status == "waiting_pool":
         status = "waiting_pool"
         message = "Upload at least three usable raw clips in Media so Echo can build a reel."
+    elif internal_status in ("held", "uncertain") and job.get("next_attempt_at"):
+        status = "retrying"
+        message = "Echo could not finish this reel. Another attempt is queued."
     else:
-        # Preserve the status value the existing portal already presents as
-        # "Needs team review", but never send the rejected overlay text, exception
-        # class, retry details or identifier that used to follow that label.
         status = "exhausted"
-        message = "Our team is reviewing this reel. No action is needed from you."
+        message = ("Echo stopped after reaching the retry limit. This reel is not scheduled."
+                   if internal_status == "exhausted" else
+                   "Echo could not finish this reel. No retry is currently queued.")
     return {
         # The current portal treats this as optional display text. An empty value
         # preserves its response shape without exposing an internal request UUID.
