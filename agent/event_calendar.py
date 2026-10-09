@@ -619,6 +619,15 @@ def _attach_media(gym_id, rows, log, *, picker=None, host=None):
     need = [r for r in rows if not (r.get("image_url") or "").strip()]
     if not need:
         return rows, []
+    # This picker/host lane selects new photos from the Drive library. Until it
+    # has a canonical prewrite journal and staged-batch finalizer, armed remote
+    # use must hold BEFORE calling even an injected picker: picking may claim
+    # an asset, and an insert/patch can land despite a lost acknowledgement.
+    # Existing media bypasses this lane; flag-OFF keeps the legacy behavior.
+    if _remote_drive_use_armed():
+        log(f"event media: armed Drive use integration unavailable; "
+            f"holding {len(need)} image-less row(s) before photo selection")
+        return [r for r in rows if (r.get("image_url") or "").strip()], list(need)
     try:
         from . import gym_media_selector as _sel, media_host
         from .integrations import drive_client as _dc
@@ -684,6 +693,22 @@ def _attach_media(gym_id, rows, log, *, picker=None, host=None):
         log(f"event media: HELD {len(held)} row(s) with no available photo "
             f"(an image-less feed post cannot publish); the gym needs more media")
     return kept, held
+
+
+def _remote_drive_use_armed():
+    """Read the shared CAS flag without opening the mutation authority.
+
+    An unreadable flag module must fail closed when the environment arms it.
+    """
+    import os
+    try:
+        from . import remote_drive_use
+        return bool(remote_drive_use.enabled())
+    except Exception:  # noqa: BLE001
+        if os.environ.get("AGENT_REMOTE_DRIVE_USE_CAS_ENABLED", "").strip().lower() \
+                in ("true", "1", "yes", "on"):
+            return True
+        return False
 
 
 def _stamp_media_usage(gym_id, rows):
