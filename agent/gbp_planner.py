@@ -497,6 +497,10 @@ def _prepare_drive_use_journal(portal_gym_key, row, pick):
     the journal itself holds (e.g. an identity conflict under the same logical
     post id)."""
     from . import gbp_drive_use_journal as journal
+    from .portal_calendar_store import prepare_calendar_caption_payload
+    # Freeze the exact deterministic caption/hold payload the store will write.
+    # Mutate this proposed row so the subsequent batch insert carries it too.
+    row.update(prepare_calendar_caption_payload(row))
     asset = pick.get("asset") or {}
     asset_id = str(asset.get("id") or "")
     if not asset_id or not pick.get("claim_id"):
