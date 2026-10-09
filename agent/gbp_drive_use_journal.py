@@ -382,6 +382,8 @@ _LANDED_OMITTED_DEFAULTS = dict.fromkeys((
     'experiment_label', 'event_id', 'approval_kind', 'approved_by',
     'approved_at', 'approval_digest', 'gbp_topic_type', 'gbp_cta_type',
     'gbp_cta_url', 'gbp_event', 'gbp_offer', 'gbp_location_id', 'reject_reason',
+    # generated_approval_pins_20261007 clears pins for non-generated media.
+    'generated_authority_pins', 'render_manifest_digest',
 ), None)
 _LANDED_OMITTED_DEFAULTS['variant_status'] = 'active'
 # Production content_calendar readback at 2026-10-09T00:25Z omitted mentions
@@ -389,10 +391,20 @@ _LANDED_OMITTED_DEFAULTS['variant_status'] = 'active'
 _LANDED_OMITTED_DEFAULTS['mentions'] = []
 
 
-def _landed_row_matches(persisted, proposed):
+def _landed_row_matches(persisted, proposed, *, manifest_digest=None):
     # Explicit server additions only. Unknown columns need contract review.
     if type(persisted) is not dict:
         return False
+    # The trusted staged binder may fill this initially-null field. Callers
+    # must separately verify its exact current reservation/manifest evidence;
+    # this argument is an exact value, never permission to ignore the column.
+    if manifest_digest is not None:
+        if (not isinstance(manifest_digest, str)
+                or not re.fullmatch(r'sha256:[0-9a-f]{64}', manifest_digest)
+                or persisted.get('render_manifest_digest') != manifest_digest
+                or proposed.get('render_manifest_digest') not in (None, manifest_digest)):
+            return False
+        proposed = dict(proposed, render_manifest_digest=manifest_digest)
     if not set(proposed) <= set(persisted):
         return False
     try:
@@ -427,7 +439,10 @@ def confirm_landed(use_id, evidence, *, path=None):
     field remains exact. Unknown schema fields hold until contract review.
 
     `evidence` is {'calendar_row': <persisted row read back>, 'asset_id': ...,
-    'content_hash': ...}. Only an exact same logical row + asset + payload
+    'content_hash': ...}. A manifest added by staged preparation additionally
+    requires `forward_manifest_evidence` from the trusted PG snapshot and
+    active reservation RPCs, bound to the finalized local batch. That evidence
+    is persisted in the landed proof. Only the same logical row + asset + payload
     settles the entry; anything less holds. Settles one row at a time so a
     partial batch only ever confirms its exact landed rows. Lands from
     write_intent or unknown_result; proof is durable before any consumption.
@@ -436,8 +451,17 @@ def confirm_landed(use_id, evidence, *, path=None):
         if row[13] not in (STATE_WRITE_INTENT, STATE_UNKNOWN):
             raise JournalHold('journal_landed_requires_intent_or_unknown')
         entry = _row_to_entry(row)
+        manifest_digest = None
+        if type(evidence) is dict and evidence.get('forward_manifest_evidence') is not None:
+            persisted = evidence.get('calendar_row')
+            bound = forward_stage_for_member(str((persisted or {}).get('id') or ''), path=path)
+            if not forward_manifest_evidence_matches(
+                    entry, persisted, bound, evidence['forward_manifest_evidence']):
+                raise JournalHold('journal_landed_evidence_mismatch')
+            manifest_digest = evidence['forward_manifest_evidence']['snapshot']['render_manifest_digest']
         if (type(evidence) is not dict
-                or not _landed_row_matches(evidence.get('calendar_row'), entry['calendar_row'])
+                or not _landed_row_matches(evidence.get('calendar_row'), entry['calendar_row'],
+                                           manifest_digest=manifest_digest)
                 or evidence.get('asset_id') != entry['asset_id']
                 or evidence.get('content_hash') != entry['content_hash']
                 or ('use_id' in evidence and evidence['use_id'] != use_id)
@@ -1009,3 +1033,89 @@ def forward_stage_member_row(entry, member_row_id, *, path=None):
     except Exception:
         return None
     return None
+
+
+def forward_stage_source_sha256(bound, row_id):
+    """Frozen producer byte identity, used only to query trusted PG authority.
+
+    An observation is not source eligibility or manifest authority. Its exact
+    SHA is a request binding which the reservation RPC independently verifies.
+    Missing observations cannot bootstrap a manifest from a live row.
+    """
+    import hashlib
+    try:
+        _validate_stage_attempt(bound)
+        request = json.loads(bound['request_text'])
+        members = [m for m in request['members'] if m['row']['id'] == row_id]
+        if len(members) != 1:
+            return None
+        member = members[0]
+        packet = member['observation']
+        observation = json.loads(packet['observation_json'])
+        raw = packet['digest_input']
+        sha = observation['source_sha256']
+        row = member['row']
+        if (json.loads(raw) != {k: v for k, v in observation.items() if k != 'observation_digest'}
+                or hashlib.sha256(raw.encode()).hexdigest() != observation['observation_digest']
+                or observation['tenant'] != bound['tenant_id']
+                or observation['source_asset_id'] != row['source_media_asset_id']
+                or observation['source_exact_url'] != row['source_media_url']
+                or observation['delivered_exact_url'] != row['image_url']
+                or not isinstance(sha, str) or not _SHA256_RE.fullmatch(sha)):
+            return None
+        return sha
+    except Exception:
+        return None
+
+
+def forward_manifest_evidence_matches(entry, persisted, bound, evidence):
+    """Bind trusted snapshot + active reservation proof to the frozen use.
+
+    The planner obtains both objects through the existing service-only PG
+    RPCs. The journal rechecks and persists them with the landing before CAS.
+    The proof's revision must be the current snapshot revision, and its
+    reservation must be the exact member's terminal batch reservation.
+    """
+    try:
+        if (type(persisted) is not dict or type(evidence) is not dict
+                or not forward_finalized_proof_valid(bound)
+                or bound['tenant_id'] != entry['gym_id']
+                or persisted.get('variant_status') != 'active'
+                or persisted.get('media_not_ready_reason') is not None):
+            return False
+        snapshot, proof = evidence['snapshot'], evidence['reservation_proof']
+        row_id = persisted['id']
+        member = forward_stage_member_row(bound, row_id)
+        sha = forward_stage_source_sha256(bound, row_id)
+        if (type(snapshot) is not dict or type(proof) is not dict or sha is None
+                or not isinstance(member, dict)
+                or member.get('logical_post_id') != entry['logical_post_id']
+                or persisted.get('source_media_asset_id') != entry['asset_id']):
+            return False
+        fields = {'calendar_row_id': 'id', 'gym_id': 'gym_id', 'account': 'account',
+                  'format': 'format', 'gbp_location_id': 'gbp_location_id',
+                  'post_date': 'post_date', 'group_key': 'visual_group_key',
+                  'source_asset_id': 'source_media_asset_id', 'source_url': 'source_media_url',
+                  'image_url': 'image_url', 'thumbnail_url': 'thumbnail_url',
+                  'render_manifest_digest': 'render_manifest_digest'}
+        if (any(k not in snapshot or snapshot[k] != persisted.get(v) for k, v in fields.items())
+                or snapshot.get('tenant_id') != entry['gym_id']
+                or not re.fullmatch(r'sha256:[0-9a-f]{64}', snapshot['render_manifest_digest'])
+                or not isinstance(snapshot.get('revision'), str)
+                or not re.fullmatch(r'[0-9a-f]{32}', snapshot['revision'])
+                or proof.get('row_revision') != snapshot['revision']
+                or proof.get('tenant_id') != entry['gym_id']
+                or proof.get('post_date') != entry['post_date']
+                or proof.get('logical_post_id') != entry['logical_post_id']
+                or proof.get('source_sha256') != sha
+                or not _UUID_RE.fullmatch(str(proof.get('lineage_evidence_id') or ''))
+                or not isinstance(proof.get('attestation_ids'), list)
+                or len(proof['attestation_ids']) != 3
+                or len(set(proof['attestation_ids'])) != 3
+                or any(not _UUID_RE.fullmatch(str(a)) for a in proof['attestation_ids'])):
+            return False
+        terminal = bound['finalize_receipt']
+        index = terminal['row_ids'].index(row_id)
+        return proof.get('reservation_id') == terminal['reservation_ids'][index]
+    except Exception:
+        return False
