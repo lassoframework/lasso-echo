@@ -105,7 +105,7 @@ def _candidate_artifact(store, tenant, source_id, source_hash, reference=None):
         "tenant": "eq." + tenant,
         "source_identity->>source_id": "eq." + source_id,
         "source_identity->>source_hash": "eq." + source_hash,
-        "select": "image_url,image_sha256,evidence,source_identity",
+        "select": "tenant,image_url,image_sha256,evidence,source_identity",
         "order": "created_at.desc", "limit": "10"})
     if len(rows) > 10:
         raise RuntimeError("artifact lookup exceeded bound")

@@ -1229,7 +1229,10 @@ def generate(headline, facts, client=None, out_path=None,
                 subject=headline, account_key=account_key or "", draft_id=draft_id,
                 failures=["Approved LASSO content brief is invalid"])
             return None
-        if paired_reference_receipt is not None: brief += "\n"+reference_note
+        # Feed/craft pixels ride only the initial Story request. Corrective
+        # requests end with the safety grid and edit only rejected Story pixels.
+        if paired_reference_receipt is not None and repair_image_bytes is None and not corrective:
+            brief += "\n"+reference_note
         call_opts["engine_prompts"] = {"astra": brief, "gemini": p}
         story_quality = (config.lasso_infographic_quality_enabled(account_key)
                          and "story" in str(render_surface).lower())
