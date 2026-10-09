@@ -5269,3 +5269,161 @@ def test_mflh_answer_in_hold_lane_is_not_a_code_release():
     ticket['fix_pr_url'] = 'https://github.com/lassoframework/lasso-echo/pull/217'
     assert OB._customer_fix_reply(ticket, att, body)
     assert not OB._direct_answerable_question(ticket, body)
+
+
+# ======================================================================================
+# support-surface sender policy (Blake, 2026-10-08): Echo channel -> Echo,
+# website support -> Wrangler, Ops portal -> Scout, never Ranger; ambiguous -> hold
+# ======================================================================================
+
+def _support_policy_case(*, product=None, source="slack_conversation",
+                         row_identity="echo", bot_identity=None, client_id=None):
+    bus = FakeBus()
+    tid = str(uuid.uuid4())
+    bus.tickets[tid] = {
+        "id": tid, "product": product, "source": source, "status": "verification",
+        "classification": "answerable_question", "client_id": client_id,
+        "bot_identity": bot_identity or row_identity, "identity_kind": "client",
+        "slack_user_id": "U_CLIENT", "slack_channel_id": "C_CLIENT",
+        "slack_thread_ts": "1.0", "escalated": False, "hold_tier": None,
+        "verification_after": {"facts": {"instagram": "connected"}},
+        "request_version": 0,
+    }
+    bus.record_inbound(ticket_id=tid, author_type="client",
+                       body="Is Instagram connected?")
+    row = bus.record_outbound(
+        ticket_id=tid, author_type=row_identity, body="Instagram is connected.",
+        delivery_status="ready", kind=A.KIND_ANSWER,
+        meta={"identity": row_identity, "recipient_kind": "client",
+              "released_by": "blake"})
+    return bus, tid, row
+
+
+@pytest.mark.parametrize("product,source,row_identity", [
+    ("echo", "slack_conversation", "echo"),      # Echo product -> Echo
+    ("echo", "echosupport", "echo"),             # echosupport source -> Echo
+    ("portal", "echosupport", "echo"),           # Echo source precedence
+    ("echo", "portal_social", "echo"),           # portal_social source -> Echo
+    ("portal", "portal_social", "echo"),         # source precedence over stale product
+    ("websites", "slack_conversation", "wrangler"),  # websites -> Wrangler
+    ("portal", "website_tab", "scout"),          # Ops portal -> Scout
+    ("ranger", "slack_conversation", "ranger"),  # unrelated product: preserved
+])
+def test_support_surface_sender_policy_allows_only_the_named_sender(
+        monkeypatch, product, source, row_identity):
+    monkeypatch.setenv("AGENT_FIXER_CHANNEL_ID", "C_FIXER")
+    bus, tid, row = _support_policy_case(
+        product=product, source=source, row_identity=row_identity,
+        client_id="gym-one" if source in ("website_tab", "portal_form") else None)
+    post, calls = _posted()
+    summary = OB.run_once(bus, post, identity=IDS.get(row_identity),
+                          log=lambda *a: None)
+    assert summary["held"] == 0 and summary["suppressed"] == 0
+    assert bus.message(row["id"])["delivery_status"] == "posted", (
+        f"the named sender posts on its own support surface: {calls!r}")
+    assert any(c["channel"] == "C_CLIENT" for c in calls)
+
+
+@pytest.mark.parametrize("product,source,row_identity,required", [
+    ("portal", "website_tab", "ranger", "scout"),   # the reported legacy-Ranger hole
+    ("portal", "portal_form", "echo", "scout"),
+    ("websites", "slack_conversation", "echo", "wrangler"),
+    ("echo", "echosupport", "ranger", "echo"),
+    ("ranger", "portal_social", "ranger", "echo"),  # source names Echo over unrelated product
+])
+def test_support_surface_sender_policy_holds_a_wrong_identity_row(
+        monkeypatch, product, source, row_identity, required):
+    """A stale-but-consistent legacy row (bot_identity matches the row) must NOT post."""
+    monkeypatch.setenv("AGENT_FIXER_CHANNEL_ID", "C_FIXER")
+    bus, tid, row = _support_policy_case(
+        product=product, source=source, row_identity=row_identity,
+        bot_identity=row_identity,
+        client_id="gym-one" if source in ("website_tab", "portal_form") else None)
+    post, calls = _posted()
+    summary = OB.run_once(bus, post, identity=IDS.get(row_identity),
+                          log=lambda *a: None)
+    held = bus.message(row["id"])
+    assert summary["held"] == 1 and summary["posted"] == 0
+    assert held["delivery_status"] == "held"
+    assert held["attachments"]["support_surface_sender_hold"] is True
+    assert held["attachments"]["support_surface_required_identity"] == required
+    assert held["attachments"]["support_surface_sender_ambiguous"] is False
+    assert not any(c["channel"] == "C_CLIENT" for c in calls)
+    assert bus.ticket(tid)["status"] == "verification", "no resolve on a held row"
+    notices = [m for m in bus.messages_for(tid)
+               if m["direction"] == "outbound"
+               and m["attachments"].get("kind") == A.KIND_HOLD_NOTICE
+               and m["attachments"].get("held_message_id") == row["id"]]
+    assert len(notices) == 1, "the sender-policy hold is never silent"
+
+
+@pytest.mark.parametrize("product,source,client_id", [
+    (None, "portal_form", "gym-one"),  # portal-deliverable, no product names a sender
+    ("", "website_tab", "gym-one"),
+])
+def test_support_surface_sender_policy_holds_ambiguous_mappings(
+        monkeypatch, product, source, client_id):
+    """Ambiguous product/source mapping fails closed: hold, never guess a sender."""
+    monkeypatch.setenv("AGENT_FIXER_CHANNEL_ID", "C_FIXER")
+    bus, tid, row = _support_policy_case(
+        product=product, source=source, row_identity="echo",
+        bot_identity="echo", client_id=client_id)
+    post, calls = _posted()
+    summary = OB.run_once(bus, post, identity=IDS.get("echo"), log=lambda *a: None)
+    held = bus.message(row["id"])
+    assert summary["held"] == 1 and summary["posted"] == 0
+    assert held["delivery_status"] == "held"
+    assert held["attachments"]["support_surface_sender_hold"] is True
+    assert held["attachments"]["support_surface_sender_ambiguous"] is True
+    assert not any(c["channel"] == "C_CLIENT" for c in calls)
+
+
+def test_support_surface_sender_policy_rechecks_a_mutated_ticket(monkeypatch):
+    """The policy reads the ticket fresh at dispatch: a row written for an echo
+    ticket must not post after the ticket is re-owned to the portal product."""
+    monkeypatch.setenv("AGENT_FIXER_CHANNEL_ID", "C_FIXER")
+    bus, tid, row = _support_policy_case(product="echo", row_identity="echo")
+    bus.tickets[tid]["product"] = "portal"
+    post, calls = _posted()
+    summary = OB.run_once(bus, post, identity=IDS.get("echo"), log=lambda *a: None)
+    assert summary["held"] == 1 and summary["posted"] == 0
+    held = bus.message(row["id"])
+    assert held["delivery_status"] == "held"
+    assert held["attachments"]["support_surface_required_identity"] == "scout"
+    assert not any(c["channel"] == "C_CLIENT" for c in calls)
+
+
+@pytest.mark.parametrize("field,value", [
+    ("client_id", "gym-other"),
+    ("slack_user_id", "U_OTHER"),
+    ("slack_channel_id", "C_OTHER"),
+    ("slack_thread_ts", "2.0"),
+    ("bot_identity", "ranger"),
+    ("product", "ranger"),
+    ("source", "portal_social"),
+])
+def test_support_surface_policy_read_holds_if_dispatch_identity_drifts(
+        monkeypatch, field, value):
+    """A post-claim ticket refresh cannot redirect a validated dispatch."""
+    monkeypatch.setenv("AGENT_FIXER_CHANNEL_ID", "C_FIXER")
+    bus, tid, row = _support_policy_case(product="echo", row_identity="echo",
+                                         client_id="gym-one")
+    original_ticket = bus.ticket
+    drifted = False
+
+    def ticket_with_post_claim_drift(ticket_id):
+        nonlocal drifted
+        if ticket_id == tid and not drifted and bus.message(row["id"])["delivery_status"] == "posting":
+            drifted = True
+            bus.tickets[tid][field] = value
+        return original_ticket(ticket_id)
+
+    bus.ticket = ticket_with_post_claim_drift
+    post, calls = _posted()
+    summary = OB.run_once(bus, post, identity=IDS.get("echo"), log=lambda *a: None)
+    assert drifted
+    assert summary["posted"] == 0
+    assert summary["held"] + summary["suppressed"] >= 1
+    assert bus.message(row["id"])["delivery_status"] in ("held", "suppressed")
+    assert not any(c["channel"] in ("C_CLIENT", "C_OTHER") for c in calls)
+    assert bus.ticket(tid)["status"] == "verification"

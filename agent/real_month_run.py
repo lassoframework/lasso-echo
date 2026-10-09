@@ -37,7 +37,7 @@ from . import config, real_month_planner as _rmp
 from datetime import datetime, timezone
 
 
-def real_builders_map(account):
+def real_builders_map(account, *, source_only=False):
     """The category -> feed-builder map for `account`, wrapping the EXISTING approved
     builders. Every wrapped builder takes (target, day_key) and returns Draft|None; the
     planner passes account=None as the target and the wrappers ignore it and close over
@@ -102,13 +102,13 @@ def real_builders_map(account):
         pillar = source_pillar(category, day_key, doc)
         if not pillar:
             return None
-        draft = daily_studio.build_daily_infographic_draft(acct, day_key, pillar=pillar, source_path=source_path)
+        draft = daily_studio.build_daily_infographic_draft(acct, day_key, pillar=pillar, source_path=source_path, **({"source_only": True} if source_only else {}))
         if draft is not None:
             draft.category = category
         return draft
 
     def _platform(_target, day_key):
-        return daily_studio.build_daily_infographic_draft(acct, day_key)
+        return daily_studio.build_daily_infographic_draft(acct, day_key, **({"source_only": True} if source_only else {}))
 
     def _b2b(_target, day_key):
         # ASTRA DEFAULT FOR NON-VIDEO (AGENT_LASSO_ASTRA_DEFAULT, Blake 2026-09-11:
@@ -123,7 +123,7 @@ def real_builders_map(account):
         # day is never left blank. Flag OFF -> byte-for-byte today's
         # rotation-first behavior.
         if config.lasso_astra_default_enabled():
-            draft = daily_studio.build_daily_infographic_draft(acct, day_key)
+            draft = daily_studio.build_daily_infographic_draft(acct, day_key, **({"source_only": True} if source_only else {}))
             if draft is not None:
                 return draft
         acct_lib = _library_for(acct)
@@ -132,7 +132,7 @@ def real_builders_map(account):
     def _doctrine(_target, day_key):
         if config.lasso_editorial_calendar_enabled():
             return _editorial("doctrine", day_key)
-        return daily_studio.build_daily_infographic_draft(acct, day_key)
+        return daily_studio.build_daily_infographic_draft(acct, day_key, **({"source_only": True} if source_only else {}))
 
     def _summit(_target, day_key):
         from .lasso_editorial import refresh_dates
@@ -158,6 +158,17 @@ def real_builders_map(account):
         # number is NEVER invented.
         from . import testimonial_pillar
         return testimonial_pillar.build_testimonial_draft(acct, day_key)
+
+    if source_only:
+        # Only deterministic approved source readers are available here.
+        # Podcast editing, rotation and queued caption generators stay out.
+        return {
+            "echo": lambda target, day: _editorial("echo", day) if config.lasso_editorial_calendar_enabled() else None,
+            "website": lambda target, day: _editorial("website", day) if config.lasso_editorial_calendar_enabled() else None,
+            "platform": _platform, "b2b": _platform, "doctrine": _doctrine,
+            "book": lambda target, day: _editorial("book", day) if config.lasso_editorial_calendar_enabled() else None,
+            "summit": lambda target, day: _editorial("summit", day) if config.lasso_editorial_calendar_enabled() else None,
+        }
 
     return {
         "echo": lambda target, day: _editorial("echo", day) if config.lasso_editorial_calendar_enabled() else None,
@@ -332,9 +343,54 @@ def sprint_builders(account, manifest=None, posts_per_day=None):
     return _feed, _story
 
 
+def _daily_paired_story_recovery_armed(account_key):
+    """True when the accepted daily paired-Story recovery job is armed for this OWNED
+    LASSO account, so month-route Story slots must be deferred to it. Mirrors the daily
+    job's arming conjunction (jobs/lasso_daily_paired_stories.run): durable LASSO 3x
+    cadence + calendar autopublish + per-tenant infographic quality + variant regen,
+    with the visual-writer prepare lane dark, PLUS the cadence-recovery lane flag
+    (AGENT_LASSO_CADENCE_RECOVERY) that owns the daily sequencing of runway, repair and
+    paired Stories. Config-only, no store I/O; any failure or a non-LASSO account ->
+    False (today's behavior, byte-for-byte)."""
+    base = str(account_key or "").strip().lower()
+    for suffix in ("_ig", "_fb"):
+        if base.endswith(suffix):
+            base = base[: -len(suffix)]
+            break
+    if base != "lasso":
+        return False
+    try:
+        from . import variant_regen, visual_writer_prepare
+        from .jobs import lasso_cadence_recovery
+        return bool(
+            config.lasso_three_feed_enabled()
+            and config.calendar_autopublish_enabled()
+            and config.lasso_infographic_quality_enabled(account_key)
+            and variant_regen.enabled()
+            and not visual_writer_prepare.enabled()
+            and lasso_cadence_recovery.enabled())
+    except Exception:
+        return False
+
+
+def _canonical_owned_source_platforms(drafts, account_key, account, source_only):
+    # The real owned Page builder uses its provider platform. Normalize only
+    # that verified source-only seam; shared Account configuration stays intact.
+    platform = getattr(account, "platform", None)
+    if (source_only and account_key == "lasso_fb"
+            and getattr(account, "key", None) == "lasso_fb"
+            and getattr(platform, "value", platform) == "facebook_page"):
+        for draft in drafts:
+            raw = getattr(draft, "platform", None)
+            if getattr(raw, "value", raw) == "facebook_page":
+                draft.platform = "facebook"
+    return drafts
+
+
 def plan_and_build(account_key, start_date, days=30, *, book_dates=None,
                    summit_day_fn=None, welcome_dates=None, account=None, logger=None,
-                   sprint_day_fn=None, sprint_feed_count_fn=None, sprint_manifest=None):
+                   sprint_day_fn=None, sprint_feed_count_fn=None, sprint_manifest=None,
+                   slot_selector=None, source_only=False):
     """Plan and build the REAL month for `account_key`: a feed + paired 9:16 story per day
     on non-sprint days, and the laid-out SUMMIT SPRINT (up to 3 feed/day plus paired 9:16
     stories, served from summit_queue's real rendered assets) on its cycle dates. Every day
@@ -377,15 +433,39 @@ def plan_and_build(account_key, start_date, days=30, *, book_dates=None,
                            sprint_day_fn=sprint_day_fn,
                            sprint_feed_count_fn=sprint_feed_count_fn,
                            posts_per_day=_ppd)
-    builders = real_builders_map(acct if acct is not None else account_key)
+    if slot_selector is not None:
+        plan = [slot for slot in plan if slot_selector(slot)]
+    # RECURRENCE PREVENTION (owned standalone Story cutover, 2026-10-08): under owned
+    # LASSO 3x AND the armed daily paired-Story recovery feature, the month route must
+    # not plan/build Story slots at all — the daily paired-Story job is the sole Story
+    # creator, from actual staged feed UUIDs through the managed feed registry. Remove
+    # Story slots BEFORE any builder/renderer is invoked. Feed slots, client accounts
+    # and the disarmed (flag-OFF) shape are unchanged. Existing month Story rows are
+    # never deleted or rewritten here; deferral is reported explicitly.
+    if _daily_paired_story_recovery_armed(account_key):
+        deferred = [slot for slot in plan if slot.fmt == _rmp.STORY]
+        if deferred:
+            plan = [slot for slot in plan if slot.fmt != _rmp.STORY]
+            (logger if callable(logger) else print)(
+                f"[real-month] deferred {len(deferred)} owned LASSO Story slots to the "
+                "daily paired-Story recovery job (3x + paired-Story recovery armed)")
+    builders = (real_builders_map(acct if acct is not None else account_key, source_only=True)
+                if source_only else real_builders_map(acct if acct is not None else account_key))
     story_builder = _real_story_builder(acct if acct is not None else account_key)
-    sprint_feed, sprint_story = sprint_builders(
-        acct if acct is not None else account_key, manifest=sprint_manifest)
+    if source_only:
+        # Campaign wrapper below may supply approved originals; ordinary sprint
+        # builders can render refreshed art and remain disabled in this mode.
+        sprint_feed, sprint_story = (lambda *a: None), (lambda *a: None)
+    else:
+        sprint_feed, sprint_story = sprint_builders(
+            acct if acct is not None else account_key, manifest=sprint_manifest)
     from .lasso_campaign_assets import wrap_builders
     builders, story_builder, sprint_feed, sprint_story = wrap_builders(
         acct if acct is not None else account_key, builders, story_builder,
         sprint_feed, sprint_story)
-    return _rmp.build_month_drafts(plan, builders, story_builder=story_builder,
-                                   account=_base, logger=logger,
+    drafts = _rmp.build_month_drafts(plan, builders, story_builder=story_builder,
+                                   account=(acct if source_only else _base), logger=logger,
                                    sprint_builder=sprint_feed,
-                                   sprint_story_builder=sprint_story)
+                                   sprint_story_builder=sprint_story,
+                                   **({"source_only": True} if source_only else {}))
+    return _canonical_owned_source_platforms(drafts, account_key, acct, source_only)

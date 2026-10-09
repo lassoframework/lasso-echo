@@ -886,7 +886,8 @@ def _default_book_dates():
 # ---- draft assembly (injectable builders; missing source is SKIPPED, never faked) -----
 
 def build_month_drafts(plan, builders, *, story_builder=None, account=None,
-                       logger=None, sprint_builder=None, sprint_story_builder=None):
+                       logger=None, sprint_builder=None, sprint_story_builder=None,
+                       source_only=False):
     """For each slot in `plan`, produce a real Draft via the injected builder for that
     slot's category. Feed and story become SEPARATE Draft objects.
 
@@ -961,7 +962,8 @@ def build_month_drafts(plan, builders, *, story_builder=None, account=None,
             try:
                 from .lasso_daily_summit import build_daily_summit
                 daily_target = target if target is not None else account
-                draft = build_daily_summit(daily_target, slot.post_date)
+                draft = (build_daily_summit(daily_target, slot.post_date, source_only=True)
+                         if source_only else build_daily_summit(daily_target, slot.post_date))
             except Exception as exc:  # noqa: BLE001 - one missing dated asset holds one slot
                 log(f"skip {slot.post_date} Summit daily feed: "
                     f"{type(exc).__name__}: {exc}")
@@ -982,7 +984,9 @@ def build_month_drafts(plan, builders, *, story_builder=None, account=None,
         draft, built_cat = _build_feed_with_fallback(
             slot, builders, target, log,
             exclude_captions={_draft_caption(d) for d in drafts
-                              if getattr(d, "day_key", "") == slot.post_date})
+                              if getattr(d, "day_key", "") == slot.post_date},
+            **({"ledger_gym_id": "lasso"} if source_only and _resolve_gym_id(target)
+               in ("lasso", "lasso_ig", "lasso_fb") else {}))
         if draft is None:
             log(f"skip {slot.post_date}: no real pillar could build a feed for the "
                 f"day (tried {slot.category} then fallbacks); left empty, not fabricated")
@@ -1099,7 +1103,7 @@ def _reslot(slot, category):
                     video_preferred=(slot.video_preferred and category == "podcast"))
 
 
-def _build_feed_with_fallback(slot, builders, target, log, exclude_captions=()):
+def _build_feed_with_fallback(slot, builders, target, log, exclude_captions=(), ledger_gym_id=None):
     """Build a feed for `slot`: the slot's own category first, then the real fallback
     pillars (_FALLBACK_ORDER) in order, until a builder returns a real draft. Returns
     (draft, built_category) or (None, None) when NO real pillar has content for the day.
@@ -1158,7 +1162,9 @@ def _build_feed_with_fallback(slot, builders, target, log, exclude_captions=()):
                     f"{cat} pillar filled the day (real fallback, not fabricated)")
             return draft, cat
         # Cooldown is enabled — check and retry up to 3 attempts.
-        draft = _cooldown_checked(draft, builder, target, slot.post_date, cat, log)
+        draft = _cooldown_checked(
+            draft, builder, target, slot.post_date, cat, log,
+            **({"gym_id_override": ledger_gym_id} if ledger_gym_id is not None else {}))
         if draft is not None:
             if cat != slot.category:
                 log(f"fill {slot.post_date}: {slot.category} had no content; the "
@@ -1171,7 +1177,7 @@ def _build_feed_with_fallback(slot, builders, target, log, exclude_captions=()):
 
 
 def _cooldown_checked(first_draft, builder, target, day_key, cat, log,
-                      _max_attempts=3):
+                      _max_attempts=3, gym_id_override=None):
     """Return the first draft from builder that is not on cooldown (up to
     _max_attempts total, including first_draft). Returns None when all attempts
     are on cooldown so the caller falls through to the next pillar.
@@ -1185,7 +1191,7 @@ def _cooldown_checked(first_draft, builder, target, day_key, cat, log,
 
     # Determine the account_key (gym_id) from `target` — target may be a string
     # key or an object with an account_key / key attribute.
-    gym_id = _resolve_gym_id(target)
+    gym_id = gym_id_override if gym_id_override is not None else _resolve_gym_id(target)
 
     # is_blocked = the fuzzy 60-day cooldown PLUS the hard 180-day VERBATIM rule
     # (report-card build 2026-08-28): when the flag is armed, a verbatim dup

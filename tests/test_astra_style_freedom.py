@@ -376,6 +376,55 @@ def test_is_lasso_account_matches_the_style_freedom_convention():
     assert astra_prompt.is_lasso_account("eng_fb") is False
 
 
+# ---- owned grounded-editorial visual standard (2026-10-09) -----------------
+
+def test_quality_content_brief_is_grounded_editorial_never_futuristic(monkeypatch):
+    """The LASSO content-led brief carries the owned visual standard and no
+    longer invites the rejected futuristic/neon treatments."""
+    monkeypatch.setenv("AGENT_LASSO_INFOGRAPHIC_QUALITY", "true")
+    brief = astra_prompt.build_infographic_brief(
+        HOOK, FACTS, cta="Book a call", account_key="lasso_ig")
+    assert "Futuristic graphics are welcome" not in brief
+    assert "futuristic designs" not in brief
+    assert "VISUAL STANDARD" in brief
+    for rejected in ("neon light trails", "holograms", "circuits"):
+        assert rejected in brief.lower()
+
+
+def test_quality_content_brief_keeps_allowed_treatments_unbanned(monkeypatch):
+    """The standard is specific: dark navy, icons, warm lighting and the book
+    black/red style stay allowed; it is not a blanket dark/icon ban."""
+    monkeypatch.setenv("AGENT_LASSO_INFOGRAPHIC_QUALITY", "true")
+    brief = astra_prompt.build_infographic_brief(
+        HOOK, FACTS, cta="Book a call", account_key="lasso_fb")
+    assert "dark navy" in brief.lower()
+    assert "icons" in brief.lower()
+
+
+def test_corrective_content_brief_also_carries_the_visual_standard(monkeypatch):
+    monkeypatch.setenv("AGENT_LASSO_INFOGRAPHIC_QUALITY", "true")
+    brief = astra_prompt.build_infographic_brief(
+        HOOK, FACTS, cta="Book a call", account_key="lasso_ig",
+        surface="Story", pixels="1080x1920",
+        corrective="Remove the glow trail.")
+    assert "EDIT the attached rejected candidate image" in brief
+    assert "VISUAL STANDARD" in brief
+    assert "Futuristic graphics are welcome" not in brief
+
+
+def test_client_gym_content_brief_keeps_verified_palette_without_lasso_standard():
+    """Client scope is untouched: a verified-palette gym brief keeps its own
+    colors and never receives the LASSO-owned visual standard."""
+    brief = astra_prompt.build_verified_gym_content_brief(
+        "somegym",
+        {"headline": "Hook", "facts": ["Fact one"], "cta": "", "footer": "gym.example"},
+        {"verified": True, "gym_id": "somegym", "evidence_ref": "owner-snapshot-1",
+         "colors": ["#1B2A3C", "#F2EDDE", "#D7263D"]})
+    assert "#1B2A3C" in brief
+    assert "VISUAL STANDARD" not in brief
+    assert "neon light trails" not in brief
+
+
 def test_voice_path_for_lasso_is_unchanged(monkeypatch):
     assert astra_prompt._voice_path_for("lasso") == config.VOICE_DOC_PATH
     assert astra_prompt._voice_path_for(None) == config.VOICE_DOC_PATH

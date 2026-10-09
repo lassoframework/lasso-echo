@@ -12,7 +12,7 @@ import uuid
 from datetime import date, datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
-from agent import config, infographic_evidence, variant_regen, visual_writer_prepare
+from agent import config, infographic_evidence, variant_regen, visual_writer_prepare, lasso_current_artifact
 from agent.infographic_artifacts import ArtifactStore
 from agent.portal_calendar_store import SupabaseCalendarStore
 from agent.jobs import lasso_paired_story_backfill as stage
@@ -82,6 +82,9 @@ def release_ready_holds(store, day, *, catchup_days=0):
         if len(feed) != 1 or feed[0].get("status") != "published" or not feed[0].get("published_at") \
                 or feed[0].get("late_post_id") is None:
             continue
+        if not lasso_current_artifact.current_pair(store,story,require_ready=False):
+            result['blocked']+=1
+            continue
         response = store._client().post(store._rest("rpc/release_lasso_paired_story_hold"),
             headers=store._headers({"Content-Type": "application/json"}),
             json={"p_story_id": story["id"]}, timeout=30)
@@ -97,21 +100,24 @@ def release_ready_holds(store, day, *, catchup_days=0):
     return result
 
 
-def _candidate_artifact(store, tenant, source_id, source_hash):
+def _candidate_artifact(store, tenant, source_id, source_hash, reference=None):
     rows = stage._request_rows(store, "echo_infographic_artifacts", {
         "tenant": "eq." + tenant,
         "source_identity->>source_id": "eq." + source_id,
         "source_identity->>source_hash": "eq." + source_hash,
-        "select": "image_url,image_sha256,evidence,source_identity",
+        "select": "tenant,image_url,image_sha256,evidence,source_identity",
         "order": "created_at.desc", "limit": "10"})
     if len(rows) > 10:
         raise RuntimeError("artifact lookup exceeded bound")
     for artifact in rows:
         evidence = artifact.get("evidence") or {}
         source = artifact.get("source_identity") or {}
-        if (source == {"source_id": source_id, "source_hash": source_hash}
+        if (reference is not None
+                and lasso_current_artifact.anchor_current(artifact,reference["feed"],reference["artifact"])
+                and source == {"source_id": source_id, "source_hash": source_hash}
                 and evidence.get("grade_status") == "PASS"
                 and stage.measured_story_evidence(evidence, artifact.get("image_sha256"))
+                and lasso_current_artifact.evidence_current(evidence,artifact.get("image_sha256"),story=True)
                 and evidence.get("policy_version") == infographic_evidence.POLICY_VERSION
                 and evidence.get("brain_snapshot") == infographic_evidence.brain_snapshot()
                 and artifact.get("image_sha256") == evidence.get("image_sha256")
@@ -256,7 +262,7 @@ def run(*, now=None, account="instagram", store=None, artifact_store=None,
                         and candidate.get("media_not_ready_reason") in
                         REPAIRABLE_STORY_HOLDS):
                     try:
-                        if store.lasso_paired_story_ready_for_feed(feed["id"]) is True:
+                        if lasso_current_artifact.current_pair(store,feed):
                             summary["occupied"] += 1
                             continue
                     except Exception:
@@ -274,6 +280,10 @@ def run(*, now=None, account="instagram", store=None, artifact_store=None,
             summary["eligible"] += 1
             if offset < 0:
                 backlog_attempts += 1
+            matched_reference=lasso_current_artifact.feed_reference(store,feed)
+            if matched_reference is None:
+                summary['blocked']+=1
+                continue
             source_id = f"content_calendar:{feed['id']}:caption"
             source_hash = hashlib.sha256(feed["caption"].encode("utf-8")).hexdigest()
             cache_key = "paired-story:" + hashlib.sha256(
@@ -281,7 +291,7 @@ def run(*, now=None, account="instagram", store=None, artifact_store=None,
             owner = str(uuid.uuid4())
             claimed = False
             try:
-                artifact = _candidate_artifact(store, tenant, source_id, source_hash)
+                artifact = _candidate_artifact(store, tenant, source_id, source_hash,matched_reference)
                 if artifact is None:
                     claimed = artifact_store.claim(tenant, cache_key, owner)
                     if not claimed:
@@ -309,11 +319,11 @@ def run(*, now=None, account="instagram", store=None, artifact_store=None,
                                  fresh_occupied[0] != repair_target))):
                         summary["occupied"] += 1
                         continue
-                    artifact = _candidate_artifact(store, tenant, source_id, source_hash)
+                    artifact = _candidate_artifact(store, tenant, source_id, source_hash,matched_reference)
                     if artifact is None:
                         result = variant_regen.generate_variant_image(
                             dict(feed, format="story"), tenant,
-                            generate_fn=generate_fn, host_fn=host_fn)
+                            generate_fn=generate_fn, host_fn=host_fn,paired_feed_reference=matched_reference)
                         if not result.get("ok"):
                             summary["blocked"] += 1
                             continue
@@ -323,7 +333,10 @@ def run(*, now=None, account="instagram", store=None, artifact_store=None,
                     summary["reused"] += 1
                 evidence = artifact.get("evidence") or {}
                 recorded = artifact.get("source_identity") or {}
-                if (recorded != {"source_id": source_id, "source_hash": source_hash}
+                if (not lasso_current_artifact.anchor_current(artifact,feed,
+                           (lasso_current_artifact.feed_reference(store,feed) or {}).get("artifact"))
+                        or recorded != {"source_id": source_id, "source_hash": source_hash}
+                        or not lasso_current_artifact.evidence_current(evidence, artifact.get("image_sha256"), story=True)
                         or evidence.get("grade_status") != "PASS"
                         or not stage.measured_story_evidence(
                             evidence, artifact.get("image_sha256"))

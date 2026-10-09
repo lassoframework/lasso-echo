@@ -509,6 +509,14 @@ def _release_claim(draft_id, account_key, why):
 
 def _post_and_save(draft, store, poster, idempotent):
     """Post the card, capture its Slack message ref (flag ON), save if not blocked."""
+    # Generated gym infographics are explicitly client-approved content. Their
+    # persisted category suffix is the durable signal; do not rely only on the
+    # in-memory force_approval bit surviving a future conversion path.
+    from .astra_prompt import is_lasso_account as _is_lasso_account
+    _client_safe_review = (
+        not _is_lasso_account(getattr(draft, "account_key", ""))
+        and str(getattr(draft, "category", "") or "").endswith(
+            "::needs_client_safe_review"))
     # Master auto-approve: AGENT_AUTO_APPROVE_ENABLED bypasses the approval card
     # entirely. Drafts publish at schedule time; a lightweight notice goes to Slack
     # so Blake can see what went out without needing to tap anything.
@@ -519,6 +527,7 @@ def _post_and_save(draft, store, poster, idempotent):
     _is_welcome = getattr(draft, "topic_type", "") == "WELCOME"
     if (draft.status.value == "pending"
             and not getattr(draft, "force_approval", False)
+            and not _client_safe_review
             and (config.auto_approve_enabled()
                  or (_is_welcome and config.welcome_autopublish_enabled()))):
         from . import db, postlog
@@ -572,8 +581,10 @@ def _post_and_save(draft, store, poster, idempotent):
             store.put(draft)
             return
     # Trust ladder wiring (both flags default OFF; nothing changes while off).
-    if draft.status.value == "pending" and not getattr(draft, "force_approval", False) and (
-            config.trust_dryrun_enabled() or config.trust_autopublish_enabled()):
+    if (draft.status.value == "pending"
+            and not getattr(draft, "force_approval", False)
+            and not _client_safe_review and (
+                config.trust_dryrun_enabled() or config.trust_autopublish_enabled())):
         from . import db
         from .accounts import get_account
         from .trust import auto_eligibility
@@ -648,7 +659,7 @@ def _post_and_save(draft, store, poster, idempotent):
                 # An unreadable autonomy setting is itself uncertainty; retain
                 # a Drive stamp if the subsequent pending-row write also fails.
                 draft._external_visibility_attempted = True
-        if (draft.status == DraftStatus.PENDING
+        if (draft.status == DraftStatus.PENDING and not _client_safe_review
                 and _autonomous_publish(draft, store, poster)):
             draft._durable_or_visible = True
             return

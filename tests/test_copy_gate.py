@@ -119,6 +119,43 @@ def test_caption_sentences_get_blank_line_without_changing_words():
         "Ready to train; come see us.", "Ready to train, come see us.")
 
 
+def test_caption_preserves_explicit_idea_groups_and_both_break_levels():
+    captions = (
+        "An inquiry is the start of a conversation.\nYour response can help someone see how to take the next step with your gym.\n\nA personal reply, a consultation time and a clear confirmation give that conversation direction.\nReminders and continued contact keep the follow through connected to the appointment.\n\nGive each lead a clear path from interest to a conversation with you.\nClaim your copy of The Full Gym. https://lassoframework.com/book",
+        "A quiet week can make every ad decision feel urgent.\nIt can also tempt you to change an ad before you understand what is happening.\n\nGive your marketing time to show a pattern.\nKeep successful ads running while you test new ideas separately.\n\nA separate challenger lets you explore the next idea while protecting the work already doing its job.\nSave this for later.",
+        "Put your gym's next chapter on the table.\nBring the questions you have been carrying into a room of serious operators.\n\nThe LASSO Growth Summit takes place in Nashville on November 7 and 8, 2026.\nTwo days together are an opportunity to step back and work on what comes next for your gym.\nGet tickets at lassoframework.com/summit",
+        "Your future member experiences one journey.\nThe ad, the first reply and the sales conversation all belong to it.\n\nWhen those parts work separately, attention can lose its direction before someone joins.\nConnect the message that brings people in with the conversation that helps them decide.\n\nThat connection gives you a way to plan growth with intention.\nSend this to a gym owner.",
+        "Would a new member know why your ad matters?\nA striking image still needs an invitation they can understand.\n\nStart with the problem your gym helps them solve.\nMake the message clear enough for someone to recognize themselves and see a reason to learn more.\n\nClarity gives your creative a purpose beyond catching the eye.\nSend this to a gym owner who needs it.",
+        "Your gym's voice belongs in every post.\nThe words that feel right to you are part of what makes that voice recognizable.\n\nIn Echo, you can accept a draft, change the wording or turn it down from your phone.\nThose approvals and edits help Echo learn your brand.\n\nYour feedback helps shape the calendar around your gym.\nBook a call to talk about Echo for your gym. https://lassoframework.com/growth-call\n\n#LASSOFramework #GymMarketingMadeSimple",
+        "What problem will someone choose your gym to solve?\nThat answer gives your marketing a place to begin.\n\nPeople need to understand how your gym fits what they want to change.\nReaching them takes deliberate work, whether you build an organic audience or pay for visibility.\n\nTreat that work as part of running the business, with a clear message behind it.\nSave this post.",
+        "Plan the week with your content calendar in view.\nYou can see the publishing schedule and keep your gym's photos in the portal.\n\nEcho brings that weekly schedule together with monthly Meta performance reports.\nThe calendar shows what is planned, and the reports give you a place to review performance.\n\nBring your publishing plans and results into the same conversation.\nBook a call to talk about Echo for your gym. https://lassoframework.com/growth-call\n\n#LASSOFramework #GymMarketingMadeSimple",
+        "What happens after someone notices your gym?\nThat question belongs beside every decision to buy more attention.\n\nAdvertising puts your existing system in front of more people.\nThe response and sales process still have work to do when that attention arrives.\n\nBuild those steps to support the visibility you are paying for.\nTag a gym owner who needs this.",
+    )
+
+    for raw in captions:
+        formatted = copy_gate.format_caption(raw)
+        assert copy_gate.format_caption(formatted) == formatted
+        assert formatted.count("\n\n") == raw.count("\n\n")
+        assert copy_gate.captions_presentation_equivalent(raw, formatted)
+    assert "Book a call to talk about Echo for your gym.\nhttps://lassoframework.com/growth-call" in (
+        copy_gate.format_caption(captions[5])
+    )
+
+
+def test_caption_explicit_groups_keep_abbreviations_and_reject_ambiguous_lists():
+    raw = "Dr. Lee is here.\nMeet at 6.30 p.m. for class.\n\nTry this.\n1. Squats 2. Lunges.\nJoin us."
+    formatted = copy_gate.format_caption(raw)
+    assert formatted == (
+        "Dr. Lee is here.\nMeet at 6.30 p.m. for class.\n\n"
+        "Try this.\n1. Squats 2. Lunges.\nJoin us."
+    )
+    with pytest.raises(ValueError, match="ambiguous numbered list"):
+        copy_gate.format_caption(
+            "Try this.\n1. Squats 2. Lunges.\nJoin us.\n\nBook a spot.",
+            reject_ambiguous_lists=True,
+        )
+
+
 def test_caption_semicolon_and_inline_url():
     assert copy_gate.format_caption(
         "Ready to train; come see us. Visit https://example.com/classes."

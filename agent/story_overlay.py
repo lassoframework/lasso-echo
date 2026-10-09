@@ -242,8 +242,14 @@ GENERIC_SAFE_HOOK = "YOUR NEXT REP STARTS HERE"   # never a claim, never a numbe
 # hope. A body overlay must carry ZERO asks (the ask lives only on the end-frame);
 # the render must end with EXACTLY ONE ask frame.
 _ASK_RE = re.compile(
-    r"\b(book|reserve|save your spot|sign up|start (this|today|here|now)|join|"
-    r"dm us|message us|comment|claim|get started|tag who|link in bio|try (a|your))\b",
+    # Keep this vocabulary aligned with the approved CTA rotation accepted by
+    # auto_reel_copy. The old matcher recognized only "save your spot" and "tag
+    # who", even though voice.py's documented approved examples are "Save this
+    # post" and "Tag a gym owner". Those real asks were miscounted as zero and
+    # exhausted an otherwise valid automatic reel at the final overlay gate.
+    r"\b(book|reserve|save|follow|sign up|start (this|today|here|now)|join|schedule|"
+    r"contact|visit|call|dm(?: us)?|message(?: us)?|comment|claim|get started|tag|"
+    r"share|link in bio|try (a|your))\b",
     re.IGNORECASE)
 
 

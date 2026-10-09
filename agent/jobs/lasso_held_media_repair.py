@@ -19,12 +19,13 @@ from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from agent import (calendar_autopublish, config, feed_image,
-                   infographic_evidence, variant_regen, visual_writer_prepare)
+                   infographic_evidence, variant_regen, visual_writer_prepare, lasso_current_artifact)
 from agent.infographic_artifacts import ArtifactStore
 from agent.portal_calendar_store import SupabaseCalendarStore
 
 HOLD_REASON = "cross_date_media_repeat_needs_new_visual"
 CAPTION_HOLD_REASON = "caption_changed_needs_new_visual"
+STYLE_HOLD_REASON = lasso_current_artifact.STYLE_HOLD
 GYM = "lasso"
 ACCOUNTS = {"instagram": "lasso_ig", "facebook": "lasso_fb"}
 ACCOUNT = "lasso_ig"
@@ -35,14 +36,7 @@ HORIZON_DAYS = 1
 INCIDENT_RECOVERY_FIRST = "2026-10-06"
 INCIDENT_RECOVERY_LAST = "2026-10-11"
 MAX_PAST_PER_RUN = 2
-_CAS_COLUMNS = (
-    "id", "gym_id", "status", "variant_status", "account", "format",
-    "post_date", "caption", "image_url", "source_media_url",
-    "source_media_asset_id", "thumbnail_url", "created_at",
-    "media_not_ready_reason", "published_at", "late_post_id",
-    "publish_claim_token", "publish_reservation_day", "slot_index",
-    "scheduled_at", "logical_post_id",
-)
+_CAS_COLUMNS = ('id', 'gym_id', 'account', 'post_date', 'pillar', 'format', 'caption', 'image_url', 'status', 'created_at', 'published_at', 'late_post_id', 'scheduled_at', 'thumbnail_url', 'gbp_topic_type', 'gbp_cta_type', 'gbp_cta_url', 'gbp_event', 'gbp_offer', 'gbp_location_id', 'reject_reason', 'source_media_url', 'mentions', 'hook_family', 'ask_type', 'time_slot', 'caption_len_band', 'has_member_face', 'experiment_label', 'slot_index', 'source_media_asset_id', 'media_not_ready_reason', 'event_id', 'variant_of', 'variant_status', 'publish_reservation_day', 'publish_claim_token', 'logical_post_id', 'approval_kind', 'approved_by', 'approved_at', 'approval_digest')
 
 
 def _local_day(now):
@@ -67,16 +61,18 @@ def _eligible(row, first, last, account_key=ACCOUNT):
             and row["gym_id"] == GYM
             and row["status"] == "pending"
             and row["variant_status"] == "active"
-            and _row_account_key(row) == account_key
+            and row["account"] in ACCOUNTS and ACCOUNTS[row["account"]] == account_key
+            and type(row["slot_index"]) is int and row["slot_index"] in (0,1,2)
             and fmt == "feed"
             and first <= str(row["post_date"] or "")[:10] <= last
-            and reason in (HOLD_REASON, CAPTION_HOLD_REASON)
+            and reason in (HOLD_REASON, CAPTION_HOLD_REASON,STYLE_HOLD_REASON)
             and isinstance(row["caption"], str)
             and bool(row["caption"].strip())
             and isinstance(row["image_url"], str) and bool(row["image_url"].strip())
             and row["published_at"] is None and row["late_post_id"] is None
             and row["publish_claim_token"] is None
-            and row["publish_reservation_day"] is None)
+            and row["publish_reservation_day"] is None
+            and all(row[k] is None for k in ('approval_kind','approved_by','approved_at','approval_digest')))
 
 
 def _same_row(left, right):
@@ -149,7 +145,7 @@ def _reviewed_artifact_rows(store, source_id, source_hash, account_key):
         params = {"tenant": f"eq.{account_key}",
                   "source_identity->>source_id": _eq(source_id),
                   "source_identity->>source_hash": _eq(source_hash),
-                  "select": "image_url,evidence,source_identity",
+                  "select": "tenant,image_url,image_sha256,evidence,source_identity",
                   "order": "image_url.asc",
                   "limit": str(ARTIFACT_LOOKUP_PAGE)}
         if cursor is not None:
@@ -197,6 +193,7 @@ def _reviewed_artifact_record(store, source_id, source_hash, account_key=ACCOUNT
                                             "source_hash": source_hash}
                 and isinstance(row.get("image_url"), str)
                 and row["image_url"].startswith("https://")
+                and lasso_current_artifact.evidence_current(evidence,row.get("image_sha256"))
                 and evidence.get("policy_version") == infographic_evidence.POLICY_VERSION
                 and evidence.get("brain_snapshot") == infographic_evidence.brain_snapshot()
                 and evidence.get("brief_model") == "gpt-6-astra"
@@ -279,7 +276,7 @@ def _reuse_ig_for_fb(store, fb_row):
         response = store._client().get(
             store._rest("echo_infographic_artifacts"),
             params={"tenant": f"eq.{ACCOUNTS['facebook']}", "image_url": _eq(url),
-                    "select": "image_url,evidence,source_identity", "limit": "2"},
+                    "select": "tenant,image_url,image_sha256,evidence,source_identity", "limit": "2"},
             headers=store._headers(), timeout=30)
         if response.status_code >= 400:
             raise RuntimeError("FB reviewed artifact lookup failed")
@@ -325,32 +322,45 @@ def _replace_exact(store, current, new_url, account_key=ACCOUNT):
     if (current["media_not_ready_reason"] == CAPTION_HOLD_REASON
             and new_url == current["image_url"]):
         return None  # a caption change needs a genuinely new reviewed visual
-    params = {key: _eq(current[key]) for key in _CAS_COLUMNS}
-    payload = {"image_url": new_url, "source_media_url": new_url,
-               "source_media_asset_id": None,
-               "thumbnail_url": None, "media_not_ready_reason": None}
-    if visual_writer_prepare.enabled():
-        payload = store._prepare_visual_replacement(GYM, current, payload)
-        params = store._visual_media_cas(current, params)
-    response = store._client().patch(
-        store._rest("content_calendar"), params=params,
-        headers=store._headers({"Content-Type": "application/json",
-                                "Prefer": "return=representation"}),
-        json=payload, timeout=30)
-    if response.status_code >= 400:
-        raise RuntimeError("held media exact-row swap failed")
-    rows = response.json()
-    if visual_writer_prepare.enabled() and store._visual_media_result(
-            rows, GYM, current, payload) is None:
-        return None
-    if not isinstance(rows, list) or len(rows) != 1 or not isinstance(rows[0], dict):
-        return None
-    after = rows[0]
-    if any(after.get(key) != payload.get(key, current[key]) for key in _CAS_COLUMNS):
-        return None
-    if any(after.get(key) != value for key, value in payload.items()):
-        return None
+    candidate=dict(current,image_url=new_url)
+    reviewed=lasso_current_artifact.current_artifact(store,candidate)
+    if reviewed is None: return None
+    response=store._client().post(store._rest('rpc/replace_lasso_style_feed_media_20261009'),
+        headers=store._headers({'Content-Type':'application/json'}),
+        json={'p_row_id':current['id'],'p_expected':current,'p_new_url':new_url,
+              'p_policy':infographic_evidence.POLICY_VERSION,'p_brain':infographic_evidence.brain_snapshot(),
+              'p_sha':reviewed['image_sha256'],'p_review_id':reviewed['evidence']['review_response_id']},timeout=30)
+    if response.status_code>=400: raise RuntimeError('held media exact-row swap failed')
+    receipt=response.json()
+    if not isinstance(receipt,dict) or receipt.get('result')!='replaced': return None
+    after=receipt.get('row')
+    payload={'image_url':new_url,'source_media_url':new_url,'source_media_asset_id':None,
+             'thumbnail_url':None,'media_not_ready_reason':None}
+    if not isinstance(after,dict) or any(after.get(k)!=payload.get(k,current[k]) for k in _CAS_COLUMNS): return None
     return after
+
+
+def discover_stale(store,first,last,account_key,*,max_per_day=MAX_PER_DAY,today=None):
+    """Bounded, truthful unheld pending discovery; every mutation full42 CAS."""
+    rows=store.rows_in_range_complete(GYM,first,last,all_statuses=True)
+    counts={};backlog=0;held=0
+    for row in sorted(rows,key=lambda r:(r.get('post_date')<today,r.get('post_date'),str(r.get('id')))):
+        if not isinstance(row,dict) or set(row)!=set(_CAS_COLUMNS): continue
+        if row.get('media_not_ready_reason') is not None: continue
+        candidate=dict(row,media_not_ready_reason=STYLE_HOLD_REASON)
+        if not _eligible(candidate,first,last,account_key): continue
+        if lasso_current_artifact.current_artifact(store,row) is not None: continue
+        day=row['post_date'];past=day<today
+        if counts.get(day,0)>=max_per_day or (past and backlog>=MAX_PAST_PER_RUN): continue
+        if not _same_row(row,store.get_row(GYM,row['id'])): continue
+        response=store._client().post(store._rest('rpc/hold_lasso_style_feed_20261009'),
+            headers=store._headers({'Content-Type':'application/json'}),
+            json={'p_row_id':row['id'],'p_expected':row,'p_first':first,'p_last':last},timeout=30)
+        if response.status_code>=400: raise RuntimeError('style hold exact CAS unavailable')
+        receipt=response.json()
+        if isinstance(receipt,dict) and receipt.get('result')=='held':
+            counts[day]=counts.get(day,0)+1;backlog+=int(past);held+=1
+    return held
 
 
 def run(*, now=None, store=None, artifact_store=None, generate_fn=None,
@@ -395,7 +405,11 @@ def run(*, now=None, store=None, artifact_store=None, generate_fn=None,
     if not artifact_store.available:
         summary["reason"] = "artifact store unavailable"
         return summary
+    if visual_writer_prepare.enabled():
+        summary['reason']='legacy visual writer unavailable for style-safe replacement'
+        return summary
     try:
+        summary['style_held']=discover_stale(store,first,last,account_key,max_per_day=max_per_day,today=today)
         rows = store.list_pending_media_between(GYM, first, last)
     except Exception:
         summary["reason"] = "held calendar read incomplete"
@@ -461,7 +475,7 @@ def run(*, now=None, store=None, artifact_store=None, generate_fn=None,
                     continue
                 url = result["image_url"]
                 summary["generated"] += 1
-            if row["media_not_ready_reason"] == CAPTION_HOLD_REASON:
+            if row["media_not_ready_reason"] in (CAPTION_HOLD_REASON,STYLE_HOLD_REASON):
                 reviewed = _reviewed_artifact_record(
                     store, source_id, source_hash, account_key)
                 if not reviewed or reviewed["image_url"] != url:

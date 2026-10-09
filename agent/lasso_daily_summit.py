@@ -72,7 +72,7 @@ def _canonical_lasso(account):
 
 def build_daily_summit(account, day_key, *, catalog_path=CATALOG_PATH,
                        creative_generate=None, host_fn=None, artifact_store=None,
-                       enabled_fn=None, nano_client=None, s3_client=None):
+                       enabled_fn=None, nano_client=None, s3_client=None, source_only=False):
     """Build one exact dated Summit Draft, or ``None`` when its gates do not clear.
 
     Dependencies are injectable so tests never need a generator, media host, or
@@ -85,6 +85,16 @@ def build_daily_summit(account, day_key, *, catalog_path=CATALOG_PATH,
     entry = _catalog_entry(day_key, catalog_path)
     if entry is None:
         return None
+
+    if source_only:
+        draft = Draft(
+            draft_id=_make_id(getattr(account, "key", "lasso"), "summit-source", day_key),
+            account_key=getattr(account, "key", ""), platform=getattr(account, "platform", ""),
+            caption=entry["caption"], hashtags=[], creative_path="", creative_public_url="",
+            scheduled_for=schedule.scheduled_for(day_key), status=DraftStatus.PENDING,
+            source_fragments=[entry["caption"]], day_key=str(day_key), category="summit")
+        draft.source_identity = _source_identity(entry)[0]
+        return draft
 
     source, cache_key = _source_identity(entry)
     artifacts = artifact_store if artifact_store is not None else ArtifactStore()

@@ -34,27 +34,28 @@ class Vision:
 def review_response(**overrides):
     data = dict(scores=dict(infographic_review.WEIGHTS), copy_complete=True,
                 copy_accurate=True, placement_safe=True,
-                placement_violations=[], issues=[])
+                placement_violations=[], issues=[],
+                style_conformant=True, style_violations=[])
     data.update(overrides)
     return json.dumps(data)
 
 
 def test_omitted_copy_blocks_even_perfect_aesthetic_score():
-    grade = infographic_review.evaluate(b'actual-candidate', headline='Approved', facts=['Required fact'],
+    grade = infographic_review.evaluate(b'actual-candidate', owned_lasso=True, headline='Approved', facts=['Required fact'],
         vision_client=Vision(review_response(copy_complete=False)))
     assert not grade.passed
     assert 'omitted' in grade.reason
 
 
 def test_incomplete_review_fails_closed():
-    grade = infographic_review.evaluate(b'actual-candidate', headline='Approved', facts=['Required fact'],
+    grade = infographic_review.evaluate(b'actual-candidate', owned_lasso=True, headline='Approved', facts=['Required fact'],
         vision_client=Vision('{"scores":{}}'))
     assert grade.status == 'UNGRADED'
     assert not grade.passed
 
 
 def test_major_issue_blocks_perfect_score():
-    grade = infographic_review.evaluate(b'actual-candidate', headline='Approved', facts=['Required fact'],
+    grade = infographic_review.evaluate(b'actual-candidate', owned_lasso=True, headline='Approved', facts=['Required fact'],
         vision_client=Vision(review_response(issues=[{'severity':'major','correction':'Move clipped CTA inside frame'}])))
     assert not grade.passed
     assert 'clipped CTA' in grade.reason
@@ -92,7 +93,7 @@ def test_astra_review_sends_actual_candidate_and_benchmark_pixels():
         return 200, json.dumps({'id':'review-response','output':[{'content':[
             {'type':'output_text','text':review_response()}]}]})
     reviewer = infographic_review.AstraReviewer('test', references=[{'b64':'cmVm'}],transport=transport)
-    result = infographic_review.evaluate(b'actual-candidate', headline='Approved',facts=['Required fact'],vision_client=reviewer)
+    result = infographic_review.evaluate(b'actual-candidate', owned_lasso=True, headline='Approved',facts=['Required fact'],vision_client=reviewer)
     assert result.passed
     assert payloads[0]['model'] == 'gpt-6-astra'
     images = [part for part in payloads[0]['input'][0]['content'] if part['type']=='input_image']
@@ -109,7 +110,7 @@ def test_story_safe_region_is_required_even_with_perfect_copy_and_score():
             assert "Do not recommend a minimal move" in question
             assert "logo or wordmark is never supplementary" in question
             return review_response(placement_safe=False)
-    result = infographic_review.evaluate(b"candidate", headline="Approved", facts=["Fact"],
+    result = infographic_review.evaluate(b"candidate", owned_lasso=True, headline="Approved", facts=["Fact"],
         surface="story", vision_client=StoryVision())
     assert not result.passed
     assert "safe region" in result.reason
@@ -178,7 +179,7 @@ def test_structured_placement_violation_blocks_contradictory_safe_verdict():
                     'correction': 'Move the wordmark down.',
                 }])
     result = infographic_review.evaluate(
-        b'candidate', headline='Approved', facts=['Fact'], surface='story',
+        b'candidate', owned_lasso=True, headline='Approved', facts=['Fact'], surface='story',
         vision_client=ContradictoryVision())
     assert not result.passed
     assert result.status == 'FAIL'
@@ -189,7 +190,7 @@ def test_missing_structured_placement_evidence_fails_closed():
     data = json.loads(review_response())
     del data['placement_violations']
     result = infographic_review.evaluate(
-        b'actual-candidate', headline='Approved', facts=['Required fact'],
+        b'actual-candidate', owned_lasso=True, headline='Approved', facts=['Required fact'],
         vision_client=Vision(json.dumps(data)))
     assert result.status == 'UNGRADED'
 
@@ -226,6 +227,7 @@ def test_lasso_story_generation_uses_native_story_canvas(monkeypatch, tmp_path):
                                         model='test-model', prompt_used=prompt)
 
     def review(image_bytes, **kwargs):
+        assert kwargs['owned_lasso'] is True
         reviewed.append((image_bytes, kwargs['surface']))
         return GradeResult({}, True, [], status='PASS')
 
@@ -245,14 +247,14 @@ def test_lasso_story_generation_uses_native_story_canvas(monkeypatch, tmp_path):
 
 
 def test_minor_polish_does_not_force_another_paid_render():
-    grade = infographic_review.evaluate(b'actual-candidate', headline='Approved', facts=['Required fact'],
+    grade = infographic_review.evaluate(b'actual-candidate', owned_lasso=True, headline='Approved', facts=['Required fact'],
         vision_client=Vision(review_response(issues=[{'severity':'minor','correction':'Increase the decorative divider spacing.'}])))
     assert grade.passed
     assert 'divider' in grade.reason
 
 
 def test_unclassified_issue_fails_closed():
-    grade = infographic_review.evaluate(b'actual-candidate', headline='Approved', facts=['Required fact'],
+    grade = infographic_review.evaluate(b'actual-candidate', owned_lasso=True, headline='Approved', facts=['Required fact'],
         vision_client=Vision(review_response(issues=[{'correction':'Move clipped CTA'}])))
     assert grade.status == 'UNGRADED'
 
@@ -264,20 +266,27 @@ def test_display_copy_avoids_forbidden_punctuation_and_url_protocol():
     assert "lassoframework.com/summit" in text
 
 
-def test_creative_preference_allows_futuristic_but_bans_punctuation():
+def test_creative_preference_is_grounded_editorial_and_bans_rejected_treatments():
     prompt = astra_prompt.build_content_brief("Hook", ["Fact"])
-    assert "Futuristic graphics are welcome" in prompt
+    assert "Futuristic graphics are welcome" not in prompt
+    assert "VISUAL STANDARD" in prompt
+    for rejected in ("neon light trails", "glowing orange or blue ribbons",
+                     "holograms", "circuits"):
+        assert rejected in prompt.lower()
     assert "never render colons or semicolons" in prompt
 
 
 def test_reuse_requires_matching_bytes_model_and_current_review(tmp_path):
     import hashlib
+    from agent import lasso_visual_standard
     from agent.infographic_evidence import reviewed_asset, POLICY_VERSION, brain_snapshot
     image = tmp_path / 'card.png'
     image.write_bytes(b'approved pixels')
     sidecar = tmp_path / 'card.png.review.json'
     evidence = dict(policy_version=POLICY_VERSION, brain_snapshot=brain_snapshot(), brief_model='gpt-6-astra',
         grade_status='PASS', response_id='generation', review_response_id='review',
+        style_conformant=True, style_violations=[],
+        visual_standard_version=lasso_visual_standard.VERSION,
         image_sha256=hashlib.sha256(image.read_bytes()).hexdigest(),
         infographic_copy={'headline':'Hook','facts':['Fact'],'cta':'Save','footer':'lassoframework.com'})
     sidecar.write_text(json.dumps(evidence))
@@ -297,6 +306,7 @@ def test_reuse_requires_matching_bytes_model_and_current_review(tmp_path):
 def test_reuse_rejects_changed_brain_snapshot(tmp_path, monkeypatch):
     import hashlib
     from agent import infographic_evidence as evidence_module
+    from agent import lasso_visual_standard
     image = tmp_path / 'card.png'
     image.write_bytes(b'pixels')
     snapshot = {'brain.md': 'original'}
@@ -304,6 +314,8 @@ def test_reuse_rejects_changed_brain_snapshot(tmp_path, monkeypatch):
     evidence = dict(policy_version=evidence_module.POLICY_VERSION,
         brain_snapshot=dict(snapshot), brief_model='gpt-6-astra', grade_status='PASS',
         response_id='generation', review_response_id='review',
+        style_conformant=True, style_violations=[],
+        visual_standard_version=lasso_visual_standard.VERSION,
         image_sha256=hashlib.sha256(image.read_bytes()).hexdigest(),
         infographic_copy={'headline':'Hook','facts':['Fact']})
     (tmp_path / 'card.png.review.json').write_text(json.dumps(evidence))

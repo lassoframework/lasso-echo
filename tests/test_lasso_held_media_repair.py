@@ -45,6 +45,7 @@ class _Response:
 
     def __init__(self, payload):
         self.payload = payload
+        self.headers = {"Content-Range": f"0-{max(0,len(payload)-1)}/{len(payload)}"} if isinstance(payload,list) else {}
 
     def json(self):
         return self.payload
@@ -57,6 +58,9 @@ class _Store:
         self.by_url = {}
         self.patches = []
         self.reads = 0
+
+    def rows_in_range_complete(self, *args, **kwargs):
+        return [deepcopy(r) for r in self.rows.values()]
 
     def list_pending_media_between(self, gym, first, last):
         self.reads += 1
@@ -99,7 +103,15 @@ class _Store:
         limit = int(params.get("limit", "50"))
         return _Response(rows[:limit])
 
-    def post(self, url, params, headers, json, timeout):
+    def post(self, url, headers, json, timeout, params=None):
+        if url == 'rpc/replace_lasso_style_feed_media_20261009':
+            row = self.rows[json['p_row_id']]
+            if row != json['p_expected']: return _Response({'result':'conflict'})
+            payload={'image_url':json['p_new_url'],'source_media_url':json['p_new_url'],
+                     'source_media_asset_id':None,'thumbnail_url':None,'media_not_ready_reason':None}
+            self.patches.append(({k:repair._eq(v) for k,v in row.items()},payload))
+            row.update(payload)
+            return _Response({'result':'replaced','row':deepcopy(row)})
         assert url == "echo_infographic_artifacts"
         key = (f"eq.{json['tenant']}", repair._eq(json["image_url"]))
         if key not in self.by_url:
@@ -147,6 +159,8 @@ class _Artifacts:
 
 
 def _armed(monkeypatch):
+    monkeypatch.setattr(repair.lasso_current_artifact, 'current_artifact', lambda *a, **k:
+        {'image_sha256':'a'*64,'evidence':{'review_response_id':'review'}})
     monkeypatch.setattr(repair.config, "lasso_three_feed_enabled", lambda: True)
     monkeypatch.setattr(repair.config, "lasso_infographic_quality_enabled",
                         lambda key: key == "lasso_ig")
@@ -208,11 +222,15 @@ def _reviewed_ig_artifact(monkeypatch, store, ig_row):
     source_hash = repair.hashlib.sha256(ig_row["caption"].encode()).hexdigest()
     record = {
         "image_url": ig_row["image_url"],
+        "image_sha256": "a"*64,
         "source_identity": {"source_id": source_id, "source_hash": source_hash},
+            "image_sha256": "a"*64,
         "evidence": {"policy_version": repair.infographic_evidence.POLICY_VERSION,
                      "brain_snapshot": {"source": "hash"},
                      "brief_model": "gpt-6-astra", "grade_status": "PASS",
-                     "image_sha256": "exact-image-hash", "review_response_id": "review"},
+                     "image_sha256": "a"*64, "review_response_id": "review",
+                     "style_conformant": True, "style_violations": [],
+                     "visual_standard_version": "lasso-grounded-editorial-2026-10-09-v1"},
     }
     store.cache[(repair._eq(source_id), repair._eq(source_hash))] = [record]
 
@@ -224,6 +242,7 @@ def _story_artifact_for(ig_row, url):
     return {
         "image_url": url,
         "source_identity": {"source_id": source_id, "source_hash": source_hash},
+            "image_sha256": "a"*64,
         "evidence": {"policy_version": repair.infographic_evidence.POLICY_VERSION,
                      "brain_snapshot": {"source": "hash"},
                      "brief_model": "gpt-6-astra", "grade_status": "PASS",
@@ -446,10 +465,11 @@ def test_changed_row_after_generation_is_not_swapped_and_cached_artifact_reuses(
         store.cache[(repair._eq(source_id), repair._eq(source_hash))] = [{
             "image_url": "https://new.example/one.png",
             "source_identity": {"source_id": source_id, "source_hash": source_hash},
+            "image_sha256": "a"*64,
             "evidence": {"policy_version": repair.infographic_evidence.POLICY_VERSION,
                          "brain_snapshot": {"source": "hash"},
                          "brief_model": "gpt-6-astra", "grade_status": "PASS",
-                         "image_sha256": "hash", "review_response_id": "review"},
+                         "image_sha256": "a"*64, "style_conformant": True, "style_violations": [], "visual_standard_version": "lasso-grounded-editorial-2026-10-09-v1", "review_response_id": "review"},
         }]
         return {"ok": True, "image_url": "https://new.example/one.png"}
 
@@ -500,10 +520,11 @@ def test_caption_change_repairs_feed_but_never_swaps_a_managed_story(monkeypatch
         store.cache[(repair._eq(source_id), repair._eq(source_hash))] = [{
             "image_url": url,
             "source_identity": {"source_id": source_id, "source_hash": source_hash},
+            "image_sha256": "a"*64,
             "evidence": {"policy_version": repair.infographic_evidence.POLICY_VERSION,
                          "brain_snapshot": {"source": "hash"},
                          "brief_model": "gpt-6-astra", "grade_status": "PASS",
-                         "image_sha256": "reviewed-hash", "review_response_id": "review"},
+                         "image_sha256": "a"*64, "style_conformant": True, "style_violations": [], "visual_standard_version": "lasso-grounded-editorial-2026-10-09-v1", "review_response_id": "review"},
         }]
         return {"ok": True, "image_url": url}
     monkeypatch.setattr(variant_regen, "generate_variant_image", fake_generate)
@@ -860,10 +881,11 @@ def _feed_artifact_for(row, url):
     return {
         "image_url": url,
         "source_identity": {"source_id": source_id, "source_hash": source_hash},
+            "image_sha256": "a"*64,
         "evidence": {"policy_version": repair.infographic_evidence.POLICY_VERSION,
                      "brain_snapshot": {"source": "hash"},
                      "brief_model": "gpt-6-astra", "grade_status": "PASS",
-                     "image_sha256": "feed-image-hash",
+                     "image_sha256": "a"*64, "style_conformant": True, "style_violations": [], "visual_standard_version": "lasso-grounded-editorial-2026-10-09-v1",
                      "review_response_id": "review"},
     }
 
@@ -1015,3 +1037,37 @@ def test_lookup_beyond_page_bound_fails_closed_without_spend(monkeypatch):
     assert out["generated"] == out["repaired"] == out["reused"] == 0
     assert store.patches == []
     assert store.rows["feed"]["media_not_ready_reason"] == repair.HOLD_REASON
+
+def test_stale_discovery_only_unheld_exact_unclaimed_owned_rows(monkeypatch):
+    base=_row('stale',media_not_ready_reason=None,media_not_ready_reason_unused=None)
+    base.pop('media_not_ready_reason_unused')
+    rows=[base,_row('claimed',media_not_ready_reason=None,publish_claim_token='token'),
+          _row('reserved',media_not_ready_reason=None,publish_reservation_day='2026-10-05'),
+          _row('approved',media_not_ready_reason=None,approval_kind='manual'),
+          _row('client',media_not_ready_reason=None,gym_id='client'),
+          _row('published',media_not_ready_reason=None,status='published'),
+          _row('badslot',media_not_ready_reason=None,slot_index=None),
+          _row('story',media_not_ready_reason=None,format='story'),
+          _row('already-held')]
+    class Store(_Store):
+        def post(self,url,headers,json,timeout,params=None):
+            assert url=='rpc/hold_lasso_style_feed_20261009'
+            row=self.rows[json['p_row_id']]
+            assert json['p_expected']==row and set(row)==set(repair._CAS_COLUMNS)
+            row['media_not_ready_reason']=repair.STYLE_HOLD_REASON
+            return _Response({'result':'held','row':deepcopy(row)})
+    store=Store(rows)
+    monkeypatch.setattr(repair.lasso_current_artifact,'current_artifact',lambda *a,**k:None)
+    assert repair.discover_stale(store,'2026-09-28','2026-10-06','lasso_ig',today='2026-10-05')==1
+    assert store.rows['stale']['caption']==base['caption']
+    assert store.rows['stale']['image_url']==base['image_url']
+    assert store.rows['stale']['media_not_ready_reason']==repair.STYLE_HOLD_REASON
+    for row in rows[1:]:assert store.rows[row['id']]==row
+
+def test_stale_discovery_source_metadata_race_never_holds(monkeypatch):
+    row=_row('race',media_not_ready_reason=None)
+    class Store(_Store):
+        def get_row(self,*a):return dict(row,gbp_event={'new':'metadata'})
+        def post(self,*a,**kw):raise AssertionError('mutated')
+    monkeypatch.setattr(repair.lasso_current_artifact,'current_artifact',lambda *a,**k:None)
+    assert repair.discover_stale(Store([row]),'2026-10-05','2026-10-06','lasso_ig',today='2026-10-05')==0

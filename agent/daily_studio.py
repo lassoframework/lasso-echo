@@ -18,7 +18,8 @@ from .drafter import Draft, DraftStatus, _make_id, variant_hashtags
 
 
 def build_daily_infographic_draft(account, day_key, *, nano_client=None,
-                                  s3_client=None, source_path=None, pillar=None):
+                                  s3_client=None, source_path=None, pillar=None,
+                                  source_only=False):
     # All three capabilities must be armed; otherwise dormant (caller falls back).
     if not (config.content_brain_enabled()
             and config.creative_studio_enabled()
@@ -69,6 +70,17 @@ def build_daily_infographic_draft(account, day_key, *, nano_client=None,
     if bad_nums:
         return _blocked(f"headline carries a stat with no approved receipt: "
                         f"{', '.join(bad_nums)} ({headline!r})")
+
+    # Runway top-up binds the final caption to its future calendar UUID before
+    # paying for the existing exact-caption reviewed render. Normal callers
+    # still render below; this mode never creates publishable media.
+    if source_only:
+        return Draft(
+            draft_id=draft_id, account_key=account.key, platform=account.platform,
+            caption=plan["caption"], hashtags=variant_hashtags(account.platform, plan["hashtags"]),
+            creative_path="", creative_public_url="", scheduled_for=schedule.scheduled_for(day_key),
+            status=DraftStatus.PENDING, source_fragments=[headline] + facts,
+            infographic_copy={"headline": headline, "facts": facts, "cta": plan.get("cta", "")})
 
     # The daily card draws a layout archetype on a deterministic rotation, so the
     # generated run varies in composition day to day (the brand never varies).

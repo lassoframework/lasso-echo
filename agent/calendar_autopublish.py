@@ -307,6 +307,21 @@ def _publish_capacity(gym_id, row, store, local_claim_day):
     row_day = str(row.get("post_date") or "")[:10]
     if (str(gym_id or "").strip().lower() == "lasso"
             and fmt in ("feed", "story")
+            and _lasso_october7_catchup_day(local_claim_day)
+            and _lasso_three_feed_enabled(gym_id, local_claim_day)
+            and (row.get("account") or "").strip().lower() in ("instagram", "facebook")
+            and (row.get("format") or "").strip().lower() in ("feed", "story")
+            and type(row.get("slot_index")) is int
+            and row["slot_index"] in (0, 1, 2)
+            and row_day in (local_claim_day, "2026-10-07")
+            and row_day <= local_claim_day):
+        # The RPC independently enforces 3 current + 3 October 7 backlog rows
+        # per account and format on the actual local publish day (Oct 8-9
+        # only). Backlog is strictly before the publish day, so October 7 is
+        # never both. Six per IG/FB feed/story class = 24 aggregate per day.
+        return 6
+    if (str(gym_id or "").strip().lower() == "lasso"
+            and fmt in ("feed", "story")
             and _lasso_immediate_backlog_day(local_claim_day)
             and _lasso_three_feed_enabled(gym_id, local_claim_day)
             and (row_day == local_claim_day
@@ -334,6 +349,10 @@ def _publish_capacity(gym_id, row, store, local_claim_day):
     return capacity if is_feed else min(capacity, 2)
 
 
+def _lasso_october7_catchup_day(day):
+    return "2026-10-08" <= str(day or "")[:10] <= "2026-10-09"
+
+
 def _lasso_immediate_backlog_day(day):
     return "2026-10-05" <= str(day or "")[:10] <= "2026-10-06"
 
@@ -347,6 +366,10 @@ def _client_publish_limits(gym_id, run_date, configured_cap):
     if (str(gym_id or "").strip().lower() != "lasso"
             or not _lasso_three_feed_enabled(gym_id, run_date)):
         return CLIENT_CATCHUP_DAYS, configured_cap
+    if _lasso_october7_catchup_day(run_date):
+        # October 7 remains in the query through Oct 9. The RPC gates the
+        # three extra backlog rows per account, format and actual local day.
+        return CLIENT_CATCHUP_DAYS, 24
     if _lasso_immediate_backlog_day(run_date):
         # Oct 2 remains in the query through Oct 6. The RPC gates the twelve
         # extra backlog pairs per account, format and actual local day, and
@@ -405,11 +428,17 @@ def _paired_lasso_feed_published(story, store):
             and matches[0].get("late_post_id") is not None)
 
 
+def _owned_visual_enabled(row):
+    from .lasso_current_artifact import owned, ACCOUNTS
+    return owned(row) and config.lasso_infographic_quality_enabled(ACCOUNTS[row['account']])
+
+
 def _paired_lasso_story_prepared(feed, store):
     """Fail closed unless the DB proves one exact usable Story for this feed."""
     try:
         reader = getattr(store, "lasso_paired_story_ready_for_feed")
-        return reader(feed["id"]) is True
+        from .lasso_current_artifact import current_pair
+        return reader(feed["id"]) is True and (not _owned_visual_enabled(feed) or current_pair(store,feed))
     except Exception:
         return False
 
@@ -1659,6 +1688,12 @@ def publish_due(run_date, *, gym_id="lasso", store=None, publisher=None,
         # final cleaned row before any claim/network call — but ONLY when the
         # caption actually moved, so a clean row pays no extra RPC.
         paired_proven_caption = row.get("caption") if paired_lasso_feed else None
+        from .lasso_current_artifact import owned as _style_owned, current_pair as _current_style_pair
+        owned_style_row = _owned_visual_enabled(row)
+        if owned_style_row and not _current_style_pair(store,row):
+            _note_repeat_failure(row_id,gym_id,RuntimeError('current owned visual review unavailable'))
+            waiting.append(row_id)
+            continue
 
         account = _account_for(row, gym_id)
         if account is None:
@@ -1949,6 +1984,23 @@ def publish_due(run_date, *, gym_id="lasso", store=None, publisher=None,
                     reject_reason="leased_feed_source_mismatch")
                 if not _reverted:
                     recovery_required.append(row_id)
+                failed.append(row_id)
+                continue
+
+        # Owned Story as well as feed: use the actual post-claim source and
+        # current visual evidence before any durable content stamp/provider I/O.
+        if owned_style_row:
+            try:
+                _styled = store.get_row(gym_id,row_id)
+            except Exception:
+                _styled = None
+            _style_lease_ok = (isinstance(_styled,dict) and _styled.get('status')=='publishing'
+                and bool(claim_token) and str(_styled.get('publish_claim_token') or '')==str(claim_token)
+                and all(_styled.get(k)==row.get(k) for k in _PAIRED_FEED_SOURCE_FIELDS))
+            if not _style_lease_ok or not _current_style_pair(store,_styled):
+                _reverted = _revert_to_pending(store=store,row_id=row_id,gym_id=gym_id,
+                    expected_claim_token=claim_token,reject_reason='lasso_current_visual_proof_missing')
+                if not _reverted: recovery_required.append(row_id)
                 failed.append(row_id)
                 continue
 

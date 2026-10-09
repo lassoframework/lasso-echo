@@ -183,3 +183,15 @@ def test_pillar_with_no_body_blocks_not_silent_none(monkeypatch, tmp_path):
     assert d.status == DraftStatus.BLOCKED
     assert "no approved body lines" in d.blocked_reason.lower()
     assert "only hook" in d.blocked_reason.lower()
+
+
+def test_source_only_returns_approved_caption_without_render_or_host(monkeypatch, tmp_path):
+    _arm(monkeypatch, tmp_path)
+    def forbidden(*a, **kw):
+        raise AssertionError("source-only draft must not render or host")
+    monkeypatch.setattr(daily_studio.creative_studio, "generate", forbidden)
+    monkeypatch.setattr(daily_studio.media_host, "host_media", forbidden)
+    draft = daily_studio.build_daily_infographic_draft(
+        _acct(), "2026-07-01", source_path=_doc(tmp_path), source_only=True)
+    assert draft.caption and draft.source_fragments
+    assert not draft.creative_public_url and not draft.creative_path

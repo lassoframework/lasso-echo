@@ -113,6 +113,79 @@ def portal_deliverable(ticket):
             and bool(str(t.get("client_id") or "").strip()))
 
 
+# ---- support-surface sender policy (Blake, 2026-10-08) ---------------------------
+# Support replies in the Echo channel come from Echo, website support from Wrangler,
+# and the overall Ops portal from Scout -- never Ranger (or any other bot) on those
+# surfaces. The production outbox loop already requires ticket.bot_identity to match
+# the row's identity, but a LEGACY 'ready' row can carry a stale-but-consistent
+# identity (e.g. a Ranger row on a portal ticket whose bot_identity is also ranger)
+# and would still post. The authoritative ticket product/source therefore names the
+# sender at actual dispatch time:
+#   source echosupport / portal_social -> echo
+#   product echo -> echo, product websites -> wrangler, product portal -> scout
+# Products outside this map keep their established identity behavior untouched. A
+# ticket whose signals disagree, or a portal-deliverable thread no signal names, is
+# ambiguous: hold it safely instead of guessing a sender.
+_SUPPORT_SOURCE_IDENTITY = {"echosupport": "echo", "portal_social": "echo"}
+_SUPPORT_PRODUCT_IDENTITY = {"echo": "echo", "websites": "wrangler", "portal": "scout"}
+
+
+def _support_surface_sender(ticket):
+    """Return (required_identity, ambiguous) for a support-surface ticket.
+
+    Exactly one named sender -> (name, False). Conflicting product/source signals,
+    or a portal-deliverable thread with no recognized signal, -> (None, True):
+    ambiguous, fail closed. Unrelated products/sources -> (None, False): the
+    established ticket/row identity is preserved.
+    """
+    t = ticket or {}
+    source = str(t.get("source") or "").strip().lower()
+    product = str(t.get("product") or "").strip().lower()
+    # Fixer's identityFor treats portal_social as an explicit Echo source even
+    # when a stale/misleading product field says "portal". Preserve that source
+    # precedence; other contradictory product/source signals remain ambiguous.
+    if source in ("portal_social", "echosupport"):
+        return "echo", False
+    signals = set()
+    if source in _SUPPORT_SOURCE_IDENTITY:
+        signals.add(_SUPPORT_SOURCE_IDENTITY[source])
+    if product in _SUPPORT_PRODUCT_IDENTITY:
+        signals.add(_SUPPORT_PRODUCT_IDENTITY[product])
+    if len(signals) == 1:
+        return next(iter(signals)), False
+    if len(signals) > 1:
+        return None, True
+    if portal_deliverable(t):
+        return None, True
+    return None, False
+
+
+def _hold_support_surface_sender(bus, row, ticket, identity, required, ambiguous,
+                                 log, summary):
+    """Fail-closed hold for a support-surface sender violation; never silent."""
+    att = row.get("attachments") or {}
+    if ambiguous:
+        why = ("support-surface sender policy: ticket product/source does not name "
+               "exactly one sender; refusing to guess")
+    else:
+        why = (f"support-surface sender policy: ticket product/source maps to "
+               f"{required!r}, not {identity.name!r}")
+    log(f"[slack-convo/outbox] HELD row {row['id']}: {why}")
+    bus.mark_message(row["id"], "held", meta_update={
+        "held_why": why,
+        "support_surface_sender_hold": True,
+        "support_surface_required_identity": required or "",
+        "support_surface_sender_ambiguous": bool(ambiguous),
+    })
+    summary["held"] += 1
+    _a.write_hold_notice(
+        bus, ident_name=identity.name, tid=ticket["id"],
+        recipient_kind=att.get("recipient_kind") or ticket.get("identity_kind") or "client",
+        user=ticket.get("slack_user_id") or "?",
+        account_key=None, kind=att.get("kind") or "", body=row.get("body") or "",
+        held_message_id=row["id"], surface=att.get("surface") or "", why=why)
+
+
 def _question_without_code_fix(ticket, att=None):
     t, a = ticket or {}, att or {}
     return (str(t.get("classification") or "").lower() == "answerable_question"
@@ -2304,6 +2377,39 @@ def _dispatch_one(bus, post, row, *, identity, log, summary, now=None,
                       "FIXER requester identity changed before delivery", log, summary)
             return
         ticket = fresh
+    # 6b. SUPPORT-SURFACE SENDER POLICY, re-checked on the freshest ticket read
+    # under the existing fresh request/tenant/version gates above, after the claim
+    # and before any Slack post or portal-deliverable marking. A legacy ready row
+    # can pass the bot_identity/attachment checks with a stale-but-consistent
+    # identity; only the authoritative ticket product/source decides who may speak
+    # on a support surface. Mismatch or ambiguity is HELD, never posted.
+    try:
+        fresh_policy_ticket = bus.ticket(ticket["id"])
+    except Exception:  # noqa: BLE001 - an unreadable sender surface never posts
+        fresh_policy_ticket = None
+    if not isinstance(fresh_policy_ticket, dict):
+        _hold_support_surface_sender(bus, row, ticket, identity, None, True,
+                                     log, summary)
+        return
+    # This final read exists only to recheck sender policy. Do not rebind the
+    # dispatch ticket from it: between the established freshness gates above
+    # and this read, tenant or Slack routing may have changed. Bind the complete
+    # dispatch identity and request cycle before accepting the refreshed data.
+    _dispatch_identity_fields = (
+        "id", "client_id", "slack_user_id", "slack_channel_id",
+        "slack_thread_ts", "request_version", "bot_identity", "product",
+        "source",
+    )
+    if any(fresh_policy_ticket.get(field) != ticket.get(field)
+           for field in _dispatch_identity_fields):
+        _hold_support_surface_sender(bus, row, ticket, identity, None, True,
+                                     log, summary)
+        return
+    _required_sender, _sender_ambiguous = _support_surface_sender(fresh_policy_ticket)
+    if _sender_ambiguous or (_required_sender and _required_sender != identity.name):
+        _hold_support_surface_sender(bus, row, ticket, identity, _required_sender,
+                                     _sender_ambiguous, log, summary)
+        return
     # 7. destination.  Compute the FIXER transport from the freshly rebound
     # ticket, never from the pre-claim snapshot.  A portal ticket may acquire its
     # Slack conversation while this worker is claiming the row; that completion
