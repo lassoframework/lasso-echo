@@ -30,7 +30,7 @@
   "migrations/DRAFT_generated_client_admission_20261009.sql": "d02782767faf0c9337ce5fba22f9716e8da7360c4f5e091b39a597e885ca1dc6",
   "migrations/DRAFT_generated_client_admission_20261009.verify.sql": "b47309bc533e6d65700b59c55e4f5fc1e21be263e9776100514a322536682f1f",
   "migrations/DRAFT_generated_client_calendar_identity_20261009.sql": "71da26e11c6860d05959ec008d72b5b09e1d67985bd71fc746110a893f0e0c88",
-  "migrations/DRAFT_generated_client_staged_adapter_20261009.sql": "6af95582cfd5351f6074e06c0e7d41c6aed90c09f5c0979d9e3401afe6c97468",
+  "migrations/DRAFT_generated_client_staged_adapter_20261009.sql": "4959200138c815b327c5229bc8373fc17b7f7ab0c42891d8f83cdb584a9b6da1",
   "migrations/DRAFT_generated_client_staged_adapter_20261009.verify.sql": "026b28c59d5fab6d2fd6154c3fd01123ca32755abdd43212bc2238aada56819b",
   "migrations/DRAFT_generated_hosted_byte_authority_20261009.sql": "162ef5cbed66e72685b352c1ba2b26e2ce7e74d8f80010fc1b4a59951e03ab94",
   "migrations/DRAFT_generated_issuer_dispatch_20261009.sql": "eb53bfeafd30f5a38bdcd40b872230a92d0845d8bc2bb208ce51a98fbfb318b4",

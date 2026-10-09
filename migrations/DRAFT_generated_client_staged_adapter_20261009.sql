@@ -305,9 +305,15 @@ begin
      and batch.tenant_id=p_tenant and batch.state='staged'
      and batch.request_digest ~ '^[0-9a-f]{64}$'
      and batch.finalize_request is null and batch.finalize_receipt is null and batch.finalized_at is null
-     and batch.request_payload=jsonb_build_object('members',jsonb_build_array(
+     -- The service store includes the canonical tenant in its frozen request.
+     -- Preserve the original direct-RPC shape, but admit no other keys or tenant.
+     and batch.request_payload in (
+      jsonb_build_object('tenant_id',p_tenant,'members',jsonb_build_array(
        jsonb_build_object('row',raw#>'{stage_plan,planned_row}','observation',null)),
-       'old_rows',jsonb_build_array(raw#>'{stage_plan,old_snapshot}'))
+       'old_rows',jsonb_build_array(raw#>'{stage_plan,old_snapshot}')),
+      jsonb_build_object('members',jsonb_build_array(
+       jsonb_build_object('row',raw#>'{stage_plan,planned_row}','observation',null)),
+       'old_rows',jsonb_build_array(raw#>'{stage_plan,old_snapshot}')))
      and prior.position=0 and prior.calendar_row_id=old_row.id and prior.tenant_id=p_tenant
      and prior.old_snapshot=to_jsonb(old_row)
      and (select count(*) from public.forward_schedule_stage_member_20261008 x where x.batch_id=batch.batch_id)=1
@@ -491,8 +497,11 @@ begin
   or p_expected_old_rows is distinct from jsonb_build_array(plan->'old_snapshot')
   or not exists(select 1 from public.forward_schedule_stage_old_row_20261008
    where batch_id=p_batch_id and calendar_row_id=(plan->>'placeholder_row_id')::uuid and old_snapshot=plan->'old_snapshot')
-  or b.request_payload is distinct from jsonb_build_object('members',jsonb_build_array(jsonb_build_object('row',plan->'planned_row','observation',null)),
-   'old_rows',jsonb_build_array(plan->'old_snapshot')) then
+  or b.request_payload not in (
+   jsonb_build_object('tenant_id',p_tenant_id,'members',jsonb_build_array(jsonb_build_object('row',plan->'planned_row','observation',null)),
+    'old_rows',jsonb_build_array(plan->'old_snapshot')),
+   jsonb_build_object('members',jsonb_build_array(jsonb_build_object('row',plan->'planned_row','observation',null)),
+    'old_rows',jsonb_build_array(plan->'old_snapshot'))) then
   raise exception 'generated exact persisted replacement binding required' using errcode='23514'; end if;
  perform public.generated_client_current_preparation_20261009(a);
  -- Full placeholder and full gap-request CAS, locked before any rebind.

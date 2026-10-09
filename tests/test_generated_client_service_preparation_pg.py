@@ -54,6 +54,8 @@ def test_generated_client_service_preparation_pg17(monkeypatch):
    assert rpc(service,'generated_client_service_preparation_20261009',*args)['prepared']
    for corrupt in ["update forward_schedule_stage_batch_20261008 set tenant_id='foreign' where batch_id=%s",
                    "update forward_schedule_stage_batch_20261008 set request_payload='{}'::jsonb where batch_id=%s",
+                   "update forward_schedule_stage_batch_20261008 set request_payload=jsonb_set(request_payload,'{tenant_id}','\\\"foreign\\\"'::jsonb) where batch_id=%s",
+                   "update forward_schedule_stage_batch_20261008 set request_payload=request_payload||'{\\\"extra\\\":true}'::jsonb where batch_id=%s",
                    "update content_calendar set caption=caption||' changed' where id=%s"]:
     db.execute('begin');db.execute('set local session_replication_role=replica')
     db.execute(corrupt,(new_id if corrupt.startswith('update content_calendar') else batch,))
