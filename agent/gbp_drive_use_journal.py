@@ -1216,3 +1216,318 @@ def forward_manifest_evidence_matches(entry, persisted, bound, evidence):
         return proof.get('reservation_id') == terminal['reservation_ids'][index]
     except Exception:
         return False
+
+
+# Event operation identity is persisted before selection. These rows have no
+# consumption authority; the existing terminal-proof listener owns settlement.
+def _ensure_event_schema(conn):
+    conn.execute("""CREATE TABLE IF NOT EXISTS event_drive_operations (
+        operation_key TEXT PRIMARY KEY, gym_id TEXT NOT NULL,
+        identity_text TEXT NOT NULL, logical_post_id TEXT NOT NULL UNIQUE,
+        input_row TEXT NOT NULL, batch_id TEXT,
+        created_at TEXT NOT NULL DEFAULT (datetime('now')))""")
+
+
+def _event_row(row):
+    if row is None:
+        return None
+    return dict(operation_key=row[0], gym_id=row[1], identity=json.loads(row[2]),
+                logical_post_id=row[3], input_row=json.loads(row[4]), batch_id=row[5],
+                created_at=row[6])
+
+
+def _event_get(conn, key):
+    return _event_row(conn.execute(
+        "SELECT operation_key,gym_id,identity_text,logical_post_id,input_row,batch_id,created_at "
+        "FROM event_drive_operations WHERE operation_key=?", (key,)).fetchone())
+
+
+def event_operation(identity, input_row, *, path=None):
+    """Persist a deterministic operation UUID BEFORE selecting or hosting media.
+
+    Retries use the first frozen content even if a restarted caption generator
+    produces new text. A recreate gets an explicit new generation. Backfills
+    include the old row UUID, never adopt its legacy logical UUID implicitly.
+    """
+    required = ('gym_id', 'event_id', 'beat', 'post_date', 'account', 'format',
+                'generation', 'old_row_id')
+    if (type(identity) is not dict or set(identity) != set(required)
+            or not _GYM.fullmatch(str(identity.get('gym_id') or ''))
+            or not identity.get('event_id') or not identity.get('beat')
+            or identity.get('account') != 'instagram'
+            or identity.get('format') not in ('feed', 'image')
+            or type(identity.get('generation')) is not int or identity['generation'] < 0
+            or type(input_row) is not dict):
+        raise JournalHold('event_operation_invalid')
+    try:
+        if date.fromisoformat(identity['post_date']).isoformat() != identity['post_date']:
+            raise ValueError
+        if identity['old_row_id'] is not None:
+            uuid.UUID(identity['old_row_id'])
+        text = canonical_json(identity)
+        key = digest(identity)
+        logical = str(uuid.uuid5(uuid.NAMESPACE_URL, 'echo:event-drive-use:v1:' + key))
+        frozen = dict(input_row, gym_id=identity['gym_id'], logical_post_id=logical,
+                      status='pending')
+        if any(frozen.get(k) != identity[k] for k in
+               ('event_id', 'post_date', 'account', 'format')):
+            raise ValueError
+    except Exception:
+        raise JournalHold('event_operation_invalid') from None
+    conn = _connect(_resolve_path(path))
+    try:
+        conn.execute('BEGIN IMMEDIATE')
+        _ensure_event_schema(conn)
+        prior = _event_get(conn, key)
+        if prior is None:
+            conn.execute("INSERT INTO event_drive_operations "
+                         "(operation_key,gym_id,identity_text,logical_post_id,input_row) "
+                         "VALUES (?,?,?,?,?)",
+                         (key, identity['gym_id'], text, logical, canonical_json(frozen)))
+        result = _event_get(conn, key)
+        conn.execute('COMMIT')
+        return result
+    except Exception:
+        _rollback(conn)
+        raise JournalHold('event_operation_write_hold') from None
+    finally:
+        _close(conn)
+
+
+def event_operations(gym_id=None, *, path=None, limit=32, after=None):
+    """Bounded circular keyset slice, scoped to one tenant or all tenants.
+
+    Enumeration never advances the cursor. Recovery admits each operation
+    durably before attempting replay, including operations that remain held.
+    """
+    if type(limit) is not int or not 1 <= limit <= 32:
+        raise JournalHold('event_replay_bound_invalid')
+    if gym_id is not None and (not isinstance(gym_id, str) or not _GYM.fullmatch(gym_id)):
+        raise JournalHold('event_replay_tenant_invalid')
+    if after is not None and (not isinstance(after, tuple) or len(after) != 2
+                              or any(not isinstance(v, str) or not v for v in after)):
+        raise JournalHold('event_replay_cursor_invalid')
+    conn = _connect(_resolve_path(path))
+    try:
+        _ensure_event_schema(conn)
+        sql = ("SELECT operation_key,gym_id,identity_text,logical_post_id,input_row,batch_id,created_at "
+               "FROM event_drive_operations WHERE batch_id IN "
+               "(SELECT batch_id FROM gbp_forward_stage_journal WHERE state='stage_intent')")
+        args = []
+        if gym_id is not None:
+            sql += ' AND gym_id=?'
+            args.append(gym_id)
+        if after is None:
+            rows = conn.execute(sql + ' ORDER BY created_at,operation_key LIMIT ?',
+                                (*args, limit)).fetchall()
+        else:
+            rows = conn.execute(sql + ' AND (created_at,operation_key)>(?,?) '
+                                'ORDER BY created_at,operation_key LIMIT ?',
+                                (*args, *after, limit)).fetchall()
+            if len(rows) < limit:
+                rows += conn.execute(sql + ' AND (created_at,operation_key)<=(?,?) '
+                                     'ORDER BY created_at,operation_key LIMIT ?',
+                                     (*args, *after, limit - len(rows))).fetchall()
+        return [_event_row(row) for row in rows]
+    finally:
+        _close(conn)
+
+
+def _event_replay_scope(gym_id):
+    if gym_id is None:
+        return 'all'
+    if not isinstance(gym_id, str) or not _GYM.fullmatch(gym_id):
+        raise JournalHold('event_replay_tenant_invalid')
+    return 'tenant:' + gym_id
+
+
+def _with_pinned_event_cursor(gym_id, fn):
+    """Cursor writes require the independently pinned original journal owner."""
+    from .jobs import gbp_drive_use_recovery as listener
+    path = listener._durable_path()
+    scope = _event_replay_scope(gym_id)
+    conn = listener._reader(path, write=True)
+    try:
+        conn.execute('BEGIN IMMEDIATE')
+        owner = listener._verify_identity(conn)
+        conn.execute("""CREATE TABLE IF NOT EXISTS event_drive_replay_cursor (
+            scope TEXT PRIMARY KEY, journal_instance_id TEXT NOT NULL,
+            cursor_created_at TEXT, cursor_operation_key TEXT,
+            cursor_version INTEGER NOT NULL DEFAULT 0)""")
+        columns = {column[1] for column in conn.execute('PRAGMA table_info(event_drive_replay_cursor)')}
+        if 'cursor_version' not in columns:
+            conn.execute('ALTER TABLE event_drive_replay_cursor '
+                         'ADD COLUMN cursor_version INTEGER NOT NULL DEFAULT 0')
+        conn.execute('INSERT OR IGNORE INTO event_drive_replay_cursor '
+                     '(scope,journal_instance_id) VALUES (?,?)', (scope, owner))
+        row = conn.execute('SELECT journal_instance_id,cursor_created_at,cursor_operation_key,cursor_version '
+                           'FROM event_drive_replay_cursor WHERE scope=?', (scope,)).fetchone()
+        if (row is None or row[0] != owner or (row[1] is None) != (row[2] is None)
+                or type(row[3]) is not int or row[3] < 0):
+            raise JournalHold('event_replay_cursor_pin_mismatch')
+        result = fn(conn, scope, row)
+        conn.execute('COMMIT')
+        return result
+    except JournalHold:
+        _rollback(conn)
+        raise
+    except Exception:
+        _rollback(conn)
+        raise JournalHold('event_replay_cursor_hold') from None
+    finally:
+        _close(conn)
+
+
+def _event_cursor_snapshot(scope, row):
+    return dict(scope=scope, journal_instance_id=row[0], version=row[3],
+                after=None if row[1] is None else (row[1], row[2]))
+
+
+def event_replay_snapshot(gym_id=None):
+    """Freeze this scope's keyset position AND durable admission version."""
+    return _with_pinned_event_cursor(gym_id, lambda conn, scope, row:
+                                    _event_cursor_snapshot(scope, row))
+
+
+def event_replay_cursor(gym_id=None):
+    """A global replay and each tenant replay keep independent fair cursors."""
+    return event_replay_snapshot(gym_id)['after']
+
+
+def advance_event_replay_cursor(operation, gym_id=None, *, expected_cursor=None):
+    """CAS admission BEFORE replay, including holds, never release use.
+
+    Every slice carries the original scope/owner/version snapshot. A newer
+    sweep invalidates all stale admissions, even after circular wrap returns
+    to the same key. Each admitted attempt returns the next snapshot; callers
+    stop the stale slice rather than overwrite the newer cursor or replan.
+    """
+    if (not isinstance(operation, dict) or not operation.get('created_at')
+            or not operation.get('operation_key')
+            or (gym_id is not None and operation.get('gym_id') != gym_id)
+            or not isinstance(expected_cursor, dict)):
+        raise JournalHold('event_replay_admission_invalid')
+    def advance(conn, scope, row):
+        if expected_cursor != _event_cursor_snapshot(scope, row):
+            raise JournalHold('event_replay_cursor_stale')
+        original = _event_get(conn, operation['operation_key'])
+        if (original is None or original['created_at'] != operation['created_at']
+                or original['gym_id'] != operation['gym_id']
+                or original['batch_id'] != operation['batch_id']):
+            raise JournalHold('event_replay_admission_mismatch')
+        updated = conn.execute('UPDATE event_drive_replay_cursor '
+                               'SET cursor_created_at=?,cursor_operation_key=?,cursor_version=cursor_version+1 '
+                               'WHERE scope=? AND journal_instance_id=? AND cursor_version=?',
+                               (operation['created_at'], operation['operation_key'], scope, row[0], row[3]))
+        if updated.rowcount != 1:
+            raise JournalHold('event_replay_cursor_stale')
+        return dict(scope=scope, journal_instance_id=row[0], version=row[3] + 1,
+                    after=(operation['created_at'], operation['operation_key']))
+    return _with_pinned_event_cursor(gym_id, advance)
+
+
+def freeze_event_stage(operation_key, attempt, request, *, alias_asset_ids=(), path=None):
+    """One SQLite commit owns claim, exact stage request, use and operation binding.
+
+    No claim exists on any precommit failure. After commit, every claim has a
+    frozen replayable request and use UUID. Unknown commit outcomes HOLD.
+    """
+    _validate_stage_attempt(attempt)
+    _validate(request)
+    from . import gym_media_selector
+    claim_id = gym_media_selector.drive_content_claim_id(request['gym_id'], request['asset_before'])
+    if claim_id != request['claim_id']:
+        raise JournalHold('event_claim_identity_mismatch')
+    parsed = json.loads(attempt['request_text'])
+    members = parsed['members']
+    if (len(members) != 1 or members[0]['row'] != request['calendar_row']
+            or not isinstance(members[0].get('observation'), dict)):
+        raise JournalHold('event_stage_member_mismatch')
+    use_id = str(uuid.uuid5(uuid.NAMESPACE_URL, 'echo:event-drive-use:use:' + operation_key))
+    conn = _connect(_resolve_path(path))
+    try:
+        conn.execute('BEGIN IMMEDIATE')
+        _ensure_event_schema(conn)
+        _ensure_schema(conn)
+        _ensure_stage_schema(conn)
+        operation = _event_get(conn, operation_key)
+        if (operation is None or operation['gym_id'] != request['gym_id']
+                or operation['logical_post_id'] != request['logical_post_id']
+                or operation['identity']['post_date'] != request['post_date']
+                or operation['batch_id'] not in (None, attempt['batch_id'])):
+            raise JournalHold('event_operation_binding_mismatch')
+        identity = operation['identity']
+        row = request['calendar_row']
+        if (any(row.get(k) != identity[k] for k in
+                ('gym_id', 'event_id', 'post_date', 'account', 'format'))
+                or row.get('status') != 'pending'
+                or row.get('media_not_ready_reason') is not None
+                or any(row.get(k) is not None for k in
+                       ('approved_by', 'approved_at', 'approval_digest', 'approval_kind',
+                        'published_at', 'late_post_id', 'publish_claim_token'))
+                or (identity['old_row_id'] is None and parsed['old_rows'])
+                or (identity['old_row_id'] is not None
+                    and (len(parsed['old_rows']) != 1
+                         or parsed['old_rows'][0].get('id') != identity['old_row_id']))):
+            raise JournalHold('event_operation_member_mismatch')
+        existing_use = _get_row(conn, use_id)
+        if existing_use:
+            entry = _row_to_entry(existing_use)
+            if (entry['request_digest'] != digest(_frozen(request))
+                    or operation['batch_id'] != attempt['batch_id']):
+                raise JournalHold('event_use_identity_conflict')
+            existing_stage = _stage_row_to_entry(_get_stage_row(conn, attempt['batch_id']))
+            if existing_stage['request_text'] != attempt['request_text']:
+                raise JournalHold('event_stage_identity_conflict')
+            claim = conn.execute("SELECT status,post_id FROM socialapi_claims "
+                                 "WHERE draft_id=? AND account_key=?",
+                                 (claim_id, request['gym_id'] + '_gbp')).fetchone()
+            if claim not in (('in_flight', request['asset_id']), ('done', request['asset_id'])):
+                raise JournalHold('event_original_claim_mismatch')
+            conn.execute('COMMIT')
+            return entry
+        if operation['batch_id'] is not None or _get_stage_row(conn, attempt['batch_id']):
+            raise JournalHold('event_stage_owned_elsewhere')
+        # Honor outstanding ID claims for every same-byte alias, plus the
+        # canonical byte key. No picker acquires a claim in this lane.
+        blocked = [claim_id] + [gym_media_selector.drive_asset_claim_id(request['gym_id'], a)
+                                for a in alias_asset_ids]
+        if any(conn.execute("SELECT 1 FROM socialapi_claims WHERE draft_id=? "
+                            "AND account_key=?", (key, request['gym_id'] + '_gbp')).fetchone()
+               for key in blocked):
+            raise JournalHold('event_bytes_already_claimed')
+        for other in conn.execute('SELECT member_row_ids FROM gbp_forward_stage_journal'):
+            if set(json.loads(other[0])) & set(attempt['member_row_ids']):
+                raise JournalHold('stage_member_conflict')
+        conn.execute("INSERT INTO socialapi_claims(draft_id,account_key,status,post_id) "
+                     "VALUES(?,?,'in_flight',?)", (claim_id, request['gym_id'] + '_gbp', request['asset_id']))
+        conn.execute("INSERT INTO gbp_forward_stage_journal "
+                     "(batch_id,tenant_id,request_digest,request_text,member_row_ids,old_row_ids,state) "
+                     "VALUES(?,?,?,?,?,?,?)", (attempt['batch_id'], attempt['tenant_id'],
+                     attempt['request_digest'], attempt['request_text'],
+                     canonical_json(attempt['member_row_ids']), canonical_json(attempt['old_row_ids']),
+                     STAGE_STATE_INTENT))
+        conn.execute('INSERT INTO gbp_forward_stage_tenant_binding VALUES (?,?,?,?)',
+                     (attempt['batch_id'], request['gym_id'], attempt['tenant_id'], attempt['request_digest']))
+        conn.execute('INSERT INTO gbp_drive_use_journal '
+                     '(use_id,gym_id,logical_post_id,claim_id,post_date,content_hash,asset_id,source_id,'
+                     'calendar_row,payload,asset_before,source_before,request_digest,state,epoch_id) '
+                     'VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+                     (use_id, request['gym_id'], request['logical_post_id'], claim_id,
+                      request['post_date'], request['content_hash'], request['asset_id'], request['source_id'],
+                      canonical_json(request['calendar_row']), canonical_json(request['payload']),
+                      canonical_json(request['asset_before']), canonical_json(request['source_before']),
+                      digest(_frozen(request)), STATE_WRITE_INTENT, request['epoch_id']))
+        conn.execute('UPDATE event_drive_operations SET batch_id=? WHERE operation_key=?',
+                     (attempt['batch_id'], operation_key))
+        entry = _row_to_entry(_get_row(conn, use_id))
+        conn.execute('COMMIT')
+        return entry
+    except JournalHold:
+        _rollback(conn)
+        raise
+    except Exception:
+        _rollback(conn)
+        raise JournalHold('event_atomic_freeze_hold') from None
+    finally:
+        _close(conn)

@@ -362,6 +362,10 @@ def stage_arc(store, event, arc_rows, *, profile="GYM", logger=None,
     if isinstance(event, dict):
         event = ge.GymEvent.from_row(event)
     gym_id = event.gym_id
+    drive_recovery = None
+    if _remote_drive_use_armed():
+        from . import event_drive_use
+        drive_recovery = event_drive_use.recover(store=store, logger=log, tenant_id=gym_id)
     months = sorted({str(r.get("post_date"))[:7] for r in arc_rows if r.get("post_date")})
 
     existing = []
@@ -465,9 +469,26 @@ def stage_arc(store, event, arc_rows, *, profile="GYM", logger=None,
     # cannot publish — Zanshin's entire first month (2026-08-30) was image-less rows
     # that could only ever fail. Attach a real photo from the gym's own pool; a row we
     # cannot give an image is HELD, never staged as an unpublishable promise.
-    to_stage, held_media = _attach_media(gym_id, to_stage, log,
-                                         picker=media_picker,
-                                         host=media_host_fn)
+    drive_staged = 0
+    if _remote_drive_use_armed():
+        from . import event_drive_use
+        drive_rows = [r for r in to_stage if not (r.get("image_url") or "").strip()]
+        # A pre-existing Drive URL without its frozen producer proof cannot
+        # acquire authority through the legacy insert/stamp path either.
+        unproved_drive = [r for r in to_stage if (r.get("image_url") or "").strip()
+                          and (r.get("source_media_asset_id") or r.get("_media_asset"))]
+        to_stage = [r for r in to_stage if r not in drive_rows and r not in unproved_drive]
+        if drive_recovery and not drive_recovery.get("ok"):
+            drive_result = dict(staged=0, held=len(drive_rows))
+        else:
+            drive_result = event_drive_use.stage_rows(
+                store, gym_id, event.id, drive_rows, log, generations=denied_count)
+        drive_staged = drive_result["staged"]
+        held_media = [None] * (drive_result["held"] + len(unproved_drive))
+    else:
+        to_stage, held_media = _attach_media(gym_id, to_stage, log,
+                                             picker=media_picker,
+                                             host=media_host_fn)
     if not _stamp_logical_post_ids(to_stage, log):
         return {"ok": False, "reason": "logical post id stamp failed", "staged": 0}
     inserted = 0
@@ -500,7 +521,7 @@ def stage_arc(store, event, arc_rows, *, profile="GYM", logger=None,
         except Exception as exc:  # noqa: BLE001
             return {"ok": False, "reason": f"insert failed {type(exc).__name__}",
                     "staged": 0}
-    return {"ok": True, "staged": inserted, "held_recap": len(held_recap),
+    return {"ok": True, "staged": inserted + drive_staged, "held_recap": len(held_recap),
             "held_media": len(held_media),
             "thinned": len(arc_rows) - len(thinned),
             "grade": (grade.total if grade else None),
@@ -551,6 +572,23 @@ def backfill_missing_media(store, gym_id, event_id, *, statuses=("pending", "app
     for row in approved_held:
         log(f"backfill_missing_media: holding approved row {row.get('id')}; media changes "
             "require owner reapproval")
+    if _remote_drive_use_armed():
+        from . import event_drive_use
+        recovery = event_drive_use.recover(store=store, logger=log, tenant_id=gym_id)
+        # SQL milestone 1 replaces only unheld pending/draft rows. Approved,
+        # queued and media-held legacy rows keep their original identities.
+        safe = [r for r in candidates if r.get("status") in ("pending", "draft")
+                and r.get("media_not_ready_reason") is None]
+        if safe and recovery.get("ok"):
+            staged = event_drive_use.stage_rows(
+                store, gym_id, event_id, safe, log,
+                old_rows={r["id"]: r for r in safe if r.get("id")})["staged"]
+            if staged:
+                log(f"event backfill: {staged} inactive replacement candidate(s) staged; "
+                    "original rows remain until independent finalization")
+                return {"backfilled": [], "held": len(eligible), "staged_candidates": staged}
+        log("event backfill: originals held; media-held legacy replacement requires SQL milestone 2")
+        return {"backfilled": [], "held": len(eligible)}
     if not candidates:
         return {"backfilled": [], "held": len(approved_held)}
     kept, held = _attach_media(gym_id, candidates, log, picker=picker, host=host)
@@ -619,6 +657,15 @@ def _attach_media(gym_id, rows, log, *, picker=None, host=None):
     need = [r for r in rows if not (r.get("image_url") or "").strip()]
     if not need:
         return rows, []
+    # This picker/host lane selects new photos from the Drive library. Until it
+    # has a canonical prewrite journal and staged-batch finalizer, armed remote
+    # use must hold BEFORE calling even an injected picker: picking may claim
+    # an asset, and an insert/patch can land despite a lost acknowledgement.
+    # Existing media bypasses this lane; flag-OFF keeps the legacy behavior.
+    if _remote_drive_use_armed():
+        log(f"event media: armed Drive use integration unavailable; "
+            f"holding {len(need)} image-less row(s) before photo selection")
+        return [r for r in rows if (r.get("image_url") or "").strip()], list(need)
     try:
         from . import gym_media_selector as _sel, media_host
         from .integrations import drive_client as _dc
@@ -684,6 +731,22 @@ def _attach_media(gym_id, rows, log, *, picker=None, host=None):
         log(f"event media: HELD {len(held)} row(s) with no available photo "
             f"(an image-less feed post cannot publish); the gym needs more media")
     return kept, held
+
+
+def _remote_drive_use_armed():
+    """Read the shared CAS flag without opening the mutation authority.
+
+    An unreadable flag module must fail closed when the environment arms it.
+    """
+    import os
+    try:
+        from . import remote_drive_use
+        return bool(remote_drive_use.enabled())
+    except Exception:  # noqa: BLE001
+        if os.environ.get("AGENT_REMOTE_DRIVE_USE_CAS_ENABLED", "").strip().lower() \
+                in ("true", "1", "yes", "on"):
+            return True
+        return False
 
 
 def _stamp_media_usage(gym_id, rows):
