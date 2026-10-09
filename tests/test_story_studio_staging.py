@@ -102,6 +102,46 @@ def _arm(monkeypatch, gym="pierce"):
     monkeypatch.setattr("agent.story_studio._host", lambda p, g: "https://r2/story.mp4")
 
 
+@pytest.mark.parametrize('source_gym, source_kind, source_cta, expected', [
+    ('pierce', 'approved_voice', 'No Sweat Intro', 'staged'),
+    ('other', 'approved_voice', 'No Sweat Intro', 'held'),
+    ('pierce', 'unapproved', 'No Sweat Intro', 'held'),
+    ('pierce', 'approved_voice', 'Free Trial', 'held'),
+])
+def test_automatic_offer_approval_is_tenant_and_text_scoped(monkeypatch, tmp_path,
+                                                          source_gym, source_kind, source_cta, expected):
+    import uuid
+    _arm(monkeypatch)
+    audio = tmp_path / 'hype.mp3'
+    audio.write_bytes(b'ID3fake')
+    class Calendar:
+        rows = []
+        def get_row(self, gym, rid):
+            return None
+        def insert_rows(self, gym, rows, **kwargs):
+            assert kwargs == {'preserve_ids':True}
+            self.rows.extend(rows)
+            return rows
+    calendar = Calendar()
+    result = ss.create_story(
+        {'id':str(uuid.uuid4()), 'gym_id':'pierce', 'auto_reel':True, '_moments_prepared':True,
+         'asset_ids':['a0', 'a1', 'a2'], 'brief':'Expert coaching for busy adults',
+         'identity_tokens':['Pierce'], 'ask':'No Sweat Intro',
+         '_automatic_copy':{'held':False, 'ask':'No Sweat Intro',
+             'caption':'Expert coaching for busy adults. No Sweat Intro',
+             'provenance':{'gym':source_gym, 'approved_cta':source_cta,
+                           'ask_source':{'kind':source_kind}}}},
+        candidates=_cands('pierce', n=3, seg=7), store=_FakeStore(),
+        music_library=_RealPathLibrary(str(audio)), render_fn=_fake_render,
+        output_dir=str(tmp_path), cal_store=calendar)
+    assert result['status'] == expected, result
+    if expected == 'staged':
+        assert calendar.rows[0]['status'] == 'pending'
+        assert result['draft'].status == DraftStatus.PENDING
+    else:
+        assert not calendar.rows
+
+
 # ---- flag gate -------------------------------------------------------------
 def test_render_lane_off_returns_off(monkeypatch):
     monkeypatch.delenv("STORY_STUDIO_RENDER", raising=False)

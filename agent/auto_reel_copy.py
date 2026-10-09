@@ -246,8 +246,8 @@ def prepare_copy(gym, analysis, *, voice=None, account=None, writer=None,
         # examples "Save this post" and "Tag a gym owner" cannot pass preparation
         # and then be misreported as zero asks during rendering. If a rotation has
         # another valid approved CTA, use it; never rewrite or invent one.
-        from .story_overlay import count_asks
-        ctas = [cta for cta in ctas if count_asks(cta) == 1]
+        from .story_overlay import count_asks, approved_offer_ask
+        ctas = [cta for cta in ctas if count_asks(cta) == 1 or approved_offer_ask(cta, cta)]
         if not ctas:
             return _held('No approved gym call to action contains exactly one ask')
         if any(len(s)>120 or copy_gate.violations(s) or _URL.search(s) for s in ctas):
@@ -262,7 +262,10 @@ def prepare_copy(gym, analysis, *, voice=None, account=None, writer=None,
         if not isinstance(caption,str) or not isinstance(tags,list):
             return _held('Writer returned invalid gym copy')
         caption=_clean(caption)
-        if not 12<=len(_WORDS.findall(caption))<=75 or not 40<=len(caption)<=500:
+        # The two body beats each require at least three words below. A short
+        # approved offer label must not fail a minimum sized for an imperative.
+        minimum_words = 6 + min(len(_WORDS.findall(cta)) for cta in ctas)
+        if not minimum_words<=len(_WORDS.findall(caption))<=75 or not 40<=len(caption)<=500:
             return _held('Gym caption must be concise and complete')
         body=caption;used=[];count=0
         for cta in ctas:
@@ -272,6 +275,8 @@ def prepare_copy(gym, analysis, *, voice=None, account=None, writer=None,
                 count+=len(found);used.append(cta);body=pattern.sub('',body)
         if count!=1:
             return _held('Caption needs exactly one approved call to action')
+        if count_asks(body) or not caption.endswith(used[0]):
+            return _held('Caption needs its single approved call to action at the end')
         if _NARRATION.search(body):
             return _held('Reel copy must be about the gym, never footage narration')
         numeric_sentences=[s.strip() for s in re.split(r'(?<=[.!?])\s+|\n+',body) if re.search(r'\d',s)]
