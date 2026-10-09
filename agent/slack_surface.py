@@ -6,8 +6,8 @@ reference, the caption + hashtags, and the action protocol (Approve / Edit /
 Skip). Buttons are included for when Slack interactivity is wired; the reply
 protocol is the robust Stage 1 path and is documented on the card itself.
 
-The Slack client is injectable so tests never hit the network. Tokens are read
-from env at send time and never logged.
+The Slack client is injectable so tests never hit the network. Each poster
+captures its token and transport once; they are never logged.
 """
 
 import json
@@ -74,7 +74,7 @@ SLACK_BACKOFF_BASE_SEC = 1.0
 
 class SlackPoster:
     def __init__(self, http=None, token=None, channel=None, sleep=None):
-        self._http = http
+        self._http = http if http is not None else _requests()
         self._token = token or os.environ.get(config.SLACK_BOT_TOKEN_ENV)
         self._channel = channel or config.SLACK_CHANNEL_ID
         self._sleep = sleep or time.sleep
@@ -83,7 +83,7 @@ class SlackPoster:
         """THE one Slack transport: every send (post, thread reply, card edit)
         goes through here. Retries rate limits with backoff; degrades transport
         errors to a failed-send dict; never raises into a caller."""
-        client = self._http or _requests()
+        client = self._http
         delay = SLACK_BACKOFF_BASE_SEC
         for attempt in range(SLACK_MAX_RETRIES + 1):
             try:
@@ -123,8 +123,24 @@ class SlackPoster:
                 continue
             if rate_limited:
                 return {"ok": False, "error": "ratelimited"}
+            if status >= 400:
+                return {"ok": False, "error": "http_error"}
             return body if body is not None else {"ok": False}
         return {"ok": False, "error": "ratelimited"}
+
+    def auth_test(self):
+        """Prove the user of THIS poster's captured token and transport.
+
+        No environment reload or second Slack client may certify this poster.
+        Return identity metadata only; never expose the token in the receipt.
+        """
+        if not self._token:
+            return {"ok": False, "error": "missing_token"}
+        result = self._send("https://slack.com/api/auth.test", {}, method="get")
+        if (not isinstance(result, dict) or result.get("ok") is not True
+                or not isinstance(result.get("user_id"), str) or not result["user_id"].strip()):
+            return {"ok": False, "error": "sender_auth_unconfirmed"}
+        return {"ok": True, "user_id": result["user_id"]}
 
     def read_conversation_messages(self, channel, *, thread_ts=None, ts=None,
                                    oldest=None, max_pages=2):

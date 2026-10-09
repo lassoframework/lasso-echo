@@ -294,7 +294,7 @@ class ConvoWiring:
         self._pool = ThreadPoolExecutor(max_workers=MAX_CONCURRENT_EVENTS,
                                         thread_name_prefix=f"slack-convo-{identity.name}")
         self._post = post or self._default_post()
-        self._readback = readback or self._default_readback
+        self._readback = readback or getattr(self._post, "readback", None) or self._default_readback
         # Injectable, like `post` above, so a test can supply fakes without a real Slack
         # client; built lazily off the identity's own bot token (never Blake's, never a
         # different identity's) only if the outreach-release path is actually exercised.
@@ -331,6 +331,10 @@ class ConvoWiring:
             if not (res or {}).get("ok"):
                 raise RuntimeError(f"slack post failed: {(res or {}).get('error')}")
             return res.get("ts")
+        # Both proofs use the exact poster/token/transport captured by POST,
+        # even if this identity's environment changes after wiring is built.
+        post.verify_sender = poster.auth_test
+        post.readback = poster.read_conversation_messages
         return post
 
     def _poster(self):

@@ -12,6 +12,7 @@ import shutil
 import subprocess
 import tempfile
 import threading
+import time
 from dataclasses import replace
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
@@ -216,7 +217,15 @@ class Transport:
     def patch(self, url, *, params, data, **kw):
         table = url.rsplit('/',1)[-1]
         fields = json.loads(data)
-        where = ' and '.join(f't.{k}={q(v[3:])}' for k,v in params.items())
+        where_parts=[]
+        for key,value in params.items():
+            if value=='is.null':
+                where_parts.append(f't.{key} is null')
+            elif key=='attachments':
+                where_parts.append(f't.{key}={q(value[3:])}::jsonb')
+            else:
+                where_parts.append(f't.{key}={q(value[3:])}')
+        where=' and '.join(where_parts)
         assignments = ','.join(f'{key}=r.{key}' for key in fields)
         sql = (f'with written as (update public.{table} t set {assignments} '
                f'from jsonb_populate_record(null::public.{table},{q(data)}::jsonb) r '
@@ -367,6 +376,7 @@ def test_pending_client_request_plus_authorized_note_preserves_client_dispatch(
     def post(*args,**kwargs):
         posts.append((args,kwargs))
         return '2.001'
+    post.verify_sender = lambda: {"ok": True, "user_id": "U_ECHO_BOT"}
     if armed:
         assert replay.dispatch_allowed(pg_bus,ack,'echo')
         outbox._dispatch_one(pg_bus,post,ack,identity=deps.identity,
@@ -404,6 +414,7 @@ def test_pending_client_question_plus_staff_note_posts_once_with_client_authorit
     def post(*args,**kwargs):
         posts.append((args,kwargs))
         return '2.001'
+    post.verify_sender = lambda: {"ok": True, "user_id": "U_ECHO_BOT"}
     outbox._dispatch_one(pg_bus,post,ack,identity=deps.identity,summary=Counter(),log=lambda *args:None)
     assert len(posts)==1 and pg_bus.message(ack['id'])['delivery_status']=='posted'
     assert posts[0][1]['thread_ts'] is None
@@ -620,6 +631,7 @@ def test_outbox_posts_one_ready_replay_ack_when_current(pg_bus,paused,monkeypatc
     def post(*args,**kwargs):
         posts.append((args,kwargs))
         return '2.001'
+    post.verify_sender = lambda: {"ok": True, "user_id": "U_ECHO_BOT"}
     summary=Counter()
     outbox._dispatch_one(pg_bus,post,row,identity=deps.identity,log=lambda *args:None,summary=summary)
     assert len(posts)==1
@@ -709,6 +721,7 @@ def test_replay_provider_timeout_remains_held_without_second_send(pg_bus,paused,
     def post(*args,**kw):
         sends.append(args)
         raise TimeoutError('Slack acceptance is unknown')
+    post.verify_sender = lambda: {"ok": True, "user_id": "U_ECHO_BOT"}
     result=outbox.run_once(pg_bus,post,identity=deps.identity,log=lambda *args:None)
     assert result['held']==1
     assert len(sends)==1
@@ -851,6 +864,7 @@ def test_stale_quarantine_wins_slow_provider_completion(pg_bus,paused,monkeypatc
         entered.set()
         assert release.wait(5)
         return '2.001'
+    post.verify_sender = lambda: {"ok": True, "user_id": "U_ECHO_BOT"}
     def dispatch():
         try:
             outbox._dispatch_one(pg_bus,post,row,identity=deps.identity,
@@ -971,6 +985,7 @@ def test_ordinary_untagged_claim_completion_keeps_existing_behavior(monkeypatch)
     def post(*args,**kw):
         sent.append(args)
         return '2.001'
+    post.verify_sender = lambda: {"ok": True, "user_id": "U_ECHO_BOT"}
     summary=Counter()
     outbox._dispatch_one(bus,post,row,identity=deps.identity,summary=summary,log=lambda *args:None)
     assert len(sent)==1 and summary['posted']==1
@@ -978,12 +993,41 @@ def test_ordinary_untagged_claim_completion_keeps_existing_behavior(monkeypatch)
     assert 'slack_replay_delivery_token' not in bus.message(row['id'])['attachments']
 
 
+def enable_support_admission(pg_bus):
+    """Install the unchanged 0624 fixture once and open only its test build."""
+    present=pg_bus.engine.sql("select to_regclass('public.support_admission_control') is not null")
+    if present != 't':
+        fixture=Path(__file__).parent/'fixtures/support_admission_0624_frozen.sql'
+        pg_bus.engine.sql(fixture.read_text())
+    pg_bus.engine.sql("update public.support_admission_control set paused=false, "
+        "allowed_builds='[{\"deployment\":\"test-deployment\","
+        "\"build\":\"test-build\"}]' where lane='support-resolution-send'")
+
+
 def ready_answer(pg_bus,paused,monkeypatch):
+    enable_support_admission(pg_bus)
+    monkeypatch.setenv('RAILWAY_DEPLOYMENT_ID','test-deployment')
+    monkeypatch.setenv('RAILWAY_GIT_COMMIT_SHA','test-build')
+    monkeypatch.setenv('AGENT_SLACK_BOT_USER_ID','U_ECHO_BOT')
     deps,ack=ready_ack(pg_bus,paused)
     monkeypatch.setattr(outbox,'_recipient_armed',lambda *args:True)
     monkeypatch.setattr(outbox.config,'slack_convo_auto_answer_armed',lambda *args:True)
     row=next(m for m in pg_bus.msgs if (m.get('attachments') or {}).get('kind')=='answer')
     return deps,row
+
+
+def admission_post(sent):
+    def post(*args,**kwargs):
+        ts=str(time.time()+1)
+        sent.append({'channel':args[0], 'text':args[1], 'thread_ts':kwargs.get('thread_ts'),
+                     'ts':ts, 'user':'U_ECHO_BOT'})
+        return ts
+    def readback(channel, *, thread_ts=None, ts=None, oldest=None):
+        rows=[dict(item, thread_ts=thread_ts) for item in sent if item['channel']==channel]
+        return {'ok':True, 'channel':channel, 'messages':rows}
+    post.readback=readback
+    post.verify_sender=lambda: {"ok":True, "user_id":"U_ECHO_BOT"}
+    return post
 
 
 @pytest.mark.parametrize('author',['client','staff'])
@@ -1002,10 +1046,9 @@ def test_new_inbound_between_delivery_and_resolve_cannot_close_new_request(
     pg_bus.transport.before_call=before
     summary=Counter()
     sends=[]
-    def post(*args,**kwargs):
-        sends.append(args)
-        return '2.001'
-    outbox._dispatch_one(pg_bus,post,row,identity=deps.identity,summary=summary,log=lambda *args:None)
+    post=admission_post(sends)
+    outbox._dispatch_one(pg_bus,post,row,identity=deps.identity,summary=summary,
+                         readback=post.readback,log=lambda *args:None)
     assert calls==['support_slack_replay_delivery_resolve']
     assert len(sends)==1 and summary['posted']==1
     assert summary['resolved']==0
@@ -1013,7 +1056,7 @@ def test_new_inbound_between_delivery_and_resolve_cannot_close_new_request(
     assert current['status']=='verification' and current['resolved_at'] is None
     assert current['request_version']==ticket['request_version']+(1 if author=='client' else 0)
     stored=pg_bus.message(row['id'])
-    assert stored['delivery_status']=='posted' and stored['slack_ts']=='2.001'
+    assert stored['delivery_status']=='posted' and stored['slack_ts']==sends[0]['ts']
     assert 'slack_replay_resolution_ticket' not in stored['attachments']
     item=next(r for r in queue(pg_bus) if r['id']==stored['attachments']['slack_replay_id'])
     assert item['resolution_receipts']=={}
@@ -1026,8 +1069,9 @@ def test_current_replay_answer_resolves_once_after_lost_response_and_newer_note_
     calls=[]
     pg_bus.transport.before_call=lambda name,args:calls.append((name,copy.deepcopy(args)))
     summary=Counter()
-    outbox._dispatch_one(pg_bus,lambda *args,**kwargs:'2.001',row,
-        identity=deps.identity,summary=summary,log=lambda *args:None)
+    post=admission_post([])
+    outbox._dispatch_one(pg_bus,post,row,
+        identity=deps.identity,summary=summary,readback=post.readback,log=lambda *args:None)
     assert summary['posted']==1 and summary['resolved']==1
     args=[args for name,args in calls if name=='support_slack_replay_delivery_resolve']
     assert len(args)==2 and args[0]==args[1]
@@ -1035,7 +1079,8 @@ def test_current_replay_answer_resolves_once_after_lost_response_and_newer_note_
     assert first['resolved'] is True
     assert pg_bus.ticket(row['ticket_id'])['status']=='resolved'
     proof=next(r for r in queue(pg_bus) if r['id']==row['attachments']['slack_replay_id'])['resolution_receipts'][row['id']]
-    assert proof['ticket']['status']=='resolved' and proof['slack_ts']=='2.001'
+    assert proof['ticket']['status']=='resolved' and proof['slack_ts']==post.readback(
+        'G0MPIM')['messages'][0]['ts']
     assert 'slack_replay_resolution_inbound' not in pg_bus.message(row['id'])['attachments']
     pg_bus.record_inbound(ticket_id=row['ticket_id'],slack_event_id='later-client',slack_ts='3.001',
         author_type='client',author_id='U_CLIENT',body='That was for another month')

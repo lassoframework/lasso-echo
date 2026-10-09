@@ -24,6 +24,7 @@ import threading
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 
 import pytest
 
@@ -51,6 +52,77 @@ class FakeBus:
         self.tables = {}
         self.now = datetime.now(timezone.utc)
         self._atomic_lock = threading.Lock()
+        self._support_lane_generation = 1
+        self._support_lane_invocations = {}
+
+    def _client(self):
+        return self
+
+    def _rest(self, table):
+        return f"http://fake/rest/v1/{table}"
+
+    def _headers(self, extra=None):
+        return {}
+
+    def post(self, url, *, data, **kwargs):
+        name = url.rsplit("/", 1)[-1]
+        args = json.loads(data)
+        if name == "support_admission_status_lane":
+            result = {"lane": args["p_lane"], "generation": self._support_lane_generation,
+                      "paused": False, "unresolved": sum(
+                          value != "completed" for value in self._support_lane_invocations.values()),
+                      "drained": False, "operation_id": "test-open"}
+        elif name == "support_admission_acquire_lane":
+            ident = args["p_invocation_id"]
+            admitted = (args["p_expected_generation"] == self._support_lane_generation
+                        and ident not in self._support_lane_invocations)
+            if admitted:
+                self._support_lane_invocations[ident] = "running"
+            result = {"admitted": admitted, "lane": args["p_lane"],
+                      "invocation_id": ident, "generation": self._support_lane_generation}
+        elif name == "support_admission_finish_lane":
+            ident = args["p_invocation_id"]
+            outcome = self._support_lane_invocations.get(ident)
+            # The frozen 0624 finish is idempotent for the same terminal outcome,
+            # and rejects attempts to turn unknown into completed (or vice versa).
+            recorded = (outcome is not None
+                        and args["p_generation"] == self._support_lane_generation
+                        and args["p_outcome"] in ("completed", "unknown")
+                        and outcome in ("running", args["p_outcome"]))
+            result = {"recorded": recorded,
+                      "lane": args["p_lane"], "invocation_id": ident}
+            if recorded:
+                self._support_lane_invocations[ident] = args["p_outcome"]
+        else:
+            return SimpleNamespace(status_code=404, json=lambda: {})
+        return SimpleNamespace(status_code=200, json=lambda: result)
+
+    def _patch(self, table, match, fields):
+        if table != "support_messages":
+            return None
+        row = self.message(match.get("id", "")[3:])
+        if not row:
+            return None
+        checks = {"ticket_id": row.get("ticket_id"), "delivery_status": row.get("delivery_status"),
+                  "body": row.get("body"), "slack_ts": row.get("slack_ts"),
+                  "delivery_request_version": row.get("delivery_request_version")}
+        for key, expected in checks.items():
+            condition = match.get(key)
+            if condition is not None and condition.startswith("eq.") and str(expected) != condition[3:]:
+                return None
+            if condition == "is.null" and expected is not None:
+                return None
+        expected_attachments = match.get("attachments")
+        if expected_attachments == "is.null" and row.get("attachments") is not None:
+            return None
+        if expected_attachments and expected_attachments.startswith("eq."):
+            if json.dumps(row.get("attachments"), sort_keys=True, separators=(",", ":")) != expected_attachments[3:]:
+                return None
+        for msg in self.msgs:
+            if msg["id"] == row["id"]:
+                msg.update(fields)
+                return dict(msg)
+        return None
 
     def _ts(self):
         return self.now.isoformat()
@@ -190,9 +262,13 @@ class FakeBus:
         self.calls.append("record_outbound")
         att = {"kind": kw["kind"]}
         att.update(kw.get("meta") or {})
+        ticket = self.ticket(kw["ticket_id"])
         m = {"id": str(uuid.uuid4()), "direction": "outbound", "ticket_id": kw["ticket_id"],
              "author_type": kw["author_type"], "body": kw["body"],
              "delivery_status": kw["delivery_status"], "attachments": att, "slack_ts": None,
+             "delivery_request_version": (kw.get("expected_request_version")
+                                          if kw.get("expected_request_version") is not None
+                                          else (ticket or {}).get("request_version")),
              "created_at": self._ts()}
         self.msgs.append(m)
         return dict(m)
@@ -563,6 +639,8 @@ def _ev(text, *, channel="G0MPIM", ts="1.001", channel_type="mpim", user="U_CLIE
 @pytest.fixture(autouse=True)
 def _bot_user(monkeypatch):
     monkeypatch.setenv("AGENT_SLACK_BOT_USER_ID", "U_ECHO_BOT")
+    monkeypatch.setenv("RAILWAY_DEPLOYMENT_ID", "test-deployment")
+    monkeypatch.setenv("RAILWAY_GIT_COMMIT_SHA", "test-build-sha")
     yield
 
 
@@ -1240,7 +1318,17 @@ def _fresh_slack_test_ts():
     return str(time.time() + 1)
 
 
-def _posted():
+def _posted(identity="echo"):
+    # These are explicit fake Railway deployment/build identities for tests that
+    # exercise successful sends. Fail-closed tests unset/replace them explicitly.
+    os.environ.setdefault("RAILWAY_DEPLOYMENT_ID", "test-deployment")
+    os.environ.setdefault("RAILWAY_GIT_COMMIT_SHA", "test-build-sha")
+    os.environ.setdefault("AGENT_SLACK_BOT_USER_ID", "U_ECHO_BOT")
+    for identity_env, user in (("RANGER_SLACK_BOT_USER_ID", "U_RANGER_BOT"),
+                               ("SCOUT_SLACK_BOT_USER_ID", "U_SCOUT_BOT"),
+                               ("WRANGLER_SLACK_BOT_USER_ID", "U_WRANGLER_BOT")):
+        os.environ.setdefault(identity_env, user)
+    sender = IDS.get(identity).bot_user_id()
     calls = []
 
     def post(channel, text, thread_ts=None, blocks=None):
@@ -1251,10 +1339,12 @@ def _posted():
     def readback(channel, *, thread_ts=None, ts=None, oldest=None):
         matching = [c for c in calls if c["channel"] == channel
                     and c["thread_ts"] == thread_ts]
-        messages = [{"ts": c["ts"], "text": c["text"], "user": "U_ECHO_BOT",
+        messages = [{"ts": c["ts"], "text": c["text"], "user": sender,
                      "thread_ts": thread_ts} for c in matching]
         return {"ok": True, "channel": channel, "messages": messages}
     post.readback = readback
+    # Synthetic auth.test result belongs to this captured sender transport.
+    post.verify_sender = lambda: {"ok": True, "user_id": sender}
     return post, calls
 
 
@@ -1401,7 +1491,7 @@ def test_verified_ops_notice_posts_and_resolves_only_for_current_request(monkeyp
     bus = FakeBus()
     tid = str(uuid.uuid4())
     bus.tickets[tid] = {
-        "id": tid, "product": "echo", "status": "verification",
+        "id": tid, "product": "echo", "source": "slack_conversation", "status": "verification",
         "classification": "action_request", "client_id": "gym-one",
         "bot_identity": "echo", "identity_kind": "client",
         "slack_user_id": "U_CLIENT", "slack_channel_id": "C_CLIENT",
@@ -1462,7 +1552,7 @@ def test_swap_media_ops_notice_delivery_gate(monkeypatch, defect):
                  "args": {"row_id": "row-abc-123"}, "gym_key": "gym-key",
                  "tenantVerified": True, "tenantId": "gym-one", "result": result}
     bus.tickets[tid] = {
-        "id": tid, "product": "echo", "status": "verification",
+        "id": tid, "product": "echo", "source": "slack_conversation", "status": "verification",
         "classification": "action_request", "client_id": "gym-one",
         "bot_identity": "echo", "identity_kind": "client",
         "slack_user_id": "U_CLIENT", "slack_channel_id": "C_CLIENT",
@@ -1535,7 +1625,7 @@ def test_swap_media_nonempty_sibling_evidence_gate(monkeypatch, defect):
                  "args": {"row_id": "row-abc-123"}, "gym_key": "gym-key",
                  "tenantVerified": True, "tenantId": "gym-one", "result": result}
     bus.tickets[tid] = {
-        "id": tid, "product": "echo", "status": "verification",
+        "id": tid, "product": "echo", "source": "slack_conversation", "status": "verification",
         "classification": "action_request", "client_id": "gym-one",
         "bot_identity": "echo", "identity_kind": "client",
         "slack_user_id": "U_CLIENT", "slack_channel_id": "C_CLIENT",
@@ -1617,7 +1707,7 @@ def _ops_notice_scenario(bus, action, operation, body):
     action, plus the resolve notice row the outbox must gate. Returns (tid, notice)."""
     tid = str(uuid.uuid4())
     bus.tickets[tid] = {
-        "id": tid, "product": "echo", "status": "verification",
+        "id": tid, "product": "echo", "source": "slack_conversation", "status": "verification",
         "classification": "action_request", "client_id": "gym-one",
         "bot_identity": "echo", "identity_kind": "client",
         "slack_user_id": "U_CLIENT", "slack_channel_id": "C_CLIENT",
@@ -1809,7 +1899,7 @@ def test_business_fix_notice_requires_authoritative_observation(monkeypatch, def
     sha = BUSINESS_SHA
     pr = "https://github.com/lassoframework/lasso-echo/pull/999"
     bus.tickets[tid] = {
-        "id": tid, "product": "echo", "status": "merged",
+        "id": tid, "product": "echo", "source": "slack_conversation", "status": "merged",
         "classification": "code_fix", "bot_identity": "echo", "identity_kind": "client",
         "slack_user_id": "U_CLIENT", "escalated": False, "hold_tier": None,
         "client_id": BUSINESS_PORTAL_GYM_ID, "slack_channel_id": "C_CLIENT", "slack_thread_ts": "1.0",
@@ -1925,7 +2015,7 @@ def test_completed_swap_notice_rechecks_worker_receipt_and_current_asset(monkeyp
     row_id, asset_id, receipt_key = BUSINESS_ROW_ID, "drive_asset_1", "swap-proof-001"
     pr = "https://github.com/lassoframework/lasso-echo/pull/999"
     bus.tickets[tid] = {
-        "id": tid, "product": "echo", "status": "merged", "classification": "code_fix",
+        "id": tid, "product": "echo", "source": "slack_conversation", "status": "merged", "classification": "code_fix",
         "bot_identity": "echo", "identity_kind": "client", "slack_user_id": "U_CLIENT",
         "escalated": False, "hold_tier": None, "client_id": BUSINESS_PORTAL_GYM_ID,
         "slack_channel_id": "C_CLIENT", "slack_thread_ts": "1.0", "fix_pr_url": pr,
@@ -2073,7 +2163,7 @@ def test_fixer_client_reply_waits_for_verified_current_deployment(monkeypatch):
     sha = BUSINESS_SHA
     pr = "https://github.com/lassoframework/lasso-echo/pull/999"
     bus.tickets[tid] = {
-        "id": tid, "status": "hold", "bot_identity": "echo", "identity_kind": "client",
+        "id": tid, "source": "slack_conversation", "status": "hold", "bot_identity": "echo", "identity_kind": "client",
         "client_id": BUSINESS_PORTAL_GYM_ID,
         "slack_channel_id": "C_CLIENT", "slack_thread_ts": "1.0", "fix_pr_url": pr,
         "verification_after": {"exit_code": 0, "fixer": {"merged_sha": sha,
@@ -2139,7 +2229,7 @@ def test_fixer_old_request_notice_cannot_post_or_resolve_after_correction(monkey
     tid = str(uuid.uuid4())
     pr, sha = "https://github.com/lassoframework/lasso-echo/pull/999", BUSINESS_SHA
     bus.tickets[tid] = {
-        "id": tid, "status": "merged", "bot_identity": "echo",
+        "id": tid, "source": "slack_conversation", "status": "merged", "bot_identity": "echo",
         "identity_kind": "client", "client_id": BUSINESS_PORTAL_GYM_ID,
         "slack_channel_id": "C_CLIENT", "slack_thread_ts": "1.0", "fix_pr_url": pr,
         "verification_after": {"exit_code": 0, "fixer": {"merged_sha": sha,
@@ -2174,7 +2264,7 @@ def test_fixer_correction_during_slack_post_keeps_ticket_open(monkeypatch):
     tid = str(uuid.uuid4())
     pr, sha = "https://github.com/lassoframework/lasso-echo/pull/999", BUSINESS_SHA
     bus.tickets[tid] = {
-        "id": tid, "status": "merged", "bot_identity": "echo",
+        "id": tid, "source": "slack_conversation", "status": "merged", "bot_identity": "echo",
         "identity_kind": "client", "client_id": BUSINESS_PORTAL_GYM_ID,
         "slack_channel_id": "C_CLIENT", "slack_thread_ts": "1.0", "fix_pr_url": pr,
         "verification_after": {"exit_code": 0, "fixer": {"merged_sha": sha,
@@ -2199,6 +2289,8 @@ def test_fixer_correction_during_slack_post_keeps_ticket_open(monkeypatch):
         posted_ts.append(_fresh_slack_test_ts())
         return posted_ts[-1]
     posted_ts = []
+    post.verify_sender = lambda: {"ok": True, "user_id": "U_ECHO_BOT"}
+
     post.readback = lambda channel, **kw: {
         "ok": True, "channel": channel,
         "messages": [{"ts": posted_ts[-1], "text": f"<@{OB.config.APPROVER_SLACK_ID}> "
@@ -2218,7 +2310,7 @@ def test_fixer_correction_before_slack_post_suppresses_old_notice(monkeypatch, w
     tid = str(uuid.uuid4())
     pr, sha = "https://github.com/lassoframework/lasso-echo/pull/999", BUSINESS_SHA
     bus.tickets[tid] = {
-        "id": tid, "status": "merged", "bot_identity": "echo",
+        "id": tid, "source": "slack_conversation", "status": "merged", "bot_identity": "echo",
         "identity_kind": "client", "client_id": BUSINESS_PORTAL_GYM_ID,
         "slack_channel_id": "C_CLIENT", "slack_thread_ts": "1.0", "fix_pr_url": pr,
         "verification_after": {"exit_code": 0, "fixer": {"merged_sha": sha,
@@ -2273,7 +2365,7 @@ def test_fixer_unreadable_request_thread_suppresses_notice(monkeypatch):
     tid = str(uuid.uuid4())
     pr, sha = "https://github.com/lassoframework/lasso-echo/pull/999", BUSINESS_SHA
     bus.tickets[tid] = {
-        "id": tid, "status": "merged", "bot_identity": "echo",
+        "id": tid, "source": "slack_conversation", "status": "merged", "bot_identity": "echo",
         "identity_kind": "client", "client_id": BUSINESS_PORTAL_GYM_ID,
         "slack_channel_id": "C_CLIENT", "slack_thread_ts": "1.0", "fix_pr_url": pr,
         "verification_after": {"exit_code": 0, "fixer": {"merged_sha": sha,
@@ -2332,7 +2424,7 @@ def test_fixer_customer_slack_reply_requires_blake_in_destination(
     tid = str(uuid.uuid4())
     pr, sha = "https://github.com/lassoframework/lasso-echo/pull/999", BUSINESS_SHA
     bus.tickets[tid] = {
-        "id": tid, "status": "merged", "bot_identity": "echo",
+        "id": tid, "source": "slack_conversation", "status": "merged", "bot_identity": "echo",
         "identity_kind": "client", "client_id": BUSINESS_PORTAL_GYM_ID,
         "slack_channel_id": channel, "slack_thread_ts": "1.0", "fix_pr_url": pr,
         "verification_after": {"exit_code": 0, "fixer": {"merged_sha": sha,
@@ -2368,7 +2460,7 @@ def test_grounded_fixer_answer_requires_blake_in_destination_without_deploy_proo
     bus = FakeBus()
     tid = str(uuid.uuid4())
     bus.tickets[tid] = {
-        "id": tid, "status": "verification", "product": "echo",
+        "id": tid, "source": "slack_conversation", "status": "verification", "product": "echo",
         "classification": "answerable_question", "escalated": False,
         "bot_identity": "echo", "identity_kind": "client",
         "slack_channel_id": "C_CLIENT", "slack_thread_ts": "1.0",
@@ -2410,7 +2502,7 @@ def test_grounded_fixer_answer_includes_blake_without_requiring_deploy_proof(
     bus = FakeBus()
     tid = str(uuid.uuid4())
     bus.tickets[tid] = {
-        "id": tid, "status": "verification", "product": "echo",
+        "id": tid, "source": "slack_conversation", "status": "verification", "product": "echo",
         "classification": "answerable_question", "escalated": False,
         "bot_identity": "echo", "identity_kind": "client",
         "slack_channel_id": "C_CLIENT", "slack_thread_ts": "1.0",
@@ -2451,9 +2543,10 @@ def _grounded_fixer_answer_case():
     bus = FakeBus()
     tid = str(uuid.uuid4())
     bus.tickets[tid] = {
-        "id": tid, "status": "verification", "product": "echo",
+        "id": tid, "source": "slack_conversation", "status": "verification", "product": "echo",
         "classification": "answerable_question", "escalated": False,
         "bot_identity": "echo", "identity_kind": "client",
+        "slack_user_id": "U_CLIENT", "request_version": 0,
         "slack_channel_id": "C_CLIENT", "slack_thread_ts": "1.0",
         "verification_after": {"facts": {"instagram": "connected"}},
     }
@@ -2751,7 +2844,13 @@ def test_fixer_readback_mismatch_never_posts_or_resolves_and_never_resends(monke
     first = OB.run_once(bus, post, identity=IDS.get("echo"),
                         member_check=lambda *_: True, log=lambda *_: None)
     assert first["posted"] == first["resolved"] == 0
-    assert bus.message(row["id"])["delivery_status"] == "posting"
+    uncertain = bus.message(row["id"])
+    assert uncertain["delivery_status"] == "held"
+    lease = uncertain["attachments"][OB.SUPPORT_SEND_ADMISSION_KEY]
+    assert lease["binding"]["message_id"] == row["id"]
+    assert lease["binding"]["ticket"]["request_version"] == bus.ticket(tid)["request_version"]
+    assert uncertain["slack_ts"] == calls[0]["ts"]
+    assert bus._support_lane_invocations[lease["invocation_id"]] == "unknown"
     stale = datetime.now(timezone.utc) - timedelta(seconds=OB.CLAIM_TIMEOUT_SECONDS + 30)
     bus.mark_message(row["id"], "posting", meta_update={"claimed_at": stale.isoformat()})
     second = OB.run_once(bus, post, identity=IDS.get("echo"),
@@ -2771,9 +2870,15 @@ def test_fixer_readback_mismatch_never_posts_or_resolves_and_never_resends(monke
                                      ).isoformat()})
     third = OB.run_once(bus, post, identity=IDS.get("echo"),
                         member_check=lambda *_: True, log=lambda *_: None)
-    assert third["resolved"] == 1
-    assert bus.message(row["id"])["delivery_status"] == "posted"
-    assert bus.ticket(tid)["status"] == "resolved"
+    # Later exact Slack evidence cannot promote a frozen 0624 unknown outcome
+    # to completed. Message reconciliation preserves delivery proof and no resend,
+    # while current-request closure awaits explicit reviewed reconciliation.
+    assert third["resolved"] == 0
+    reconciled = bus.message(row["id"])
+    assert reconciled["delivery_status"] == "posted"
+    assert reconciled["attachments"]["delivery_readback_verified"] is True
+    assert bus.ticket(tid)["status"] == "verification"
+    assert bus._support_lane_invocations[lease["invocation_id"]] == "unknown"
     assert len([c for c in calls if c["channel"] == "C_CLIENT"]) == 1
 
 
@@ -2799,6 +2904,7 @@ def test_fixer_slack_timestamp_survives_concurrent_stale_quarantine_without_rese
             assert held["delivery_status"] == "held"
         return base_post.readback(channel, **kwargs)
 
+    post.verify_sender = base_post.verify_sender
     post.readback = readback
     summary = OB.run_once(
         bus, post, identity=IDS.get("echo"), member_check=lambda *_: True,
@@ -2824,6 +2930,7 @@ def test_fixer_slack_timestamp_conflict_holds_and_never_resolves_or_resends(monk
         bus.mark_message(row["id"], "held", slack_ts="8.888")
         return ts
 
+    post.verify_sender = base_post.verify_sender
     post.readback = base_post.readback
     first = OB.run_once(bus, post, identity=IDS.get("echo"),
                         member_check=lambda *_: True, log=lambda *_: None)
@@ -2849,6 +2956,8 @@ def test_fixer_crash_before_timestamp_persistence_holds_without_second_post(monk
             slack_ts.append(f"{datetime.now(timezone.utc).timestamp():.6f}")
             raise SystemExit("process died after Slack accepted")
         return "8.888"
+
+    post.verify_sender = lambda: {"ok": True, "user_id": "U_ECHO_BOT"}
 
     def readback(channel, *, thread_ts=None, ts=None, oldest=None):
         return {"ok": True, "channel": channel, "messages": [
@@ -2968,6 +3077,7 @@ def test_fixer_crash_before_post_never_claims_identical_other_echo_reply(
     def post(channel, text, thread_ts=None, blocks=None):
         sent.append((channel, text))
         return _fresh_slack_test_ts()
+    post.verify_sender = lambda: {"ok": True, "user_id": "U_ECHO_BOT"}
 
     def readback(channel, *, thread_ts=None, ts=None, oldest=None):
         # Another identical Echo reply may fall before OR after this intent.
@@ -3004,6 +3114,8 @@ def test_fixer_uncertain_handler_survives_state_read_failure(monkeypatch):
         post_started = True
         return None  # Slack outcome is unknown without a message timestamp.
 
+    post.verify_sender = lambda: {"ok": True, "user_id": "U_ECHO_BOT"}
+
     post.readback = lambda *args, **kwargs: {
         "ok": True, "channel": args[0], "messages": []}
 
@@ -3039,6 +3151,7 @@ def test_fixer_uncertain_alert_retries_after_slack_outage(monkeypatch):
         if len(attempts) == 1:
             raise RuntimeError("Slack outage")
         return _fresh_slack_test_ts()
+    post.verify_sender = lambda: {"ok": True, "user_id": "U_ECHO_BOT"}
 
     start = datetime(2026, 10, 6, 2, 0, tzinfo=timezone.utc)
     OB.run_once(bus, post, identity=IDS.get("echo"), now=start, log=lambda *_: None)
@@ -3741,6 +3854,8 @@ def test_grounded_fixer_correction_during_post_keeps_newer_request_open(
         posted_ts.append(_fresh_slack_test_ts())
         return posted_ts[-1]
     posted_ts = []
+    post.verify_sender = lambda: {"ok": True, "user_id": "U_ECHO_BOT"}
+
     post.readback = lambda channel, **kw: {
         "ok": True, "channel": channel,
         "messages": [{"ts": posted_ts[-1], "text": f"<@{OB.config.APPROVER_SLACK_ID}> "
@@ -4188,7 +4303,7 @@ def test_fixer_customer_slack_reply_does_not_send_if_exact_body_cannot_be_saved(
     tid = str(uuid.uuid4())
     pr, sha = "https://github.com/lassoframework/lasso-echo/pull/999", BUSINESS_SHA
     bus.tickets[tid] = {
-        "id": tid, "status": "merged", "bot_identity": "echo",
+        "id": tid, "source": "slack_conversation", "status": "merged", "bot_identity": "echo",
         "identity_kind": "client", "client_id": BUSINESS_PORTAL_GYM_ID,
         "slack_channel_id": "C_CLIENT", "slack_thread_ts": "1.0", "fix_pr_url": pr,
         "verification_after": {"exit_code": 0, "fixer": {"merged_sha": sha,
@@ -5315,7 +5430,7 @@ def test_support_surface_sender_policy_allows_only_the_named_sender(
     bus, tid, row = _support_policy_case(
         product=product, source=source, row_identity=row_identity,
         client_id="gym-one" if source in ("website_tab", "portal_form") else None)
-    post, calls = _posted()
+    post, calls = _posted(row_identity)
     summary = OB.run_once(bus, post, identity=IDS.get(row_identity),
                           log=lambda *a: None)
     assert summary["held"] == 0 and summary["suppressed"] == 0
@@ -5339,7 +5454,7 @@ def test_support_surface_sender_policy_holds_a_wrong_identity_row(
         product=product, source=source, row_identity=row_identity,
         bot_identity=row_identity,
         client_id="gym-one" if source in ("website_tab", "portal_form") else None)
-    post, calls = _posted()
+    post, calls = _posted(row_identity)
     summary = OB.run_once(bus, post, identity=IDS.get(row_identity),
                           log=lambda *a: None)
     held = bus.message(row["id"])
