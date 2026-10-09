@@ -24,7 +24,8 @@ the preceding guards. Text-only rows remain writable.
 Capabilities are private database records bound to backend, transaction and
 request row IDs. Only four exact trusted entry wrappers manage them; renamed
 bodies lose all runtime execute grants. Entry signatures and prior execute
-ACLs are preserved. Shared `postgres` ownership and caller-set session flags
+ACLs are preserved after clearing every nonowner creation grant, including
+non-PUBLIC ALTER DEFAULT PRIVILEGES grants. Shared `postgres` ownership and caller-set session flags
 are insufficient. A database superuser or schema owner remains an administrator
 who can disable triggers or change the gate; this is not an admin sandbox.
 Graph then census locks serialize armed operations at read committed isolation.

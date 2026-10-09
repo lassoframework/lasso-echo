@@ -8,6 +8,7 @@ import json
 from pathlib import Path
 import sys
 import uuid
+from unittest.mock import patch
 from concurrent.futures import ThreadPoolExecutor
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -20,6 +21,24 @@ MIGRATION = 'DRAFT_fixer_calendar_admission_guard_20261009.sql'
 
 def acceptance(*, sql, denied, seed, attest, dsn):
     import psycopg
+    # Non-PUBLIC default grants must not widen a recreated wrapper's ACL.
+    # Compare every explicit EXECUTE grantee and grant option against the
+    # original catalog, including a custom original grant with grant option.
+    assert sql('select count(*) from synthetic_original_entry_acl')[0][0] >= 4
+    assert sql("""with current_acl as (
+      select p.proname,a.grantee,a.privilege_type,a.is_grantable
+      from pg_proc p join pg_namespace n on n.oid=p.pronamespace
+      cross join lateral aclexplode(coalesce(p.proacl,acldefault('f',p.proowner))) a
+      where n.nspname='public' and p.proname in (select proname from synthetic_original_entry_acl)
+    ), difference as (
+      (select * from current_acl except select * from synthetic_original_entry_acl)
+      union all
+      (select * from synthetic_original_entry_acl except select * from current_acl)
+    ) select count(*) from difference""")[0][0] == 0, 'recreated entry EXECUTE ACL drift'
+    for role in ('anon','authenticated','synthetic_default_executor'):
+        assert sql("select bool_and(not has_function_privilege(%s,p.oid,'execute')) from pg_proc p where p.proname in (select proname from synthetic_original_entry_acl)", (role,))[0][0] is True
+    assert sql("select has_function_privilege('synthetic_original_executor','fixer_bind_forward_media_manifest_20261006(uuid)','execute with grant option')")[0][0] is True
+    assert sql("select bool_and(not has_function_privilege('synthetic_original_executor',p.oid,'execute')) from pg_proc p where proname like 'fixer_admission_body_%'")[0][0] is True
     assert sql('select enabled from fixer_calendar_admission_gate_20261009')[0][0] is False
     denied('update fixer_calendar_admission_gate_20261009 set enabled=true', fragment='permission denied')
     for role in ('service_role', 'fixer_forward_media_owner_20261006', 'fixer_forward_media_attester_20261006'):
@@ -145,11 +164,33 @@ def acceptance(*, sql, denied, seed, attest, dsn):
     assert archived['archived_old_row_ids']==[c['rid']]
     assert sql('select variant_status from content_calendar where id=%s',(c['rid'],))[0][0]=='archived'
     assert sql('select count(*) from fixer_calendar_admission_capability_20261009')[0][0]==0
-    print('PASS: real PG17 registered preparation/finalization; null logical insert; PATCH/backfill/clear/swap; definer/GUC/ACL; borrowed/stale authority; tenant/date/source/derivative conflicts; concurrent refusal; nonmedia operations; exact persisted old-row archival')
+    print('PASS: real PG17 registered preparation/finalization; null logical insert; PATCH/backfill/clear/swap; definer/GUC/exact default-ACL isolation; borrowed/stale authority; tenant/date/source/derivative conflicts; concurrent refusal; nonmedia operations; exact persisted old-row archival')
 
 
 def main():
-    composed_pg(runtime_check=acceptance,extra_migrations=(MIGRATION,))
+    original_read = Path.read_text
+    def with_default_acl(path, *args, **kwargs):
+        source = original_read(path, *args, **kwargs)
+        if path.name == MIGRATION:
+            # Inject only disposable pre-migration catalog setup. The DRAFT
+            # itself is then installed unchanged, after the full prior stack.
+            source = """
+              create role synthetic_default_executor;
+              create role synthetic_original_executor;
+              grant execute on function public.fixer_bind_forward_media_manifest_20261006(uuid)
+                to synthetic_original_executor with grant option;
+              create table synthetic_original_entry_acl as
+                select p.proname,a.grantee,a.privilege_type,a.is_grantable
+                from pg_proc p join pg_namespace n on n.oid=p.pronamespace
+                cross join lateral aclexplode(coalesce(p.proacl,acldefault('f',p.proowner))) a
+                where n.nspname='public' and p.proname=any(array[
+                  'finalize_forward_schedule_batch_20261008','finalize_forward_schedule_staged_batch_20261008',
+                  'fixer_bind_forward_media_manifest_20261006','fixer_bind_forward_schedule_staged_manifest_20261008']);
+              alter default privileges grant execute on functions to anon,authenticated,synthetic_default_executor;
+            """ + source
+        return source
+    with patch.object(Path, 'read_text', with_default_acl):
+        composed_pg(runtime_check=acceptance,extra_migrations=(MIGRATION,))
 
 
 def test_calendar_admission_guard_pg():

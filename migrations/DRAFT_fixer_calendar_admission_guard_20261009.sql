@@ -80,6 +80,18 @@ begin
   end if;
   execute format('create function public.%I(%s) returns %s language plpgsql security definer set search_path=pg_catalog,public as %L',f.proname,f.declaration_args,f.result_type,body);
   execute format('revoke all on function public.%I(%s) from public',f.proname,f.identity_args);
+  -- CREATE applies the installer's current ALTER DEFAULT PRIVILEGES.
+  -- Clear every newly created non-owner grant, including custom grantees,
+  -- before restoring the original entry ACL. REVOKE PUBLIC alone does not
+  -- remove non-PUBLIC defaults and would silently widen trusted entry access.
+  for acl in select a.* from pg_proc p join pg_namespace n on n.oid=p.pronamespace
+   cross join lateral aclexplode(coalesce(p.proacl,acldefault('f',p.proowner))) a
+   where n.nspname='public' and p.proname=f.proname and p.proargtypes=f.proargtypes
+  loop
+   if acl.grantee<>0 and acl.grantee<>f.proowner then
+    execute format('revoke all on function public.%I(%s) from %I',f.proname,f.identity_args,pg_get_userbyid(acl.grantee));
+   end if;
+  end loop;
   -- Restore the frozen entry's exact caller EXECUTE ACL, not an assumed
   -- role list. Renamed bodies remain inaccessible to every runtime role.
   for acl in select * from aclexplode(coalesce(f.proacl,acldefault('f',f.proowner))) loop
