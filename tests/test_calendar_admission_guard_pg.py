@@ -19,6 +19,102 @@ from tests.test_forward_media_owner_two_phase_pg import png
 MIGRATION = 'DRAFT_fixer_calendar_admission_guard_20261009.sql'
 
 
+def platform_sibling(sql, seed, dsn, anchor):
+    """Same logical slot/source with a real distinct controlled rendition.
+
+    Each row has its own observation, signed certificate, manifest, lineage and
+    visual attestation. Only the synthetic signing key is reused from the
+    composed harness; production functions and constraints remain unchanged.
+    """
+    import copy
+    import hashlib
+    from dataclasses import asdict
+    import psycopg
+    from agent import forward_media_attester as attester, forward_media_prepare as media_prepare
+    from agent.forward_media_photo_certificate import canonical, digest
+    from agent.forward_media_still_certificate_v2 import IndependentStillPhotoAuditorV2
+
+    closure = dict(zip(seed.__code__.co_freevars, (cell.cell_contents for cell in seed.__closure__)))
+    recipe = attester.make_still_recipe('gbp_crop_4x3')
+    delivered = attester.replay_still_recipe(anchor['bytes'], recipe)['image_bytes']
+    assert delivered != anchor['bytes']
+    image_md5 = hashlib.md5(delivered).hexdigest()
+    image_sha = hashlib.sha256(delivered).hexdigest()
+    assert image_sha != anchor['sha']
+    rid, batch = str(uuid.uuid4()), str(uuid.uuid4())
+    image_url = 'https://scratch.example/' + uuid.uuid4().hex + '.jpg'
+    group = anchor['packet']['payload']['candidate']['group_key']
+    row = {'id': rid, 'gym_id': anchor['tenant'], 'post_date': anchor['day'],
+           'account': 'facebook', 'format': 'feed', 'status': 'pending',
+           'logical_post_id': anchor['logical'], 'source_media_url': anchor['url'],
+           'image_url': image_url, 'source_media_asset_id': anchor['asset'], 'visual_group_key': group}
+    observation = {'schema_version': 1, 'provenance_status': 'unverified', 'tenant': anchor['tenant'],
+                   'source_asset_id': anchor['asset'], 'source_exact_url': anchor['url'],
+                   'delivered_exact_url': image_url, 'source_sha256': anchor['sha'],
+                   'delivered_sha256': image_sha, 'source_byte_length': len(anchor['bytes']),
+                   'delivered_byte_length': len(delivered), 'recipe': recipe, 'hold_reasons': []}
+    raw = canonical(observation)
+    obs = {'digest_input': raw, 'observation_json': canonical(dict(
+        observation, observation_digest=hashlib.sha256(raw.encode()).hexdigest()))}
+    request = canonical({'members': [{'row': row, 'observation': obs}], 'old_rows': []})
+    sql('select stage_forward_schedule_batch_20261008(%s,%s,%s,%s)',
+        (anchor['tenant'], batch, request, hashlib.sha256(request.encode()).hexdigest()), 'service_role')
+    receipt = 'source-receipt:' + digest(rid)
+    sql("""insert into fixer_forward_media_source_receipt_20261007
+      (receipt_ref,calendar_row_id,row_revision,binding_revision,tenant_id,source_asset_id,
+       source_id,folder_id,exact_source_url,source_fingerprint,source_sha256,source_length,evidence_json)
+      select %s,r.id,md5(to_jsonb(r)::text),md5(jsonb_build_array(to_jsonb(a),to_jsonb(s))::text),
+        r.gym_id,a.id,s.id,s.folder_id,r.source_media_url,%s,%s,%s,
+        'SYNTHETIC independently verified same original sibling bytes'
+      from content_calendar r join media_asset a on a.id=r.source_media_asset_id
+      join media_source s on s.id=a.source_id where r.id=%s""",
+        (receipt, 'md5:' + anchor['md5'], 'sha256:' + anchor['sha'], len(anchor['bytes']), rid))
+    candidate = copy.deepcopy(anchor['packet']['payload']['candidate'])
+    candidate.update(calendar_row_id=rid, image_url=image_url,
+                     image_fingerprint='md5:' + image_md5, image_sha256='sha256:' + image_sha,
+                     image_length=len(delivered), source_receipt_ref=receipt,
+                     render_recipe_digest=digest(recipe), content_digest=sql(
+                         "select 'sha256:'||encode(sha256(convert_to(fixer_forward_media_photo_content_20261007(%s)::text,'UTF8')),'hex')",
+                         (rid,))[0][0])
+    snapshot = sql('select fixer_still_photo_snapshot_v2_20261008()')[0][0]
+    payload = copy.deepcopy(anchor['packet']['payload'])
+    dispositions = [{'history_key': h['history_key'], 'disposition': 'reviewed_visual_nonmatch',
+                     'inspected_sha256': h['visual_sha256'], 'published_binding_ref': h['published_binding_ref'],
+                     'review_evidence_ref': 'SYNTHETIC complete corpus review with authorized same-slot sibling'}
+                    for h in snapshot['rows']]
+    payload.update(audit_id=str(uuid.uuid4()), candidate=candidate, baseline_id=snapshot['baseline_id'],
+                   generation=snapshot['generation'], spine_digest=snapshot['spine_digest'],
+                   dispositions=dispositions, disposition_digest=digest(dispositions))
+    packet = {'payload': payload, 'signature_hex': closure['private'].sign(canonical(payload).encode()).hex()}
+    with psycopg.connect(dsn) as conn:
+        conn.execute('set role photo_auditor')
+        cert = IndependentStillPhotoAuditorV2(conn, 'photo_auditor').submit(packet)
+    original = media_prepare.OriginalRegistration(anchor['tenant'], anchor['asset'], anchor['url'],
+        'md5:' + anchor['md5'], len(anchor['bytes']), receipt)
+    manifest = media_prepare.build_render_manifest(original, image_url, delivered, 'render',
+        cert.receipt_ref, render_recipe=recipe)
+    sql('select fixer_prepare_owner_staged_still_v2_20261008(%s,%s::jsonb,%s::jsonb)',
+        (payload['audit_id'], json.dumps(asdict(original)), json.dumps(asdict(manifest))), 'photo_owner')
+    sql('select fixer_bind_forward_schedule_staged_manifest_20261008(%s)', (rid,), 'service_role')
+    rev = sql("select fixer_forward_media_attestation_request_20261006(%s)->>'revision'", (rid,))[0][0]
+    evidence = str(uuid.uuid4())
+    sql("select fixer_attest_forward_media_20261006(%s,%s,%s,%s,%s,%s,%s,null,null,'render',%s)",
+        (rid, rev, evidence, 'md5:' + anchor['md5'], len(anchor['bytes']), 'md5:' + image_md5,
+         len(delivered), cert.receipt_ref), 'fixer_forward_media_attester_20261006')
+    reads = sql('select source_read_receipt,image_read_receipt from fixer_forward_media_lineage_20261006 where evidence_id=%s', (evidence,))[0]
+    ids = []
+    for role, url, data, sha, md5, read in [
+        ('original', anchor['url'], anchor['bytes'], anchor['sha'], anchor['md5'], reads[0]),
+        ('delivered', image_url, delivered, image_sha, image_md5, reads[1]),
+        ('thumbnail', image_url, delivered, image_sha, image_md5, reads[1])]:
+        aid = str(uuid.uuid4()); ids.append(aid)
+        sql('insert into forward_media_visual_attestation(attestation_id,tenant_key,media_url,role,source_sha256,source_md5,byte_length,phash_v1,row_revision,lineage_receipt_id,object_read_receipt_id) values(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)',
+            (aid, anchor['tenant'], url, role, sha, md5, len(data), 0, int(rev[:15], 16), evidence, read),
+            'fixer_forward_media_attester_20261006')
+    return {'rid': rid, 'logical': anchor['logical'], 'batch': batch, 'tenant': anchor['tenant'],
+            'rev': rev, 'ids': ids, 'packet': packet, 'image_sha': image_sha}
+
+
 def acceptance(*, sql, denied, seed, attest, dsn):
     import psycopg
     # Non-PUBLIC defaults must not widen an existing entry or its private copy.
@@ -100,6 +196,20 @@ def acceptance(*, sql, denied, seed, attest, dsn):
     receipt = finalize(c)
     assert finalize(c) == receipt
     assert sql('select variant_status from content_calendar where id=%s', (c['rid'],))[0][0] == 'active'
+    assert sql('select count(*) from fixer_calendar_admission_capability_20261009')[0][0] == 0
+
+    # Same source/day/logical slot can activate a distinct platform rendition
+    # without weakening the staged-preparation duplicate-rendition exclusion.
+    sibling = platform_sibling(sql, seed, dsn, c)
+    occupancy = sql('select admit_prospective_still_v2_20261008(%s,%s,%s,%s::uuid[],%s)',
+        (sibling['rid'], sibling['logical'], sibling['rev'], sibling['ids'],
+         sibling['packet']['payload']['audit_id']), 'photo_owner')[0][0]
+    assert occupancy == sql('select occupancy_id from forward_prospective_photo_binding_20261008 where calendar_row_id=%s', (c['rid'],))[0][0]
+    sibling_receipt = finalize(sibling)
+    assert finalize(sibling) == sibling_receipt
+    assert sql('select count(*) from forward_prospective_photo_occupancy_20261008')[0][0] == 1
+    assert sql('select count(*) from forward_prospective_photo_binding_20261008 where occupancy_id=%s', (occupancy,))[0][0] == 2
+    assert sql("select array_agg(account order by account) from content_calendar where logical_post_id=%s and variant_status='active'", (c['logical'],))[0][0] == ['facebook', 'instagram']
     assert sql('select count(*) from fixer_calendar_admission_capability_20261009')[0][0] == 0
 
     # Null logical identity, caller flags and a postgres-owned legacy definer
@@ -191,7 +301,7 @@ def acceptance(*, sql, denied, seed, attest, dsn):
     assert archived['archived_old_row_ids']==[c['rid']]
     assert sql('select variant_status from content_calendar where id=%s',(c['rid'],))[0][0]=='archived'
     assert sql('select count(*) from fixer_calendar_admission_capability_20261009')[0][0]==0
-    print('PASS: real PG17 registered preparation/finalization; null logical insert; PATCH/backfill/clear/swap; definer/GUC/exact OID/config/default-ACL/grantor-cascade isolation; borrowed/stale authority; tenant/date/source/derivative conflicts; concurrent refusal; nonmedia operations; exact persisted old-row archival')
+    print('PASS: real PG17 registered preparation/finalization; null logical insert; PATCH/backfill/clear/swap; definer/GUC/exact OID/config/default-ACL/grantor-cascade isolation; borrowed/stale authority; tenant/date/source/derivative conflicts; distinct-rendition same-slot platform siblings; concurrent refusal; nonmedia operations; exact persisted old-row archival')
 
 
 def main():
