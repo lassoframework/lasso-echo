@@ -157,7 +157,15 @@ def send(self,request,**kwargs):
     values=[Jsonb(v) if isinstance(v,(dict,list)) else v for v in args.values()]
     with psycopg.connect(config()['service_dsn'],autocommit=True) as conn:
         # Only actual immutable service RPCs execute under restricted identity.
-        value=conn.execute('select public.'+name+'('+','.join(k+'=>%s' for k in args)+')',values).fetchone()[0]
+        try:
+            value=conn.execute('select public.'+name+'('+','.join(k+'=>%s' for k in args)+')',values).fetchone()[0]
+        except psycopg.Error as exc:
+            # Disposable synthetic DB only. Retain bounded SQL diagnostics while
+            # preserving the original refusal; never fabricate an RPC response.
+            with (ROOT/'calls.jsonl').open('a') as stream:
+                stream.write(json.dumps(dict(kind='rpc_refused',rpc=name,
+                    sqlstate=exc.sqlstate,message=(exc.diag.message_primary or '')[:500]))+'\n')
+            raise
     record(name)
     response=requests.Response();response.status_code=200;response._content=json.dumps(value).encode()
     response.headers={'Content-Type':'application/json'}
