@@ -384,6 +384,9 @@ _LANDED_OMITTED_DEFAULTS = dict.fromkeys((
     'gbp_cta_url', 'gbp_event', 'gbp_offer', 'gbp_location_id', 'reject_reason',
 ), None)
 _LANDED_OMITTED_DEFAULTS['variant_status'] = 'active'
+# Production content_calendar readback at 2026-10-09T00:25Z omitted mentions
+# as an empty array on both rows; accept only that exact server-added value.
+_LANDED_OMITTED_DEFAULTS['mentions'] = []
 
 
 def _landed_row_matches(persisted, proposed):

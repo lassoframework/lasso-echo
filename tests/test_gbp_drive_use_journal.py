@@ -138,6 +138,21 @@ def test_exact_landed_proof_and_mismatch_hold(db):
     assert reopened['landed_proof']['use_id'] == entry['use_id']
 
 
+def test_landed_readback_allows_only_empty_mentions_extra(db):
+    entry = journal.prepare(make_request(), path=db)
+    journal.record_write_intent(entry['use_id'], path=db)
+    full_row = dict(entry['calendar_row'], mentions=[])
+    evidence = dict(_evidence(entry), calendar_row=full_row)
+    assert journal.confirm_landed(entry['use_id'], evidence, path=db)['state'] == 'confirmed_landed'
+
+    for value in (['member'], 'member'):
+        other = journal.prepare(make_request(logical=f'lp-{type(value).__name__}'), path=db)
+        journal.record_write_intent(other['use_id'], path=db)
+        bad = dict(_evidence(other), calendar_row=dict(other['calendar_row'], mentions=value))
+        with pytest.raises(JournalHold, match='journal_landed_evidence_mismatch'):
+            journal.confirm_landed(other['use_id'], bad, path=db)
+
+
 def test_partial_batch_settles_only_exact_rows(db):
     one = journal.prepare(make_request(logical='lp-a'), path=db)
     two = journal.prepare(make_request(logical='lp-b', asset_id='asset-2',
