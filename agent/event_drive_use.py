@@ -22,6 +22,21 @@ def required_gates():
     _required_gates()
 
 
+
+def _visual_group_for(operation):
+    """Stable event placement group, independent of hosting or process lifetime.
+
+    The logical UUID already binds the event beat/generation/old-row identity.
+    Explicit tenant/date fields keep the visual binding scoped to this exact
+    operation. This producer value is not a registry or attestation receipt.
+    """
+    from .local_inventory_mutation import canonical_json
+    binding = dict(namespace='echo:event-visual-group:v1', gym_id=operation['gym_id'],
+                   post_date=operation['identity']['post_date'],
+                   logical_post_id=operation['logical_post_id'])
+    return 'vg_' + hashlib.sha256(canonical_json(binding).encode('utf-8')).hexdigest()
+
+
 def select(gym_id, row, *, media_store=None, exclude_ids=()):
     """Read-only selection with eligible/exhausted/unknown outcomes.
 
@@ -141,6 +156,8 @@ class _AtomicStage:
         if raw_tenant != self.operation['gym_id']:
             raise journal.JournalHold('event_raw_tenant_mismatch')
         row = json.loads(attempt['request_text'])['members'][0]['row']
+        if row.get('visual_group_key') != _visual_group_for(self.operation):
+            raise journal.JournalHold('event_visual_group_mismatch')
         asset, source = self.media['asset_before'], self.media['source_before']
         fresh = gbp_planner._authoritative_drive_snapshots(
             dict(base=raw_tenant, asset=asset, store=self.media_store))
@@ -196,17 +213,27 @@ def stage_rows(store, gym_id, event_id, rows, log, *, generations=None, old_rows
                             format=proposed.get('format'),
                             generation=generations.get(_slot_key(proposed), 0),
                             old_row_id=old.get('id') if old else None)
-            operation = journal.event_operation(identity, _db_row(proposed))
+            input_row = _db_row(proposed)
+            supplied_group = input_row.pop('visual_group_key', None)
+            operation = journal.event_operation(identity, input_row)
+            group = _visual_group_for(operation)
+            if (supplied_group is not None and supplied_group != group
+                    or operation['input_row'].get('visual_group_key') not in (None, group)):
+                raise journal.JournalHold('event_visual_group_mismatch')
             if operation['operation_key'] in seen:
                 raise journal.JournalHold('event_duplicate_operation')
             seen.add(operation['operation_key'])
             if operation['batch_id']:
                 bound = journal.get_forward_stage(operation['batch_id'])
+                import json
+                frozen_row = json.loads(bound['request_text'])['members'][0]['row']
+                if frozen_row.get('visual_group_key') != group:
+                    raise journal.JournalHold('event_frozen_visual_group_mismatch')
                 if bound['state'] == 'stage_intent':
                     authority.replay_frozen_event_stage(operation['batch_id'], gym_id)
                 result['staged'] += 1
                 continue
-            row = dict(operation['input_row'])
+            row = dict(operation['input_row'], visual_group_key=group)
             pick = select(gym_id, row)
             if pick['state'] != 'eligible':
                 result['held'] += 1

@@ -105,6 +105,8 @@ def test_real_event_caller_has_atomic_original_derivative_and_use_before_rpc(cas
         assert packet['source_sha256'] == hashlib.sha256(case['original']).hexdigest()
         assert packet['source_sha256'] != packet['delivered_sha256']
         assert entry['calendar_row']['status'] == 'pending'
+        group = entry['calendar_row']['visual_group_key']
+        assert group.startswith('vg_') and len(group) == 67
         seen.append(entry)
     case['http'].on_stage = sent
     result = stage(case)
@@ -119,6 +121,8 @@ def test_lost_ack_restart_replays_exact_frozen_request_without_selection(case, m
     result = stage(case)
     assert result['staged'] == 0 and result['held_media'] == 1
     original = deepcopy(case['http'].stage_calls[0])
+    group = json.loads(original['p_request'])['members'][0]['row']['visual_group_key']
+    assert group.startswith('vg_')
     use = journal.unsettled()[0]
     assert len(claims()) == 1
     monkeypatch.setattr(lane, 'select', lambda *a, **k: pytest.fail('reselected after crash'))
@@ -128,6 +132,7 @@ def test_lost_ack_restart_replays_exact_frozen_request_without_selection(case, m
     result = recovery.run(store=case['store'], tenant_id='pete')
     assert result['replayed'] == 1
     assert case['http'].stage_calls == [original, original]
+    assert json.loads(case['http'].stage_calls[-1]['p_request'])['members'][0]['row']['visual_group_key'] == group
     assert journal.unsettled()[0]['use_id'] == use['use_id']
     assert len(claims()) == 1
 
@@ -452,3 +457,44 @@ def test_replay_admission_snapshot_is_scope_bound_even_at_equal_versions(case):
         journal.advance_event_replay_cursor(other, 'other', expected_cursor=pete_snapshot)
     assert journal.event_replay_cursor('other') is None
     assert journal.event_replay_snapshot('other')['version'] == 0
+
+
+
+def test_event_visual_group_is_stable_before_selection_and_accepts_only_matching_input(case, monkeypatch):
+    real_select = lane.select
+    groups = []
+    def hold(gym_id, candidate):
+        groups.append(candidate['visual_group_key'])
+        return dict(state='unknown')
+    monkeypatch.setattr(lane, 'select', hold)
+    assert stage(case)['held_media'] == 1
+    assert stage(case)['held_media'] == 1
+    assert groups[0] == groups[1] and groups[0].startswith('vg_')
+    assert claims() == []
+    monkeypatch.setattr(lane, 'select', real_select)
+    assert stage(case, visual_group_key=groups[0])['staged'] == 1
+    member = json.loads(case['http'].stage_calls[0]['p_request'])['members'][0]['row']
+    assert member['visual_group_key'] == groups[0]
+
+
+@pytest.mark.parametrize('conflict', ['vg_foreign', '', 7])
+def test_conflicting_event_visual_group_holds_before_selection_or_claim(case, monkeypatch, conflict):
+    monkeypatch.setattr(lane, 'select', lambda *a: pytest.fail('conflicting group selected media'))
+    assert stage(case, visual_group_key=conflict)['held_media'] == 1
+    assert claims() == [] and journal.unsettled() == []
+    assert case['http'].stage_calls == [] and journal.pending_forward_stages() == []
+
+
+def test_event_visual_group_isolates_tenant_date_and_logical_generation(case):
+    identity = dict(gym_id='pete', event_id='evt1', beat='announce',
+                    post_date='2026-10-03', account='instagram', format='feed',
+                    generation=0, old_row_id=None)
+    first = journal.event_operation(identity, row())
+    retry = journal.event_operation(identity, row())
+    another_day = journal.event_operation(dict(identity, post_date='2026-10-04'),
+                                           dict(row(), post_date='2026-10-04'))
+    another_tenant = journal.event_operation(dict(identity, gym_id='other'), row())
+    recreate = journal.event_operation(dict(identity, generation=1), row())
+    groups = [lane._visual_group_for(op) for op in (first, another_day, another_tenant, recreate)]
+    assert len(set(groups)) == 4
+    assert lane._visual_group_for(retry) == groups[0]
