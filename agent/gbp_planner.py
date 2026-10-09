@@ -587,7 +587,91 @@ def _settle_armed_drive_landing(portal_gym_key, row, pick, persisted_row, log):
         return False
     if current is None:
         return False
+    # GBP staged-journal binding (2026-10-09, flag AGENT_GBP_STAGED_JOURNAL,
+    # default OFF): with the binding armed, a staged forward-reservation
+    # CANDIDATE row is never a landed placement and never consumes remote
+    # Drive use. Settlement of ANY remote-consuming state requires an exact
+    # ACTIVE member readback PLUS exactly one durable batch binding whose
+    # tenant, exact frozen member row and terminal `finalized` proof all
+    # match. A missing, conflicting, cross-tenant or non-finalized binding
+    # holds with ZERO remote calls; an ambiguous flag holds before any remote
+    # mutation. The legacy explicit-OFF path below is byte-identical.
+    from .portal_calendar_store import gbp_staged_journal_flag
+    staged_flag = gbp_staged_journal_flag()
+    if staged_flag is None:
+        log(f"{portal_gym_key}: staged journal flag is ambiguous; holding "
+            f"remote use for {use_id} before any remote mutation")
+        return False
     state = current["state"]
+    if staged_flag and state in ("write_intent", "unknown_result",
+                                 "confirmed_landed", "consumption_pending"):
+        if not isinstance(persisted_row, dict):
+            # Armed recovery with no exact active persisted row (readback
+            # error or missing) makes ZERO remote calls.
+            log(f"{portal_gym_key}: armed settlement lacks an exact persisted "
+                f"row readback; holding remote use for {use_id}")
+            return False
+        if (persisted_row.get("variant_status") != "active"
+                or persisted_row.get("media_not_ready_reason")
+                == "forward_reservation_staged"):
+            log(f"{portal_gym_key}: staged candidate is not a landed placement; "
+                f"holding remote use for {use_id}")
+            return False
+        row_id = persisted_row.get("id")
+        try:
+            bound = (journal.forward_stage_for_member(str(row_id))
+                     if row_id else None)
+        except journal.JournalHold as hold:
+            log(f"{portal_gym_key}: member batch binding hold for {use_id}: "
+                f"{hold}")
+            return False
+        if bound is None:
+            log(f"{portal_gym_key}: no durable batch binding for the landed "
+                f"member row; holding remote use for {use_id}")
+            return False
+        if bound["state"] != "finalized":
+            log(f"{portal_gym_key}: batch {bound['batch_id']} not finalized; "
+                f"holding remote use for {use_id}")
+            return False
+        if not journal.forward_finalized_proof_valid(bound):
+            log(f"{portal_gym_key}: batch {bound['batch_id']} lacks exact "
+                f"terminal proof; holding remote use for {use_id}")
+            return False
+        if bound["tenant_id"] != current["gym_id"]:
+            log(f"{portal_gym_key}: cross-tenant batch binding "
+                f"({bound['tenant_id']}); holding remote use for {use_id}")
+            return False
+        member_row = journal.forward_stage_member_row(bound, str(row_id))
+        # The stage RPC changes only the reservation markers; finalization
+        # restores active/unheld. Every other frozen member field must match
+        # the live row, with only the journal's explicit server additions.
+        expected_member = dict(member_row) if isinstance(member_row, dict) else None
+        if expected_member is not None:
+            if (expected_member.get("variant_status") not in (None, "candidate")
+                    or expected_member.get("media_not_ready_reason") is not None):
+                expected_member = None
+            else:
+                expected_member["variant_status"] = "active"
+                expected_member["media_not_ready_reason"] = None
+        proof = current.get("landed_proof")
+        if (expected_member is None
+                or str(member_row.get("logical_post_id") or "")
+                != current["logical_post_id"]
+                or not journal._landed_row_matches(persisted_row, expected_member)
+                or not journal._landed_row_matches(persisted_row, current["calendar_row"])
+                or (state in ("confirmed_landed", "consumption_pending")
+                    and (not isinstance(proof, dict)
+                         or proof.get("use_id") != use_id
+                         or proof.get("logical_post_id") != current["logical_post_id"]
+                         or not isinstance(proof.get("calendar_row"), dict)
+                         or proof.get("asset_id") != current["asset_id"]
+                         or proof.get("content_hash") != current["content_hash"]
+                         or not journal._landed_row_matches(
+                             persisted_row, proof.get("calendar_row") or {})))):
+            log(f"{portal_gym_key}: landed row is not the exact frozen member "
+                f"of batch {bound['batch_id']}; holding remote use for "
+                f"{use_id}")
+            return False
     if state in ("write_intent", "unknown_result"):
         if persisted_row is None:
             # An unseen row is never settled from counters or absence.
@@ -673,7 +757,13 @@ def _recover_armed_drive_uses(portal_gym_key, account_gen_key, store, log):
                     claim_id=entry["claim_id"], claim_account=f"{base}_gbp",
                     journal_entry=entry)
         persisted = None
-        if entry["state"] in ("write_intent", "unknown_result"):
+        readback_states = {"write_intent", "unknown_result"}
+        from .portal_calendar_store import gbp_staged_journal_flag
+        if gbp_staged_journal_flag():
+            # Armed: recovery of landed/consumption states must also re-read
+            # the exact active persisted row before any remote consumption.
+            readback_states |= {"confirmed_landed", "consumption_pending"}
+        if entry["state"] in readback_states:
             readback = _readback_inserted_rows(store, portal_gym_key, [row])
             matches = [r for r in (readback or [])
                        if r.get("logical_post_id") == entry["logical_post_id"]]

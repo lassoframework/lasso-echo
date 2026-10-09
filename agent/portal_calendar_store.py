@@ -444,6 +444,31 @@ def forward_reservation_flag():
     return None
 
 
+# GBP staged-journal binding (2026-10-09, default OFF). When armed alongside
+# the forward reservation lane, stage_forward_schedule_batch freezes the exact
+# canonical stage attempt (batch id, tenant, request digest, exact request
+# text, member/old-row sets) in the durable local gbp_forward_stage_journal
+# BEFORE the stage RPC, binds the exact `staged` receipt afterwards, and a
+# lost acknowledgment or restart recovers through the batch-status RPC bound
+# to that durable identity -- never calendar presence or a regenerated
+# request. Remote Drive use may settle only after the durable journal holds an
+# exact terminal `finalized` receipt. With the flag OFF the legacy in-memory
+# attempt behavior is byte-identical.
+GBP_STAGED_JOURNAL_FLAG_ENV = "AGENT_GBP_STAGED_JOURNAL"
+
+
+def gbp_staged_journal_flag():
+    """Tri-state read of AGENT_GBP_STAGED_JOURNAL: True (on), False (off or
+    unset), None (ambiguous -- fail closed on the armed lane)."""
+    import os
+    raw = (os.environ.get(GBP_STAGED_JOURNAL_FLAG_ENV, "") or "").strip().lower()
+    if raw in ("1", "true", "yes", "on"):
+        return True
+    if raw in ("", "0", "false", "no", "off"):
+        return False
+    return None
+
+
 class ReservationStoreError(PortalStoreError):
     """A reservation RPC failed or returned something that fails strict
     parsing. The reservation outcome is UNKNOWN: fail closed."""
@@ -1927,6 +1952,24 @@ class SupabaseCalendarStore:
         self.last_forward_stage_attempt = {
             "batch_id": batch_id, "tenant_id": tenant, "request_digest": digest,
             "member_row_ids": list(planned_ids), "old_row_ids": list(old_ids)}
+        staged_journal = gbp_staged_journal_flag()
+        if staged_journal is None:
+            # Ambiguous flag on an armed lane: fail closed before any write.
+            raise ReservationStoreError(
+                502, "staged journal flag unreadable; refusing to stage")
+        if staged_journal:
+            from . import gbp_drive_use_journal as _stage_journal
+            try:
+                # Freeze the exact canonical stage attempt DURABLY before the
+                # RPC; a hold here means nothing was sent (definite no-write).
+                _stage_journal.record_forward_stage_intent({
+                    "batch_id": batch_id, "tenant_id": tenant,
+                    "request_digest": digest, "request_text": request_text,
+                    "member_row_ids": list(planned_ids),
+                    "old_row_ids": list(old_ids)})
+            except _stage_journal.JournalHold as hold:
+                raise ReservationStoreError(
+                    409, f"staged journal intent hold before stage RPC: {hold}")
         data = self._reservation_rpc(_STAGE_RPC, {
             "p_tenant_id": tenant, "p_batch_id": batch_id,
             "p_request": request_text, "p_request_digest": digest}, timeout=60)
@@ -1944,6 +1987,17 @@ class SupabaseCalendarStore:
             raise ReservationStoreError(
                 502, "batch stage receipt mismatch; outcome unknown -- resolve "
                 "through forward_schedule_batch_status, never calendar rows")
+        if staged_journal:
+            try:
+                _stage_journal.record_forward_stage_receipt(batch_id, data)
+            except _stage_journal.JournalHold as hold:
+                # The stage DID commit server-side but its exact receipt could
+                # not be durably bound: UNKNOWN to this caller. Resolve only
+                # through the batch status RPC, never by resending.
+                raise ReservationStoreError(
+                    502, f"staged journal receipt hold after stage RPC: {hold}; "
+                    "outcome unknown -- resolve through "
+                    "forward_schedule_batch_status, never calendar rows")
         self.last_forward_stage = data
         return data
 
@@ -2032,13 +2086,95 @@ class SupabaseCalendarStore:
         ReservationStoreError when no attempt was recorded or the readback
         does not match it exactly; never consults calendar rows."""
         attempt = self.last_forward_stage_attempt
-        if not isinstance(attempt, dict) or not attempt.get("batch_id"):
-            raise ReservationStoreError(502, "no forward stage attempt recorded")
-        return self.forward_schedule_batch_status(
+        if (not isinstance(attempt, dict) or not attempt.get("batch_id")):
+            if gbp_staged_journal_flag():
+                # Restart / lost process memory: the DURABLE journal is the
+                # only handle. Exactly one pending attempt may be resolved
+                # unbound; anything else is ambiguous and holds.
+                from . import gbp_drive_use_journal as _stage_journal
+                try:
+                    pending = _stage_journal.pending_forward_stages()
+                except _stage_journal.JournalHold as hold:
+                    raise ReservationStoreError(
+                        502, f"durable stage attempt unreadable: {hold}")
+                if len(pending) != 1:
+                    raise ReservationStoreError(
+                        502, "durable forward stage attempt missing or ambiguous")
+                entry = pending[0]
+                attempt = {"batch_id": entry["batch_id"],
+                           "tenant_id": entry["tenant_id"],
+                           "request_digest": entry["request_digest"],
+                           "member_row_ids": list(entry["member_row_ids"]),
+                           "old_row_ids": list(entry["old_row_ids"])}
+            else:
+                raise ReservationStoreError(502, "no forward stage attempt recorded")
+        data = self.forward_schedule_batch_status(
             attempt["batch_id"], tenant_id=attempt.get("tenant_id"),
             request_digest=attempt.get("request_digest"),
             member_row_ids=attempt.get("member_row_ids"),
             old_row_ids=attempt.get("old_row_ids"))
+        if gbp_staged_journal_flag():
+            # Keep the durable binding in step with the authority readback:
+            # an exact `staged` state binds the receipt; an exact terminal
+            # `finalized` proof binds finalization. A binding hold makes the
+            # outcome UNKNOWN to the caller -- never inferred from rows.
+            from . import gbp_drive_use_journal as _stage_journal
+            try:
+                if data["state"] == "staged":
+                    _stage_journal.record_forward_stage_receipt(
+                        attempt["batch_id"], data)
+                else:
+                    _stage_journal.record_forward_finalized(
+                        attempt["batch_id"], data)
+            except _stage_journal.JournalHold as hold:
+                raise ReservationStoreError(
+                    502, f"staged journal binding hold on resolve: {hold}")
+        return data
+
+    def bind_forward_finalization(self, batch_id):
+        """Bind an exact terminal finalize receipt into the durable journal.
+
+        Reads the batch-status RPC bound to the DURABLE frozen attempt
+        identity (never a caller-supplied snapshot) and records `finalized`
+        only when the complete terminal proof matches exactly. Any mismatch,
+        non-final state or unreadable journal raises and leaves the entry
+        staged_pending: remote use stays forbidden. Requires the staged
+        journal flag; the legacy OFF lane is untouched."""
+        if not gbp_staged_journal_flag():
+            raise ReservationStoreError(502, "staged journal binding is OFF")
+        from . import gbp_drive_use_journal as _stage_journal
+        try:
+            entry = _stage_journal.get_forward_stage(batch_id)
+        except _stage_journal.JournalHold as hold:
+            raise ReservationStoreError(
+                502, f"durable stage binding unreadable: {hold}")
+        if entry is None:
+            raise ReservationStoreError(502, "no durable stage attempt bound")
+        data = self.forward_schedule_batch_status(
+            entry["batch_id"], tenant_id=entry["tenant_id"],
+            request_digest=entry["request_digest"],
+            member_row_ids=entry["member_row_ids"],
+            old_row_ids=entry["old_row_ids"])
+        if data["state"] != "finalized":
+            raise ReservationStoreError(
+                409, "batch is not finalized; terminal receipt required")
+        try:
+            _stage_journal.record_forward_finalized(entry["batch_id"], data)
+        except _stage_journal.JournalHold as hold:
+            raise ReservationStoreError(
+                502, f"terminal receipt binding hold: {hold}")
+        return data
+
+    def forward_remote_use_settlement_allowed(self, batch_id):
+        """True ONLY when the durable staged journal holds an exact terminal
+        `finalized` receipt for this batch. A staged candidate, an unknown
+        stage outcome, a missing/ambiguous binding or an unreadable journal
+        is never consumption evidence. The flag-OFF legacy lane never calls
+        this; it answers False rather than guessing."""
+        if not gbp_staged_journal_flag():
+            return False
+        from . import gbp_drive_use_journal as _stage_journal
+        return _stage_journal.forward_remote_use_allowed(batch_id)
 
     def forward_preparation_eligible(self, calendar_row_id):
         """Strictly parsed read of the SQL preparation-eligibility predicate.
