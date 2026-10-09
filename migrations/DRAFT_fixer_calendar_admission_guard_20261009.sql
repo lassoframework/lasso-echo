@@ -53,10 +53,13 @@ begin
    'array(select (x->>''calendar_row_id'')::uuid from jsonb_array_elements(p_candidates) x) || array(select (x->>''id'')::uuid from jsonb_array_elements(p_expected_old_rows) x)'
    else 'array[p_calendar_row_id]' end;
   execute format('alter function public.%I(%s) rename to %I',f.proname,f.identity_args,internal_name);
-  execute format('revoke all on function public.%I(%s) from public,anon,authenticated,service_role,fixer_forward_media_owner_20261006,fixer_forward_media_attester_20261006,fixer_forward_media_photo_auditor_20261007',internal_name,f.identity_args);
+  execute format('revoke all on function public.%I(%s) from public,anon,authenticated,service_role,fixer_forward_media_owner_20261006,fixer_forward_media_attester_20261006,fixer_forward_media_photo_auditor_20261007 cascade',internal_name,f.identity_args);
+  -- Revoke delegated grant chains only on this renamed body. The frozen
+  -- ACL above still includes every downstream executor and grant option for
+  -- restoration on the public wrapper; unrelated objects are never revoked.
   for acl in select * from aclexplode(coalesce(f.proacl,acldefault('f',f.proowner))) loop
    if acl.grantee<>0 and acl.grantee<>f.proowner then
-    execute format('revoke all on function public.%I(%s) from %I',internal_name,f.identity_args,pg_get_userbyid(acl.grantee));
+    execute format('revoke all on function public.%I(%s) from %I cascade',internal_name,f.identity_args,pg_get_userbyid(acl.grantee));
    end if;
   end loop;
   body:=format($b$declare cap uuid:=gen_random_uuid(); result %s;

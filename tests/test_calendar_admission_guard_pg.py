@@ -39,6 +39,17 @@ def acceptance(*, sql, denied, seed, attest, dsn):
         assert sql("select bool_and(not has_function_privilege(%s,p.oid,'execute')) from pg_proc p where p.proname in (select proname from synthetic_original_entry_acl)", (role,))[0][0] is True
     assert sql("select has_function_privilege('synthetic_original_executor','fixer_bind_forward_media_manifest_20261006(uuid)','execute with grant option')")[0][0] is True
     assert sql("select bool_and(not has_function_privilege('synthetic_original_executor',p.oid,'execute')) from pg_proc p where proname like 'fixer_admission_body_%'")[0][0] is True
+    assert sql("select has_function_privilege('synthetic_downstream_executor','fixer_bind_forward_media_manifest_20261006(uuid)','execute')")[0][0] is True
+    assert sql("select bool_and(not has_function_privilege('synthetic_downstream_executor',p.oid,'execute')) from pg_proc p where proname like 'fixer_admission_body_%'")[0][0] is True
+    assert sql("""with current_acl as (
+        select a.* from pg_proc p cross join lateral aclexplode(p.proacl) a
+        where p.oid='public.synthetic_unrelated_acl()'::regprocedure
+      ), difference as (
+        (select * from current_acl except select * from synthetic_unrelated_acl_before)
+        union all
+        (select * from synthetic_unrelated_acl_before except select * from current_acl)
+      ) select count(*) from difference""")[0][0] == 0, 'unrelated function grant chain changed'
+    assert sql('select synthetic_unrelated_acl()',role='synthetic_downstream_executor')[0][0] == 1
     assert sql('select enabled from fixer_calendar_admission_gate_20261009')[0][0] is False
     denied('update fixer_calendar_admission_gate_20261009 set enabled=true', fragment='permission denied')
     for role in ('service_role', 'fixer_forward_media_owner_20261006', 'fixer_forward_media_attester_20261006'):
@@ -164,7 +175,7 @@ def acceptance(*, sql, denied, seed, attest, dsn):
     assert archived['archived_old_row_ids']==[c['rid']]
     assert sql('select variant_status from content_calendar where id=%s',(c['rid'],))[0][0]=='archived'
     assert sql('select count(*) from fixer_calendar_admission_capability_20261009')[0][0]==0
-    print('PASS: real PG17 registered preparation/finalization; null logical insert; PATCH/backfill/clear/swap; definer/GUC/exact default-ACL isolation; borrowed/stale authority; tenant/date/source/derivative conflicts; concurrent refusal; nonmedia operations; exact persisted old-row archival')
+    print('PASS: real PG17 registered preparation/finalization; null logical insert; PATCH/backfill/clear/swap; definer/GUC/exact default-ACL/grant-chain isolation; borrowed/stale authority; tenant/date/source/derivative conflicts; concurrent refusal; nonmedia operations; exact persisted old-row archival')
 
 
 def main():
@@ -177,8 +188,19 @@ def main():
             source = """
               create role synthetic_default_executor;
               create role synthetic_original_executor;
+              create role synthetic_downstream_executor;
+              create function public.synthetic_unrelated_acl() returns integer language sql as 'select 1';
+              revoke all on function public.synthetic_unrelated_acl() from public;
+              grant execute on function public.synthetic_unrelated_acl() to synthetic_original_executor with grant option;
               grant execute on function public.fixer_bind_forward_media_manifest_20261006(uuid)
                 to synthetic_original_executor with grant option;
+              set role synthetic_original_executor;
+              grant execute on function public.fixer_bind_forward_media_manifest_20261006(uuid) to synthetic_downstream_executor;
+              grant execute on function public.synthetic_unrelated_acl() to synthetic_downstream_executor;
+              reset role;
+              create table synthetic_unrelated_acl_before as
+                select a.* from pg_proc p cross join lateral aclexplode(p.proacl) a
+                where p.oid='public.synthetic_unrelated_acl()'::regprocedure;
               create table synthetic_original_entry_acl as
                 select p.proname,a.grantee,a.privilege_type,a.is_grantable
                 from pg_proc p join pg_namespace n on n.oid=p.pronamespace
