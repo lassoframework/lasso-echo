@@ -296,6 +296,52 @@ def test_client_infographic_fill_suffixed_pillar_never_autopublishes(armed):
     assert "ordinary2" in summary["published"]
 
 
+def test_generated_client_infographic_remains_held_until_human_proof_contract(armed, monkeypatch):
+    """Owner status alone cannot bypass the generated-card hard block."""
+    from agent import client_infographic_fill as cif
+    row = _row("owner-review", status="pending",
+               image_url="https://cdn/igfill_2026-08-10_flow.png")
+    row.update(gym_id="gymx", pillar="offer" + cif._NEEDS_CLIENT_SAFE_REVIEW_SUFFIX)
+    store = _FakeStore([row])
+    class _Acct:
+        key = "gymx_ig"
+        platform = "instagram"
+        display_name = "Gym X"
+    monkeypatch.setattr(cap, "_account_for", lambda _row, _gym: _Acct())
+    sent = []
+
+    pending = cap.publish_due(RUN_DATE, gym_id="gymx", store=store,
+                              now=LATE_NOW, approved_only=True, catch_all=True,
+                              zernio_publish=_zern_capture(sent))
+    assert "owner-review" in pending["skipped"]
+    assert pending["waiting"] == []
+    assert pending["published"] == []
+    assert store.rows["owner-review"]["status"] == "pending"
+    assert store.rows["owner-review"]["status"] != "coach_review"
+    assert store.publishing_calls == []
+    assert sent == []
+
+    store.rows["owner-review"]["status"] = "approved"
+    approved = cap.publish_due(RUN_DATE, gym_id="gymx", store=store,
+                               now=LATE_NOW, approved_only=True, catch_all=True,
+                               zernio_publish=_zern_capture(sent))
+    assert "owner-review" in approved["skipped"]
+    assert approved["published"] == []
+    assert store.publishing_calls == []
+    assert sent == []
+
+    # Autonomy does not weaken this generated-card approval requirement.
+    autonomous_row = dict(row, id="autonomous-review", status="approved")
+    autonomous_store = _FakeStore([autonomous_row])
+    autonomous_sent = []
+    autonomous = cap.publish_due(RUN_DATE, gym_id="gymx", store=autonomous_store,
+                                 now=LATE_NOW, approved_only=False, catch_all=True,
+                                 zernio_publish=_zern_capture(autonomous_sent))
+    assert "autonomous-review" in autonomous["skipped"]
+    assert autonomous_store.publishing_calls == []
+    assert autonomous_sent == []
+
+
 # ---- legacy igfill media hard block (2026-10-04) -----------------------------
 # Swift River rows e11f7bec-7ec4-47da-b4b7-b53da85ff0eb / 8de2ef1e-167e-42bb-9954-
 # db0800c1348e (dated Sep 25) published Oct 1 on legacy igfill_2026-09-10 media
