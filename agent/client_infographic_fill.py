@@ -640,6 +640,10 @@ def fill_gaps(base, account, store, *, voice, logger=None, now=None,
             day_key=day,
             category=_with_review_mark(getattr(source, "category", "")),
             image_engine=f"{_res.engine}:{_res.model}" if _res is not None else "",
+            # Keep this draft out of every automatic approval lane even if it is
+            # later routed through runner._post_and_save instead of the calendar
+            # insert path used below. The gym owner is the required approver.
+            force_approval=not _ap.is_lasso_account(account.key),
         )
         if not _ensure_logical_post_id(draft):
             log(f"{base} {day}: logical post identity unavailable; holding infographic")
