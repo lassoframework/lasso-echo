@@ -217,7 +217,11 @@ def test_missing_or_unhealthy_health_never_permits_website_only_capture(tmp_path
                        match='authenticated_social_status_unavailable_or_incomplete'):
         runner.capture(GYM, 'website-only-held')
     assert not websites and not apify.calls and not storage.rows
-    assert len(zernio.calls) == 1  # no accounts or capture request after health hold
+    assert zernio.calls[0][0].endswith('/v1/accounts/health')
+    assert not any(url == 'https://api.zernio.com/v1/accounts'
+                   for url, _ in zernio.calls)
+    # Empty health may probe the exact stored profile for an absence proof;
+    # this fixture cannot confirm it, so capture must still hold.
     latest = storage.attestations[-1]['attestation']
     assert latest['lookup_status'] == 'partial' and latest['instagram'] is None
 
