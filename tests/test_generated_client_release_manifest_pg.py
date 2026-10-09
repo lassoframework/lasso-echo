@@ -23,6 +23,8 @@ ROOT = Path(__file__).resolve().parents[1]
 FIXTURES = ROOT / 'tests/fixtures/generated_client_release_manifest'
 P0611 = ROOT / 'tests/fixtures'
 P0625 = FIXTURES
+CALENDAR_IDENTITY = ROOT / 'migrations/DRAFT_generated_client_calendar_identity_20261009.sql'
+CALENDAR_IDENTITY_SHA = '71da26e11c6860d05959ec008d72b5b09e1d67985bd71fc746110a893f0e0c88'
 P0611_APPLY = P0611 / 'portal_0611_echo_source_brand_bundle_held_20261008.sql'
 P0611_VERIFY = FIXTURES / '0611_echo_source_brand_bundle.verify.sql'
 SEED = FIXTURES / 'generated_client_seed_20261009.py'
@@ -115,7 +117,7 @@ def install(db):
  # Match Supabase's production extension placement before any migration runs.
  db.execute('create schema extensions; create extension pgcrypto with schema extensions')
  db.execute('''alter table content_calendar add column pillar text,add column slot_index integer,
-  add column scheduled_at timestamptz,add column byte_hash text,add column gbp_topic_type text,
+  add column scheduled_at timestamptz,add column gbp_topic_type text,
   add column gbp_cta_type text,add column gbp_cta_url text,add column gbp_event jsonb,add column gbp_offer jsonb;
   create table gym_assignments(app_user_id uuid,gym_id uuid,relationship text,primary key(app_user_id,gym_id));
   create table echo_gym_settings(gym_id uuid primary key,autonomous boolean,autonomy_updated_by text);
@@ -138,7 +140,18 @@ def install(db):
  apply(db,P0611_APPLY)
  apply(db,P0611_VERIFY)
  for name in STAGED: apply(db,ROOT/'migrations'/name)
+ apply(db,CALENDAR_IDENTITY)
  apply(db,P0625/'DRAFT_0625_generated_client_approval.sql')
+ shape = db.execute('''select a.atttypid='text'::regtype,a.atttypmod,a.attnotnull,
+   a.attgenerated,a.attidentity,d.oid is null
+   from pg_attribute a left join pg_attrdef d on d.adrelid=a.attrelid and d.adnum=a.attnum
+   where a.attrelid='public.content_calendar'::regclass and a.attname='byte_hash'
+   and a.attnum>0 and not a.attisdropped''').fetchone()
+ assert shape == (True,-1,False,'','',True), shape
+ trigger_source = db.execute('''select p.prosrc from pg_trigger t join pg_proc p on p.oid=t.tgfoid
+   where t.tgrelid='public.content_calendar'::regclass
+   and t.tgname='zzz_calendar_generated_approval_guard' ''').fetchone()
+ assert trigger_source and 'old.byte_hash' in trigger_source[0] and 'new.byte_hash' in trigger_source[0]
  for name in CONSUMER: apply(db,ROOT/'migrations'/name)
  apply(db,P0625/'DRAFT_0625_generated_client_approval.verify.sql')
  for table in ('fixer_inventory_protocol_control_20261008','fixer_remote_drive_use_control_20261008',
@@ -285,13 +298,69 @@ def pg17_bin_dir():
  return None
 
 
+def test_generated_client_calendar_identity_prereq_pg17():
+ psycopg=pytest.importorskip('psycopg')
+ pg17=pg17_bin_dir()
+ if pg17 is None: pytest.skip('Calendar identity prerequisite requires PostgreSQL 17 server binaries')
+ assert hashlib.sha256(CALENDAR_IDENTITY.read_bytes()).hexdigest()==CALENDAR_IDENTITY_SHA
+ with tempfile.TemporaryDirectory(prefix='calendar_identity_pg_',dir='/tmp') as directory:
+  temp=Path(directory);sock=temp/'sock';sock.mkdir();port=random.randint(41000,59000)
+  subprocess.run([str(pg17/'initdb'),'-D',str(temp/'data'),'-U','postgres','--no-sync'],check=True,capture_output=True,timeout=60)
+  subprocess.run([str(pg17/'pg_ctl'),'-D',str(temp/'data'),'-l',str(temp/'pg.log'),
+   '-o',f"-k {sock} -p {port} -c listen_addresses=''",'-w','start'],check=True,capture_output=True,timeout=60)
+  try:
+   with psycopg.connect(host=str(sock),port=port,user='postgres',dbname='postgres',autocommit=True) as db:
+    db.execute('create table public.content_calendar(id integer primary key)')
+    db.execute(CALENDAR_IDENTITY.read_text())
+    shape=db.execute('''select a.atttypid='text'::regtype,a.atttypmod,a.attnotnull,
+      a.attgenerated,a.attidentity,d.oid is null
+      from pg_attribute a left join pg_attrdef d on d.adrelid=a.attrelid and d.adnum=a.attnum
+      where a.attrelid='public.content_calendar'::regclass and a.attname='byte_hash'
+      and a.attnum>0 and not a.attisdropped''').fetchone()
+    assert shape==(True,-1,False,'','',True),shape
+    db.execute("insert into public.content_calendar values(1,'existing-evidence')")
+    db.execute(CALENDAR_IDENTITY.read_text())
+    assert db.execute('select byte_hash from public.content_calendar where id=1').fetchone()==('existing-evidence',)
+    print('PASS absent nullable text column added; compatible existing value survives idempotent rerun',flush=True)
+
+    incompatible=(
+     ('varchar','varchar(40)','kept'),
+     ('default','text default \'unexpected\'','kept'),
+     ('not-null','text not null','kept'),
+     ('generated','text generated always as (\'generated\'::text) stored',None),
+    )
+    for label,definition,value in incompatible:
+     db.execute('drop table public.content_calendar')
+     db.execute(f'create table public.content_calendar(id integer primary key,byte_hash {definition})')
+     if value is None: db.execute('insert into public.content_calendar(id) values(1)')
+     else: db.execute('insert into public.content_calendar values(1,%s)',(value,))
+     with pytest.raises(psycopg.errors.CheckViolation):
+      db.execute(CALENDAR_IDENTITY.read_text())
+     db.execute('rollback')
+     actual=db.execute('select byte_hash from public.content_calendar where id=1').fetchone()[0]
+     assert actual==('generated' if value is None else value),(label,actual)
+     typ=db.execute('''select format_type(a.atttypid,a.atttypmod),a.attnotnull,a.attgenerated,
+       d.oid is not null from pg_attribute a left join pg_attrdef d
+       on d.adrelid=a.attrelid and d.adnum=a.attnum
+       where a.attrelid='public.content_calendar'::regclass and a.attname='byte_hash'
+       and a.attnum>0 and not a.attisdropped''').fetchone()
+     assert typ is not None,label
+     if label=='varchar': assert typ[0]=='character varying(40)',typ
+     elif label=='default': assert typ[1:] == (False,'',True),typ
+     elif label=='not-null': assert typ[1] is True,typ
+     else: assert typ[2]=='s',typ
+     print('PASS incompatible existing shape rejected transactionally:',label,flush=True)
+  finally:
+   subprocess.run([str(pg17/'pg_ctl'),'-D',str(temp/'data'),'-m','immediate','-w','stop'],check=True,capture_output=True,timeout=60)
+
+
 @pytest.mark.parametrize('ordinary',[False,True],ids=['generated','ordinary'])
 def test_generated_client_full_release_manifest_pg17(ordinary,monkeypatch):
  psycopg=pytest.importorskip('psycopg')
  pg17=pg17_bin_dir()
  if pg17 is None: pytest.skip('Full manifest requires PostgreSQL 17 server binaries (initdb and pg_ctl); set PG17_BIN')
  required=[SEED,P0611_APPLY,
-  P0611_VERIFY,P0625/'DRAFT_0625_generated_client_approval.sql',
+  P0611_VERIFY,CALENDAR_IDENTITY,P0625/'DRAFT_0625_generated_client_approval.sql',
   P0625/'DRAFT_0625_generated_client_approval.verify.sql']
  missing=[str(path) for path in required if not path.is_file()]
  if missing: pytest.fail('Required checked-in release fixtures are missing: '+', '.join(missing))
@@ -300,6 +369,7 @@ def test_generated_client_full_release_manifest_pg17(ordinary,monkeypatch):
   assert hashlib.sha256(path.read_bytes()).hexdigest()==expected, f'fixture SHA-256 mismatch: {path}'
  assert hashlib.sha256(SEED.read_bytes()).hexdigest()==SEED_SHA
  assert hashlib.sha256((P0625/'DRAFT_0625_generated_client_approval.sql').read_bytes()).hexdigest()==PORTAL_SHA
+ assert hashlib.sha256(CALENDAR_IDENTITY.read_bytes()).hexdigest()==CALENDAR_IDENTITY_SHA
  assert shutil.disk_usage('/tmp').free>5*1024**3
  if ordinary: monkeypatch.setenv('ONLY_ORDINARY','1')
  else: monkeypatch.delenv('ONLY_ORDINARY',raising=False)
@@ -318,5 +388,23 @@ def test_generated_client_full_release_manifest_pg17(ordinary,monkeypatch):
     chain_portability_and_private_acl(db,sock,port,ordinary)
     seed=accepted_seed()
     seed.run(db,sock,port)
+    if not ordinary:
+     generated=db.execute('''select id,image_url,generated_artifact_version_id,generated_artifact_sha256
+       from public.content_calendar where creative_origin='generated' limit 1''').fetchone()
+     assert generated and all(generated[1:]), generated
+     # A successful no-op UPDATE with the exact immutable receipt must pass
+     # through the actual 0625 trigger's old/new.byte_hash comparison.
+     no_op=db.execute('''update public.content_calendar set image_url=image_url
+       where id=%s returning id''',(generated[0],)).fetchone()
+     assert no_op==(generated[0],),no_op
+     # A source-row mutation that no longer matches the immutable receipt is
+     # rejected, with the prior binding preserved.
+     with pytest.raises(psycopg.errors.CheckViolation):
+      db.execute('update public.content_calendar set image_url=%s where id=%s',
+       ('https://invalid.example/changed.png',generated[0]))
+     after=db.execute('''select image_url,generated_artifact_version_id,generated_artifact_sha256
+       from public.content_calendar where id=%s''',(generated[0],)).fetchone()
+     assert after == generated[1:], (generated,after)
+     print('PASS actual portal generated UPDATE trigger byte_hash dereference and artifact binding rejection',flush=True)
   finally:
    subprocess.run([str(pg17/'pg_ctl'),'-D',str(temp/'data'),'-m','immediate','-w','stop'],check=True,capture_output=True,timeout=60)

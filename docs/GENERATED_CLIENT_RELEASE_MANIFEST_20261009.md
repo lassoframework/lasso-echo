@@ -11,6 +11,22 @@ is not provisioned: there are no production LOGINs, tenant grants, secrets,
 service configuration or invocation in this packet. The SQL creates only
 unprivileged `NOLOGIN` group roles; it does not provision credentials.
 
+## Calendar identity prerequisite discovered in production-shaped restore
+
+The captured production schema does not contain
+`public.content_calendar.byte_hash`, but portal 0625's deferred generated
+approval trigger compares `old.byte_hash` and `new.byte_hash` on UPDATE. The
+test harness previously fabricated this column in its synthetic base-schema
+bootstrap, masking the live incompatibility. The narrow draft migration
+`migrations/DRAFT_generated_client_calendar_identity_20261009.sql` now installs
+immediately before 0625. It adds only nullable `text` when absent; an existing
+column must already be nullable `text` with no default, generated expression,
+or identity. Existing values are never updated. PG17 tests cover absent and
+compatible schemas, preserve an existing value across rerun, reject
+incompatible shapes transactionally, and exercise the actual 0625 generated-row
+UPDATE trigger plus immutable artifact binding rejection. This is local draft
+rehearsal, not a production migration receipt or release approval.
+
 ## Historical preflight discovery — 2026-10-09 15:52 UTC
 
 **Production-shaped install/reconciliation rehearsal: BLOCKED.** The initial
@@ -215,7 +231,7 @@ called out separately and must not be mistaken for deployable SQL.
 
 | # | PG17 sequence | File SHA-256 |
 |---:|---|---|
-| 1 | Test harness creates synthetic base schema, roles and fixture columns inline; no file | — |
+| 1 | Test harness creates synthetic base schema, roles and fixture columns inline; `byte_hash` is intentionally absent so the production prerequisite below is tested | — |
 | 2 | Apply foundation | `migrations/DRAFT_fixer_forward_media_claim_20261006.sql` — `2e2f007608c96bd63bd71e874ff7aa0b69b2f21935140f261d6f4041792d6bdb` |
 | 3 | Apply foundation | `migrations/DRAFT_fixer_forward_media_observation_bridge_20261007.sql` — `6f13aea721b88d8fa510d3930428f40aba75ce13ea86490b81ee79ca6c4e6bce` |
 | 4 | Apply foundation | `migrations/DRAFT_fixer_forward_media_source_history_20261007.sql` — `81bc6101a6b2802b7be44d8b94ec8f6f5ff07c63875955f50f68a234ee67c4ca` |
@@ -233,13 +249,14 @@ called out separately and must not be mistaken for deployable SQL.
 | 16 | Apply generated foundation | `migrations/DRAFT_generated_send_lease_20261007.sql` — `75c585f5d1f0badabd9f095142b48e7aba05089fe9afee694f4b6dc8c9cd8f05` |
 | 17 | Apply portal 0611 held fixture | `tests/fixtures/portal_0611_echo_source_brand_bundle_held_20261008.sql` — `55374ffe33677a1ef8ccbb41256c8abc9634645d0d9658f55ebc40fd1bc21dd2` |
 | 18 | Run portal 0611 verifier immediately after 0611, before later migrations add triggers to `echo_source_captures` | `tests/fixtures/generated_client_release_manifest/0611_echo_source_brand_bundle.verify.sql` — `4e99445cf04fff7046d8da64d13e02eb5ca875a7cc988c64cd9ad0e08a67063f` |
-| 19 | Apply staged predecessor, in order | `migrations/DRAFT_fixer_forward_media_owner_transport_20261007.sql` — `ac264c4c79968be37f9d1a36614d2dc819609846d90a58644b18bb1c34516893`; `migrations/DRAFT_fixer_generated_bundle_bridge_20261008.sql` — `122a9faeff59999fee7e0377793ccf98af4d5ddc0f225a6d136111533889c888`; `migrations/DRAFT_fixer_forward_visual_index_20261008.sql` — `dbdd4a5b35a0b5d7f74d6fe6234e61a58006c9f6cf04b28c065cd443bdc66017`; `migrations/DRAFT_fixer_forward_schedule_reservation_20261008.sql` — `898dd3d3202add1f3cb6137eb98da954ce1d99ce23cc43bd312c3f9bbc5b6be0`; `migrations/DRAFT_fixer_forward_schedule_stage_20261008.sql` — `31b6007e86df4b46ddd4d4d6b9b7212f76d0f92072159a0012d0f6b390b5fca4`; `migrations/DRAFT_fixer_forward_schedule_worker_discovery_20261008.sql` — `5152ddc07c1eaf8c11febc7c4ee3518f6952d39a125e5187d77a8c08fd3ddb14`; `migrations/DRAFT_fixer_forward_schedule_staged_preparation_20261008.sql` — `e2c9ab6dfd7b5e3406d72ea3a1f81a718e3e60e4dcbebc060988a96764d6c95a`; `migrations/DRAFT_fixer_generated_local_census_producer_20261008.sql` — `2e3130c1ee80f2c1a81453495591d13893ca8e01e2af84e4ecf7cf0a03ba6875`; `migrations/DRAFT_fixer_photo_historical_clearance_20261008.sql` — `c389b8a81b81e7c4044fe43b5b57b0050bd19b47c1e4574b17f3c6ddab64687b`; `migrations/DRAFT_fixer_prospective_photo_authority_20261008.sql` — `6d9396649e50ff442730164233efecc2665a929293277db6a2c061bb42842a2b`; **same historical-clearance file is applied again** — same SHA; `migrations/DRAFT_fixer_prospective_still_v2_20261008.sql` — `2f300cffd13c4702fd476618cdcb28a12f89d7a3ab561c12cc218ecb9aca12f4`; `migrations/DRAFT_fixer_still_v2_owner_transport_20261008.sql` — `ae45a14a69558eeef8d786acd74b35f0f69eba898f7440b14c2f9418d4c274ae`; `migrations/DRAFT_fixer_current_census_reservation_lookup_20261008.sql` — `911699edffb5160add17c0bb76be686e99fb3a79513ddc96c5834b1fdcfe0a06`; `migrations/DRAFT_fixer_inventory_mutation_protocol_20261008.sql` — `50cd1d7666efd1dd6e18256cc0fa577248200a189138dedc9569c3c550d80376`; `migrations/DRAFT_fixer_remote_drive_use_cas_20261008.sql` — `c13697fa7a6a9bb738f538da0858e260f01e958b5fa22fdec221ea35cc324847`; `migrations/DRAFT_fixer_calendar_admission_guard_20261009.sql` — `83f205f0157ad7644194478eda4e3e98ab58a128580fd2adedbc7374c85d8d3c` |
-| 20 | Apply portal 0625 fixture | `tests/fixtures/generated_client_release_manifest/DRAFT_0625_generated_client_approval.sql` — `d54a5b9e1f857d31912540f38f626b59c891296a4aebd7b3c2d55a1f4abdc705` |
-| 21 | Apply consumer SQL and its two local verification SQL files, in this order | `migrations/DRAFT_generated_hosted_byte_authority_20261009.sql` — `162ef5cbed66e72685b352c1ba2b26e2ce7e74d8f80010fc1b4a59951e03ab94`; `migrations/DRAFT_generated_client_admission_20261009.sql` — `d02782767faf0c9337ce5fba22f9716e8da7360c4f5e091b39a597e885ca1dc6`; `migrations/DRAFT_generated_client_staged_adapter_20261009.sql` — `6af95582cfd5351f6074e06c0e7d41c6aed90c09f5c0979d9e3401afe6c97468`; `migrations/DRAFT_generated_client_admission_20261009.verify.sql` — `b47309bc533e6d65700b59c55e4f5fc1e21be263e9776100514a322536682f1f`; `migrations/DRAFT_generated_client_staged_adapter_20261009.verify.sql` — `026b28c59d5fab6d2fd6154c3fd01123ca32755abdd43212bc2238aada56819b` |
-| 22 | Run portal 0625 verifier | `tests/fixtures/generated_client_release_manifest/DRAFT_0625_generated_client_approval.verify.sql` — `19fd8aa6b031bd9fd80aa70a64b34b737daf1ae02d03d0e04bfa6d3bf4953ee7` |
-| 23 | Harness checks controls remain disabled and private census/protocol functions are not executable by PUBLIC | In-test assertions; no file |
-| 24 | **Append issuer queue migration** | `migrations/DRAFT_generated_issuer_dispatch_20261009.sql` — `eb53bfeafd30f5a38bdcd40b872230a92d0845d8bc2bb208ce51a98fbfb318b4` |
-| 25 | Run issuer queue verifier | `migrations/DRAFT_generated_issuer_dispatch_20261009.verify.sql` — `84262c1e905c53128b7612a4271e1f1fb82b9b816edeb4ee615161aaf9738914` |
+| 19 | Apply staged predecessor, in order | `migrations/DRAFT_fixer_forward_media_owner_transport_20261007.sql` — `ac264c4c79968be37f9d1a36614d2dc819609846d90a58644b18bb1c34516893`; `migrations/DRAFT_fixer_generated_bundle_bridge_20261008.sql` — `122a9faeff59999fee7e0377793ccf98af4d5ddc0f225a6d136111533889c888`; `migrations/DRAFT_fixer_forward_visual_index_20261008.sql` — `dbdd4a5b35a0b5d7f74d6fe6234e61a58006c9f6cf04b28c065cd443bdc66017`; `migrations/DRAFT_fixer_forward_schedule_reservation_20261008.sql` — `898dd3d3202add1f3cb6137eb98da954ce1d99ce23cc43bd312c3f9bbc5b6be0`; `migrations/DRAFT_fixer_forward_schedule_stage_20261008.sql` — `31b6007e86df4b46ddd4d4d6b9b7212f76d0f92072159a0012d0f6b390b5fca4`; `migrations/DRAFT_fixer_forward_schedule_worker_discovery_20261008.sql` — `5152ddc07c1eaf8c11febc7c4ee3518f6952d39a125e5187d77a8c08fd3ddb14`; `migrations/DRAFT_fixer_forward_schedule_staged_preparation_20261008.sql` — `e2c9ab6dfd7b5e3406d72ea3a1f81a718e3e60e4dcbebc060988a96764d6c95a`; `migrations/DRAFT_fixer_generated_local_census_producer_20261008.sql` — `2e3130c1ee80f2c1a81453495591d13893ca8e01e2af84e4ecf7cf0a03ba6875`; `migrations/DRAFT_fixer_photo_historical_clearance_20261008.sql` — `c389b8a81b81e7c4044fe43b5b57b0050bd19b47c1e4574b17f3c6ddab64687b`; `migrations/DRAFT_fixer_prospective_photo_authority_20261008.sql` — `6d9396649e50ff442730164233efecc2665a929293277db6a2c061bb42842a2b`; **same historical-clearance file is applied again** — same SHA; `migrations/DRAFT_fixer_prospective_still_v2_20261008.sql` — `2f300cffd13c4702fd476618cdcb28a12f89d7a3ab561c12cc218ecb9aca12f4`; `migrations/DRAFT_fixer_still_v2_owner_transport_20261008.sql` — `ae45a14a69558eeef8d786acd74b35f0f69eba898f7440b14c2f9418d4c274ae`; `migrations/DRAFT_fixer_current_census_reservation_lookup_20261008.sql` — `911699edffb5160add17c0bb76be686e99fb3a79513ddc96c5834b1fdcfe0a06`; `migrations/DRAFT_fixer_inventory_mutation_protocol_20261008.sql` — `50cd1d7666efd1dd6e18256cc0fa577248200a189138dedc9569c3c550d80376`; `migrations/DRAFT_fixer_remote_drive_use_cas_20261008.sql` — `2cef193e491b3e037491d1b7825ce7268184d86b65d0c1c78c1399fc0e0dd3e1`; `migrations/DRAFT_fixer_calendar_admission_guard_20261009.sql` — `83f205f0157ad7644194478eda4e3e98ab58a128580fd2adedbc7374c85d8d3c` |
+| 20 | Apply calendar byte-hash compatibility prerequisite before the portal trigger references `old/new.byte_hash` | `migrations/DRAFT_generated_client_calendar_identity_20261009.sql` — `71da26e11c6860d05959ec008d72b5b09e1d67985bd71fc746110a893f0e0c88` |
+| 21 | Apply portal 0625 fixture | `tests/fixtures/generated_client_release_manifest/DRAFT_0625_generated_client_approval.sql` — `d54a5b9e1f857d31912540f38f626b59c891296a4aebd7b3c2d55a1f4abdc705` |
+| 22 | Apply consumer SQL and its two local verification SQL files, in this order | `migrations/DRAFT_generated_hosted_byte_authority_20261009.sql` — `162ef5cbed66e72685b352c1ba2b26e2ce7e74d8f80010fc1b4a59951e03ab94`; `migrations/DRAFT_generated_client_admission_20261009.sql` — `d02782767faf0c9337ce5fba22f9716e8da7360c4f5e091b39a597e885ca1dc6`; `migrations/DRAFT_generated_client_staged_adapter_20261009.sql` — `6af95582cfd5351f6074e06c0e7d41c6aed90c09f5c0979d9e3401afe6c97468`; `migrations/DRAFT_generated_client_admission_20261009.verify.sql` — `b47309bc533e6d65700b59c55e4f5fc1e21be263e9776100514a322536682f1f`; `migrations/DRAFT_generated_client_staged_adapter_20261009.verify.sql` — `026b28c59d5fab6d2fd6154c3fd01123ca32755abdd43212bc2238aada56819b` |
+| 23 | Run portal 0625 verifier | `tests/fixtures/generated_client_release_manifest/DRAFT_0625_generated_client_approval.verify.sql` — `19fd8aa6b031bd9fd80aa70a64b34b737daf1ae02d03d0e04bfa6d3bf4953ee7` |
+| 24 | Harness checks controls remain disabled and private census/protocol functions are not executable by PUBLIC | In-test assertions; no file |
+| 25 | **Append issuer queue migration** | `migrations/DRAFT_generated_issuer_dispatch_20261009.sql` — `eb53bfeafd30f5a38bdcd40b872230a92d0845d8bc2bb208ce51a98fbfb318b4` |
+| 26 | Run issuer queue verifier | `migrations/DRAFT_generated_issuer_dispatch_20261009.verify.sql` — `84262c1e905c53128b7612a4271e1f1fb82b9b816edeb4ee615161aaf9738914` |
 
 The portal fixtures used by the test are copied from reviewed source artifacts,
 not reconstructed: 0611 apply and verifier bytes match the owner-frozen files in
@@ -319,7 +336,7 @@ or data deletion.
 
 - `agent/generated_issuer_dispatch_entrypoint.py` — `104a6aed72849c127439d70ca31a404028913749fb826355b38ed3c092cd6238`
 - `tests/test_generated_issuer_dispatch_entrypoint.py` — `c05793011c4b6e70567e3d645ae8d57ea03fb7e78baaf525b35b6c1c527207d6`
-- `tests/test_generated_client_release_manifest_pg.py` — `215907d0834ef8d3d433d27b8eacc680371836dee883c5ddf0a6c8896a3d341b`
+- `tests/test_generated_client_release_manifest_pg.py` — `dad8892fb2290e3b443acb699e8433a4cd03f527138e47704885df6cea305bf9`
 - `tests/test_generated_client_full_dispatch_pg.py` — `a88f6452ce63bf5193da7fc6abaad5fe9e4375eaab57aee8488ad0b565bb4bd4`
 - `tests/test_forward_corpus_atomic_cutover_pg.py` (source of entry extraction semantics) — `b4a454597d4fded3dd21eade69eabf39c600e37d8d2b3174cc489a29e51b422a`
 - `tests/fixtures/generated_client_release_manifest/README.md` documents portal fixture provenance.
