@@ -18,6 +18,24 @@ from .generated_hosted_byte_authority import GeneratedHostedByteAuthority, Hoste
 FLAG = 'AGENT_GENERATED_CLIENT_ADMISSION'
 
 
+def _queue_operation(queue, name, *args):
+    """One authenticated issuer-queue call; every failure is a static hold.
+
+    The queue is an injected trusted dependency (Child B's dispatch client):
+    submit(request) plus result(tenant, version, binding_digest). Identity is
+    the queue's authenticated session, never caller content.
+    """
+    operation = getattr(queue, name, None)
+    if not callable(operation):
+        raise AdmissionHold('generated_client_queue_protocol_required')
+    try:
+        return operation(*args)
+    except AdmissionHold:
+        raise
+    except Exception:
+        raise AdmissionHold('generated_client_queue_unavailable') from None
+
+
 class AdmissionHold(RuntimeError):
     """Static diagnostic only; no credentials or source data."""
 
@@ -162,6 +180,81 @@ class GeneratedClientAdmission:
                 raise HostedByteHold('generated_client_reader_only_required') from None
         self.authority = GeneratedHostedByteAuthority(reader_factory, tenant_id=authority.tenant_id)
 
+    def _frozen_request(self, row_id):
+        """Exact durable manifest as one frozen issuer dispatch request.
+
+        The manifest bytes frozen BEFORE any dispatch are the exact bytes the
+        issuer validates; replay rebuilds the identical request, so a restart
+        or a lost ACK never changes the submitted binding.
+        """
+        from .generated_hosted_byte_issuer_worker import IssuerDispatchHold, IssuerDispatchRequest
+        frozen = self.journal.load(row_id)
+        binding = frozen['binding']
+        candidate = binding.get('candidate')
+        if not isinstance(candidate, dict) or candidate.get('gym_id') != self.authority.tenant_id:
+            raise AdmissionHold('generated_client_tenant_mismatch')
+        try:
+            request = IssuerDispatchRequest(
+                tenant=self.authority.tenant_id,
+                artifact_version_id=frozen['artifact_version_id'],
+                hosted_url=candidate['original_url'],
+                expected_sha256=candidate['original_sha256'],
+                manifest_bytes=frozen['manifest_bytes'])
+        except IssuerDispatchHold:
+            raise AdmissionHold('generated_client_manifest_binding_invalid') from None
+        return frozen, request
+
+    def queue_receipt(self, row_id, *, queue, persistence):
+        """Authenticated queue submit/readback/resume for one frozen manifest.
+
+        The trusted owner census is the photo-first gate: the newest local
+        authority at the frozen tenant and inventory revision must certify zero
+        usable local photos before any queue or issuer work is requested.
+        Missing, uncertain or False holds closed and the queue is never called.
+        The injected queue is the authenticated producer client (Child B):
+        submit(request) is exactly-once per dispatch key; result(tenant,
+        version, binding_digest) returns only {'status','receipt_id'}. A lost
+        ACK or restart resumes here: submit replays identically and readback
+        returns the committed receipt. An already-attached receipt must match
+        the queue's exact current committed receipt; a stale, cross-tenant or
+        revoked result fails closed and the durable journal is never changed.
+        Returns the attached receipt UUID; raises AdmissionHold otherwise.
+        """
+        if not enabled():
+            raise AdmissionHold('generated_client_admission_disabled')
+        from .generated_issuer_dispatch_client import IssuerDispatchClient
+        if type(queue) is not IssuerDispatchClient:
+            raise AdmissionHold('generated_client_queue_protocol_required')
+        frozen, request = self._frozen_request(row_id)
+        candidate = frozen['binding']['candidate']
+        from . import generated_infographic_runtime as runtime
+        try:
+            runtime._require_latest_local_depletion(
+                persistence, candidate['gym_id'], candidate['inventory_revision'])
+        except Exception:
+            raise AdmissionHold('generated_client_photo_gate_unverified') from None
+        digest = request.binding_digest()
+        version = frozen['artifact_version_id']
+        if frozen['receipt_id'] is not None:
+            # Resume with a durable receipt: only the exact same committed
+            # queue result proves the evidence is still current and issued.
+            value = _queue_operation(queue, 'result', self.authority.tenant_id, version, digest)
+            if (not isinstance(value, dict) or value.get('status') != 'issued'
+                    or value.get('receipt_id') != frozen['receipt_id']):
+                raise AdmissionHold('generated_client_receipt_stale')
+            return frozen['receipt_id']
+        _queue_operation(queue, 'submit', request)
+        value = _queue_operation(queue, 'result', self.authority.tenant_id, version, digest)
+        if not isinstance(value, dict) or value.get('status') != 'issued':
+            raise AdmissionHold('generated_client_receipt_pending')
+        receipt_id = value.get('receipt_id')
+        if not isinstance(receipt_id, str):
+            raise AdmissionHold('generated_client_receipt_pending')
+        # Attachment is immutable and exact; the committed-authority lookup in
+        # stage() remains the final reader-side proof before any owner commit.
+        self.journal.attach_receipt(row_id, receipt_id)
+        return receipt_id
+
     def stage(self, persistence, row_id, candidate, visuals, manifest, source_revision):
         if not enabled():
             raise AdmissionHold('generated_client_admission_disabled')
@@ -192,6 +285,8 @@ class GeneratedClientAdmission:
         frozen = self.journal.freeze(row_id, candidate, manifest, source_revision, stage_plan=plan)
         if frozen['binding']['calendar_row_id'] != prepared_id or frozen['artifact_version_id'] != version_id:
             raise AdmissionHold('generated_client_binding_changed')
+        if persistence is not None:
+            persistence._conn.rollback()
         if not frozen['receipt_id']:
             raise AdmissionHold('generated_client_receipt_pending')
         # Always use a NEW dedicated lookup, including replay. Caller receipt
@@ -202,6 +297,8 @@ class GeneratedClientAdmission:
                                   manifest_bytes=frozen['manifest_bytes'], receipt_id=frozen['receipt_id'])
         except HostedByteHold:
             raise AdmissionHold('generated_client_committed_receipt_unavailable') from None
+        if persistence is None:
+            raise AdmissionHold('generated_client_owner_plan_required')
         if frozen['state'] in ('dispatching', 'committing', 'committed'):
             with persistence._conn.cursor() as cur:
                 cur.execute('select public.generated_client_reconcile_20261009(%s,%s,%s,%s)',

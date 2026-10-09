@@ -252,6 +252,79 @@ begin
   'artifact_version_id',p_version,'receipt_id',p_receipt,'manifest_sha256',a.manifest_sha256,'stage_plan',plan);
 end $$;
 
+
+-- Service consumes only an exact committed preparation. This confers no table,
+-- writer, approval, source-reader or issuer authority. The full old snapshot is
+-- checked even if a candidate was inserted, so finalized preparations refuse.
+create function public.generated_client_service_preparation_20261009(
+ p_tenant text,p_row uuid,p_version uuid,p_receipt uuid,p_manifest_sha text,p_stage_plan jsonb)
+returns jsonb language plpgsql security definer set search_path=pg_catalog,public as $$
+declare a public.generated_client_admission_20261009%rowtype; raw jsonb;
+ old_row public.content_calendar%rowtype; candidate public.content_calendar%rowtype;
+begin
+ if not pg_has_role(session_user,'service_role','MEMBER') then
+  raise exception 'generated preparation service required' using errcode='42501'; end if;
+ if current_setting('transaction_isolation')<>'read committed' then
+  raise exception 'generated preparation requires read committed' using errcode='25000'; end if;
+ perform pg_advisory_xact_lock_shared(hashtextextended('fixer_forward_graph_20261006',0));
+ perform pg_advisory_xact_lock_shared(hashtextextended('fixer_forward_photo_census_20261007',0));
+ select * into a from public.generated_client_admission_20261009 where calendar_row_id=p_row;
+ if not found or a.gym_id is distinct from p_tenant
+  or a.artifact_version_id is distinct from p_version or a.receipt_id is distinct from p_receipt
+  or a.manifest_sha256 is distinct from p_manifest_sha then
+  raise exception 'exact generated preparation required' using errcode='23514'; end if;
+ raw:=convert_from(a.manifest_bytes,'UTF8')::jsonb;
+ if jsonb_typeof(raw->'stage_plan') is distinct from 'object'
+  or raw->'stage_plan' is distinct from p_stage_plan
+  or raw->>'gym_id' is distinct from a.gym_id
+  or raw->>'calendar_row_id' is distinct from a.calendar_row_id::text
+  or raw->>'artifact_version_id' is distinct from a.artifact_version_id::text then
+  raise exception 'exact generated stage plan required' using errcode='23514'; end if;
+ select * into old_row from public.content_calendar
+  where id=(raw#>>'{stage_plan,placeholder_row_id}')::uuid for share;
+ if not found or old_row.gym_id is distinct from p_tenant
+  or to_jsonb(old_row) is distinct from raw#>'{stage_plan,old_snapshot}' then
+  raise exception 'generated preparation old snapshot changed' using errcode='23514'; end if;
+ select * into candidate from public.content_calendar where id=p_row for share;
+ if found and to_jsonb(candidate) is distinct from raw#>'{stage_plan,planned_row}' then
+  -- The stage RPC adds exactly this sentinel. It is authority only with its
+  -- immutable singleton batch, member and full old-row request bindings.
+  if candidate.variant_status is distinct from 'candidate'
+   or candidate.media_not_ready_reason is distinct from 'forward_reservation_staged'
+   or to_jsonb(candidate) is distinct from jsonb_set(raw#>'{stage_plan,planned_row}',
+      '{media_not_ready_reason}','"forward_reservation_staged"'::jsonb)
+   or not exists(select 1 from public.forward_schedule_stage_member_20261008 member
+    join public.forward_schedule_stage_batch_20261008 batch using(batch_id)
+    join public.forward_schedule_stage_old_row_20261008 prior using(batch_id)
+    where member.calendar_row_id=p_row and member.position=0
+     and member.tenant_id=p_tenant and member.gym_id=candidate.gym_id
+     and member.logical_post_id=candidate.logical_post_id and member.post_date=candidate.post_date
+     and member.source_media_url=candidate.source_media_url and member.image_url=candidate.image_url
+     and member.thumbnail_url is not distinct from candidate.thumbnail_url
+     and member.observation_digest is null and member.staged_snapshot=to_jsonb(candidate)
+     and batch.tenant_id=p_tenant and batch.state='staged'
+     and batch.request_digest ~ '^[0-9a-f]{64}$'
+     and batch.finalize_request is null and batch.finalize_receipt is null and batch.finalized_at is null
+     and batch.request_payload=jsonb_build_object('members',jsonb_build_array(
+       jsonb_build_object('row',raw#>'{stage_plan,planned_row}','observation',null)),
+       'old_rows',jsonb_build_array(raw#>'{stage_plan,old_snapshot}'))
+     and prior.position=0 and prior.calendar_row_id=old_row.id and prior.tenant_id=p_tenant
+     and prior.old_snapshot=to_jsonb(old_row)
+     and (select count(*) from public.forward_schedule_stage_member_20261008 x where x.batch_id=batch.batch_id)=1
+     and (select count(*) from public.forward_schedule_stage_old_row_20261008 x where x.batch_id=batch.batch_id)=1
+     and public.fixer_forward_schedule_staged_authorized_20261008(p_row,p_tenant,batch.batch_id)) then
+   raise exception 'generated preparation candidate changed' using errcode='23514'; end if;
+ end if;
+ perform public.generated_client_current_preparation_20261009(a);
+ return jsonb_build_object('admitted',true,'reserved',true,'prepared',true,
+  'calendar_row_id',a.calendar_row_id,'artifact_version_id',a.artifact_version_id,
+  'receipt_id',a.receipt_id,'manifest_sha256',a.manifest_sha256,'stage_plan',raw->'stage_plan');
+end $$;
+revoke all on function public.generated_client_service_preparation_20261009(text,uuid,uuid,uuid,text,jsonb)
+ from public,anon,authenticated,fixer_forward_media_owner_20261006,
+ generated_hosted_byte_reader_20261009,generated_hosted_byte_issuer_20261009;
+grant execute on function public.generated_client_service_preparation_20261009(text,uuid,uuid,uuid,text,jsonb) to service_role;
+
 -- Explicitly reject the abandoned direct ACTIVE-row route.
 create or replace function public.generated_client_stage_20261009(p_row uuid,c jsonb,visuals jsonb,m jsonb,
  p_source text,p_version uuid,p_receipt uuid,p_manifest bytea)

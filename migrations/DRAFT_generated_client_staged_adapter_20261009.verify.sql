@@ -87,3 +87,14 @@ begin
   or has_function_privilege('fixer_forward_media_owner_20261006','public.finalize_forward_schedule_staged_batch_20261008(text,uuid,jsonb,jsonb)','EXECUTE') then
   raise exception 'separate finalizer role boundary missing'; end if;
 end $$;
+
+do $$ declare r text; p record; begin
+ select * into strict p from pg_proc where oid='public.generated_client_service_preparation_20261009(text,uuid,uuid,uuid,text,jsonb)'::regprocedure;
+ if p.proowner<>'postgres'::regrole or not p.prosecdef or p.proconfig is distinct from array['search_path=pg_catalog, public']::text[]
+  or not has_function_privilege('service_role',p.oid,'EXECUTE') then raise exception 'service preparation boundary missing'; end if;
+ foreach r in array array['anon','authenticated','fixer_forward_media_owner_20261006','generated_hosted_byte_reader_20261009','generated_hosted_byte_issuer_20261009'] loop
+  if has_function_privilege(r,p.oid,'EXECUTE') then raise exception 'service preparation ACL leaked'; end if;
+ end loop;
+ if has_table_privilege('service_role','public.generated_client_admission_20261009','SELECT') then
+  raise exception 'service preparation table SELECT leaked'; end if;
+end $$;

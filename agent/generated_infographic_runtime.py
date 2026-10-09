@@ -704,7 +704,7 @@ def _same_post_job(jobs, row_id, frozen, source_revision):
 
 
 def run_calendar_row(base, account, row_id, *, persistence, loader=None, jobs=None,
-                     provider=None, reviewer=None, storage=None, client_admission=None):
+                     provider=None, reviewer=None, storage=None, client_admission=None, issuer_dispatch=None):
     """Generate one exact persisted feed row and acknowledge owner reservation.
 
     Missing/changed photos, palette, copy and delivered-byte history hold before
@@ -737,6 +737,8 @@ def run_calendar_row(base, account, row_id, *, persistence, loader=None, jobs=No
             if (type(client_admission) is not client_contract.GeneratedClientAdmission
                     or os.path.realpath(client_admission.journal.path) != os.path.realpath(jobs.path)):
                 raise RuntimeHold('generated_client_durable_binding_required')
+            if client_admission.authority.tenant_id != base:
+                raise RuntimeHold('generated_client_tenant_mismatch')
         elif client_contract.enabled():
             raise RuntimeHold('generated_client_reader_not_provisioned')
         existing = _runtime_record(jobs, row_id)
@@ -793,10 +795,29 @@ def run_calendar_row(base, account, row_id, *, persistence, loader=None, jobs=No
             raise RuntimeHold('generated_approved_source_changed')
         if candidate['job_id'] != existing['job_id']:
             raise RuntimeHold('generated_row_job_changed')
-        reservation = guard.reserve_generated(persistence, row_id, candidate, current,
-                                              history_visuals=visuals, read_bytes=loader.reader,
-                                              **({'client_admission': client_admission}
-                                                 if client_admission is not None else {}))
+        def reserve():
+            return guard.reserve_generated(persistence, row_id, candidate, current,
+                history_visuals=visuals, read_bytes=loader.reader,
+                **({'client_admission': client_admission} if client_admission is not None else {}))
+        if client_admission is not None:
+            try:
+                client_admission.journal.load(row_id)
+            except AdmissionHold as exc:
+                if str(exc) != 'generated_client_binding_unavailable':
+                    raise
+                # Freeze the actual owner plan and render manifest first.
+                try:
+                    reserve()
+                except AdmissionHold as pending:
+                    if str(pending) != 'generated_client_receipt_pending':
+                        raise
+                else:
+                    raise RuntimeHold('generated_client_binding_changed')
+            persistence._conn.rollback()
+            client_admission.queue_receipt(row_id, queue=issuer_dispatch, persistence=persistence)
+            reservation = reserve()
+        else:
+            reservation = reserve()
         if client_admission is not None:
             client_admission.before_commit(row_id)
         _runtime_record(jobs, row_id, state='committing')
