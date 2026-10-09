@@ -17,4 +17,6 @@ the test before execution.
 The 0611 apply SQL is not duplicated because the existing held fixture is an
 exact-byte match. PostgreSQL server binaries must be major version 17. The test
 auto-discovers common installations or accepts `PG17_BIN` / `POSTGRESQL_17_BIN`;
-it skips only when no usable PostgreSQL 17 installation is available.
+it skips only when no usable PostgreSQL 17 installation is available. The
+repository's main-target CI installs PostgreSQL 17 and Python test dependencies
+before running this manifest check.
