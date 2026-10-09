@@ -144,13 +144,13 @@ class Apify:
             'defaultDatasetId': 'dataset123', 'status': 'SUCCEEDED'}}).encode()
 
 
-def setup(tmp_path, connected=True):
+def setup(tmp_path, connected=True, urls=(URL,)):
     os.chmod(tmp_path, 0o700)
     env, storage = environment(), Storage(connected)
     zernio = Zernio([account()] if connected else [])
     reader = CollectorPortalReader(environ=env, http=storage)
     identity = AuthenticatedZernioIdentityReader(read_rows=reader, environ=env, http=zernio)
-    entry = ServerMapping(GYM, KEY, (URL,), ('synthetic-domain-proof',),
+    entry = ServerMapping(GYM, KEY, urls, ('synthetic-domain-proof',),
         'synthetic-approval', (datetime.now(timezone.utc) + timedelta(days=1)).isoformat(),
         HANDLE if connected else None)
     resolver = PortalMappingResolver(read_rows=reader, approved_mappings=[entry], social_identity_reader=identity)
@@ -466,3 +466,26 @@ def test_attestation_write_failure_holds_without_capture(tmp_path):
     with pytest.raises(CaptureIngestError, match='provider_attestation_unconfirmed'):
         runner.capture(GYM, 'unconfirmed-status')
     assert not websites and not apify.calls and not storage.rows
+
+
+CSS_URL = 'https://swiftrivercrossfit.com/styles/site.css'
+
+
+def test_approved_exact_css_url_classified_as_website_asset(tmp_path):
+    runner, storage, zernio, apify, websites = setup(tmp_path, urls=(URL, CSS_URL))
+    result = runner.capture(GYM, 'css-request')
+    assert websites == [URL, CSS_URL]  # approved URLs only; no discovery, no new URL
+    by_url = {r['source_url']: r for r in storage.rows.values()}
+    assert by_url[URL]['source_kind'] == 'website'
+    assert by_url[CSS_URL]['source_kind'] == 'website_asset'
+    assert len(result['captures']) == 3  # page + css asset + social
+    # Replay of the same request reuses the same classification.
+    assert runner.capture(GYM, 'css-request') == result
+
+
+def test_non_css_approved_urls_stay_website_kind(tmp_path):
+    runner, storage, zernio, apify, websites = setup(
+        tmp_path, urls=(URL, 'https://swiftrivercrossfit.com/programs'))
+    runner.capture(GYM, 'kinds-request')
+    assert {r['source_kind'] for r in storage.rows.values()
+            if r['source_kind'] != 'social'} == {'website'}

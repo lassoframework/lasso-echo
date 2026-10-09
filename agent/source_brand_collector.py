@@ -46,7 +46,10 @@ class ServerMapping:
 SWIFT_RIVER_DRAFT = {
     'gym_id': 'e5c9db81-110d-4308-9bb7-3ad3bf563a0b',
     'echo_account_key': 'swiftrivercrossfite5c9db',
-    'website_urls': ('https://swiftrivercrossfit.com/',),
+    # Exact official program page for facts plus owner-uploaded CSS for palette.
+    # Draft only; the private approved mapping and provider proof remain required.
+    'website_urls': ('https://swiftrivercrossfit.com/crossfit-in-conway-nh/',
+                     'https://swiftrivercrossfit.com/wp-content/uploads/zyth-style-custom.css'),
     'domain_evidence': ('https://swiftrivercrossfit.com/',
                         'https://www.crossfit.com/gym/13058/swift-river-crossfit'),
     'instagram_handle': 'swiftrivercrossfit',
