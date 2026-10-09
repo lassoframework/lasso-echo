@@ -46,6 +46,11 @@ def _d(days_out):
 @pytest.fixture(autouse=True)
 def _tmp(monkeypatch, tmp_path):
     monkeypatch.setenv("AGENT_DB_PATH", str(tmp_path / "echo.db"))
+    # Keep relative fixture dates and the documented horizon clock seam on
+    # the same day, even when a long suite crosses midnight after collection.
+    horizon_end = ph.horizon_end
+    monkeypatch.setattr(ph, "horizon_end", lambda now=None:
+                        horizon_end(TODAY if now is None else now))
     yield
 
 
