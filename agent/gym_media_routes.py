@@ -589,6 +589,58 @@ def _flip_pending_using_asset(gym_id, asset_id):
         return 0, None
 
 
+def _video_thumbnail(gym, asset_id, asset, drive, thumb):
+    """Video branch of the thumbnail proxy (2026-10-09 repair, hardened after
+    independent audit of ENG production posters). Serve the Drive thumbnail
+    only when it decodes as an informative image of plausible size — anomalous
+    tiny posters (a 632-byte pure-black poster and a 2.3 KB blurred
+    unidentifiable HYROX poster both looked fine or went unjudged before) and
+    undecodable bytes never return 200. Otherwise extract the BEST
+    representative JPEG frame from the ORIGINAL bytes (size pre-verified AND
+    post-download verified, bounded total ffmpeg runtime, bounded output),
+    cached by gym+asset+content hash only when the hash is nonempty.
+    FAIL CLOSED: no usable frame means non-200, never a faked thumbnail."""
+    from . import video_thumb_fallback as _vt  # lazy: PIL/ffmpeg import chain
+    content_hash = str(asset.get("content_hash") or "")
+    ckey = _vt.cache_key(gym, asset_id, content_hash)
+    cached = _vt.get_cached(ckey)
+    if cached:
+        return 200, "image/jpeg", cached
+    if thumb and _vt.is_informative_image(
+            thumb[0], suspect_tiny_bytes=_vt.TINY_POSTER_SUSPECT_BYTES):
+        return 200, thumb[1], thumb[0]           # plausible informative Drive thumbnail
+    try:
+        size = int(asset.get("size_bytes") or 0)
+    except (TypeError, ValueError):
+        size = 0
+    # Unknown (0/missing/unparseable) or over-cap declared size: never pull an
+    # unbounded original. Drive DOES report sizes for these assets.
+    if size <= 0 or size > _vt.MAX_SOURCE_BYTES:
+        return 404, "text/plain", b"not found"
+    import os as _os
+    import tempfile
+    with tempfile.TemporaryDirectory(prefix="gymthumbvid_") as tmp_dir:
+        tmp = _os.path.join(tmp_dir, "src.bin")
+        try:
+            drive.download(asset_id, tmp)
+        except Exception:  # noqa: BLE001
+            return 404, "text/plain", b"not found"
+        try:
+            actual = _os.path.getsize(tmp)
+        except OSError:
+            return 404, "text/plain", b"not found"
+        # Post-download verification: an empty or unexpectedly large payload
+        # is never handed to ffmpeg.
+        if actual <= 0 or actual > _vt.MAX_SOURCE_BYTES:
+            return 404, "text/plain", b"not found"
+        frame = _vt.representative_frame(tmp)
+    if not frame:
+        return 404, "text/plain", b"not found"   # fail closed, never fake it
+    if content_hash:
+        _vt.put_cached(ckey, frame)
+    return 200, "image/jpeg", frame
+
+
 # ---- GET /media/thumb/<asset_id> (gym-scoped proxy) --------------------------
 _PREVIEW_UNAVAILABLE = b'''<svg xmlns="http://www.w3.org/2000/svg" width="640" height="360" viewBox="0 0 640 360" role="img" aria-label="Preview unavailable"><rect width="640" height="360" fill="#121E3C"/><rect x="220" y="105" width="200" height="120" rx="12" fill="none" stroke="#5EB9E6" stroke-width="8"/><circle cx="275" cy="150" r="18" fill="#5EB9E6"/><path d="M235 210l62-55 40 35 31-25 37 45z" fill="#FAF6F0"/><text x="320" y="278" fill="#FAF6F0" font-family="Arial,sans-serif" font-size="24" text-anchor="middle">Preview unavailable</text></svg>'''
 
@@ -632,6 +684,11 @@ def handle_thumbnail(account_key, asset_id, *, store=None, drive=None,
         thumb = drive.thumbnail(asset_id)
     except Exception:  # noqa: BLE001
         thumb = None
+
+    is_video = (str(asset.get("kind") or "") == "video"
+                or str(asset.get("mime_type") or "").startswith("video/"))
+    if is_video:
+        return _video_thumbnail(gym, asset_id, asset, drive, thumb)
     if thumb:
         data, ctype = thumb
         return 200, ctype, data
