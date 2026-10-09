@@ -126,7 +126,12 @@ def _run_infographic(monkeypatch, enabled):
     out = infographic.fill_gaps(
         "gymx", _gym_account(), store, voice=_voice(),
         now="2026-10-04T12:00:00-04:00", days_ahead=2, max_per_run=2)
-    assert out["ok"] is True and out["filled"] == 2, out
+    # Generated infographic cards are intentionally held until a trusted
+    # hosted-byte receipt authority exists. Keep returning the outcome so the
+    # tests can assert the safety boundary without weakening it.
+    assert out["ok"] is True and out["filled"] == 0, out
+    assert "generated cards held" in (out.get("reason") or ""), out
+    assert store.inserted == []
     return store.inserted
 
 
@@ -148,20 +153,10 @@ def _assert_uuid(value):
     assert str(uuid.UUID(value)) == value
 
 
-def test_enabled_infographic_insert_shares_ids_only_for_explicit_fb_mirrors(
+def test_enabled_infographic_generation_is_held_without_trusted_receipt(
         monkeypatch, writer_environment):
     rows = _run_infographic(monkeypatch, True)
-    instagram = [row for row in rows if row["account"] == "instagram"]
-    facebook = [row for row in rows if row["account"] == "facebook"]
-    assert len(instagram) == len(facebook) == 2
-    ids_by_day = {}
-    for row in rows:
-        _assert_uuid(row["logical_post_id"])
-        ids_by_day.setdefault(row["post_date"], {})[row["account"]] = row["logical_post_id"]
-    assert len(ids_by_day) == 2
-    for pair in ids_by_day.values():
-        assert pair["instagram"] == pair["facebook"]
-    assert len({pair["instagram"] for pair in ids_by_day.values()}) == 2
+    assert rows == []
 
 
 def test_enabled_no_media_insert_assigns_distinct_ids_per_generated_row(
@@ -178,7 +173,11 @@ def test_flag_off_preserves_legacy_insert_shapes_for_both_writers(
         monkeypatch, writer_environment):
     infographic_rows = _run_infographic(monkeypatch, False)
     no_media_rows = _run_no_media(monkeypatch, False)
-    assert infographic_rows and no_media_rows
+    # The infographic writer holds generated cards regardless of the logical
+    # identity flag; the no-media writer has a valid insert path for checking
+    # the legacy payload shape while that flag is off.
+    assert infographic_rows == []
+    assert no_media_rows
     assert all("logical_post_id" not in row
                for row in infographic_rows + no_media_rows)
 
