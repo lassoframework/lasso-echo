@@ -145,7 +145,7 @@ def _reviewed_artifact_rows(store, source_id, source_hash, account_key):
         params = {"tenant": f"eq.{account_key}",
                   "source_identity->>source_id": _eq(source_id),
                   "source_identity->>source_hash": _eq(source_hash),
-                  "select": "image_url,evidence,source_identity",
+                  "select": "tenant,image_url,image_sha256,evidence,source_identity",
                   "order": "image_url.asc",
                   "limit": str(ARTIFACT_LOOKUP_PAGE)}
         if cursor is not None:
@@ -276,7 +276,7 @@ def _reuse_ig_for_fb(store, fb_row):
         response = store._client().get(
             store._rest("echo_infographic_artifacts"),
             params={"tenant": f"eq.{ACCOUNTS['facebook']}", "image_url": _eq(url),
-                    "select": "image_url,evidence,source_identity", "limit": "2"},
+                    "select": "tenant,image_url,image_sha256,evidence,source_identity", "limit": "2"},
             headers=store._headers(), timeout=30)
         if response.status_code >= 400:
             raise RuntimeError("FB reviewed artifact lookup failed")
