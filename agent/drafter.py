@@ -11,6 +11,8 @@ be constrained to the voice doc + client note and stay inside the same contract.
 
 import hashlib
 import os
+import re
+import uuid
 from dataclasses import dataclass, field
 from datetime import date
 from enum import Enum
@@ -112,7 +114,80 @@ class Draft:
     # mirror's delete/reinsert cycle keeps one immutable identity per draft. Empty
     # until stamped; never inferred from date/photo/caption.
     logical_post_id: str = ""
+    # GENERATED-CLIENT CONTRACT (2026-10-09, frozen package): portal draft contract
+    # fields for an AI-generated card. creative_origin is "" for every ordinary
+    # photo / library / caption-only draft (unchanged); "generated" marks a card
+    # whose creative was generated. The version id is a UUID bound to ONE immutable
+    # artifact rendition (a replacement renders a NEW version); the SHA is the
+    # lowercase 64-hex digest of the exact delivered bytes. generated_receipt is
+    # the TRUSTED immutable receipt row (gym, version, hosted URL, delivered SHA,
+    # render manifest, receipt id) that ONLY a trusted hosted-byte readback writer
+    # may create. Empty receipt means UNVERIFIED: no consumer may treat the local
+    # bytes as proof of the hosted bytes, so every consumer holds the card.
+    creative_origin: str = ""
+    generated_artifact_version_id: str = ""
+    generated_artifact_sha256: str = ""
+    generated_receipt: dict = field(default_factory=dict)
 
+
+CREATIVE_ORIGIN_GENERATED = "generated"
+_GENERATED_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+# The exact trusted-receipt row shape, documented for the FUTURE trusted
+# hosted-byte readback writer. While no such authority exists no receipt is
+# ever consulted: generated_hold_reason holds every generated card.
+GENERATED_RECEIPT_KEYS = frozenset(
+    {"receipt_id", "gym_id", "artifact_version_id", "hosted_url",
+     "delivered_sha256", "render_manifest"})
+
+
+def _generated_identity_present(draft):
+    """True when ANY generated-contract field is set, even partially. A draft
+    with version/SHA/receipt but no creative_origin marker is a partial
+    generated identity and must fail closed, never read as an ordinary photo."""
+    if (getattr(draft, "creative_origin", "") or "").strip():
+        return True
+    if (getattr(draft, "generated_artifact_version_id", "") or "").strip():
+        return True
+    if (getattr(draft, "generated_artifact_sha256", "") or "").strip():
+        return True
+    if str(getattr(draft, "source_media_asset_id", "") or "").strip().startswith(
+            "generated-astra:"):
+        return True
+    receipt = getattr(draft, "generated_receipt", None)
+    return isinstance(receipt, dict) and bool(receipt)
+
+
+def generated_hold_reason(draft):
+    """Fail-closed generated-card gate. Returns None only when the draft carries
+    NO generated identity at all (an ordinary photo/library/caption-only draft).
+    Every generated or partially-generated card HOLDS.
+
+    UNCONDITIONAL HOLD (safety repair, 2026-10-09): there is NO trusted
+    hosted-byte readback writer or receipt lookup in production, so a
+    producer-supplied generated_receipt -- even one whose shape binds gym,
+    version, hosted URL and delivered SHA exactly -- is not proof of the hosted
+    bytes. Independent review confirmed a fabricated receipt id, inaccessible
+    URL and invented manifest passed shape validation. Until a real trusted
+    authority exists, every generated card holds before calendar insert; no
+    bypass flag is added and no test fixture is treated as authority."""
+    origin = (getattr(draft, "creative_origin", "") or "").strip()
+    if not origin:
+        if _generated_identity_present(draft):
+            return ("partial generated identity without creative_origin "
+                    "(fail closed)")
+        return None
+    if origin != CREATIVE_ORIGIN_GENERATED:
+        return f"unsupported creative_origin {origin!r}"
+    version = (getattr(draft, "generated_artifact_version_id", "") or "").strip()
+    try:
+        version = str(uuid.UUID(version))
+    except (ValueError, AttributeError, TypeError):
+        return "generated card carries no valid artifact version id"
+    sha = (getattr(draft, "generated_artifact_sha256", "") or "").strip()
+    if not _GENERATED_SHA256_RE.fullmatch(sha):
+        return "generated card carries no valid delivered sha256"
+    return ("generated card held: no trusted hosted-byte receipt authority is "
+            "deployed, so a producer-supplied receipt is not proof")
 
 def _make_id(account_key, creative_path, scheduled_for):
     h = hashlib.sha1(f"{account_key}|{creative_path}|{scheduled_for}".encode()).hexdigest()
