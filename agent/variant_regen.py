@@ -126,6 +126,33 @@ def _lasso_caption_brief(row):
     return headline, [caption]
 
 
+def _owned_story_caption_fields(row, headline, facts, cta):
+    """Split an owned LASSO caption into headline / body facts / CTA so the
+    separate Story render fields don't duplicate copy the caption carries once.
+
+    Allocates only when the canonical paragraphs reconstruct the raw caption
+    byte-for-byte (headline = first, CTA = last, at least one nonempty body
+    paragraph between), the raw caption has no leading/trailing whitespace, and
+    no paragraph changes under .strip(). Indexed first/tail removal preserves
+    intentional repeats inside the body. Any mismatch returns the inputs
+    unchanged."""
+    caption = str(row.get("caption") or "")
+    if not caption or not cta or caption != caption.strip() or facts != [caption]:
+        return headline, facts, cta
+    paragraphs = caption.split("\n\n")
+    if len(paragraphs) < 3:
+        return headline, facts, cta
+    body = [p for i, p in enumerate(paragraphs)
+            if i not in (0, len(paragraphs) - 1)]
+    if (paragraphs[0] != headline or paragraphs[-1] != cta
+            or any(not p for p in paragraphs)
+            or any(p != p.strip() for p in paragraphs)
+            or not any(p.strip() for p in body)
+            or "\n\n".join([headline, *body, cta]) != caption):
+        return headline, facts, cta
+    return headline, body, cta
+
+
 def _caption_approved_cta(caption):
     """Render a Brain CTA only when this scheduled caption actually contains it."""
     try:
@@ -176,7 +203,10 @@ def generate_variant_image(row, account_key, client=None, generate_fn=None,
     gen = generate_fn or _default_generate
     # The caption remains the source of claim text. A CTA must already occur in
     # that caption; None lets creative_studio render its approved URL footer.
-    extra = ({"cta": _caption_approved_cta(str(row["caption"])),
+    cta = _caption_approved_cta(str(row["caption"])) if lasso_quality else ""
+    if lasso_quality and is_story:
+        headline, facts, cta = _owned_story_caption_fields(row, headline, facts, cta)
+    extra = ({"cta": cta,
               "footer": None, "draft_id": str(row["id"])}
              if lasso_quality else {})
     if lasso_quality and is_story: extra["paired_feed_reference"]=paired_feed_reference
