@@ -129,6 +129,9 @@ class CheckCtx:
     observed_at: datetime        # timezone-aware clock owned by the observer
     ticket_id: str = ''
     receipt_read: object = None
+    thumbnail_probe: object = None
+    approved_cta_probe: object = None
+    job_status_probe: object = None
 
 
 def _parse_utc_timestamp(value):
@@ -578,7 +581,85 @@ def _check_media_swap_completed(ctx):
     return Observation(True, True, evidence)
 
 
+def automatic_reel_params_valid(params):
+    return (isinstance(params, dict) and set(params) == {'request_id', 'asset_ids', 'approved_cta'}
+            and isinstance(params.get('request_id'), str) and _PORTAL_GYM_ID.fullmatch(params['request_id'])
+            and isinstance(params.get('approved_cta'), str) and 1 <= len(params['approved_cta']) <= 120
+            and isinstance(params.get('asset_ids'), list) and 2 <= len(params['asset_ids']) <= 10
+            and all(isinstance(v, str) and _MEDIA_ID.fullmatch(v) for v in params['asset_ids'])
+            and len(set(params['asset_ids'])) == len(params['asset_ids']))
+
+
+def _check_automatic_reel_and_thumbnails_ready(ctx):
+    """Reported status and picker previews are repaired; safety holds may remain."""
+    if not automatic_reel_params_valid(ctx.params):
+        raise CheckRefused('bad_params')
+    gym = _resolve_echo_gym_key(ctx.read, ctx.gym_key)
+    rid, ids = ctx.params['request_id'], ctx.params['asset_ids']
+    statuses = _read_rows(ctx, 'auto_reel_status', {
+        'gym_id':f'eq.{gym}', 'select':'gym_id,snapshot,updated_at', 'limit':'2'}, 2)
+    if len(statuses) != 1 or statuses[0].get('gym_id') != gym:
+        raise CheckUnavailable('reel_status_unavailable')
+    stamp = _parse_utc_timestamp(statuses[0].get('updated_at'))
+    if not 0 <= (ctx.observed_at - stamp).total_seconds() <= 900:
+        raise CheckUnavailable('reel_status_stale')
+    snapshot = statuses[0].get('snapshot') or {}
+    if snapshot.get('gym') != gym or snapshot.get('ok') is not True:
+        raise CheckUnavailable('reel_status_unavailable')
+    jobs = [j for j in snapshot.get('jobs', []) if isinstance(j, dict) and j.get('request_id') == rid]
+    if len(jobs) != 1 or jobs[0].get('status') not in {'staged', 'running', 'held', 'uncertain', 'exhausted', 'waiting_pool'}:
+        return Observation(True, False, f'reel:{rid}:status_unknown', 'reel_status_unknown')
+    if not callable(ctx.job_status_probe):
+        raise CheckUnavailable('worker_status_reader_unavailable')
+    actual = ctx.job_status_probe(gym, rid)
+    if not isinstance(actual, dict) or actual.get('request_id') != rid:
+        raise CheckUnavailable('worker_status_unavailable')
+    status_fields = ('status', 'reason', 'updated_at', 'clip_count', 'next_attempt_at')
+    if any(actual.get(field) != jobs[0].get(field) for field in status_fields):
+        raise CheckUnavailable('worker_mirror_status_mismatch')
+    # A truthful stopped label alone cannot certify that the reported CTA bug
+    # was repaired. Require a new authoritative outcome beyond those exact copy
+    # failures; distinct framing/media safety holds remain explicit follow-ups.
+    if re.search(r'end-frame carries 0 ask\(s\)|no approved gym call to action|'
+                 r'caption needs (?:exactly one approved|its single approved)|'
+                 r'approved call to action violates', str(actual.get('reason') or ''), re.I):
+        return Observation(True, False, f'reel:{rid}:cta_failure_remaining',
+                           'original_cta_failure_remaining')
+    from .story_studio_routes import _automatic_job_for_client
+    projected = _automatic_job_for_client(jobs[0])
+    if projected is None or re.search(r'team|reviewing', projected.get('reason', ''), re.I):
+        return Observation(True, False, f'reel:{rid}:status_claim_unsafe', 'status_claim_unsafe')
+    ask = ctx.params['approved_cta']
+    if not callable(ctx.approved_cta_probe):
+        raise CheckUnavailable('approved_cta_reader_unavailable')
+    approved = ctx.approved_cta_probe(gym, ask)
+    if approved is None:
+        raise CheckUnavailable('approved_cta_unavailable')
+    if approved is not True:
+        return Observation(True, False, f'reel:{rid}:cta_unapproved', 'cta_not_approved')
+    if not callable(ctx.thumbnail_probe):
+        raise CheckUnavailable('thumbnail_probe_unavailable')
+    for asset_id in ids:
+        assets = _read_rows(ctx, 'media_asset', {'id':f'eq.{asset_id}', 'gym_id':f'eq.{gym}',
+            'select':','.join(_MEDIA_FIELDS), 'limit':'2'}, 2)
+        if (len(assets) != 1 or assets[0].get('id') != asset_id or assets[0].get('gym_id') != gym):
+            raise CheckUnavailable('clip_scope_unavailable')
+        if assets[0].get('kind') != 'video' or not gym_media_selector.is_usable(assets[0]):
+            return Observation(True, False, f'reel:{rid}:clip_unavailable', 'clip_not_usable')
+        result = ctx.thumbnail_probe(gym, asset_id)
+        if result is None:
+            raise CheckUnavailable('thumbnail_unavailable')
+        if result is not True:
+            return Observation(True, False, f'reel:{rid}:thumbnail_failed', 'thumbnail_not_image')
+    return Observation(True, True, f'reel:{rid}:{projected["status"]}:{len(ids)}_thumbnails')
+
+
 CHECKS = MappingProxyType({
+    'automatic_reel_and_thumbnails_ready': CheckSpec(
+        'automatic_reel_and_thumbnails_ready', _check_automatic_reel_and_thumbnails_ready,
+        params={'request_id':'original automatic reel UUID', 'asset_ids':'exact source clips',
+                'approved_cta':'exact independently verified approved offer'},
+        description='current original reel status is truthful and same-tenant picker thumbnails respond as images; does not prove reel completion'),
     'story_calendar_media_ready': CheckSpec(
         'story_calendar_media_ready', _check_story_calendar_media_ready,
         params={'row_id': 'confirmed shared Story row UUID',
@@ -700,7 +781,8 @@ def _observe(check_id, *, gym_key, request_key, merged_sha, params=None, deps=No
     ctx = CheckCtx(gym_key=gym_key, request_key=request_key, merged_sha=merged_sha,
                    params=params, read=read, observed_at=captured,
                    ticket_id=ticket_id if isinstance(ticket_id, str) else '',
-                   receipt_read=deps.get('receipt_read'))
+                   receipt_read=deps.get('receipt_read'), thumbnail_probe=deps.get('thumbnail_probe'),
+                   approved_cta_probe=deps.get('approved_cta_probe'), job_status_probe=deps.get('job_status_probe'))
     try:
         seen = spec.run(ctx)
     except CheckRefused as refused:
