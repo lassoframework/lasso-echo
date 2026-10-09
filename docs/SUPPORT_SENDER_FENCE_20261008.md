@@ -64,13 +64,16 @@ follow-up routing and hold-card helpers are admitted separately. A new paused ev
 returns `support_sender_paused` with its captured ticket and no outbound rows;
 inbound event deduplication remains effective.
 
-**PARTIAL / release blocker:** resume does not automatically replay captured inbound
-events. The listener submits only newly received events, and an exact duplicate is
-ignored before dispatch. The client DM poll covers only a subset of those requests
-and cannot establish generic question/code-fix/staff request replay. A durable,
-request-bound pending/replay path must be implemented and verified before accepting
-this adapter pause/resume capability. The producer guards alone are not full intake
-continuity proof.
+**PARTIAL / release blocker:** `DRAFT_support_slack_replay_20261009.sql` now
+implements durable, request-bound capture and replay of paused inbound events.
+The source-aware replay safety check uses actual inbound/context evidence rather
+than nonexistent ticket STOP/DND/takeover columns, and the claim and commit
+paths recheck that evidence. This remains draft local code: the SQL is unapplied
+and pause/resume continuity has not been proved against the live worker fleet.
+Before enabling the fence, stop or deny every old sender owner, reconcile
+ambiguous durable claims, apply and verify the scoped replay SQL, and collect
+same-generation process receipts. Producer guards and a local replay test do
+not establish production intake continuity by themselves.
 
 The production `record_outbound` call-site census is:
 
