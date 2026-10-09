@@ -405,6 +405,11 @@ def _business_evidence_deps(bus, check_id=None):
         return get(table, params)
 
     deps = {"read": read}
+    if check_id == "automatic_reel_and_thumbnails_ready":
+        from ..support_thumbnail_probe import probe_thumbnail, probe_approved_cta, probe_job_status
+        deps["thumbnail_probe"] = probe_thumbnail
+        deps["approved_cta_probe"] = probe_approved_cta
+        deps["job_status_probe"] = probe_job_status
     if check_id == "media_swap_completed":
         # The Slack outbox runs on the Echo worker with its durable SQLite
         # volume. Keyed FIXER swaps intended for automatic closure must run on
