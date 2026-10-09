@@ -1,0 +1,11 @@
+{
+  "colors": [
+    "#DF2F4E",
+    "#0B1634",
+    "#000B27",
+    "#06090A",
+    "#FAFAFA"
+  ],
+  "source_url": "https://cdn.prod.website-files.com/623341b39323eec24ed01694/css/tough-temple.webflow.shared.aa8c41d68.min.css",
+  "source_note": "Tough Temple's official homepage (https://www.toughtemple.com/) links this Webflow stylesheet. Its :root tokens define --crimson:#DF2F4E, --midnight-blue:#0B1634, --black:#000B27, --text-colour:#06090A, and --white-text-colour:#FAFAFA. #DF2F4E is also used by .hero-button-2 and .register-btn."
+}
