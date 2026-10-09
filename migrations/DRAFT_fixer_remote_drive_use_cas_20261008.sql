@@ -148,10 +148,28 @@ do $$ declare obj record; grantee record; target text; begin
 end $$;
 grant execute on function public.fixer_remote_drive_use_apply_20261008(jsonb),public.fixer_remote_drive_use_receipt_20261008(jsonb)
  to fixer_inventory_mutator_20261008;
--- Owner-role inheritance cannot be repaired by REVOKE. Refuse installation
--- if any non-superuser mutator member retains effective raw access.
-do $$ declare principal record; target text; begin
+-- Pin the trusted installation identity to the accepted auth helper, rather
+-- than caller attributes or role membership. PG17 CREATEROLE automatically
+-- grants ADMIN membership; configured creator self-grants also add SET.
+-- Only that exact owner is exempt; inherited owner authority remains forbidden.
+do $$ declare principal record; target text; installation_owner oid; begin
+ select proowner into installation_owner from pg_proc
+  where oid='public.fixer_inventory_mutator_check_private_20261008()'::regprocedure;
+ if installation_owner is null
+  or (select proowner from pg_proc where oid=
+   'public.fixer_inventory_protocol_lock_private_20261008()'::regprocedure) is distinct from installation_owner
+  or exists(select 1 from pg_class where oid=any(array[
+   'public.fixer_remote_drive_use_20261008'::regclass,
+   'public.fixer_remote_drive_use_control_20261008'::regclass,
+   'public.fixer_remote_drive_version_20261008'::regclass]) and relowner<>installation_owner)
+  or exists(select 1 from pg_proc where oid=any(array[
+   'public.fixer_remote_drive_version_private_20261008()'::regprocedure,
+   'public.fixer_remote_drive_use_immutable_20261008()'::regprocedure,
+   'public.fixer_remote_drive_use_apply_20261008(jsonb)'::regprocedure,
+   'public.fixer_remote_drive_use_receipt_20261008(jsonb)'::regprocedure]) and proowner<>installation_owner) then
+  raise exception 'remote drive installation owner mismatch' using errcode='42501'; end if;
  for principal in select oid,rolname from pg_roles where not rolsuper
+  and oid<>installation_owner
   and pg_has_role(oid,'fixer_inventory_mutator_20261008','member') loop
   foreach target in array array['public.fixer_remote_drive_use_20261008',
    'public.fixer_remote_drive_use_control_20261008'] loop

@@ -34,7 +34,7 @@ def pg(request):
         temp=Path(tmp)
         socket=temp/'socket'; socket.mkdir()
         port=random.randint(41000,59000)
-        subprocess.run([str(PG/'initdb'),'-D',str(temp/'data'),'-U','postgres','--no-sync'],check=True,capture_output=True,timeout=60)
+        subprocess.run([str(PG/'initdb'),'-D',str(temp/'data'),'-U','bootstrap','--no-sync'],check=True,capture_output=True,timeout=60)
         subprocess.run([str(PG/'pg_ctl'),'-D',str(temp/'data'),'-l',str(temp/'log'),'-o',f"-k {socket} -p {port} -c listen_addresses=''",'-w','start'],check=True,capture_output=True,timeout=60)
         connections=[]
         try:
@@ -42,15 +42,24 @@ def pg(request):
                 c=psycopg.connect(f'host={socket} port={port} dbname=postgres user={role}',autocommit=autocommit)
                 connections.append(c)
                 return c
-            admin=connect()
-            admin.execute('''create role anon;create role authenticated;create role service_role login bypassrls;
-            create role fixer_inventory_mutator_20261008 nologin;
+            bootstrap=connect('bootstrap')
+            bootstrap.execute('''create role postgres login nosuperuser createrole createdb;
+            grant all on schema public to postgres;
+            create role anon;create role authenticated;create role service_role login bypassrls;
             create role fixer_forward_media_owner_20261006 nologin;
             create role fixer_forward_media_attester_20261006 nologin;
             create role generated_authority_publisher_20261007 nologin;
             create role generated_send_reconciler_20261007 nologin;
-            create role writer login;grant fixer_inventory_mutator_20261008 to writer;
-            create role mixed login;grant fixer_inventory_mutator_20261008,service_role to mixed;
+            create role writer login;create role mixed login;
+            create role inherited_acl nologin;
+            create role other_owner nologin;
+            grant service_role to mixed;''')
+            admin=connect()
+            # Match production PG17's non-superuser CREATEROLE installation:
+            # Its role setting adds ADMIN/SET, non-INHERIT creator membership.
+            admin.execute("set createrole_self_grant='set'")
+            admin.execute('''create role fixer_inventory_mutator_20261008 nologin noinherit;
+            grant fixer_inventory_mutator_20261008 to writer,mixed;
             create table fixer_inventory_generation_20261008(gym_id text primary key,generation bigint not null);
             create table fixer_still_cutover_20261007(singleton boolean primary key,enabled boolean,epoch_id uuid);
             create table media_source(id text primary key,gym_id text,kind text,active boolean,folder_id text);
@@ -70,23 +79,41 @@ def pg(request):
             before=admin.execute("select oid,prosrc,proacl::text from pg_proc where proname like 'fixer_inventory_%' order by oid").fetchall()
             # Reproduce hostile creator default ACLs, including transitive
             # privileges inherited by the mutator through another group role.
-            admin.execute('''create role inherited_acl nologin;
-             grant inherited_acl to fixer_inventory_mutator_20261008;
+            bootstrap.execute('grant inherited_acl to fixer_inventory_mutator_20261008 with inherit true')
+            admin.execute('''
              alter default privileges grant all on tables to fixer_inventory_mutator_20261008,inherited_acl,writer,service_role;
              alter default privileges grant all on sequences to fixer_inventory_mutator_20261008,inherited_acl,writer,service_role;
              alter default privileges grant all on functions to fixer_inventory_mutator_20261008,inherited_acl,writer,service_role;''')
-            if getattr(request,'param',None)=='owner_inherited':
-                admin.execute('grant postgres to fixer_inventory_mutator_20261008')
-                with pytest.raises(psycopg.Error,match='retains raw table authority'):
-                    admin.execute(MIGRATION.read_text())
-                admin.execute('rollback')
+            failure=getattr(request,'param',None)
+            if failure=='owner_inherited':
+                bootstrap.execute('grant postgres to writer with inherit true')
+            elif failure=='lock_owner_mismatch':
+                bootstrap.execute('alter function fixer_inventory_protocol_lock_private_20261008() owner to other_owner')
+            elif failure=='new_object_owner_mismatch':
+                # Run installation with a different creator while the accepted
+                # auth helper remains owned by postgres. This must not bless
+                # current_user as the installation identity.
+                bootstrap.execute('grant all on media_source,media_asset to bootstrap')
+            if failure:
+                installer=bootstrap if failure=='new_object_owner_mismatch' else admin
+                message='retains raw table authority' if failure=='owner_inherited' else 'installation owner mismatch'
+                with pytest.raises(psycopg.Error,match=message) as denied:
+                    installer.execute(MIGRATION.read_text())
+                assert denied.value.sqlstate=='42501'
+                installer.execute('rollback')
                 assert admin.execute(
                  "select to_regclass('public.fixer_remote_drive_use_20261008')").fetchone()==(None,)
                 assert admin.execute(
                  "select to_regclass('public.fixer_remote_drive_version_20261008')").fetchone()==(None,)
+                assert admin.execute("select count(*) from pg_attribute where attrelid in ('media_asset'::regclass,'media_source'::regclass) and attname='drive_use_version'").fetchone()==(0,)
+                assert admin.execute("select count(*) from pg_proc where proname like 'fixer_remote_drive_%'").fetchone()==(0,)
                 yield None
                 return
             admin.execute(MIGRATION.read_text())
+            assert admin.execute("select rolsuper,rolcreaterole from pg_roles where rolname='postgres'").fetchone()==(False,True)
+            # PG17 records the automatic ADMIN grant and optional self SET
+            # grant separately, with different grantors. Inspect both rows.
+            assert admin.execute("select admin_option,inherit_option,set_option from pg_auth_members where roleid='fixer_inventory_mutator_20261008'::regrole and member='postgres'::regrole order by admin_option").fetchall()==[(False,False,True),(True,False,False)]
             assert before==admin.execute("select oid,prosrc,proacl::text from pg_proc where proname like 'fixer_inventory_%' order by oid").fetchall()
             epoch=uuid.uuid4()
             admin.execute('insert into fixer_still_cutover_20261007 values(true,true,%s)',(epoch,))
@@ -131,7 +158,7 @@ def test_atomic_idempotent_and_stale_cas(pg):
     assert rpc(writer,'fixer_remote_drive_use_receipt_20261008',r)==receipt
     assert rpc(writer,'fixer_remote_drive_use_apply_20261008',r)==receipt
     # Neither service-role nor a mixed writer nor a superuser session can use RPC.
-    for role in ('service_role','mixed','postgres'):
+    for role in ('service_role','mixed','bootstrap'):
         with pytest.raises(psycopg.Error):
             rpc(connect(role),'fixer_remote_drive_use_apply_20261008',r)
     with pytest.raises(psycopg.Error):
@@ -273,6 +300,6 @@ def test_default_and_inherited_acl_scrub_and_immutable_owner_dml(pg):
     assert admin.execute("select drive_use_version>0 from media_asset where id='new'").fetchone()==(True,)
 
 
-@pytest.mark.parametrize('pg',['owner_inherited'],indirect=True)
+@pytest.mark.parametrize('pg',['owner_inherited','lock_owner_mismatch','new_object_owner_mismatch'],indirect=True)
 def test_installation_holds_unrevokable_owner_inheritance(pg):
     assert pg is None
