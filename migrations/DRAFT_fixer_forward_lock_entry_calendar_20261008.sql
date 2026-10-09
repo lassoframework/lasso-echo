@@ -26,7 +26,9 @@
 --   granted. Child 1 should CALL this helper for the same entry sequence.
 --
 -- Function text: each CREATE OR REPLACE below is the exact frozen production
--- definition from evidence/portal-function-definitions-20261008.sql with ONLY
+-- definition from evidence/portal-function-definitions-20261008.sql (except
+-- claim_calendar_publish_slot_owned, frozen from the complete live October 7
+-- catchup migration lasso_october7_catchup_capacity_20261008.sql) with ONLY
 -- the entry-lock call inserted at the top of the body (and, for
 -- approve_calendar_row_if_media_ready, a LANGUAGE sql -> plpgsql wrapper so
 -- the lock can precede its single UPDATE; the UPDATE statement, its embedded
@@ -44,8 +46,11 @@
 -- md5(p.prosrc)). Any production drift -- body edit, drop, or a duplicate
 -- overload -- raises 23514 and rolls the transaction back before any replace.
 --
--- Rollback before use: restore the frozen definitions from the evidence file
--- and drop public.fixer_forward_calendar_entry_lock_20261008().
+-- Rollback before use: restore claim_calendar_publish_slot_owned from the
+-- complete migrations/lasso_october7_catchup_capacity_20261008.sql so its
+-- October 7 capacity-six behavior is preserved. Restore the other five frozen
+-- definitions from evidence/portal-function-definitions-20261008.sql, then
+-- drop public.fixer_forward_calendar_entry_lock_20261008().
 begin;
 
 -- PRECONDITION GUARD: frozen production definitions (abort on any drift).
@@ -68,7 +73,7 @@ begin
       ('calendar_recover_unproved_approval', '7c509400fe0322d87f8c39b2d0254edd', 'p_row_id uuid, p_gym_id text, p_expected jsonb'),
       ('calendar_stamp_verified_approval', '704fb687d1126d6904dd4cfcaa6fe2ce', 'p_gym_id uuid, p_calendar_id uuid, p_clerk_actor_id text, p_echo_approval_digest text'),
       ('claim_calendar_gbp_publish_owned', '5dc70ca074016626f32af9772696b241', 'p_row_id uuid, p_gym_id text'),
-      ('claim_calendar_publish_slot_owned', 'db59bf4d6d0be4c42e5e49ab0b5a8b4f', 'p_row_id uuid, p_gym_id text, p_day date, p_timezone text, p_capacity integer, p_approved_only boolean, p_require_approval_proof boolean'),
+      ('claim_calendar_publish_slot_owned', 'c624eedcee819496129639108be991f6', 'p_row_id uuid, p_gym_id text, p_day date, p_timezone text, p_capacity integer, p_approved_only boolean, p_require_approval_proof boolean'),
       ('content_calendar_swap_variant', '548886200ea1a64ad6147f7504ec4e00', 'p_gym_id text, p_candidate_id uuid, p_actor text')
     ) as f(proname, body_md5, identity_args)
   loop
@@ -364,7 +369,7 @@ begin
   perform public.fixer_forward_calendar_entry_lock_20261008();
   if p_capacity is null or p_approved_only is null
       or p_require_approval_proof is null
-      or p_capacity < 1 or (p_capacity > 3 and p_capacity not in (5, 15))
+      or p_capacity < 1 or (p_capacity > 3 and p_capacity not in (5, 6, 15))
       or p_day is null or p_timezone is null
       or nullif(btrim(p_gym_id), '') is null then
     return null;
@@ -381,6 +386,12 @@ begin
   if p_capacity = 15 and not (
       p_gym_id = 'lasso'
       and p_day between date '2026-10-05' and date '2026-10-06'
+      and p_timezone = 'America/New_York') then
+    return null;
+  end if;
+  if p_capacity = 6 and not (
+      p_gym_id = 'lasso'
+      and p_day between date '2026-10-08' and date '2026-10-09'
       and p_timezone = 'America/New_York') then
     return null;
   end if;
@@ -418,12 +429,12 @@ begin
   if v_enforce_proof and v_row.status <> 'approved' then
     return null;
   end if;
-  if p_capacity in (5, 15) and
+  if p_capacity in (5, 6, 15) and
       (v_row.post_date is null
        or nullif(btrim(coalesce(v_row.account, '')), '') is null) then
     return null;
   end if;
-  if p_capacity in (3, 5, 15) and
+  if p_capacity in (3, 5, 6, 15) and
       coalesce(nullif(lower(btrim(v_row.format)), ''), 'feed') not in ('feed', 'story') then
     return null;
   end if;
@@ -436,6 +447,14 @@ begin
       v_row.post_date = p_day
       or (v_row.post_date between date '2026-10-02' and date '2026-10-05'
           and v_row.post_date < p_day)) then
+    return null;
+  end if;
+  if p_capacity = 6 and (
+      (v_row.post_date = p_day
+       or (v_row.post_date = date '2026-10-07' and v_row.post_date < p_day))
+      and lower(btrim(coalesce(v_row.account, ''))) in ('instagram', 'facebook')
+      and lower(btrim(v_row.format)) in ('feed', 'story')
+      and v_row.slot_index in (0, 1, 2)) is not true then
     return null;
   end if;
 
@@ -517,6 +536,30 @@ begin
                       (published_at at time zone p_timezone)::date = p_day))));
     if (v_row.post_date = p_day and v_current_used >= 3)
         or (v_row.post_date < p_day and v_backlog_used >= 12) then
+      return null;
+    end if;
+  end if;
+
+  if p_capacity = 6 then
+    -- Three current-day slots plus three October 7 backlog slots on the
+    -- October 8-9 publish days. The tenant advisory lock serializes both
+    -- class counts, and October 7 is strictly before either publish day.
+    select count(*) filter (where post_date = p_day),
+           count(*) filter (where post_date = date '2026-10-07')
+      into v_current_used, v_backlog_used
+      from public.content_calendar
+      where gym_id = p_gym_id
+        and lower(btrim(coalesce(account, ''))) =
+            lower(btrim(coalesce(v_row.account, '')))
+        and coalesce(nullif(lower(btrim(format)), ''), 'feed') =
+            coalesce(nullif(lower(btrim(v_row.format)), ''), 'feed')
+        and ((status = 'publishing' and publish_reservation_day = p_day)
+             or (status = 'published' and
+                 (publish_reservation_day = p_day
+                  or (published_at is not null and
+                      (published_at at time zone p_timezone)::date = p_day))));
+    if (v_row.post_date = p_day and v_current_used >= 3)
+        or (v_row.post_date < p_day and v_backlog_used >= 3) then
       return null;
     end if;
   end if;
