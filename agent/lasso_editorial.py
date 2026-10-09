@@ -226,7 +226,7 @@ def editorial_caption(draft):
         subject='Echo for your gym' if draft.category=='echo' else 'your gym website'
         caption=fragments[0]+'\n\n'+' '.join(fragments[1:])
         # LASSO Brain website-kb.md section 4: site-wide Growth Call CTA.
-        caption+='\n\nBook a call to talk about '+subject+': https://lassoframework.com/growth-call'
+        caption+='\n\nBook a call to talk about '+subject+', https://lassoframework.com/growth-call'
         if draft.hashtags:
             caption+='\n\n'+' '.join(draft.hashtags)
     elif '\n' not in caption:
