@@ -124,6 +124,26 @@ def finalizer_process(dsn, batch):
     print(json.dumps({'report': report, 'calls': transport.calls}))
 
 
+PORTAL_0611_FIXTURE = ROOT / 'tests' / 'fixtures' / 'portal_0611_echo_source_brand_bundle_held_20261008.sql'
+PORTAL_0611_FIXTURE_SHA256 = '5277e3d1192a56454f4a3233fb87756a24b1977ded898649c55883d06e1eb8ef'
+
+
+def portal_0611_fixture():
+    """Frozen test-only snapshot of the HELD portal 0611 source-brand migration.
+
+    Exact bytes of portal-brand-source-bundle-20261008 portal git HEAD 82c174c9
+    supabase/migrations/0611_echo_source_brand_bundle.sql, pinned by hash so a
+    changed real migration cannot silently alter this composition evidence.
+    This fixture is disposable-PG test evidence only: it is not deployed SQL,
+    not a production migration source, and the real 0611 remains held pending
+    the normal portal migration gate. See the PROVENANCE file beside it.
+    """
+    data = PORTAL_0611_FIXTURE.read_bytes()
+    assert hashlib.sha256(data).hexdigest() == PORTAL_0611_FIXTURE_SHA256, (
+        'portal 0611 test fixture drifted from the pinned held-migration snapshot')
+    return PORTAL_0611_FIXTURE
+
+
 def install_remaining(sql):
     """Actual assembled prerequisites, never stand-in authority functions."""
     # The prospective-photo fixture only declared the columns it exercised.
@@ -138,9 +158,7 @@ def install_remaining(sql):
                  'DRAFT_generated_source_palette_authority_20261007.sql',
                  'DRAFT_generated_send_lease_20261007.sql'):
         sql((ROOT / 'migrations' / name).read_text())
-    portal = ROOT.parent / 'portal-brand-source-bundle-20261008/supabase/migrations/0611_echo_source_brand_bundle.sql'
-    assert portal.is_file(), 'assembled portal source-brand migration required'
-    sql(portal.read_text())
+    sql(portal_0611_fixture().read_text())
     for name in ('DRAFT_fixer_generated_bundle_bridge_20261008.sql',
                  'DRAFT_fixer_generated_local_census_producer_20261008.sql',
                  'DRAFT_fixer_still_v2_owner_transport_20261008.sql',
@@ -253,12 +271,9 @@ def staged_gbp(sql, dsn, seed, store, epoch):
 
 
 def test_separate_finalizer_and_original_listener_recover_staged_drive_once(tmp_path):
-    # This cross-repository composition needs the actual portal 0611 SQL.
-    # Ordinary Echo CI has no sibling portal checkout, so keep the test
-    # explicitly unverified there rather than substituting synthetic SQL.
-    portal_sql = ROOT.parent / 'portal-brand-source-bundle-20261008/supabase/migrations/0611_echo_source_brand_bundle.sql'
-    if not portal_sql.is_file():
-        pytest.skip('cross-repository PG composition requires portal 0611 migration checkout')
+    # Uses the frozen test-only fixture snapshot of the held portal 0611
+    # migration (see portal_0611_fixture); no sibling portal checkout needed.
+    portal_0611_fixture()
     listener = tmp_path / 'listener'; listener.mkdir()
     library = listener / 'library'; (library / 'gym').mkdir(parents=True)
     env = {key: value for key, value in os.environ.items()
