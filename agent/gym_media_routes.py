@@ -590,11 +590,22 @@ def _flip_pending_using_asset(gym_id, asset_id):
 
 
 # ---- GET /media/thumb/<asset_id> (gym-scoped proxy) --------------------------
+_PREVIEW_UNAVAILABLE = b'''<svg xmlns="http://www.w3.org/2000/svg" width="640" height="360" viewBox="0 0 640 360" role="img" aria-label="Preview unavailable"><rect width="640" height="360" fill="#121E3C"/><rect x="220" y="105" width="200" height="120" rx="12" fill="none" stroke="#5EB9E6" stroke-width="8"/><circle cx="275" cy="150" r="18" fill="#5EB9E6"/><path d="M235 210l62-55 40 35 31-25 37 45z" fill="#FAF6F0"/><text x="320" y="278" fill="#FAF6F0" font-family="Arial,sans-serif" font-size="24" text-anchor="middle">Preview unavailable</text></svg>'''
+
+
+def _preview_unavailable():
+    """A visible, inert fallback for an owned asset whose bytes cannot be previewed."""
+    return 200, "image/svg+xml", _PREVIEW_UNAVAILABLE
+
+
 def handle_thumbnail(account_key, asset_id, *, store=None, drive=None,
                      host=None):
-    """GET /media/thumb/<asset_id> — Echo fetches the Drive thumbnail via the SA,
-    caches it by content_hash, and streams it. REFUSES a gym requesting another
-    gym's asset (§8 tenant isolation). Returns (status, content_type, bytes)."""
+    """GET /media/thumb/<asset_id> — Echo fetches the Drive thumbnail via the SA
+    and streams it. REFUSES a gym requesting another
+    gym's asset (§8 tenant isolation). Images fall back to original bytes only when
+    browsers can display that format. Videos without a Drive poster frame receive a
+    visible fallback card instead of an unusable full video response. Returns
+    (status, content_type, bytes)."""
     if not _armed(account_key):
         return 403, "text/plain", b"media connect is not enabled"
     store = store or _store()
@@ -611,7 +622,7 @@ def handle_thumbnail(account_key, asset_id, *, store=None, drive=None,
 
     drive = drive or _drive()
     if not drive.available():
-        return 404, "text/plain", b"not found"
+        return _preview_unavailable()
 
     # Prefer Drive's server-side thumbnail: a small, downsized JPEG rendition Google
     # generates for images AND video frames. Serving THAT (correctly typed image/jpeg)
@@ -625,8 +636,17 @@ def handle_thumbnail(account_key, asset_id, *, store=None, drive=None,
         data, ctype = thumb
         return 200, ctype, data
 
-    # Fallback: Drive made no thumbnail (rare). Stream the original, but label it with
-    # the asset's OWN mime type so the bytes are never mislabeled as something else.
+    # A video response cannot render in the image/poster slot that calls this route,
+    # and browsers do not display HEIC/HEIF originals consistently. Those formats
+    # require Drive's image rendition; make its absence visible instead of returning
+    # bytes the page cannot show.
+    asset_type = str(asset.get("mime_type") or "").lower()
+    if (not asset_type.startswith("image/")
+            or asset_type in ("image/heic", "image/heif")):
+        return _preview_unavailable()
+
+    # Fallback: Drive made no thumbnail (rare). Stream a browser-readable image
+    # original, labeled with its OWN mime type so bytes are never mislabeled.
     try:
         import tempfile
         import os as _os
@@ -643,6 +663,5 @@ def handle_thumbnail(account_key, asset_id, *, store=None, drive=None,
             except OSError:
                 pass
     except Exception:  # noqa: BLE001
-        return 404, "text/plain", b"not found"
-    ctype = asset.get("mime_type") or "application/octet-stream"
-    return 200, ctype, data
+        return _preview_unavailable()
+    return 200, asset_type, data

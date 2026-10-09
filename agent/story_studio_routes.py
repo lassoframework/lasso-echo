@@ -355,6 +355,40 @@ def _automatic_job_for_client(job):
     }
 
 
+def _automatic_snapshot_job_for_client(snapshot):
+    """Project a fleet-level outcome when no reserved job exists yet.
+
+    Some normal exits happen before ``auto_reels`` can assign a request id: no
+    eligible footage, an upload batch that has not settled, or a worker
+    prerequisite that is unavailable. Those outcomes live on the snapshot itself,
+    not in ``jobs``. Dropping them left the portal with an empty, otherwise healthy
+    response, so it substituted its generic team-review error even though no review
+    had been requested.
+    """
+    snapshot = snapshot if isinstance(snapshot, dict) else {}
+    internal_status = str(snapshot.get("status") or "").strip().lower()
+    internal_reason = str(snapshot.get("reason") or "").strip().lower()
+    if internal_status in ("", "idle", "active") and not internal_reason:
+        return None
+    if internal_status == "waiting" or "no settled new batch" in internal_reason:
+        status = "waiting_pool"
+        message = "Echo is waiting for a new group of usable clips. No reel is scheduled yet."
+    elif "no eligible raw footage" in internal_reason:
+        status = "waiting_pool"
+        message = "Upload at least three usable raw clips in Media so Echo can build a reel."
+    elif internal_status == "exhausted":
+        status = "exhausted"
+        message = "Echo stopped after reaching the retry limit. This reel is not scheduled."
+    else:
+        # Keep the public state vocabulary bounded to the statuses already consumed
+        # by the portal. The message distinguishes a prerequisite block from a job
+        # that actually used all of its retries.
+        status = "exhausted"
+        message = "Echo cannot build an automatic reel right now. No reel is scheduled."
+    return {"request_id": "", "status": status, "reason": message,
+            "updated_at": snapshot.get("updated_at"), "clip_count": 0}
+
+
 def _automatic_status_for_client(snapshot, upload_url=""):
     """Return only automatic-reel fields intended for a gym-facing page."""
     snapshot = snapshot if isinstance(snapshot, dict) else {}
@@ -367,16 +401,32 @@ def _automatic_status_for_client(snapshot, upload_url=""):
             jobs.append(projected)
         if len(jobs) >= 20:
             break
-    reason = ""
+    snapshot_job = (_automatic_snapshot_job_for_client(snapshot)
+                    if snapshot.get("ok", False) else None)
+    if not jobs and snapshot_job is not None:
+        jobs.append(snapshot_job)
     if not snapshot.get("ok", False):
+        status = "unavailable"
         reason = "Automatic reel status is temporarily unavailable."
+    elif snapshot_job is not None:
+        # This is the newest fleet pass and can be newer than every reserved job.
+        # Keep it at the top level even when history exists so the portal does not
+        # replace an empty reason with a generic review message.
+        status = snapshot_job["status"]
+        reason = snapshot_job["reason"]
+    elif jobs:
+        status = jobs[0]["status"]
+        reason = ""
+    else:
+        status, reason = "idle", ""
     action = {
         "url": str(upload_url or ""),
         "label": "Upload video clips",
         "received_means_indexed": False,
     }
     return {"enabled": True, "ok": bool(snapshot.get("ok", False)),
-            "reason": reason, "jobs": jobs, "upload_action": action}
+            "status": status, "reason": reason, "jobs": jobs,
+            "upload_action": action}
 
 
 def handle_list_stories(account_key, *, store=None, status=None, automatic_only=False,

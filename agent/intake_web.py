@@ -1923,6 +1923,39 @@ def handle_tracker(token, which="tracker"):
         return 404, b"not found"
 
 
+def _scope_media_preview_urls(payload, token):
+    """Bind media preview links to the authenticated Echo route that serves them.
+
+    The media and Story Studio handlers cannot include a portal token because they
+    operate on an already-resolved account key. Their historical ``/media/thumb``
+    links therefore named no real HTTP route: the proxy is mounted at
+    ``/portal/<token>/media/thumb/<asset>``. A browser on the separate portal origin
+    also resolved the relative link against the portal itself. Complete the URL only
+    at this token-aware transport boundary, without changing media ownership checks.
+    """
+    if not isinstance(payload, dict) or not token:
+        return payload
+    from urllib.parse import quote
+    base = (f"{_upload_base_url()}/portal/{quote(str(token), safe='')}/media/thumb")
+    scoped = dict(payload)
+    for collection in ("assets", "items"):
+        rows = payload.get(collection)
+        if not isinstance(rows, list):
+            continue
+        normalized = []
+        for raw in rows:
+            if not isinstance(raw, dict):
+                normalized.append(raw)
+                continue
+            row = dict(raw)
+            asset_id = str(row.get("id") or row.get("asset_id") or "").strip()
+            if asset_id:
+                row["thumb_url"] = f"{base}/{quote(asset_id, safe='')}"
+            normalized.append(row)
+        scoped[collection] = normalized
+    return scoped
+
+
 def build_server(port=None):
     """Build the HTTP server (bound, not serving). serve() runs it; tests bind
     port 0 and drive real requests against it without blocking."""
@@ -2279,6 +2312,7 @@ def build_server(port=None):
                     return self._send_json(body, status)
                 if mt_kind == "assets":
                     status, body = _gm.handle_list_assets(account_key)
+                    body = _scope_media_preview_urls(body, mt_token)
                     return self._send_json(body, status)
                 # thumb: a gym-scoped image proxy (status, content_type, bytes).
                 status, ctype, data = _gm.handle_thumbnail(account_key, mt_arg)
@@ -2344,6 +2378,7 @@ def build_server(port=None):
                 if account_key is None or is_revoked(account_key):
                     return self._deny(404)
                 status, body = _ss.handle_list_sort_queue(account_key)
+                body = _scope_media_preview_urls(body, ss_token)
                 return self._send_json(body, status)
 
             # Story Studio READ lane (2026-09-04): GET /portal/<token>/studio/story
