@@ -505,6 +505,41 @@ def _strict_json(raw):
         parse_constant=lambda _: (_ for _ in ()).throw(ValueError()))
 
 
+def _require_coherent_row_total(data, rows, *summary_keys):
+    """Every readable count claim in a response must equal the delivered rows.
+
+    A top-level ``total``/``count`` and each named summary wrapper's ``total``
+    are independent completeness claims for the same unpaginated row list.
+    Any present claim must be a non-negative integer exactly equal to
+    ``len(rows)``; a missing claim is not required, but a malformed or
+    contradictory one (e.g. summary.total=1 with accounts=[]) fails closed.
+    """
+    claims = []
+    for name in ('total', 'count'):
+        # Absent optional metadata is fine; a present field is a real
+        # completeness claim, so present null/type-invalid values hold.
+        if name not in data:
+            continue
+        claim = data[name]
+        if type(claim) is not int or claim < 0 or claim != len(rows):
+            _fail('authenticated_social_status_incomplete')
+        claims.append(claim)
+    for key in summary_keys:
+        if key not in data:
+            continue
+        summary = data[key]
+        if type(summary) is not dict:
+            _fail('authenticated_social_status_incomplete')
+        if 'total' in summary:
+            # summary.total present-but-null or type-invalid is a malformed
+            # count claim, not an absent one, and never proves a complete
+            # empty listing.
+            claim = summary['total']
+            if type(claim) is not int or claim < 0 or claim != len(rows):
+                _fail('authenticated_social_status_incomplete')
+            claims.append(claim)
+
+
 def _zernio_health_candidate(client, key, profile, clock):
     """Independent profile ownership/status authority: GET /v1/accounts/health.
 
@@ -521,10 +556,11 @@ def _zernio_health_candidate(client, key, profile, clock):
     Reuse of this profile's candidate account ID by any row with a different
     readable profile identity is conflicting ownership evidence and fails
     closed.
-    Returns (health_row_or_None,
-    observed_at, raw_bytes): None means this profile has no Instagram
-    candidate (missing or disconnected — never proof of disconnection).
-    Handle is never used to infer ownership.
+    Returns (health_row_or_None, observed_at, raw_bytes, instagram_rows):
+    a None row means this profile has no healthy Instagram candidate. An
+    empty instagram_rows is the only shape that may attempt the conservative
+    absence proof; a non-healthy row is present-but-unusable evidence, never
+    absence. Handle is never used to infer ownership.
     """
     response = client.get('https://api.zernio.com/v1/accounts/health',
         headers={'Authorization': 'Bearer ' + key}, timeout=30, allow_redirects=False)
@@ -537,6 +573,11 @@ def _zernio_health_candidate(client, key, profile, clock):
     if (not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows)
             or any(name in data for name in ('pagination', 'nextCursor', 'hasMore', 'next'))):
         _fail('authenticated_social_status_incomplete')
+    # Any count/completeness metadata must cohere with the unpaginated row
+    # list: a summary.total or total that disagrees with the delivered rows
+    # (e.g. total=1 with accounts=[]) is contradictory evidence, never a
+    # complete empty listing, and cannot support an absence proof.
+    _require_coherent_row_total(data, rows, 'summary')
     # Strict validation is scoped to rows for the requested profile. A row
     # whose readable profile identity differs can hold unrelated malformed
     # non-identity fields without holding this gym; a row whose profile
@@ -576,15 +617,17 @@ def _zernio_health_candidate(client, key, profile, clock):
         # Duplicate or conflicting Instagram rows for this exact profile hold.
         _fail('authenticated_social_identity_ambiguous_or_missing')
     if not instagram:
-        return None, observed_at, raw
+        return None, observed_at, raw, instagram
     row = instagram[0]
     if not re.fullmatch(r'[a-z0-9._]{1,30}', row['username']):
         _fail('authenticated_social_status_incomplete')
     if (row['status'] != 'healthy'
             or row['tokenValid'] is not True or row['needsReconnect'] is not False
             or row['canPost'] is not True):
-        return None, observed_at, raw
-    return row, observed_at, raw
+        # An Instagram row in any non-healthy state (unhealthy, reconnecting,
+        # expired) is present-but-unusable evidence, never absence.
+        return None, observed_at, raw, instagram
+    return row, observed_at, raw, instagram
 
 
 def _zernio_account_match(client, key, profile, health, clock):
@@ -645,6 +688,119 @@ def _zernio_account_match(client, key, profile, health, clock):
             or len(set(handles)) != 1 or handles[0] != health['username']):
         _fail('independent_social_id_evidence_missing')
     return ids[0], raw
+
+
+def _zernio_absence_evidence(client, key, profile, clock):
+    """Conservative proof of Instagram absence for the exact stored profile.
+
+    A complete authenticated negative requires all independent evidence to
+    agree that the exact stored profile has zero Instagram rows: the profile
+    itself must exist (authenticated GET /v1/profiles/{profileId} with a
+    matching _id), and the complete unpaginated profile-scoped account list,
+    requested with includeOverLimit=true and excludeHidden=false and no status
+    filter, must contain no Instagram row. The caller separately requires the
+    health authority to contain no Instagram row for this profile. Any
+    Instagram row in any state — healthy, unhealthy, reconnecting, expired,
+    over-limit or hidden — any profile mismatch, and any partial, paginated
+    or malformed response is a hold, never proof of absence.
+    Returns (profile_raw, accounts_raw).
+    """
+    response = client.get('https://api.zernio.com/v1/profiles/' + profile,
+        headers={'Authorization': 'Bearer ' + key}, timeout=30, allow_redirects=False)
+    profile_raw = response.content
+    if (response.status_code != 200 or type(profile_raw) is not bytes
+            or not 1 <= len(profile_raw) <= 2_000_000):
+        _fail('authenticated_social_status_unavailable')
+    data = _strict_json(profile_raw)
+    if (not isinstance(data, dict)
+            or any(name in data for name in ('pagination', 'nextCursor', 'hasMore', 'next'))):
+        _fail('authenticated_social_status_incomplete')
+    # Collect every readable profile identity claim in the envelope: a
+    # top-level _id plus any nested profile/data wrapper _id. Conflicting or
+    # duplicated identities (e.g. a matching top-level _id with a different
+    # nested profile._id) are ambiguous ownership evidence and hold; the
+    # single surviving identity must exactly equal the stored profile. The
+    # display name is never ownership evidence.
+    identities = []
+    if isinstance(data.get('_id'), str):
+        identities.append(data['_id'])
+    for name in ('profile', 'data'):
+        if name not in data:
+            continue
+        wrapper = data[name]
+        if (not isinstance(wrapper, dict)
+                or not isinstance(wrapper.get('_id'), str) or not wrapper['_id']):
+            # A present wrapper with a missing, null or type-invalid _id is a
+            # malformed secondary identity claim: it is held, never ignored.
+            _fail('authenticated_social_status_incomplete')
+        identities.append(wrapper['_id'])
+    if len(identities) != 1:
+        # None is partial data; more than one readable claim — conflicting
+        # or merely duplicated — is an ambiguous envelope and holds.
+        if not identities:
+            _fail('authenticated_social_status_incomplete')
+        _fail('authenticated_social_identity_ambiguous_or_missing')
+    if identities[0] != profile:
+        _fail('authenticated_social_profile_mismatch')
+    response = client.get('https://api.zernio.com/v1/accounts',
+        params={'profileId': profile, 'includeOverLimit': 'true',
+                'excludeHidden': 'false'},
+        headers={'Authorization': 'Bearer ' + key}, timeout=30, allow_redirects=False)
+    accounts_raw = response.content
+    if (response.status_code != 200 or type(accounts_raw) is not bytes
+            or not 1 <= len(accounts_raw) <= 2_000_000):
+        _fail('authenticated_social_status_unavailable')
+    data = _strict_json(accounts_raw)
+    accounts = data.get('accounts') if isinstance(data, dict) else None
+    if (not isinstance(accounts, list) or any(not isinstance(a, dict) for a in accounts)
+            or any(name in data for name in ('pagination', 'nextCursor', 'hasMore', 'next'))):
+        _fail('authenticated_social_status_incomplete')
+    # Count/completeness metadata must cohere with the delivered rows before
+    # zero Instagram rows can prove absence; a total that disagrees with the
+    # delivered list is contradictory evidence and holds.
+    _require_coherent_row_total(data, accounts, 'summary')
+    seen = set()
+    for a in accounts:
+        if (not isinstance(a.get('platform'), str)
+                or not re.fullmatch(r'[a-z][a-z0-9_]*', a['platform'])
+                or not isinstance(a.get('_id'), str) or not a['_id']):
+            _fail('authenticated_social_status_incomplete')
+        if a['_id'] in seen:
+            _fail('authenticated_social_identity_ambiguous_or_missing')
+        seen.add(a['_id'])
+        # A present scalar or populated profile identity must exactly match
+        # the stored profile; the display name is never ownership evidence.
+        if 'profileId' in a:
+            account_profile = a['profileId']
+            if isinstance(account_profile, dict):
+                account_profile = account_profile.get('_id')
+            if not isinstance(account_profile, str) or account_profile != profile:
+                _fail('authenticated_social_profile_mismatch')
+        if a['platform'] == 'instagram':
+            # Any Instagram row — over-limit, hidden, unhealthy or otherwise —
+            # contradicts absence and holds.
+            _fail('authenticated_social_identity_ambiguous_or_missing')
+    return profile_raw, accounts_raw
+
+
+def _zernio_absence_response_sha256(profile_raw, health_raw, accounts_raw):
+    """Bind the exact stored profile and all three absence-evidence responses.
+
+    Same versioned, domain-separated framing as
+    ``_zernio_identity_response_sha256``: fixed endpoint labels plus NUL, an
+    unsigned 8-byte big-endian response length, and the original response
+    bytes. JSON is never reserialized. Only a complete proven absence uses
+    this composite; a partial runtime receipt retains its single
+    health-response digest.
+    """
+    digest = hashlib.sha256(b'echo:zernio:absence-responses:v1\0')
+    for endpoint, raw in ((b'/v1/profiles/{profileId}', profile_raw),
+                          (b'/v1/accounts/health', health_raw),
+                          (b'/v1/accounts', accounts_raw)):
+        digest.update(endpoint + b'\0')
+        digest.update(len(raw).to_bytes(8, 'big'))
+        digest.update(raw)
+    return digest.hexdigest()
 
 
 def _zernio_identity_response_sha256(health_raw, accounts_raw):
@@ -724,25 +880,41 @@ class AuthenticatedZernioIdentityReader:
             # The health endpoint is the independent profile ownership/status
             # authority; the account list only supplies the numeric owner ID
             # and metadata for the exact health-matched account.
-            health, observed_at, health_raw = _zernio_health_candidate(
+            health, observed_at, health_raw, instagram_rows = _zernio_health_candidate(
                 client, key, profile, self._now)
             status.update(authenticated=True,
                           response_sha256=hashlib.sha256(health_raw).hexdigest(),
                           lookup_status='partial')
             if health is None:
-                # Missing or unhealthy evidence cannot establish a complete
-                # negative identity that would permit website-only capture.
-                _fail('authenticated_social_identity_ambiguous_or_missing')
-            platform_user_id, accounts_raw = _zernio_account_match(
-                client, key, profile, health, self._now)
-            identity = dict(connected=True, account_id=health['accountId'],
-                            platform_user_id=platform_user_id,
-                            handle=health['username'])
-            if self._now() - _timestamp(status['observed_at']) > timedelta(minutes=15):
-                _fail('authenticated_social_status_expired')
-            status.update(lookup_status='complete', instagram=identity,
-                          response_sha256=_zernio_identity_response_sha256(
-                              health_raw, accounts_raw))
+                if instagram_rows:
+                    # An Instagram row in any non-healthy state (unhealthy,
+                    # reconnecting, expired) is present evidence that always
+                    # holds; it is never proof of absence.
+                    _fail('authenticated_social_identity_ambiguous_or_missing')
+                # Zero Instagram rows in the health authority: only an exact
+                # stored-profile existence proof plus the complete over-limit/
+                # hidden-inclusive unpaginated account listing, all agreeing
+                # on zero Instagram rows, establishes a complete negative.
+                profile_raw, accounts_raw = _zernio_absence_evidence(
+                    client, key, profile, self._now)
+                if self._now() - _timestamp(status['observed_at']) > timedelta(minutes=15):
+                    _fail('authenticated_social_status_expired')
+                identity = dict(connected=False, account_id=None,
+                                platform_user_id=None, handle=None)
+                status.update(lookup_status='complete', instagram=identity,
+                              response_sha256=_zernio_absence_response_sha256(
+                                  profile_raw, health_raw, accounts_raw))
+            else:
+                platform_user_id, accounts_raw = _zernio_account_match(
+                    client, key, profile, health, self._now)
+                identity = dict(connected=True, account_id=health['accountId'],
+                                platform_user_id=platform_user_id,
+                                handle=health['username'])
+                if self._now() - _timestamp(status['observed_at']) > timedelta(minutes=15):
+                    _fail('authenticated_social_status_expired')
+                status.update(lookup_status='complete', instagram=identity,
+                              response_sha256=_zernio_identity_response_sha256(
+                                  health_raw, accounts_raw))
         except Exception:
             # Persist the negative/partial lookup as a hold, never as proof of
             # disconnection. Provider exceptions are never propagated or logged.
@@ -794,7 +966,7 @@ def read_zernio_identity_readonly(gym_id, echo_account_key, *, read_rows,
         import requests
         client = requests
     try:
-        health, observed_at, health_raw = _zernio_health_candidate(client, key, profile, clock)
+        health, observed_at, health_raw, _rows = _zernio_health_candidate(client, key, profile, clock)
         if health is None:
             # Missing or non-healthy profile candidate: fail closed. This is a
             # hold, never proof of disconnection.

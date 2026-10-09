@@ -480,11 +480,11 @@ def test_identity_reader_duplicate_instagram_rows_still_hold():
 
 
 @pytest.mark.parametrize('health', [
-    [], [zhealth(platform='facebook')], [zhealth(status='disconnected')],
+    [zhealth(status='disconnected')],
     [zhealth(tokenValid=False)], [zhealth(needsReconnect=True)],
     [zhealth(canPost=False)],
 ])
-def test_identity_reader_missing_or_unhealthy_profile_is_partial_hold(health):
+def test_identity_reader_unhealthy_profile_instagram_is_partial_hold(health):
     rows = IdentityReadRows(None)
     http = IdentityHttp(health, [zaccount()])
     with pytest.raises(CaptureIngestError,
@@ -557,3 +557,301 @@ def test_identity_reader_ambiguous_or_mismatched_holds(health, accounts):
                        match='authenticated_social_status_unavailable_or_incomplete'):
         zreader(http, rows)(GYM, KEY)
     assert len(rows.attestations) == 1
+
+
+# --- Conservative authenticated absence proof for website-only capture.
+
+class AbsenceHttp(IdentityHttp):
+    def __init__(self, health, accounts, profile='default', status=200):
+        super().__init__(health, accounts)
+        import json as _json
+        if profile == 'default':
+            profile = {'_id': ZPROFILE, 'name': 'Synthetic profile display name'}
+        self.profile_raw = (profile if type(profile) is bytes else
+            _json.dumps(profile, separators=(',', ':')).encode())
+        self.profile_status = status
+        self.params = []
+
+    def get(self, url, **kwargs):
+        self.calls.append(url)
+        self.params.append(kwargs.get('params'))
+        if url == 'https://api.zernio.com/v1/accounts/health':
+            return SimpleNamespace(status_code=200, content=self.health_raw)
+        if url == 'https://api.zernio.com/v1/profiles/' + ZPROFILE:
+            return SimpleNamespace(status_code=self.profile_status, content=self.profile_raw)
+        return SimpleNamespace(status_code=200, content=self.accounts_raw)
+
+
+SIBLINGS = [zhealth(accountId='facebook-account', platform='facebook'),
+            zhealth(accountId='gbp-account', platform='google')]
+
+
+def test_identity_reader_proven_absence_writes_complete_negative():
+    rows = IdentityReadRows(None)
+    http = AbsenceHttp(SIBLINGS, [zaccount(_id='facebook-account', platform='facebook'),
+                                  zaccount(_id='gbp-account', platform='googlebusiness')])
+    result = zreader(http, rows)(GYM, KEY)
+    assert result['connected'] is False
+    assert result['account_id'] is None and result['handle'] is None
+    assert result['platform_user_id'] is None and result['profile_id'] == ZPROFILE
+    assert http.calls == ['https://api.zernio.com/v1/accounts/health',
+                          'https://api.zernio.com/v1/profiles/' + ZPROFILE,
+                          'https://api.zernio.com/v1/accounts']
+    # The negative listing is requested complete: over-limit and hidden rows
+    # included, and no status filter is ever sent.
+    assert http.params[2] == {'profileId': ZPROFILE, 'includeOverLimit': 'true',
+                              'excludeHidden': 'false'}
+    status = rows.attestations[0][0]
+    assert status['lookup_status'] == 'complete' and status['authenticated'] is True
+    assert status['instagram'] == {'connected': False, 'account_id': None,
+                                   'platform_user_id': None, 'handle': None}
+    framed = (b'echo:zernio:absence-responses:v1\0'
+              + b'/v1/profiles/{profileId}\0' + len(http.profile_raw).to_bytes(8, 'big') + http.profile_raw
+              + b'/v1/accounts/health\0' + len(http.health_raw).to_bytes(8, 'big') + http.health_raw
+              + b'/v1/accounts\0' + len(http.accounts_raw).to_bytes(8, 'big') + http.accounts_raw)
+    assert status['response_sha256'] == hashlib.sha256(framed).hexdigest()
+
+
+def test_identity_reader_proven_absence_accepts_wrapped_profile_and_empty_health():
+    rows = IdentityReadRows(None)
+    http = AbsenceHttp([], [], profile={'profile': {'_id': ZPROFILE}})
+    result = zreader(http, rows)(GYM, KEY)
+    assert result['connected'] is False
+    assert rows.attestations[0][0]['lookup_status'] == 'complete'
+
+
+@pytest.mark.parametrize('account', [
+    zaccount(status='overLimit'),
+    zaccount(_id='hidden-ig', hidden=True),
+    zaccount(_id='unhealthy-ig', status='expired'),
+])
+def test_identity_reader_overlimit_hidden_or_unhealthy_instagram_row_holds(account):
+    rows = IdentityReadRows(None)
+    http = AbsenceHttp(SIBLINGS, [zaccount(_id='facebook-account', platform='facebook'),
+                                  account])
+    with pytest.raises(CaptureIngestError,
+                       match='authenticated_social_status_unavailable_or_incomplete'):
+        zreader(http, rows)(GYM, KEY)
+    status = rows.attestations[0][0]
+    assert status['lookup_status'] == 'partial' and status['instagram'] is None
+    assert status['response_sha256'] == hashlib.sha256(http.health_raw).hexdigest()
+
+
+def test_identity_reader_health_instagram_row_contradicts_absent_listing():
+    # An unhealthy Instagram row in the health authority is present evidence:
+    # hold even when the account listing shows no Instagram row.
+    rows = IdentityReadRows(None)
+    http = AbsenceHttp([zhealth(status='disconnected')], [])
+    with pytest.raises(CaptureIngestError,
+                       match='authenticated_social_status_unavailable_or_incomplete'):
+        zreader(http, rows)(GYM, KEY)
+    assert http.calls == ['https://api.zernio.com/v1/accounts/health']
+    assert rows.attestations[0][0]['lookup_status'] == 'partial'
+
+
+@pytest.mark.parametrize('profile', [
+    {'_id': 'wrong-profile'}, {'name': 'no identity'}, {'_id': None}, [],
+    {'profile': {'_id': 'wrong-profile'}}, {'profile': {'_id': ZPROFILE}, 'data': {'_id': ZPROFILE}},
+    b'{"_id":"' + ZPROFILE.encode() + b'","_id":"other"}',
+    'status-not-200',
+])
+def test_identity_reader_stale_partial_or_ambiguous_profile_holds(profile):
+    rows = IdentityReadRows(None)
+    status = 404 if profile == 'status-not-200' else 200
+    if status != 200:
+        profile = 'default'
+    http = AbsenceHttp(SIBLINGS, [], profile=profile, status=status)
+    with pytest.raises(CaptureIngestError,
+                       match='authenticated_social_status_unavailable_or_incomplete'):
+        zreader(http, rows)(GYM, KEY)
+    assert rows.attestations[0][0]['lookup_status'] == 'partial'
+
+
+def test_identity_reader_paginated_absence_listing_holds():
+    import json
+    rows = IdentityReadRows(None)
+    http = AbsenceHttp(SIBLINGS, [])
+    http.accounts_raw = json.dumps({'accounts': [], 'hasMore': True}).encode()
+    with pytest.raises(CaptureIngestError,
+                       match='authenticated_social_status_unavailable_or_incomplete'):
+        zreader(http, rows)(GYM, KEY)
+    assert rows.attestations[0][0]['lookup_status'] == 'partial'
+
+
+def test_identity_reader_health_summary_total_contradicting_empty_list_holds():
+    # Reproduction: health summary.total=1 with accounts=[] must not yield a
+    # connected=false complete negative; the count metadata contradicts the
+    # delivered rows, so the lookup holds.
+    import json
+    rows = IdentityReadRows(None)
+    http = AbsenceHttp(SIBLINGS, [])
+    http.health_raw = json.dumps(
+        {'summary': {'total': 1}, 'accounts': []}, separators=(',', ':')).encode()
+    with pytest.raises(CaptureIngestError,
+                       match='authenticated_social_status_unavailable_or_incomplete'):
+        zreader(http, rows)(GYM, KEY)
+    assert http.calls == ['https://api.zernio.com/v1/accounts/health']
+    # Health-authority contradictions hold before any partial receipt exists.
+    assert rows.attestations[0][0]['lookup_status'] == 'unavailable'
+
+
+@pytest.mark.parametrize('health_body', [
+    {'total': 1, 'accounts': []},
+    {'total': 0, 'accounts': [zhealth()]},
+    {'total': '1', 'accounts': []},
+    {'count': -1, 'accounts': []},
+    {'summary': 'not-a-dict', 'accounts': []},
+])
+def test_identity_reader_incoherent_health_count_metadata_holds(health_body):
+    import json
+    rows = IdentityReadRows(None)
+    http = AbsenceHttp(SIBLINGS, [])
+    http.health_raw = json.dumps(health_body, separators=(',', ':')).encode()
+    with pytest.raises(CaptureIngestError,
+                       match='authenticated_social_status_unavailable_or_incomplete'):
+        zreader(http, rows)(GYM, KEY)
+    assert rows.attestations[0][0]['lookup_status'] == 'unavailable'
+
+
+def test_identity_reader_absence_listing_total_contradiction_holds():
+    import json
+    rows = IdentityReadRows(None)
+    http = AbsenceHttp(SIBLINGS, [zaccount(_id='facebook-account', platform='facebook')])
+    http.accounts_raw = json.dumps(
+        {'total': 2, 'accounts': [zaccount(_id='facebook-account', platform='facebook')]},
+        separators=(',', ':')).encode()
+    with pytest.raises(CaptureIngestError,
+                       match='authenticated_social_status_unavailable_or_incomplete'):
+        zreader(http, rows)(GYM, KEY)
+    assert rows.attestations[0][0]['lookup_status'] == 'partial'
+
+
+def test_identity_reader_coherent_count_metadata_preserves_negative_and_positive():
+    # Coherent metadata is accepted: an exact summary.total of zero preserves
+    # the proven absence, and a matching positive total preserves identity.
+    import json
+    rows = IdentityReadRows(None)
+    http = AbsenceHttp(SIBLINGS, [zaccount(_id='facebook-account', platform='facebook'),
+                                  zaccount(_id='gbp-account', platform='googlebusiness')])
+    http.health_raw = json.dumps(
+        {'summary': {'total': 2}, 'accounts': SIBLINGS}, separators=(',', ':')).encode()
+    http.accounts_raw = json.dumps(
+        {'total': 2, 'accounts': [zaccount(_id='facebook-account', platform='facebook'),
+                                  zaccount(_id='gbp-account', platform='googlebusiness')]},
+        separators=(',', ':')).encode()
+    result = zreader(http, rows)(GYM, KEY)
+    assert result['connected'] is False and result['profile_id'] == ZPROFILE
+    rows = IdentityReadRows(None)
+    http = IdentityHttp([zhealth()], [zaccount()])
+    http.health_raw = json.dumps(
+        {'total': 1, 'accounts': [zhealth()]}, separators=(',', ':')).encode()
+    result = zreader(http, rows)(GYM, KEY)
+    assert result['connected'] is True and result['handle'] == ZHANDLE
+
+
+@pytest.mark.parametrize('health_body', [
+    {'summary': {'total': None}, 'accounts': []},
+    {'total': None, 'accounts': []},
+    {'count': None, 'accounts': []},
+])
+def test_identity_reader_present_null_count_metadata_holds(health_body):
+    # Reproduction: {"summary":{"total":null},"accounts":[]} is a present
+    # malformed count claim, not absent metadata. It must not prove a
+    # connected=false complete negative; the lookup holds.
+    import json
+    rows = IdentityReadRows(None)
+    http = AbsenceHttp(SIBLINGS, [])
+    http.health_raw = json.dumps(health_body, separators=(',', ':')).encode()
+    with pytest.raises(CaptureIngestError,
+                       match='authenticated_social_status_unavailable_or_incomplete'):
+        zreader(http, rows)(GYM, KEY)
+    assert rows.attestations[0][0]['lookup_status'] == 'unavailable'
+
+
+def test_identity_reader_absence_listing_present_null_summary_holds():
+    # The same present-null count claim in the absence listing holds instead
+    # of proving the complete zero-Instagram listing required for a negative.
+    import json
+    rows = IdentityReadRows(None)
+    http = AbsenceHttp(SIBLINGS, [])
+    http.accounts_raw = json.dumps(
+        {'summary': {'total': None}, 'accounts': []}, separators=(',', ':')).encode()
+    with pytest.raises(CaptureIngestError,
+                       match='authenticated_social_status_unavailable_or_incomplete'):
+        zreader(http, rows)(GYM, KEY)
+    assert rows.attestations[0][0]['lookup_status'] == 'partial'
+
+
+@pytest.mark.parametrize('profile', [
+    {'profile': {'_id': ZPROFILE}, 'data': {'_id': 123}},
+    {'profile': {'_id': ZPROFILE}, 'data': {'_id': None}},
+    {'profile': {'_id': ZPROFILE}, 'data': {'_id': []}},
+    {'profile': {'_id': ZPROFILE}, 'data': {}},
+    {'profile': {'_id': ZPROFILE}, 'data': None},
+    {'profile': {'_id': ZPROFILE}, 'data': 'not-a-wrapper'},
+    {'_id': ZPROFILE, 'profile': {'_id': 123}},
+])
+def test_identity_reader_malformed_secondary_envelope_identity_holds(profile):
+    # Reproduction: a valid profile wrapper plus a malformed secondary
+    # data._id (numeric/null/list/absent/null wrapper) is a present malformed
+    # identity claim. It must hold, never silently complete a connected=false
+    # proof from the single readable wrapper identity.
+    rows = IdentityReadRows(None)
+    http = AbsenceHttp(SIBLINGS, [], profile=profile)
+    with pytest.raises(CaptureIngestError,
+                       match='authenticated_social_status_unavailable_or_incomplete'):
+        zreader(http, rows)(GYM, KEY)
+    assert rows.attestations[0][0]['lookup_status'] == 'partial'
+
+
+@pytest.mark.parametrize('profile', [
+    {'_id': ZPROFILE},
+    {'profile': {'_id': ZPROFILE}},
+    {'data': {'_id': ZPROFILE}},
+])
+def test_identity_reader_valid_single_identity_and_count_complete(profile):
+    # Valid single identity claims with coherent count metadata still
+    # complete the conservative negative; absent optional metadata (no
+    # summary wrapper) remains accepted.
+    import json
+    rows = IdentityReadRows(None)
+    listing = [zaccount(_id='facebook-account', platform='facebook'),
+               zaccount(_id='gbp-account', platform='googlebusiness')]
+    http = AbsenceHttp(SIBLINGS, listing, profile=profile)
+    http.accounts_raw = json.dumps(
+        {'summary': {'total': 2}, 'accounts': listing}, separators=(',', ':')).encode()
+    result = zreader(http, rows)(GYM, KEY)
+    assert result['connected'] is False and result['profile_id'] == ZPROFILE
+    assert rows.attestations[0][0]['lookup_status'] == 'complete'
+
+
+@pytest.mark.parametrize('profile', [
+    {'_id': ZPROFILE, 'profile': {'_id': 'other-exact-profile'}},
+    {'_id': 'other-exact-profile', 'profile': {'_id': ZPROFILE}},
+    {'_id': ZPROFILE, 'data': {'_id': 'other-exact-profile'}},
+    {'_id': ZPROFILE, 'profile': {'_id': ZPROFILE}},
+])
+def test_identity_reader_conflicting_profile_envelope_identity_holds(profile):
+    # Reproduction: a matching top-level profile _id must not complete when a
+    # nested profile/data envelope carries a second (conflicting or merely
+    # duplicated) readable identity.
+    rows = IdentityReadRows(None)
+    http = AbsenceHttp(SIBLINGS, [], profile=profile)
+    with pytest.raises(CaptureIngestError,
+                       match='authenticated_social_status_unavailable_or_incomplete'):
+        zreader(http, rows)(GYM, KEY)
+    assert rows.attestations[0][0]['lookup_status'] == 'partial'
+
+
+def test_identity_reader_absence_negative_contradicts_connected_portal_row():
+    # A proven-absence identity never waives a live connected portal row:
+    # the tenant contradiction holds at the resolver.
+    evidence = {'gym_id': GYM, 'echo_account_key': KEY,
+                'source': 'zernio_authenticated_accounts', 'connected': False,
+                'account_id': None, 'platform_user_id': None, 'handle': None}
+    r, rows = resolver()
+    read = lambda table, params: rows[table]
+    r = PortalMappingResolver(read_rows=read, approved_mappings=[authority()],
+        now=lambda: NOW, social_identity_reader=lambda gym_id, key: evidence)
+    with pytest.raises(CaptureIngestError, match='current_social_mapping_mismatch'):
+        r(GYM)
