@@ -2,7 +2,8 @@ from agent.jobs import lasso_daily_paired_stories as daily
 from agent import calendar_autopublish as autopublish
 
 
-def test_feed_preflight_fails_closed_and_accepts_exact_database_proof():
+def test_feed_preflight_fails_closed_and_accepts_exact_database_proof(monkeypatch):
+    monkeypatch.setattr(daily.lasso_current_artifact,"current_pair", lambda *a, **k:True)
     feed = {"id": "feed"}
     class Store:
         def __init__(self, answer): self.answer = answer
@@ -16,6 +17,10 @@ def test_feed_preflight_fails_closed_and_accepts_exact_database_proof():
 
 
 def _armed(monkeypatch):
+    monkeypatch.setattr(daily.lasso_current_artifact,"anchor_current",lambda *a,**k:True)
+    monkeypatch.setattr(daily.lasso_current_artifact,"current_pair",lambda *a,**k:False)
+    monkeypatch.setattr(daily.lasso_current_artifact,"feed_reference",lambda _,feed:{'feed':feed,'artifact':{}})
+    monkeypatch.setattr(daily.lasso_current_artifact,"evidence_current",lambda *a,**k:True)
     monkeypatch.setattr(daily.config, "calendar_autopublish_enabled", lambda: True)
     monkeypatch.setattr(daily.config, "lasso_three_feed_enabled", lambda: True)
     monkeypatch.setattr(daily.config, "lasso_infographic_quality_enabled", lambda *_: True)
@@ -112,6 +117,7 @@ def test_autonomous_insert_reads_exact_story_and_feed_link(monkeypatch):
 
 
 def test_release_only_after_feed_receipt(monkeypatch):
+    monkeypatch.setattr(daily.lasso_current_artifact,"current_pair",lambda *a,**k:True)
     monkeypatch.setattr(daily, "_system_ready", lambda *_: True)
     feed = {"id": "feed", "gym_id": "lasso", "account": "instagram",
             "format": "feed", "post_date": "2026-10-07", "slot_index": 0, "variant_status": "active",
@@ -134,6 +140,7 @@ def test_release_only_after_feed_receipt(monkeypatch):
 
 
 def test_release_catches_prior_day_only_with_publisher_window(monkeypatch):
+    monkeypatch.setattr(daily.lasso_current_artifact,"current_pair",lambda *a,**k:True)
     monkeypatch.setattr(daily, "_system_ready", lambda *_: True)
     rows = [
         {"id": "old-feed", "gym_id": "lasso", "account": "instagram",

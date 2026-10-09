@@ -139,7 +139,7 @@ def _caption_approved_cta(caption):
 
 
 def generate_variant_image(row, account_key, client=None, generate_fn=None,
-                           host_fn=None):
+                           host_fn=None, paired_feed_reference=None):
     """Generate ONE new image for the logical post `row` already represents,
     WITHOUT touching `row` itself. Returns {"ok": True, "image_url": ...,
     "prompt": ...} or {"ok": False, "reason": REASON_*}.
@@ -166,12 +166,20 @@ def generate_variant_image(row, account_key, client=None, generate_fn=None,
     pixels = "1080x1920" if is_story else None
     surface = "story" if is_story else "feed post"
 
+    if lasso_quality and is_story:
+        from .lasso_current_artifact import artifact_current
+        feed=(paired_feed_reference or {}).get('feed') or {}
+        artifact=(paired_feed_reference or {}).get('artifact') or {}
+        if (feed.get('id')!=row.get('id') or feed.get('caption')!=row.get('caption')
+                or not artifact_current(artifact,feed)):
+            return {'ok':False,'reason':'paired_feed_reference_unavailable'}
     gen = generate_fn or _default_generate
     # The caption remains the source of claim text. A CTA must already occur in
     # that caption; None lets creative_studio render its approved URL footer.
     extra = ({"cta": _caption_approved_cta(str(row["caption"])),
               "footer": None, "draft_id": str(row["id"])}
              if lasso_quality else {})
+    if lasso_quality and is_story: extra["paired_feed_reference"]=paired_feed_reference
     result = gen(headline, facts, client=client, aspect=aspect, pixels=pixels,
                 surface=surface, account_key=account_key, **extra)
     if not result or not result.get("path"):
@@ -199,9 +207,9 @@ def generate_variant_image(row, account_key, client=None, generate_fn=None,
 
 
 def _default_generate(headline, facts, client=None, aspect=None, pixels=None,
-                      surface=None, account_key=None, cta="", footer=None, draft_id=""):
+                      surface=None, account_key=None, cta="", footer=None, draft_id="", paired_feed_reference=None):
     from . import creative_studio
     return creative_studio.generate(
         headline, facts, client=client, aspect=aspect, pixels=pixels,
         surface=surface, account_key=account_key, cta=cta, footer=footer,
-        draft_id=draft_id)
+        draft_id=draft_id,paired_feed_reference=paired_feed_reference)

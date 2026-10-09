@@ -2,6 +2,15 @@
 
 Source of truth for every infographic Echo generates.
 
+## Precedence: visual treatment direction (2026-10-09)
+
+For LASSO-owned feed + Stories (lasso_ig / lasso_fb, gym_id 'lasso'),
+`brand_voice/lasso_visual_standard.md` (version
+`lasso-grounded-editorial-2026-10-09-v1`) takes precedence over this document
+on visual treatment direction. Everything else in this document — copy rules,
+the grade gate, brand color values, model routing — is unchanged. Client gyms
+and every non-LASSO lane are unaffected.
+
 ## LASSO content-led background direction (2026-09-22)
 
 For the LASSO-only `AGENT_LASSO_INFOGRAPHIC_QUALITY` path, the content-led

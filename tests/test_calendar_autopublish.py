@@ -3308,3 +3308,28 @@ def test_forward_media_actual_draft_mismatch_never_claims_or_sends(armed, monkey
     monkeypatch.setattr(cap.meta_publisher, "publish", pub)
     out = cap.publish_due(RUN_DATE, store=store, publisher=pub, now=LATE_NOW)
     assert pub.calls == [] and out["forward_media_holds"] == {"changed": "forward_media_verification"}
+
+@pytest.mark.parametrize('fmt',['feed','story'])
+def test_owned_current_style_failure_preclaim_never_calls_provider(armed,monkeypatch,fmt):
+    from agent import lasso_current_artifact
+    monkeypatch.setenv('AGENT_LASSO_INFOGRAPHIC_QUALITY','true')
+    monkeypatch.setattr(lasso_current_artifact,'current_pair',lambda *a,**k:False)
+    row=_row('style-block',fmt=fmt)
+    store=_FakeStore([row]);pub=_FakePublisher(PublishResult(ok=True,mode='published',media_id='M'))
+    result=cap.publish_due(RUN_DATE,store=store,publisher=pub,now=LATE_NOW)
+    assert result['waiting']==['style-block']
+    assert not store.publishing_calls and not pub.calls
+
+@pytest.mark.parametrize('fmt',['feed','story'])
+def test_owned_current_style_changes_after_claim_reverts_owned_token(armed,monkeypatch,fmt):
+    from agent import lasso_current_artifact
+    monkeypatch.setenv('AGENT_LASSO_INFOGRAPHIC_QUALITY','true')
+    # Registry/artifact source was current before lease, then changed after it.
+    monkeypatch.setattr(lasso_current_artifact,'current_pair',lambda _,r:r.get('status')!='publishing')
+    row=_row('style-race',fmt=fmt)
+    store=_LeasedPairStore([row]);pub=_FakePublisher(PublishResult(ok=True,mode='published',media_id='M'))
+    result=cap.publish_due(RUN_DATE,store=store,publisher=pub,now=LATE_NOW)
+    assert result['failed']==['style-race'] and not pub.calls
+    assert store.rows['style-race']['status']=='pending'
+    assert store.rows['style-race']['publish_claim_token'] is None
+    assert store.rows['style-race']['reject_reason']=='lasso_current_visual_proof_missing'
