@@ -359,6 +359,7 @@ class _Conn:
 
 def _persistence(conn):
     persistence = object.__new__(ForwardMediaOwnerPersistence)
+    persistence._environment_lane = 'owner'
     persistence._conn = conn
     persistence._expected_owner = conn.owner
     return persistence
