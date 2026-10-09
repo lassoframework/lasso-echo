@@ -11,13 +11,14 @@ is not provisioned: there are no production LOGINs, tenant grants, secrets,
 service configuration or invocation in this packet. The SQL creates only
 unprivileged `NOLOGIN` group roles; it does not provision credentials.
 
-## Bounded production install diagnostic — 2026-10-09
+## Historical preflight discovery — 2026-10-09 15:52 UTC
 
-**Production-shaped install/reconciliation rehearsal: BLOCKED.** The selected
-milestone stopped at a verified whole-file source conflict. The three current
-changes are an exact-file read-only diagnostic, focused static/stub checks, and
-this record. There is no apply path or production-shaped PG fixture in this
-change. Existing full-manifest tests and their synthetic seed remain unchanged.
+**Production-shaped install/reconciliation rehearsal: BLOCKED.** The initial
+milestone stopped at a verified whole-file source conflict. Its three changes
+were an exact-file read-only diagnostic, focused static/stub checks, and this
+record. The compatible overlay checkpoint below supersedes this source-conflict
+finding. Neither checkpoint has an apply path or production-shaped PG fixture.
+Existing full-manifest tests and their synthetic seed remain separate evidence.
 
 Frozen task HEAD before these uncommitted edits:
 `62ea62666363577a54a4c13d36e4b51894e27a8c` (Echo #385). The earlier checkout
@@ -68,9 +69,9 @@ production schema, triggers, constraints, enums, role inheritance, default ACLs,
 extension placement and ledger baseline. A production-shaped rehearsal cannot
 be established safely from the accepted synthetic bootstrap/table slices.
 
-`tools/generated_image_release_preflight.py` pins six complete source files
+The first revision of `tools/generated_image_release_preflight.py` pinned six complete source files
 before any connection is opened. It classifies 0611 ledger state, 0625 absence,
-the current claim source and the incompatible entry prerequisite. Hash, target,
+the current claim source and the then-incompatible entry prerequisite. Hash, target,
 owner, ACL, signature, body or configuration drift stays blocked. It supports a
 caller-supplied fresh authorized TLS-verified connection for metadata readback;
 it always rolls back and closes that connection, including on a read failure.
@@ -117,6 +118,37 @@ API/CLI regression returns sanitized `invalid_catalog_receipt` and exit 2.
 The same targeted plus preservation command returned **62 passed in 6.85s**,
 including 58 static/stub diagnostics and all four unchanged PG17 cases, with
 the same 14 existing Pillow warnings. Production scope remains blocked.
+
+## Compatible whole-overlay checkpoint — 2026-10-09 16:14 UTC
+
+Independent review accepted the whole calendar entry source SHA-256
+`ca9e49459b817cee291ce70db71a8f3d4a71a264f091030d28499185ea98aa1a`
+and whole atomic cutover source SHA-256
+`82a485a0aa8beb339a2ddb906a0fdef241950716826c659a1f3c6e44f6a9cd81`.
+The calendar source preserves the complete live October 7 claim body MD5
+`c624eedcee819496129639108be991f6` with only the G/C entry insertion before
+existing locks. The resulting body MD5 `0f0a4ee00e2a31f2e0d3e7c0f59e7e77`
+is pinned in the whole cutover source. Rollback instructions restore the claim
+from the complete October 7 migration, preserving capacity six, and the other
+five functions from frozen evidence. No production SQL was applied.
+
+The new focused disposable PG17 proof executes whole calendar overlay and
+whole cutover, including stale-body atomic refusal, metadata/ACL preservation,
+both capacity-six days, prior capacities, negative cases, approval proof and
+tenant isolation. Root independently reran it, the existing calendar fixture
+and atomic cutover test; all passed. The updated read-only preflight pins the
+accepted whole-file hashes and now reports the live claim as matching the
+calendar entry **body prerequisite only**. Its CLI still always exits no-go.
+
+The separate read-only public catalog bundle at
+`work/evidence/image-production-baseline-20261009` captured a broad metadata
+snapshot at 16:08:55 UTC with no customer rows or passwords. It is **not** a
+replayable schema-only baseline or complete dependency closure. A verified
+schema-only dump, local restore/catalog parity and whole pending-stack install
+rehearsal remain required. The historical synthetic install sequence below
+retains its original hashes as earlier evidence; it is not a production plan.
+Image migration, issuer, hosted-byte writer/reader, flags, provider publishing
+and global image outcome remain UNAPPLIED / UNVERIFIED.
 
 Frozen current live receipt:
 

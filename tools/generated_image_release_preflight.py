@@ -3,8 +3,8 @@
 This is deliberately NOT an installer. It checks six exact source files and
 reconciles a catalog receipt. No pending SQL, verifier, DDL, role grant, customer
 row query or flag change is executed. The existing synthetic full-manifest tests
-remain separate evidence. A complete baseline and compatible entry overlay are
-required before an installation/rehearsal runner can be implemented.
+remain separate evidence. The compatible entry overlay has focused PG17 proof;
+a replayable production baseline and full install rehearsal are still required.
 """
 from __future__ import annotations
 
@@ -21,13 +21,13 @@ CLAIM = "claim_calendar_publish_slot_owned"
 IDENTITY = ("p_row_id uuid, p_gym_id text, p_day date, p_timezone text, "
             "p_capacity integer, p_approved_only boolean, p_require_approval_proof boolean")
 LIVE_BODY_MD5 = "c624eedcee819496129639108be991f6"
-ENTRY_EXPECTED_MD5 = "db59bf4d6d0be4c42e5e49ab0b5a8b4f"
-ENTRY_OVERLAY_MD5 = "7c09844f2c8c00190e007b1bca83d2a0"
+ENTRY_EXPECTED_MD5 = LIVE_BODY_MD5
+ENTRY_OVERLAY_MD5 = "0f0a4ee00e2a31f2e0d3e7c0f59e7e77"
 ACL = ["postgres=X/postgres", "service_role=X/postgres"]
 PINS = {
     "migrations/lasso_october7_catchup_capacity_20261008.sql": "c8f1c4c3af064e17df3670252153b2698a64ec607271127093d0f9aaf1d26927",
-    "migrations/DRAFT_fixer_forward_lock_entry_calendar_20261008.sql": "1818dc65918f1640932e39e198b8b60ad8576131124a832b592f5ba2208d326a",
-    "migrations/DRAFT_fixer_forward_corpus_atomic_cutover_20261008.sql": "9ba1c7cbfc25a197abeb26f12c9b439f849491ad0fab1b60a4bdb07446426d57",
+    "migrations/DRAFT_fixer_forward_lock_entry_calendar_20261008.sql": "ca9e49459b817cee291ce70db71a8f3d4a71a264f091030d28499185ea98aa1a",
+    "migrations/DRAFT_fixer_forward_corpus_atomic_cutover_20261008.sql": "82a485a0aa8beb339a2ddb906a0fdef241950716826c659a1f3c6e44f6a9cd81",
     "tests/fixtures/portal_0611_echo_source_brand_bundle_held_20261008.sql": "55374ffe33677a1ef8ccbb41256c8abc9634645d0d9658f55ebc40fd1bc21dd2",
     "tests/fixtures/generated_client_release_manifest/0611_echo_source_brand_bundle.verify.sql": "4e99445cf04fff7046d8da64d13e02eb5ca875a7cc988c64cd9ad0e08a67063f",
     "tests/fixtures/generated_client_release_manifest/DRAFT_0625_generated_client_approval.sql": "d54a5b9e1f857d31912540f38f626b59c891296a4aebd7b3c2d55a1f4abdc705",
@@ -195,8 +195,8 @@ def reconcile(receipt: dict) -> dict:
 def preflight(root: Path = ROOT, *, receipt=_UNSET, open_connection=None) -> dict:
     report = {"mode": "read_only", "mutation_supported": False,
               "installation_authorized": False, "production_rehearsal": "BLOCKED",
-              "missing": ["owner-frozen complete baseline DDL/catalog/ACL export",
-                          "whole entry/cutover overlay preserving current October 7 catchup body"]}
+              "missing": ["owner-frozen replayable baseline DDL/catalog/ACL export",
+                          "production-shaped install/reconciliation rehearsal"]}
     try:
         actual = exact_files(root)
     except OSError:

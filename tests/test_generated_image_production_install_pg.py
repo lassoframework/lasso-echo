@@ -35,21 +35,21 @@ def body(filename):
     return rest[delimiter.end():rest.index(delimiter[1], delimiter.end())]
 
 
-def test_exact_whole_sources_expose_current_body_and_incompatible_overlay():
+def test_exact_whole_sources_expose_current_body_and_compatible_overlay():
     assert preflight.exact_files() == preflight.PINS
     current = body("lasso_october7_catchup_capacity_20261008.sql")
     old = body("calendar_approval_provenance_20261005.sql")
     overlay = body("DRAFT_fixer_forward_lock_entry_calendar_20261008.sql")
     assert hashlib.md5(current.encode()).hexdigest() == preflight.LIVE_BODY_MD5
-    assert hashlib.md5(old.encode()).hexdigest() == preflight.ENTRY_EXPECTED_MD5
+    assert hashlib.md5(old.encode()).hexdigest() != preflight.ENTRY_EXPECTED_MD5
+    assert preflight.ENTRY_EXPECTED_MD5 == preflight.LIVE_BODY_MD5
     assert hashlib.md5(overlay.encode()).hexdigest() == preflight.ENTRY_OVERLAY_MD5
-    assert "p_capacity = 6" in current
-    assert "p_capacity = 6" not in overlay
+    assert "p_capacity = 6" in current and "p_capacity = 6" in overlay
     assert "perform public.fixer_forward_calendar_entry_lock_20261008();" in overlay
     assert "fixer_forward_calendar_entry_lock" not in current
     cutover = (preflight.ROOT / "migrations/DRAFT_fixer_forward_corpus_atomic_cutover_20261008.sql").read_text()
     assert preflight.ENTRY_OVERLAY_MD5 in cutover
-    assert preflight.LIVE_BODY_MD5 not in cutover
+    assert "'c624eedcee819496129639108be991f6'" not in cutover
 
 
 def test_live_receipt_cannot_be_misclassified_as_install_acceptance():
@@ -61,7 +61,7 @@ def test_live_receipt_cannot_be_misclassified_as_install_acceptance():
     assert report["catalog"]["0611"] == "already_applied_ledger_only"
     assert report["catalog"]["0625"] == "pending"
     assert report["catalog"]["claim_source"] == "current_whole_file_match"
-    assert report["catalog"]["calendar_entry"] == "drift"
+    assert report["catalog"]["calendar_entry"] == "body_prerequisite_only_matched"
 
 
 @pytest.mark.parametrize("field,value", [
@@ -157,7 +157,7 @@ def test_fresh_readback_uses_new_connection_read_only_and_always_rolls_back():
         assert connection.commands == ["BEGIN READ ONLY",
             "SET LOCAL statement_timeout='30s'; SET LOCAL lock_timeout='5s'", preflight.CATALOG_SQL]
         assert connection.rolled_back and connection.closed
-    assert result["catalog"]["calendar_entry"] == "drift"
+    assert result["catalog"]["calendar_entry"] == "body_prerequisite_only_matched"
     assert "COMMIT" not in fresh.commands
 
 
