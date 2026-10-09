@@ -84,7 +84,11 @@ begin
      or p_context->>'product' is distinct from t.product
      or p_context->>'event_key' is distinct from p_event_key
      or p_event_key is distinct from concat(ev->>'channel',':',ev->>'ts')
-     or ev->>'channel' is distinct from t.slack_channel_id
+     -- A capped user may reuse an owned ticket from another channel. Preserve
+     -- that inbound without allowing a reply to the ticket's original channel.
+     or (ev->>'channel' is distinct from t.slack_channel_id
+         and not (p_context->>'rate_limited'='true'
+                  and who->>'kind' in ('client','unknown')))
      or ev->>'user' is distinct from who->>'slack_user_id'
      or coalesce(ev->>'user','')=''
      or coalesce(ev->>'channel','')=''
@@ -98,7 +102,7 @@ begin
      or (who->>'kind'='client' and (who->>'gym_id') is distinct from t.client_id::text)
   then raise exception 'Slack replay capture identity/source mismatch'; end if;
   if p_context->>'chatter'='true' and (length(p_context->>'text')>60
-     or not (p_context->>'text' ~* '^\s*(hey|hi|hello|yo|thanks|thank you|thx|ty|ok|okay|k|got it|sounds good|great|perfect|awesome|cool|nice|yep|yes|sure|np|no problem|lol|haha|👍|🙏|✅)[\s!.,]*$'))
+     or not (p_context->>'text' ~* '^\s*(hey|hi|hello|yo|thanks|thank you|thx|ty|ok|okay|k|got it|sounds good|great|perfect|awesome|cool|nice|yep|yes|sure|np|no problem|lol|haha|👍|🙏|✅|got it[,\s]+(thanks|thank you))[\s!.,]*$'))
   then raise exception 'Slack replay substantive message is not benign chatter'; end if;
   select * into q from public.support_slack_replay where event_key=p_event_key;
   if found then
@@ -122,11 +126,26 @@ begin
     'who',who,'event',ev,'surface',p_context->'surface',
     'unknown_in_channel',p_context->'unknown_in_channel','rate_limited',p_context->'rate_limited',
     'noop',coalesce((p_context->>'chatter')::boolean,false)));
+  -- A capped message from another channel advances the ticket snapshot but
+  -- must neither erase an uncommitted request from the ticket's own channel
+  -- nor disclose this other channel's text in a reply there. Carry only the
+  -- original dispatch; the new inbound remains durable on the ticket.
+  if p_context->>'rate_limited'='true' and ev->>'channel' is distinct from t.slack_channel_id then
+    select context into first_context from public.support_slack_replay
+      where ticket_id=p_ticket_id and bot_identity=p_identity and state<>'committed'
+        and context->'dispatch'->'event'->>'channel'=t.slack_channel_id
+        and context->'dispatch'->'who'->>'slack_user_id'=t.slack_user_id
+      order by created_at desc,id desc limit 1;
+    if found then
+      p_context:=p_context||jsonb_build_object('dispatch',first_context->'dispatch');
+    end if;
+  end if;
   -- A pause can collect multiple messages before the initial request was ever
   -- routed. Only the newest snapshot may commit. Compose its source transcript
   -- once, preserving every original event separately; do not dispatch stale
   -- initial prompts, or turn its newest follow-up into an inert `new` ticket.
   if p_context->>'classification'='follow_up'
+     and ev->>'channel'=t.slack_channel_id
      and not exists(select 1 from public.support_slack_replay where ticket_id=p_ticket_id and state='committed')
   then
     select context into first_context from public.support_slack_replay

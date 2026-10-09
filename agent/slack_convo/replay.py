@@ -28,7 +28,8 @@ _HUMAN = re.compile(r"\b(?:speak|talk) (?:to|with) (?:a |an )?(?:human|person)|"
 _BINDING = ("kind", "slack_user_id", "email", "account_key", "gym_id")
 _BENIGN_CHATTER = re.compile(
     r"^\s*(?:hey|hi|hello|yo|thanks|thank you|thx|ty|ok|okay|k|got it|sounds good|great|"
-    r"perfect|awesome|cool|nice|yep|yes|sure|np|no problem|lol|haha|👍|🙏|✅)[\s!.,]*$", re.I)
+    r"perfect|awesome|cool|nice|yep|yes|sure|np|no problem|lol|haha|👍|🙏|✅|"
+    r"got it[,\s]+(?:thanks|thank you))[\s!.,]*$", re.I)
 
 
 def benign_chatter(text):
@@ -167,29 +168,50 @@ def process(deps, replay_id):
             fresh_who = deps.resolve_identity(bound_who.slack_user_id)
             if any(getattr(fresh_who, key) != getattr(bound_who, key) for key in _BINDING):
                 return _held(deps.bus, item, token, "identity_binding_changed")
-        if dispatch["classification"] == adapter._cls.CANCEL_POST:
+        if (dispatch.get("rate_limited")
+                and dispatch["event"]["channel"] != item["ticket_snapshot"]["slack_channel_id"]):
+            # The capped user's inbound is durable on their existing ticket.
+            # The ticket's delivery channel belongs to the original request;
+            # emitting a reply for this other channel would misaddress it.
+            planner = PlanningBus(item)
+            decision = adapter.Decision("ticketed", "rate_limited_cross_channel_recorded",
+                                        dispatch["surface"], who.kind, item["ticket_id"],
+                                        rate_limited=True)
+        elif dispatch["classification"] == adapter._cls.CANCEL_POST:
             # cancel_lane mutates a calendar in a separate store. It cannot be
             # rolled back with this replay plan and is not safe to auto-retry.
             return _held(deps.bus, item, token, "external_cancel_requires_reconciliation")
-        planner = PlanningBus(item)
-        planned_deps = replace(deps, bus=planner)
-        try:
-            if dispatch.get("noop"):
-                decision = adapter.Decision("ticketed", "chatter_noted", dispatch["surface"],
-                                            who.kind, item["ticket_id"])
-            else:
-                decision = adapter._dispatch_recorded_event(
-                    deps=planned_deps, ident=deps.identity, who=who,
-                    user=who.slack_user_id, text=dispatch["text"], surface=dispatch["surface"],
-                    channel=dispatch["event"]["channel"], tid=item["ticket_id"],
-                    ticket=planner.ticket(item["ticket_id"]), created=dispatch["created"],
-                    classification=dispatch["classification"],
-                    unknown_in_channel=dispatch["unknown_in_channel"],
-                    rate_limited=dispatch["rate_limited"], request_type=dispatch["request_type"])
-        except Exception as exc:
-            # No plan escaped the buffering bus. Hold rather than repeat an
-            # unsupported effect or guess what a failed custom dependency did.
-            return _held(deps.bus, item, token, f"planning_failed:{type(exc).__name__}")
+        else:
+            planning_item = item
+            if context["event"]["channel"] != dispatch["event"]["channel"]:
+                # The SQL replay carries a pending request from its original
+                # channel across a capped note. Do not expose the other
+                # channel's inbound text to answer/model planning.
+                planning_item = copy.deepcopy(item)
+                origin = dispatch["event"]["channel"] + ":"
+                planning_item["messages_snapshot"] = [
+                    row for row in item["messages_snapshot"]
+                    if row.get("direction") != "inbound"
+                    or str(row.get("slack_event_id") or "").startswith(origin)]
+            planner = PlanningBus(planning_item)
+            planned_deps = replace(deps, bus=planner)
+            try:
+                if dispatch.get("noop"):
+                    decision = adapter.Decision("ticketed", "chatter_noted", dispatch["surface"],
+                                                who.kind, item["ticket_id"])
+                else:
+                    decision = adapter._dispatch_recorded_event(
+                        deps=planned_deps, ident=deps.identity, who=who,
+                        user=who.slack_user_id, text=dispatch["text"], surface=dispatch["surface"],
+                        channel=dispatch["event"]["channel"], tid=item["ticket_id"],
+                        ticket=planner.ticket(item["ticket_id"]), created=dispatch["created"],
+                        classification=dispatch["classification"],
+                        unknown_in_channel=dispatch["unknown_in_channel"],
+                        rate_limited=dispatch["rate_limited"], request_type=dispatch["request_type"])
+            except Exception as exc:
+                # No plan escaped the buffering bus. Hold rather than repeat an
+                # unsupported effect or guess what a failed custom dependency did.
+                return _held(deps.bus, item, token, f"planning_failed:{type(exc).__name__}")
         plan = {"ticket_fields": planner.fields, "rows": planner.rows,
                 "decision": asdict(decision)}
         args = {"p_id": item["id"], "p_identity": deps.identity.name,

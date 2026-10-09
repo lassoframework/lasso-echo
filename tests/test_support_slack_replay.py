@@ -279,6 +279,67 @@ def capture_one(pg_bus, paused, text='my photos are broken', **kwargs):
     return deps, queue(pg_bus)[0]
 
 
+def test_capped_cross_channel_inbound_is_durable_without_wrong_channel_reply(pg_bus, paused):
+    deps = _deps(pg_bus, cap=1)
+    first = adapter.handle_event(_ev('my photos are broken', channel='G0', ts='0.0'),
+                                 'G0:0.0', deps)
+    assert first.reason == 'support_sender_paused'
+    second = adapter.handle_event(_ev('another photo issue', channel='G1', ts='1.0'),
+                                  'G1:1.0', deps)
+    assert second.reason == 'support_sender_paused'
+    assert len(pg_bus.tickets) == 1
+    assert [m['slack_event_id'] for m in pg_bus.msgs] == ['G0:0.0', 'G1:1.0']
+    second_replay = next(item for item in queue(pg_bus) if item['event_key'] == 'G1:1.0')
+    assert second_replay['context']['rate_limited'] is True
+    assert second_replay['ticket_snapshot']['slack_channel_id'] == 'G0'
+    resume(paused)
+    replay.run_once(deps)
+    assert next(item for item in queue(pg_bus) if item['event_key'] == 'G1:1.0')['state'] == 'committed'
+    # The old pending request must still reach the internal fixer exactly once.
+    # No client reply may target the original channel using the new channel's
+    # message as its authority.
+    fixer = [m for m in pg_bus.msgs if (m.get('attachments') or {}).get('kind') == 'fixer_request']
+    assert len(fixer) == 1
+    assert 'my photos are broken' in fixer[0]['body']
+    assert not any(m['direction'] == 'outbound' and
+                   (m.get('attachments') or {}).get('kind') == 'answer' for m in pg_bus.msgs)
+
+    # The exception is scoped to the capped original requester, never a
+    # general permission to move a ticket across channels or tenants.
+    context = copy.deepcopy(second_replay['context'])
+    context['event']['channel'] = 'G2'
+    context['event']['ts'] = '2.0'
+    context['event_key'] = 'G2:2.0'
+    context['rate_limited'] = False
+    with pytest.raises(RuntimeError, match='identity/source mismatch'):
+        pg_bus.engine.call('support_slack_replay_capture', {
+            'p_ticket_id': first.ticket_id, 'p_event_key': 'G2:2.0',
+            'p_identity': 'echo', 'p_context': context})
+    context['rate_limited'] = True
+    context['who']['gym_id'] = 'foreign-gym'
+    with pytest.raises(RuntimeError, match='identity/source mismatch'):
+        pg_bus.engine.call('support_slack_replay_capture', {
+            'p_ticket_id': first.ticket_id, 'p_event_key': 'G2:2.0',
+            'p_identity': 'echo', 'p_context': context})
+
+
+def test_capped_other_channel_text_never_reaches_original_answer_context(pg_bus, paused):
+    seen = []
+    def answer(_ticket, _who, messages, _question):
+        seen.extend(messages)
+        return {'body': 'There are three draft posts.', 'grounding': {'drafts': 3}}
+    deps = _deps(pg_bus, cap=1, client_armed=True, auto_answer=True, answer=answer)
+    adapter.handle_event(_ev('is the calendar loaded?', channel='G0', ts='0.0'),
+                         'G0:0.0', deps)
+    adapter.handle_event(_ev('private note from another channel', channel='G1', ts='1.0'),
+                         'G1:1.0', deps)
+    resume(paused)
+    replay.run_once(deps)
+    assert seen
+    assert all('private note' not in row.get('body', '') for row in seen)
+    assert any((row.get('attachments') or {}).get('kind') == 'ack' for row in pg_bus.msgs)
+
+
 def test_pause_restart_resume_and_duplicate_never_strand_or_repeat(pg_bus, paused):
     deps,item = capture_one(pg_bus,paused)
     assert item['context']['event'] == _ev('my photos are broken')
@@ -783,14 +844,15 @@ def test_paused_issue_then_thanks_preserves_initial_request_once(pg_bus,paused):
 
 
 @pytest.mark.parametrize('armed',[True,False])
-def test_chatter_renews_only_untouched_delivery_authority_preserving_plan_and_hold(pg_bus,paused,armed):
+@pytest.mark.parametrize('text',['thanks!', 'got it, thanks', 'got it thank you'])
+def test_chatter_renews_only_untouched_delivery_authority_preserving_plan_and_hold(pg_bus,paused,armed,text):
     deps,item=capture_one(pg_bus,paused,text='is the calendar loaded?',client_armed=armed,
         auto_answer=True,answer=lambda *args:{'body':'There are three draft posts.','grounding':{'drafts':3}})
     resume(paused)
     replay.process(deps,item['id'])
     original=copy.deepcopy(queue(pg_bus)[0])
     row=next(m for m in pg_bus.msgs if (m.get('attachments') or {}).get('kind')=='ack')
-    noted=adapter.handle_event(_ev('thanks!',ts='1.002'),'G0MPIM:1.002',deps)
+    noted=adapter.handle_event(_ev(text,ts='1.002'),'G0MPIM:1.002',deps)
     assert noted.reason=='chatter_noted'
     assert not noted.outbound_kinds
     renewed=pg_bus.message(row['id'])
@@ -1114,3 +1176,13 @@ def test_production_shape_uses_verified_inbound_safety_without_imaginary_columns
     adapter.handle_event(_ev('thanks',ts='3.002'),'G0MPIM:3.002',deps)
     assert len(pg_bus.msgs)==before+1
     assert not replay.dispatch_allowed(pg_bus,pg_bus.message(row['id']),'echo')
+
+
+@pytest.mark.parametrize("text", ["got it, thanks", "got it thank you", "got it, thanks!"])
+def test_compound_acknowledgement_is_benign(text):
+    assert replay.benign_chatter(text)
+
+
+@pytest.mark.parametrize("text", ["got it, thanks please fix my posts", "got it thank you but stop", "thanks, my photos are broken"])
+def test_acknowledgement_prefix_does_not_suppress_request(text):
+    assert not replay.benign_chatter(text)

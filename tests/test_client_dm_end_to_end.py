@@ -18,6 +18,7 @@ from datetime import datetime, timezone
 
 from agent.client_dm_support import lane as L
 from agent.slack_convo import adapter as A
+from tests.slack_replay_fake import handle_event as _handle_event
 from agent.slack_convo import identities as IDS
 from agent.slack_convo import identity_gate as IG
 
@@ -170,7 +171,7 @@ def test_johns_real_message_via_the_real_adapter_now_reaches_client_dm_support(
     bus = HybridBus()
     ev = _real_client_group_dm_event(
         "the posts need a real call to action", channel="G0SCOUT", user="U_JOHN")
-    decision = A.handle_event(ev, "e1", _deps(bus, scout))
+    decision = _handle_event(ev, "e1", _deps(bus, scout))
 
     assert decision.action == "ticketed"
     tid = decision.ticket_id

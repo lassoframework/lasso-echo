@@ -18,6 +18,7 @@ import os
 import sys
 
 import pytest
+from tests.slack_replay_fake import handle_event as _handle_event
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
@@ -169,7 +170,7 @@ def _answering(bus, body, **kw):
 def test_slack_adapter_floor_hold_tells_the_client_and_the_team(monkeypatch):
     _armed(monkeypatch)
     bus = FakeBus()
-    d = A.handle_event(_ev("is my instagram connected?"), "k",
+    d = _handle_event(_ev("is my instagram connected?"), "k",
                        _answering(bus, "Yes. We will refund last month's charge."))
     tid = d.ticket_id
     answers = _rows(bus, tid, A.KIND_ANSWER)
@@ -197,7 +198,7 @@ def test_slack_adapter_floor_hold_tells_the_client_and_the_team(monkeypatch):
 def test_slack_adapter_needs_review_hands_the_ticket_to_the_fixer(monkeypatch):
     _armed(monkeypatch)
     bus = FakeBus()
-    d = A.handle_event(_ev(THIRD_PARTY_Q), "k", _answering(bus, "Yes, it went out tuesday."))
+    d = _handle_event(_ev(THIRD_PARTY_Q), "k", _answering(bus, "Yes, it went out tuesday."))
     tid = d.ticket_id
     t = bus.tickets[tid]
     assert t["status"] == "hold" and t["escalated"] is True
@@ -215,13 +216,13 @@ def test_slack_adapter_needs_review_hands_the_ticket_to_the_fixer(monkeypatch):
 def test_slack_adapter_sends_dean_and_pete_and_escalates_petes_promise(monkeypatch):
     _armed(monkeypatch)
     bus = FakeBus()
-    d = A.handle_event(_ev(DEAN_Q), "k", _answering(bus, DEAN_A))
+    d = _handle_event(_ev(DEAN_Q), "k", _answering(bus, DEAN_A))
     assert _rows(bus, d.ticket_id, A.KIND_ANSWER)[0]["delivery_status"] == "ready"
     assert not _rows(bus, d.ticket_id, A.KIND_HOLD_NOTICE)
     assert bus.tickets[d.ticket_id]["status"] == "verification"
 
     bus = FakeBus()
-    d = A.handle_event(_ev(PETE_Q, user="U_PETE"), "k2", _answering(bus, PETE_A))
+    d = _handle_event(_ev(PETE_Q, user="U_PETE"), "k2", _answering(bus, PETE_A))
     assert _rows(bus, d.ticket_id, A.KIND_ANSWER)[0]["delivery_status"] == "ready"
     t = bus.tickets[d.ticket_id]
     assert t["status"] == "hold" and t["escalated"] is True and t["classification"] is None, \
@@ -231,7 +232,7 @@ def test_slack_adapter_sends_dean_and_pete_and_escalates_petes_promise(monkeypat
 def test_slack_adapter_unarmed_auto_answer_still_tells_the_client(monkeypatch):
     _armed(monkeypatch)
     bus = FakeBus()
-    d = A.handle_event(_ev(DEAN_Q), "k",
+    d = _handle_event(_ev(DEAN_Q), "k",
                        _deps(bus, answer=lambda t, w, m, q: {"body": DEAN_A, "grounding": {"x": 1}},
                              client_armed=True, auto_answer=False))
     tid = d.ticket_id
@@ -249,7 +250,7 @@ def test_client_reply_off_means_the_legacy_card_only(monkeypatch):
     only honest surface and no template row is written to sit held beside it."""
     _armed(monkeypatch)
     bus = FakeBus()
-    d = A.handle_event(_ev("is my instagram connected?"), "k",
+    d = _handle_event(_ev("is my instagram connected?"), "k",
                        _deps(bus, answer=lambda t, w, m, q: {"body": "We will refund it.",
                                                              "grounding": {"x": 1}},
                              client_armed=False, auto_answer=False))
@@ -261,7 +262,7 @@ def test_client_reply_off_means_the_legacy_card_only(monkeypatch):
 def test_staff_answers_are_never_held_by_the_floor(monkeypatch):
     _armed(monkeypatch)
     bus = FakeBus()
-    d = A.handle_event(_ev("is my instagram connected?", user="U_STAFF", channel="D_STAFF",
+    d = _handle_event(_ev("is my instagram connected?", user="U_STAFF", channel="D_STAFF",
                            channel_type="im"), "k",
                        _answering(bus, "We will refund it.", who=IG.STAFF))
     assert _rows(bus, d.ticket_id, A.KIND_ANSWER)[0]["delivery_status"] == "ready"
@@ -477,7 +478,7 @@ def _follow_up_hold(t):
 def test_slack_adapter_promise_posts_once_and_hands_the_ticket_to_the_fixer(monkeypatch):
     _armed(monkeypatch)
     bus = FakeBus()
-    d = A.handle_event(_ev("is my instagram connected?"), "k", _answering(bus, FOLLOW_UP_A))
+    d = _handle_event(_ev("is my instagram connected?"), "k", _answering(bus, FOLLOW_UP_A))
     tid = d.ticket_id
     answers = _rows(bus, tid, A.KIND_ANSWER)
     assert len(answers) == 1 and answers[0]["delivery_status"] == "ready"
@@ -632,7 +633,7 @@ def test_outbox_third_person_fixer_promise_is_not_sent_before_deployment(monkeyp
 def test_slack_question_with_no_grounded_answer_is_handed_to_the_fixer(monkeypatch):
     _armed(monkeypatch)
     bus = FakeBus()
-    d = A.handle_event(_ev("is my instagram connected?"), "k",
+    d = _handle_event(_ev("is my instagram connected?"), "k",
                        _deps(bus, answer=lambda t, w, m, q: None, client_armed=True,
                              auto_answer=True))
     tid = d.ticket_id
@@ -654,7 +655,7 @@ def test_slack_question_with_no_grounded_answer_is_handed_to_the_fixer(monkeypat
 def test_slack_undecided_classification_clears_a_stale_label(monkeypatch):
     _armed(monkeypatch)
     bus = FakeBus()
-    d = A.handle_event(_ev("asdkjh qwe zxc"), "k", _deps(bus, client_armed=True))
+    d = _handle_event(_ev("asdkjh qwe zxc"), "k", _deps(bus, client_armed=True))
     t = bus.tickets[d.ticket_id]
     assert t["status"] == "hold" and t["escalated"] is True and t["classification"] is None
     card = _rows(bus, d.ticket_id, A.KIND_ESCALATION)[0]["body"]
