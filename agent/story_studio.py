@@ -512,7 +512,9 @@ def _held(request_id, gym_id, reason, store, request, tmpl_name, shelf,
                 store.update_request(
                     request_id, {"status": STATUS_HELD, "hold_reason": reason},
                     gym_id=gym_id)
-                if already_persisted:
+                existing_render = (store.get_render(request_id, gym_id=gym_id)
+                                   if callable(getattr(store, "get_render", None)) else None)
+                if already_persisted or existing_render:
                     store.update_render(
                         request_id, {"status": STATUS_DENIED}, gym_id=gym_id)
             else:

@@ -589,6 +589,19 @@ def test_automatic_request_id_collision_in_foreign_gym_fails_closed(monkeypatch,
     assert store.requests[rid] == foreign
 
 
+def test_retried_hold_denies_an_older_unstaged_render():
+    store = _UniqueIdStore()
+    store.insert_request({'id': 'same-request', 'gym_id': 'pierce',
+                          'status': 'pending', 'hold_reason': None})
+    store.insert_render({'id': 'same-request', 'request_id': 'same-request',
+                         'gym_id': 'pierce', 'status': 'pending'})
+    ss._held('same-request', 'pierce', 'Current portrait hold', store,
+             {'asset_ids': []}, 'hype_montage', '')
+    assert store.requests['same-request']['status'] == 'held'
+    assert store.requests['same-request']['hold_reason'] == 'Current portrait hold'
+    assert store.renders['same-request']['status'] == 'denied'
+
+
 def test_calendar_insert_failure_corrects_the_persisted_rows_to_held(monkeypatch, tmp_path):
     """Reproduces the real Zanshin bug (story_request/story_render 8e1b4bdf-...,
     2026-09-07): _persist() already INSERTed both rows as PENDING before the
