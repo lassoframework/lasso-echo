@@ -563,7 +563,7 @@ def _recorded_remote_receipt(use_id):
 
 
 def _settle_armed_drive_landing(portal_gym_key, row, pick, persisted_row, log, *,
-                              forward_binding_reader=None):
+                              forward_binding_reader=None, manifest_evidence=None):
     """Consume one exact landed armed Drive row to a verified receipt.
 
     Sequence: confirm_landed (exact same logical row + asset + payload) ->
@@ -643,10 +643,18 @@ def _settle_armed_drive_landing(portal_gym_key, row, pick, persisted_row, log, *
             log(f"{portal_gym_key}: cross-tenant batch binding "
                 f"({bound['tenant_id']}); holding remote use for {use_id}")
             return False
+        manifest_digest = None
+        if persisted_row.get("render_manifest_digest") is not None:
+            if not journal.forward_manifest_evidence_matches(
+                    current, persisted_row, bound, manifest_evidence):
+                log(f"{portal_gym_key}: trusted manifest/reservation proof unavailable; "
+                    f"holding remote use for {use_id}")
+                return False
+            manifest_digest = manifest_evidence["snapshot"]["render_manifest_digest"]
         member_row = journal.forward_stage_member_row(bound, str(row_id))
-        # The stage RPC changes only the reservation markers; finalization
-        # restores active/unheld. Every other frozen member field must match
-        # the live row, with only the journal's explicit server additions.
+        # Finalization restores active/unheld. Trusted staged preparation may
+        # fill the manifest digest verified above. Every other frozen member
+        # field must match, with only explicit safe server defaults.
         expected_member = dict(member_row) if isinstance(member_row, dict) else None
         if expected_member is not None:
             if (expected_member.get("variant_status") not in (None, "candidate")
@@ -659,8 +667,10 @@ def _settle_armed_drive_landing(portal_gym_key, row, pick, persisted_row, log, *
         if (expected_member is None
                 or str(member_row.get("logical_post_id") or "")
                 != current["logical_post_id"]
-                or not journal._landed_row_matches(persisted_row, expected_member)
-                or not journal._landed_row_matches(persisted_row, current["calendar_row"])
+                or not journal._landed_row_matches(persisted_row, expected_member,
+                                                   manifest_digest=manifest_digest)
+                or not journal._landed_row_matches(persisted_row, current["calendar_row"],
+                                                   manifest_digest=manifest_digest)
                 or (state in ("confirmed_landed", "consumption_pending")
                     and (not isinstance(proof, dict)
                          or proof.get("use_id") != use_id
@@ -681,6 +691,8 @@ def _settle_armed_drive_landing(portal_gym_key, row, pick, persisted_row, log, *
         evidence = {"calendar_row": persisted_row,
                     "asset_id": str((pick.get("asset") or {}).get("id") or ""),
                     "content_hash": str(current.get("content_hash") or "")}
+        if manifest_evidence is not None:
+            evidence["forward_manifest_evidence"] = manifest_evidence
         try:
             journal.confirm_landed(use_id, evidence)
             journal.begin_consumption(use_id)
@@ -743,8 +755,14 @@ def _settle_armed_drive_landing(portal_gym_key, row, pick, persisted_row, log, *
     return True
 
 
-def _forward_recovery_member_matches(entry, persisted, bound):
-    """Validate frozen placement BEFORE asking PG to bind terminal proof."""
+def _forward_recovery_member_matches(entry, persisted, bound, *, provisional=False,
+                                     manifest_evidence=None):
+    """Match frozen placement; provisional discovery never authorizes CAS.
+
+    Preparation may add a digest after staging. Discovery checks its shape
+    while preserving every other field. Strict matching requires the exact
+    trusted snapshot and current active reservation proof for that digest.
+    """
     from . import gbp_drive_use_journal as journal
     if (not isinstance(bound, dict) or bound.get("tenant_id") != entry["gym_id"]
             or persisted.get("gym_id") != entry["gym_id"]
@@ -758,8 +776,39 @@ def _forward_recovery_member_matches(entry, persisted, bound):
             or member.get("media_not_ready_reason") is not None):
         return False
     expected = dict(member, variant_status="active", media_not_ready_reason=None)
-    return (journal._landed_row_matches(persisted, expected)
-            and journal._landed_row_matches(persisted, entry["calendar_row"]))
+    manifest_digest = persisted.get("render_manifest_digest")
+    if manifest_digest is not None and not provisional:
+        if not journal.forward_manifest_evidence_matches(entry, persisted, bound, manifest_evidence):
+            return False
+    return (journal._landed_row_matches(persisted, expected, manifest_digest=manifest_digest)
+            and journal._landed_row_matches(persisted, entry["calendar_row"],
+                                           manifest_digest=manifest_digest))
+
+
+def _forward_recovery_manifest_evidence(store, entry, persisted, bound):
+    """Read exact manifest and reservation authority via existing PG RPCs.
+
+    No new DSN, mutable registry read, row-derived source hash or caller
+    manifest is used. The frozen observation binds the source SHA request;
+    PG independently validates it against the current active reservation.
+    """
+    from . import gbp_drive_use_journal as journal
+    from .portal_calendar_store import _SNAPSHOT_RPC
+    if persisted.get("render_manifest_digest") is None:
+        return None
+    if not journal.forward_finalized_proof_valid(bound):
+        raise ValueError("terminal batch proof required before manifest read")
+    sha = journal.forward_stage_source_sha256(bound, str(persisted.get("id") or ""))
+    if sha is None:
+        raise ValueError("frozen source SHA unavailable")
+    authority = getattr(store, "_s", store)
+    snapshot = authority._reservation_rpc(_SNAPSHOT_RPC,
+        {"p_calendar_row_id": persisted["id"]}, timeout=30)
+    proof = authority.forward_reservation_proof(persisted["id"], sha)
+    evidence = {"snapshot": snapshot, "reservation_proof": proof}
+    if not journal.forward_manifest_evidence_matches(entry, persisted, bound, evidence):
+        raise ValueError("trusted manifest/reservation binding mismatch")
+    return evidence
 
 
 def _recover_armed_drive_uses(portal_gym_key, account_gen_key, store, log):

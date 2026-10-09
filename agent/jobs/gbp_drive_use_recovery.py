@@ -273,7 +273,7 @@ def run(*, store=None, media_store=None, logger=None, row_limit=MAX_ROWS):
                 raise ValueError("exact active row unavailable")
             persisted = matches[0]
             bound = _bound_member(path, str(persisted.get("id") or ""))
-            if not gbp_planner._forward_recovery_member_matches(entry, persisted, bound):
+            if not gbp_planner._forward_recovery_member_matches(entry, persisted, bound, provisional=True):
                 raise ValueError("frozen member mismatch")
             if bound["batch_id"] != batch_id:
                 raise ValueError("live member differs from admitted frozen batch")
@@ -285,12 +285,16 @@ def run(*, store=None, media_store=None, logger=None, row_limit=MAX_ROWS):
                 raise ValueError("batch binding failed this wave")
             if authority.forward_remote_use_settlement_allowed(batch_id) is not True:
                 raise ValueError("terminal settlement proof unavailable")
+            bound = _bound_member(path, str(persisted.get("id") or ""))
+            manifest_evidence = gbp_planner._forward_recovery_manifest_evidence(
+                store, entry, persisted, bound)
             # Re-read after the PG receipt lookup; its acknowledgment is not
             # evidence that the member is still ACTIVE with these exact bytes.
             fresh = gbp_planner._readback_inserted_rows(
                 store, tenant, [entry["calendar_row"]], max_rows=2)
             if (fresh is None or len(fresh) != 1
-                    or not gbp_planner._forward_recovery_member_matches(entry, fresh[0], bound)):
+                    or not gbp_planner._forward_recovery_member_matches(
+                        entry, fresh[0], bound, manifest_evidence=manifest_evidence)):
                 raise ValueError("fresh active member unavailable")
             persisted = fresh[0]
             if (enabled() is not True or gbp_staged_journal_flag() is not True
@@ -306,7 +310,8 @@ def run(*, store=None, media_store=None, logger=None, row_limit=MAX_ROWS):
                         journal_entry=entry)
             if not gbp_planner._settle_armed_drive_landing(
                     tenant, entry["calendar_row"], pick, persisted, log,
-                    forward_binding_reader=lambda row_id: _bound_member(path, row_id)):
+                    forward_binding_reader=lambda row_id: _bound_member(path, row_id),
+                    manifest_evidence=manifest_evidence):
                 raise ValueError("settlement held")
             summary["recovered"] += 1
         except Exception:
