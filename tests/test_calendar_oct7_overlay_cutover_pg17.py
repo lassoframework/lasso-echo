@@ -1,26 +1,66 @@
 """Whole calendar overlay and atomic cutover against the live Oct7 claim body.
 
-PG17 private disposable Unix socket; stdlib only, no production connections.
+PG17 private disposable Unix socket; stdlib harness with a pytest entry, no production connections.
 Other tranches use their tracked actual entry definitions; schema and autonomy /
 digest resolvers are synthetic. Run python3 tests/test_calendar_oct7_overlay_cutover_pg17.py.
 """
 import hashlib
+import os
 from pathlib import Path
 import random
 import shutil
 import subprocess
 import tempfile
 import uuid
+import pytest
 
 from test_forward_corpus_atomic_cutover_pg import entry_definitions, function
 
 ROOT = Path(__file__).resolve().parents[1]
-PG = Path('/opt/homebrew/opt/postgresql@17/bin')
 CLAIM = 'claim_calendar_publish_slot_owned'
 ENTRY = '  -- FORWARD LOCK ENTRY (2026-10-08 DRAFT): graph shared \'G\', then census\n  -- exclusive \'C\', before the tenant advisory lock and any row lock below.\n  perform public.fixer_forward_calendar_entry_lock_20261008();\n'
 
 
-def main():
+def pg17_bin_dir():
+    """Find a complete PostgreSQL 17 installation without accepting other majors."""
+    candidates = []
+    for env_name in ('POSTGRESQL_17_BIN', 'PG17_BIN'):
+        value = os.environ.get(env_name)
+        if value:
+            candidates.append(Path(value))
+    pg_config = shutil.which('pg_config')
+    if pg_config:
+        try:
+            bindir = subprocess.run([pg_config, '--bindir'], check=True, capture_output=True,
+                                    text=True, timeout=5).stdout.strip()
+            if bindir:
+                candidates.append(Path(bindir))
+        except (OSError, subprocess.SubprocessError):
+            pass
+    candidates.extend((Path('/opt/homebrew/opt/postgresql@17/bin'),
+                       Path('/usr/local/opt/postgresql@17/bin'),
+                       Path('/usr/lib/postgresql/17/bin'), Path('/usr/pgsql-17/bin')))
+    initdb = shutil.which('initdb')
+    if initdb:
+        candidates.append(Path(initdb).resolve().parent)
+    for directory in candidates:
+        if any(not (directory / name).is_file() for name in ('initdb', 'pg_ctl', 'postgres', 'psql')):
+            continue
+        try:
+            version = subprocess.run([str(directory / 'initdb'), '--version'], check=True,
+                                      capture_output=True, text=True, timeout=5).stdout
+        except (OSError, subprocess.SubprocessError):
+            continue
+        if '(PostgreSQL) 17.' in version or 'PostgreSQL 17.' in version:
+            return directory
+    return None
+
+
+def main(pg=None):
+    pg = pg or pg17_bin_dir()
+    if pg is None:
+        print('SKIP: PostgreSQL 17 server binaries unavailable; set PG17_BIN')
+        return
     assert shutil.disk_usage('/tmp').free > 5 * 1024**3
     live_sql = (ROOT / 'migrations/lasso_october7_catchup_capacity_20261008.sql').read_text()
     live_body = live_sql.split('$$')[1]
@@ -37,10 +77,10 @@ def main():
     port = random.randint(41000, 59000)
     started = False
     try:
-        subprocess.run([str(PG / 'initdb'), '-D', str(data), '-U', 'postgres', '--no-sync'], check=True, capture_output=True, timeout=60)
+        subprocess.run([str(pg / 'initdb'), '-D', str(data), '-U', 'postgres', '--no-sync'], check=True, capture_output=True, timeout=60)
         started = True
-        subprocess.run([str(PG / 'pg_ctl'), '-D', str(data), '-l', str(work / 'pg.log'), '-o', f"-k {sock} -p {port} -c listen_addresses=''", '-w', 'start'], check=True, capture_output=True, timeout=60)
-        base = [str(PG / 'psql'), '-X', '-qAt', '-v', 'ON_ERROR_STOP=1', '-h', str(sock), '-p', str(port), '-U', 'postgres']
+        subprocess.run([str(pg / 'pg_ctl'), '-D', str(data), '-l', str(work / 'pg.log'), '-o', f"-k {sock} -p {port} -c listen_addresses=''", '-w', 'start'], check=True, capture_output=True, timeout=60)
+        base = [str(pg / 'psql'), '-X', '-qAt', '-v', 'ON_ERROR_STOP=1', '-h', str(sock), '-p', str(port), '-U', 'postgres']
 
         def sql(statement, fail=None):
             result = subprocess.run(base, input='set check_function_bodies=off;\n' + statement, text=True, capture_output=True, timeout=60)
@@ -160,7 +200,7 @@ def main():
         print('LIMIT: synthetic schema and autonomy/digest resolvers; unrelated B entries loaded as full definitions; no production mutation, provider delivery, release acceptance or activation')
     finally:
         if started and (data / 'postmaster.pid').exists():
-            subprocess.run([str(PG / 'pg_ctl'), '-D', str(data), '-m', 'immediate', '-w', 'stop'], check=True, capture_output=True, timeout=30)
+            subprocess.run([str(pg / 'pg_ctl'), '-D', str(data), '-m', 'immediate', '-w', 'stop'], check=True, capture_output=True, timeout=30)
         if (data / 'postmaster.pid').exists():
             raise RuntimeError('active disposable cluster preserved: ' + str(work))
         shutil.rmtree(work)
@@ -168,3 +208,10 @@ def main():
 
 if __name__ == '__main__':
     main()
+
+
+def test_calendar_oct7_overlay_cutover_pg17():
+    pg = pg17_bin_dir()
+    if pg is None:
+        pytest.skip('requires existing PostgreSQL 17 server binaries (initdb, pg_ctl, postgres, psql); set PG17_BIN')
+    main(pg)
