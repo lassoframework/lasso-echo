@@ -1,13 +1,166 @@
 # Generated client release manifest candidate — 2026-10-09
 
-**State: DRAFT / UNAPPLIED / NOT ACCEPTED.** This is a frozen review packet
+**Image release state: DRAFT / UNAPPLIED / NOT ACCEPTED.** Portal 0611 has
+subsequently been applied; its current read-only ledger receipt is below.
+This is a frozen review packet
 derived from the PG17 integration tests, not a migration script or deployment
-authorization. No production database was touched and no client/provider
+authorization. No production database mutations were made by this packet and no client/provider
 outcome is established here. All admission, inventory, remote-drive and
 calendar-admission controls remain default-OFF. The dedicated issuer entrypoint
 is not provisioned: there are no production LOGINs, tenant grants, secrets,
 service configuration or invocation in this packet. The SQL creates only
 unprivileged `NOLOGIN` group roles; it does not provision credentials.
+
+## Bounded production install diagnostic — 2026-10-09
+
+**Production-shaped install/reconciliation rehearsal: BLOCKED.** The selected
+milestone stopped at a verified whole-file source conflict. The three current
+changes are an exact-file read-only diagnostic, focused static/stub checks, and
+this record. There is no apply path or production-shaped PG fixture in this
+change. Existing full-manifest tests and their synthetic seed remain unchanged.
+
+Frozen task HEAD before these uncommitted edits:
+`62ea62666363577a54a4c13d36e4b51894e27a8c` (Echo #385). The earlier checkout
+identity and exact test install sequence below remain historical local proof.
+That sequence is not an approved production installation plan.
+
+The fresh catalog/ledger query ran inside `BEGIN READ ONLY` / `ROLLBACK` on
+project `ooqcvmcjspeltuuhcvlh` at `2026-10-09T15:52:12.764759Z`. It read metadata
+and migration receipts only. No customer rows, provider calls, flags, roles,
+production SQL installation or deployments were changed. The frozen receipt
+is reproduced below; CLI-supplied offline receipts require independent
+authenticity and freshness verification.
+
+| Scope | Read-only finding |
+|---|---|
+| Production identity | PostgreSQL 17.6, postgres, system identifier `7642734024280108049` |
+| Portal 0611 | Already applied in both ledgers, version `20261009143836`, exact SQL SHA `55374ffe33677a1ef8ccbb41256c8abc9634645d0d9658f55ebc40fd1bc21dd2`; this diagnostic does not repeat the full 0611 catalog verifier |
+| Portal 0625 | Pending: no matching receipt in either ledger and no 0625 relation/function/column remnants |
+| Current claim function | Exact live body MD5 `c624eedcee819496129639108be991f6`, postgres owner, SECURITY DEFINER, `search_path=public`, ACL only postgres and service_role EXECUTE |
+| Calendar entry prerequisite | Drift: expects older body MD5 `db59bf4d6d0be4c42e5e49ab0b5a8b4f` |
+| Atomic cutover prerequisite | Pins the older body with lock entry added, MD5 `7c09844f2c8c00190e007b1bca83d2a0` |
+
+The live claim body matches the complete checked-in
+`migrations/lasso_october7_catchup_capacity_20261008.sql`, SHA
+`c8f1c4c3af064e17df3670252153b2698a64ec607271127093d0f9aaf1d26927`.
+Its final ACL statements also match the live explicit ACL. This file preserves
+the dated capacity-six October 7 catchup behavior. It is absent from the
+historical manifest sequence. The public migration ledger has no matching
+filename receipt for this file or the three historical capacity/provenance
+foundations queried; absence of a filename receipt is not evidence that their
+catalog effects are pending.
+
+Reapplying `calendar_approval_provenance_20261005.sql` would overwrite the live
+claim with the older body and make the calendar-entry guard pass by erasing
+current behavior. The entry overlay also omits capacity six. Reapplying the
+matching October 7 source after entry would erase the required G/C entry call.
+No later whole file in the historical sequence reconciles these requirements.
+The atomic cutover would refuse an overlay of the current body because its
+frozen body pin still targets `7c09844...`. Do not rewrite hashes, extract
+replacement bodies, replay foundations, or restore the old body to bypass this.
+
+Required next source-owner deliverables are a reviewed whole calendar-entry
+overlay that preserves the current claim behavior plus its corresponding whole
+atomic-cutover pins, and an owner-frozen complete baseline DDL/catalog/ACL export
+for the actual dependency corpus. Current fixture exports contain function
+definitions and selected catalog facts; they do not establish the complete
+production schema, triggers, constraints, enums, role inheritance, default ACLs,
+extension placement and ledger baseline. A production-shaped rehearsal cannot
+be established safely from the accepted synthetic bootstrap/table slices.
+
+`tools/generated_image_release_preflight.py` pins six complete source files
+before any connection is opened. It classifies 0611 ledger state, 0625 absence,
+the current claim source and the incompatible entry prerequisite. Hash, target,
+owner, ACL, signature, body or configuration drift stays blocked. It supports a
+caller-supplied fresh authorized TLS-verified connection for metadata readback;
+it always rolls back and closes that connection, including on a read failure.
+It cannot retry issuance or apply. Its CLI only checks local inputs and an
+optional JSON catalog receipt; it always exits 2 (no-go) and rejects `--apply`.
+This fresh-readback mechanism does not establish a lost-COMMIT-ACK installation
+receipt, rollback implementation, complete catalog acceptance or fixture parity.
+Those remain unimplemented until the missing sources are resolved. Runtime and
+release controls remain unactivated by this milestone.
+
+Focused check command: `python3 -m pytest tests/test_generated_image_production_install_pg.py -q`
+returned **23 passed**. These are static/stub diagnostics, with explicit refusal
+of hash/ACL/catalog drift and fresh read-only connection cleanup. They are not
+a production-shaped PG17 installation proof. Preservation rerun used verified
+PostgreSQL 17.11 binaries at `/opt/homebrew/Cellar/postgresql@17/17.11/bin` and
+existing psycopg 3.3.6 at `/tmp/echo-0611-test-deps`, without an installation.
+`PG17_BIN=/opt/homebrew/Cellar/postgresql@17/17.11/bin PYTHONPATH=/tmp/echo-0611-test-deps python3 -m pytest tests/test_generated_image_production_install_pg.py tests/test_generated_client_release_manifest_pg.py tests/test_generated_client_full_dispatch_pg.py -q -rs`
+returned **27 passed in 9.40s**, including all four existing generated/ordinary
+full-manifest/full-dispatch cases. The 14 warnings are existing Pillow
+`Image.getdata` deprecations in `agent/vision.py`. The first system-Python run
+skipped the four PG cases because psycopg was unavailable there; the rerun above
+resolved that runtime issue. Source files and accepted seed were unchanged.
+
+Independent review identified two diagnostic defects, now repaired within the
+same three owned files. The 0611 reconciliation pins the exact Supabase ledger
+version `20261009143836`; a different otherwise valid 14-digit version is drift.
+Nested offline receipt rows and field types are validated and projected before
+reconciliation. Null/scalar rows, invalid ACL types, malformed MD5 bodies and
+invalid UTC timestamps return structured `invalid_catalog_receipt` with no
+catalog content reflected. The CLI also handles malformed JSON, invalid UTF-8,
+excessive JSON nesting and unreadable files with the same sanitized no-go and
+exit 2. Extra offline fields are discarded.
+
+The hardened targeted plus preservation rerun used the same command and shared
+runtime above and returned **61 passed in 6.28s**, with the same 14 existing
+Pillow warnings. This includes 57 static/stub diagnostics and all four unchanged
+PG17 generated/ordinary manifest/dispatch cases. No production read or mutation
+was required for these two repairs; the frozen live receipt below is unchanged.
+
+Follow-up independent review found that a missing nullable `claim.config` key
+could pass type validation and fail during projection. Every projected row
+field now must be present before its value is checked. The deleted-config
+API/CLI regression returns sanitized `invalid_catalog_receipt` and exit 2.
+The same targeted plus preservation command returned **62 passed in 6.85s**,
+including 58 static/stub diagnostics and all four unchanged PG17 cases, with
+the same 14 existing Pillow warnings. Production scope remains blocked.
+
+Frozen current live receipt:
+
+```json
+{
+  "claim": [
+    {
+      "acl": [
+        "postgres=X/postgres",
+        "service_role=X/postgres"
+      ],
+      "name": "claim_calendar_publish_slot_owned",
+      "owner": "postgres",
+      "config": [
+        "search_path=public"
+      ],
+      "definer": true,
+      "body_md5": "c624eedcee819496129639108be991f6",
+      "identity": "p_row_id uuid, p_gym_id text, p_day date, p_timezone text, p_capacity integer, p_approved_only boolean, p_require_approval_proof boolean"
+    }
+  ],
+  "database": "postgres",
+  "project_id": "ooqcvmcjspeltuuhcvlh",
+  "ledger_0625": [],
+  "public_0611": [
+    {
+      "checksum": "55374ffe33677a1ef8ccbb41256c8abc9634645d0d9658f55ebc40fd1bc21dd2",
+      "filename": "0611_echo_source_brand_bundle.sql"
+    }
+  ],
+  "public_0625": [],
+  "objects_0625": [],
+  "supabase_0611": [
+    {
+      "name": "0611_echo_source_brand_bundle",
+      "version": "20261009143836",
+      "sql_sha256": "55374ffe33677a1ef8ccbb41256c8abc9634645d0d9658f55ebc40fd1bc21dd2"
+    }
+  ],
+  "server_version": "17.6",
+  "captured_at_utc": "2026-10-09T15:52:12.764759+00:00",
+  "system_identifier": "7642734024280108049"
+}
+```
 
 ## Frozen checkout identity
 
