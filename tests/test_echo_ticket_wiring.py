@@ -64,3 +64,14 @@ def test_live_echo_stamp_uses_request_and_identity_cas():
     assert match["slack_channel_id"] == "is.null"
     assert match["slack_thread_ts"] == "is.null"
     assert fields["slack_channel_id"] == "G123"
+
+
+def test_post_first_message_factory_binds_verify_sender_to_the_captured_poster():
+    """The current-notice send admission authenticates the exact transport that
+    POSTs: verify_sender must be the SAME captured poster's auth.test, not a
+    later environment lookup."""
+    poster = _FakePoster({"ok": True, "ts": "1.2"})
+    poster.auth_test = lambda: {"ok": True, "user_id": "U_ECHO"}
+    post_first_message = W._post_first_message_factory(poster)
+    assert post_first_message.verify_sender == poster.auth_test
+    assert post_first_message.verify_sender()["user_id"] == "U_ECHO"

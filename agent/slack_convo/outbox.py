@@ -1404,6 +1404,16 @@ def _finish_pending_route_notice(bus, row, proof, identity, log, summary):
         if not verified or (verified.get("attachments") or {}).get(
                 "delivery_readback_verified") is not True:
             return False
+        # An admitted 0624 send is closed only when its confirmed durable
+        # completion receipt was persisted before this bind (the primary path
+        # records it ahead of bind_current_notice_route). Absent, unknown or
+        # mismatched receipts stay held -- never bind, promote or resolve on
+        # uncertainty. Legacy proof-only rows predate the admission contract
+        # and keep their existing proof-only recovery below.
+        if not _support_send_completed(verified):
+            log(f"[slack-convo/outbox] pending route notice lacks durable send "
+                f"completion receipt row={row.get('id')}")
+            return False
         current_ticket = bus.ticket(row["ticket_id"])
         if (not current_ticket
                 or current_ticket.get("request_version") != row.get(
