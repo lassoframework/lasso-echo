@@ -1074,15 +1074,25 @@ def _handle_approve_supabase(account_key, draft_id, actor_id, reader, sb_store,
         # and generated source markers. Keep it before idempotent/terminal
         # branches so an old approved row cannot bypass the hold either.
         _source_asset_id = str(row.get("source_media_asset_id") or "").strip()
-        if (_generated_identity_present_in_row(row)
-                or _source_asset_id.startswith("generated-astra:")):
-            return 409, {"ok": False, "action": "approve", "draft_id": draft_id,
-                         "error": "generated creative approval is unavailable until trusted verification is enabled"}
+        _generated = (_generated_identity_present_in_row(row)
+                      or _source_asset_id.startswith("generated-astra:"))
+        if _generated:
+            from .generated_client_admission import enabled as client_admission_enabled
+            if not client_admission_enabled() or _generated_row_hold_reason(row):
+                return 409, {"ok": False, "action": "approve", "draft_id": draft_id,
+                             "error": "generated creative approval is unavailable until trusted verification is enabled"}
+            # Generated approval always uses actual atomic SQL + exact displayed
+            # snapshot; admission/receipt/freshness checks run in its transaction.
+            expected, why = _validate_expected_creative(expected_creative)
+            binding = _generated_from_row(row)
+            if expected is None or any(expected.get(k) != v for k, v in binding.items()):
+                return 409, {"ok": False, "action": "approve", "draft_id": draft_id,
+                             "error": "review_refresh_required", "detail": why}
         # idempotent: an already approved row is a clean no-op (never a re-publish);
         # an already PUBLISHED row is also a clean no-op (the approval already ran its
         # course), never a status rewrite back to 'approved'.
         if (row.get("status") or "") == _pcs.action_status("approve"):
-            if config.approval_capture_enabled() or config.approval_proof_enabled():
+            if _generated or config.approval_capture_enabled() or config.approval_proof_enabled():
                 expected, why = _validate_expected_creative(expected_creative)
                 if expected is None:
                     return 409, {"ok": False, "action": "approve", "draft_id": draft_id,
@@ -1157,7 +1167,7 @@ def _handle_approve_supabase(account_key, draft_id, actor_id, reader, sb_store,
         # mismatch inside the atomic RPC, is a 409 review_refresh_required:
         # no status change, no digest. Flag OFF ignores the body field
         # entirely and keeps the legacy wire + error shape.
-        _capture = config.approval_capture_enabled() or config.approval_proof_enabled()
+        _capture = _generated or config.approval_capture_enabled() or config.approval_proof_enabled()
         _expected = None
         if _capture:
             _expected, _why = _validate_expected_creative(expected_creative)

@@ -272,7 +272,7 @@ def generated_snapshot(persistence, calendar_row_id):
 
 
 def reserve_generated(persistence, calendar_row_id, candidate, trusted_snapshot, *,
-                      history_visuals, read_bytes=None):
+                      history_visuals, read_bytes=None, client_admission=None):
     """Existing dedicated owner prepares an Astra original atomically.
 
     The configured owner must reload its verified copy/palette/depletion facts
@@ -427,6 +427,12 @@ def reserve_generated(persistence, calendar_row_id, candidate, trusted_snapshot,
     manifest = prepare.build_render_manifest(original, original.source_url, data,
         'same_object', 'generated-astra:' + candidate['job_id'])
     persistence._assert_owner_identity()
+    if client_admission is not None:
+        from .generated_client_admission import GeneratedClientAdmission
+        if type(client_admission) is not GeneratedClientAdmission or not delegated:
+            raise ForwardMediaVerificationHold('dedicated generated client admission required')
+        return client_admission.stage(persistence, calendar_row_id, candidate,
+                                      checked_visuals, manifest.row(), approved_source_revision)
     with persistence._conn.cursor() as cur:
         operation = 'fixer_reserve_generated_bundle_20261007' if delegated else 'fixer_reserve_generated_20261007'
         cur.execute('select public.' + operation + '(%s,%s::jsonb,%s::jsonb,%s::jsonb,%s::text)',

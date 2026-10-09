@@ -761,3 +761,25 @@ def prepare_verified_infographic_candidate(request, snapshot, *, jobs, provider,
                 else "generated_photo_inventory_uncertain"}
     return prepare_candidate(request, snapshot, jobs=jobs, provider=provider,
                              reviewer=reviewer, storage=storage, enabled=True)
+
+
+def fill_verified_client_row(base, account, row_id, *, persistence, jobs,
+                             client_admission, loader=None, provider=None,
+                             reviewer=None, storage=None):
+    """Default-OFF owner composition for an already canonically bound gap row.
+
+    Legacy fill/mirror cannot lift their hold. This dedicated lane reuses the
+    current owner snapshot, candidate preparation and permanent reservation,
+    freezes a detached preparation for ordinary forward staging, and waits for
+    a separately issued committed receipt. The returned stage plan is consumed
+    by the separately authorized service stage/finalizer processes; this owner
+    never inserts, activates or approves a calendar row.
+    Reader dependency is injected; no issuer credential or approval is used.
+    """
+    from .generated_client_admission import enabled
+    if not enabled():
+        return dict(ok=False, held=True, reason='generated_client_admission_disabled')
+    from .generated_infographic_runtime import run_calendar_row
+    return run_calendar_row(base, account, row_id, persistence=persistence, jobs=jobs,
+                            client_admission=client_admission, loader=loader,
+                            provider=provider, reviewer=reviewer, storage=storage)
