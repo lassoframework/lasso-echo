@@ -77,6 +77,7 @@ import time
 
 from . import adapter as _a
 from .. import config
+from .. import support_sender_fence as _fence
 
 # Surfaces where a reply goes TOP LEVEL rather than in a thread: DMs and group DMs (people do
 # not thread there), and a portal-bridge ticket, whose Slack home is the group DM this system
@@ -1862,6 +1863,7 @@ def _blake_is_member(identity, channel, user):
     return False
 
 
+@_fence.guarded("outbox", lambda: {"paused": 1})
 def run_once(bus, post, *, identity, log=print, limit=50, now=None,
              member_check=None, readback=None):
     """Process up to `limit` ready rows for THIS identity.
@@ -2874,6 +2876,7 @@ def _resolve_on_answer(bus, ticket, row, kind, summary, att=None, body=""):
             summary["resolved"] += 1
 
 
+@_fence.guarded("operator_release", lambda: False)
 def release_held(bus, message_id, *, approved_by, identity=None, log=print):
     """A human tap on a hold notice: flip that held row to ready and stamp the ticket.
     Returns True when a held row was released. Refuses anything not currently held, any
@@ -2909,6 +2912,7 @@ def release_held(bus, message_id, *, approved_by, identity=None, log=print):
     return True
 
 
+@_fence.guarded("operator_resolve", lambda: False)
 def resolve_and_notify(bus, ticket_id, *, approved_by, identity, log=print):
     """A human tap on an escalation card: tell the person it is handled, and close the
     ticket (D48).

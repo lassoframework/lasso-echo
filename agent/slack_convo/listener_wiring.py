@@ -37,6 +37,7 @@ from . import classifier as _cls
 from . import identity_gate as _ig
 from . import identities as _ids
 from . import outbox as _outbox
+from .. import support_sender_fence as _fence
 from . import outreach as _outreach
 
 HEALTH_EVERY_SECONDS = 15 * 60
@@ -536,6 +537,7 @@ class ConvoWiring:
             seen.setdefault(want, 0)
         other = {k: v for k, v in self.counts.items() if not k.startswith("event:")}
         other.update(self.classifier_health())
+        other["support_sender_fence"] = _fence.receipt(self.deps.bus)
         return (f"[slack-convo/{self.identity.name}] health enabled="
                 f"{self.deps.identity_enabled()} events={dict(sorted(seen.items()))} "
                 f"other={dict(sorted(other.items()))}")

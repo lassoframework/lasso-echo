@@ -39,6 +39,7 @@ from datetime import datetime, timezone
 import uuid
 
 from .. import config
+from .. import support_sender_fence as _fence
 from . import identity_gate as _ig
 from .adapter import _slack_escape, KIND_OUTREACH_REQUEST
 
@@ -276,6 +277,7 @@ def initiate(ticket, who, ident, *, open_group_dm, post_first_message, record_ou
                 member_check=member_check, log=log)
 
 
+@_fence.guarded("direct_outreach", lambda: OutreachResult(opened=False, reason="support_sender_paused"))
 def _send(ticket, who, ident, *, open_group_dm, post_first_message, record_outbound,
          stamp_ticket=None, message_text=None, message_text_already_escaped=False,
          mark_message=None, claim_message=None, completion=False,
@@ -706,6 +708,7 @@ def request_approval(ticket, who, ident, *, record_outbound, write_hold_notice,
     return ApprovalRequestResult(requested=True, held_message_id=held_id, reason="held")
 
 
+@_fence.guarded("outreach_release", lambda: OutreachResult(opened=False, reason="support_sender_paused"))
 def release_approved_outreach(message_id, ticket, who, ident, *, get_held_message,
                               open_group_dm, post_first_message, record_outbound,
                               stamp_ticket=None, mark_message=None, claim_message=None,
