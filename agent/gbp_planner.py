@@ -562,7 +562,8 @@ def _recorded_remote_receipt(use_id):
     return receipt if isinstance(receipt, dict) else None
 
 
-def _settle_armed_drive_landing(portal_gym_key, row, pick, persisted_row, log):
+def _settle_armed_drive_landing(portal_gym_key, row, pick, persisted_row, log, *,
+                              forward_binding_reader=None):
     """Consume one exact landed armed Drive row to a verified receipt.
 
     Sequence: confirm_landed (exact same logical row + asset + payload) ->
@@ -619,7 +620,8 @@ def _settle_armed_drive_landing(portal_gym_key, row, pick, persisted_row, log):
             return False
         row_id = persisted_row.get("id")
         try:
-            bound = (journal.forward_stage_for_member(str(row_id))
+            binding_reader = forward_binding_reader or journal.forward_stage_for_member
+            bound = (binding_reader(str(row_id))
                      if row_id else None)
         except journal.JournalHold as hold:
             log(f"{portal_gym_key}: member batch binding hold for {use_id}: "
@@ -741,6 +743,25 @@ def _settle_armed_drive_landing(portal_gym_key, row, pick, persisted_row, log):
     return True
 
 
+def _forward_recovery_member_matches(entry, persisted, bound):
+    """Validate frozen placement BEFORE asking PG to bind terminal proof."""
+    from . import gbp_drive_use_journal as journal
+    if (not isinstance(bound, dict) or bound.get("tenant_id") != entry["gym_id"]
+            or persisted.get("gym_id") != entry["gym_id"]
+            or persisted.get("variant_status") != "active"
+            or persisted.get("media_not_ready_reason") is not None):
+        return False
+    member = journal.forward_stage_member_row(bound, str(persisted.get("id") or ""))
+    if (not isinstance(member, dict)
+            or member.get("logical_post_id") != entry["logical_post_id"]
+            or member.get("variant_status") not in (None, "candidate")
+            or member.get("media_not_ready_reason") is not None):
+        return False
+    expected = dict(member, variant_status="active", media_not_ready_reason=None)
+    return (journal._landed_row_matches(persisted, expected)
+            and journal._landed_row_matches(persisted, entry["calendar_row"]))
+
+
 def _recover_armed_drive_uses(portal_gym_key, account_gen_key, store, log):
     """Recover frozen uses before selection. Never resend a calendar POST."""
     from . import gbp_drive_use_journal as journal, gym_media_index
@@ -803,7 +824,7 @@ def _calendar_row_key(row):
             str((row or {}).get("account") or ""))
 
 
-def _readback_inserted_rows(store, portal_gym_key, proposed):
+def _readback_inserted_rows(store, portal_gym_key, proposed, *, max_rows=None):
     """Return exact landed rows, [] for proven-none, or None when unreadable.
 
     Supabase may commit an insert and lose the HTTP response. A normal month
@@ -818,7 +839,13 @@ def _readback_inserted_rows(store, portal_gym_key, proposed):
             rows = authoritative(portal_gym_key, proposed)
         except Exception:  # noqa: BLE001
             return None
-        return None if rows is None else list(rows)
+        if rows is None:
+            return None
+        if max_rows is not None:
+            from itertools import islice
+            rows = list(islice(iter(rows), max_rows + 1))
+            return rows if len(rows) <= max_rows else None
+        return list(rows)
 
     base = getattr(store, "_s", store)
     client_fn = getattr(base, "_client", None)
@@ -838,6 +865,7 @@ def _readback_inserted_rows(store, portal_gym_key, proposed):
                     "format": f"eq.{row.get('format') or ''}",
                     "image_url": f"eq.{row.get('image_url') or ''}",
                     "select": "*",
+                    **({"limit": str(max_rows)} if max_rows is not None else {}),
                 },
                 headers=headers_fn({"Prefer": "count=exact"}), timeout=30)
             if response.status_code >= 400:
@@ -848,6 +876,8 @@ def _readback_inserted_rows(store, portal_gym_key, proposed):
             except (IndexError, ValueError):
                 return None
             found = response.json() or []
+            if max_rows is not None and (total > max_rows or len(found) > max_rows):
+                return None
             if total == 0:
                 if found:
                     return None
