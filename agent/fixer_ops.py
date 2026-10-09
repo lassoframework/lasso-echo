@@ -229,6 +229,9 @@ def _now_iso():
 def _business_params_valid(check_id, params):
     if not isinstance(params, dict):
         return False
+    if check_id == "automatic_reel_and_thumbnails_ready":
+        from .fixer_business_evidence import automatic_reel_params_valid
+        return bool(automatic_reel_params_valid(params))
     if check_id == "story_calendar_media_ready":
         from .fixer_business_seed import validate_story_target, validate_story_created_at, SeedError
         if set(params) != {"row_id", "calendar_gym_key", "account", "post_date", "created_at"}:
@@ -394,10 +397,14 @@ def _run_business_evidence(raw_body, deps, now=None):
         if receipt_store is None:
             receipt_store = receipts.default_store()
         receipt_read = lambda key, echo_key: receipts.get_receipt(receipt_store, key, echo_key)
+    from .support_thumbnail_probe import probe_thumbnail, probe_approved_cta, probe_job_status
     record = evidence.observe(
         check_id, gym_key=client_id, request_key=request_key,
         merged_sha=merged_sha, params=params,
-        deps={"read": read, "receipt_read": receipt_read},
+        deps={"read": read, "receipt_read": receipt_read,
+              "thumbnail_probe": deps.get("thumbnail_probe") or probe_thumbnail,
+              "approved_cta_probe": deps.get("approved_cta_probe") or probe_approved_cta,
+              "job_status_probe": deps.get("job_status_probe") or probe_job_status},
         ticket_id=ticket_id, now=now)
     if not isinstance(record, dict):
         return 503, {"error": "evidence_unavailable"}
