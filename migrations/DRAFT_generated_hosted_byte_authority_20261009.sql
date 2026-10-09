@@ -70,7 +70,11 @@ language sql stable security definer set search_path=pg_catalog,public as $$
    (p_purpose='issue' and g.can_issue and pg_has_role(session_user,'generated_hosted_byte_issuer_20261009','MEMBER'))
    or (p_purpose='lookup' and (g.can_lookup or g.can_issue) and
     (pg_has_role(session_user,'generated_hosted_byte_reader_20261009','MEMBER')
-     or pg_has_role(session_user,'generated_hosted_byte_issuer_20261009','MEMBER'))))),false);
+     or pg_has_role(session_user,'generated_hosted_byte_issuer_20261009','MEMBER')))
+   -- Reconciliation of a lost issuance ACK is issuer-only. Dedicated readers
+   -- keep the exact pinned lookup and cannot enumerate receipt UUIDs.
+   or (p_purpose='reconcile' and g.can_issue and
+    pg_has_role(session_user,'generated_hosted_byte_issuer_20261009','MEMBER')))),false);
 $$;
 
 create function public.generated_hosted_byte_issue_20261009(
@@ -153,14 +157,55 @@ begin
  return result;
 end $$;
 
+
+-- Issuer-only readback for a lost successful issuance ACK. On a fresh
+-- post-issuance transaction, returns the ONE committed receipt whose exact
+-- identity matches every supplied binding; it never issues, mutates, retries
+-- or enumerates. A caller in the original issuance transaction can see its
+-- own uncommitted writes, so only the dedicated adapter's fresh connection
+-- supplies the committed-readback guarantee. Unique version/URL constraints
+-- make an ambiguous match impossible and a mismatch is rejected below.
+create function public.generated_hosted_byte_reconcile_20261009(
+ p_gym text,p_version uuid,p_url text,p_sha text,p_manifest_sha text)
+returns jsonb language plpgsql volatile security definer set search_path=pg_catalog,public as $$
+declare result jsonb; allowed boolean;
+begin
+ if not public.generated_hosted_byte_authorized_20261009(p_gym,'reconcile') then
+  raise exception 'dedicated tenant issuer required' using errcode='42501'; end if;
+ -- Serialize principal-grant revocation with this reconciliation transaction.
+ select can_issue into allowed from public.generated_hosted_byte_principals_20261009
+  where principal=session_user and gym_id=p_gym for share;
+ if not coalesce(allowed,false) then
+  raise exception 'dedicated tenant issuer required' using errcode='42501'; end if;
+ if p_version is null or p_url is null or length(p_url)>2048
+  or p_url !~ '^https://([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?/[^[:space:]?#]*$'
+  or p_sha is null or p_sha !~ '^[0-9a-f]{64}$'
+  or p_manifest_sha is null or p_manifest_sha !~ '^[0-9a-f]{64}$' then
+  raise exception 'exact identity binding required' using errcode='23514'; end if;
+ select v.delivery_receipt into result from public.generated_hosted_byte_receipts_20261009 r
+  join public.calendar_generated_artifact_versions v on v.id=r.artifact_version_id
+  where r.gym_id=p_gym and r.artifact_version_id=p_version and r.hosted_url=p_url
+   and r.delivered_sha256=p_sha and r.manifest_sha256=p_manifest_sha
+   and row(v.gym_id,v.image_url,v.delivered_sha256,v.render_manifest_digest)
+    is not distinct from row(r.gym_id,r.hosted_url,r.delivered_sha256,r.manifest_sha256)
+   and v.delivery_receipt=jsonb_build_object('receipt_id',r.receipt_id,'gym_id',r.gym_id,
+    'artifact_version_id',r.artifact_version_id,'hosted_url',r.hosted_url,'delivered_sha256',r.delivered_sha256,
+    'render_manifest',convert_from(r.manifest_bytes,'UTF8')::jsonb);
+ if not found then
+  raise exception 'no committed hosted byte receipt matches the exact binding' using errcode='P0002'; end if;
+ return result;
+end $$;
+
 revoke all on function public.generated_hosted_byte_immutable_20261009(),
  public.generated_hosted_byte_authorized_20261009(text,text),
  public.generated_hosted_byte_issue_20261009(text,uuid,text,text,text,bytea,bytea),
- public.generated_hosted_byte_lookup_20261009(text,uuid,text,text,text,uuid)
+ public.generated_hosted_byte_lookup_20261009(text,uuid,text,text,text,uuid),
+ public.generated_hosted_byte_reconcile_20261009(text,uuid,text,text,text)
  from public,anon,authenticated,service_role,generated_hosted_byte_issuer_20261009,generated_hosted_byte_reader_20261009;
 grant execute on function public.generated_hosted_byte_authorized_20261009(text,text),
  public.generated_hosted_byte_lookup_20261009(text,uuid,text,text,text,uuid)
  to generated_hosted_byte_issuer_20261009,generated_hosted_byte_reader_20261009;
-grant execute on function public.generated_hosted_byte_issue_20261009(text,uuid,text,text,text,bytea,bytea)
+grant execute on function public.generated_hosted_byte_issue_20261009(text,uuid,text,text,text,bytea,bytea),
+ public.generated_hosted_byte_reconcile_20261009(text,uuid,text,text,text)
  to generated_hosted_byte_issuer_20261009;
 commit;

@@ -46,8 +46,11 @@ class Connection:
             self.events.append("authorize")
             value = self.authorized
         else:
-            self.events.append("lookup" if "lookup" in sql else "issue")
+            self.events.append("reconcile" if "reconcile" in sql
+                               else "lookup" if "lookup" in sql else "issue")
             value = self.receipt
+            if "reconcile" in sql:
+                assert args == (TENANT, VERSION, URL, SHA, hashlib.sha256(MANIFEST_BYTES).hexdigest())
             if "issue" in sql:
                 assert args == (TENANT, VERSION, URL, SHA, hashlib.sha256(MANIFEST_BYTES).hexdigest(), DATA, MANIFEST_BYTES)
         return SimpleNamespace(fetchone=lambda: (value,))
@@ -81,6 +84,13 @@ def lookup(authority, **over):
                 manifest_bytes=MANIFEST_BYTES, receipt_id=RECEIPT["receipt_id"])
     args.update(over)
     return authority.lookup(**args)
+
+
+def reconcile(authority, **over):
+    args = dict(artifact_version_id=VERSION, hosted_url=URL, expected_sha256=SHA,
+                manifest_bytes=MANIFEST_BYTES)
+    args.update(over)
+    return authority.reconcile(**args)
 
 
 def test_issue_fresh_read_and_commit_exact_receipt_without_locks_during_get():
@@ -141,6 +151,65 @@ def test_invalid_or_unbound_manifest_never_reaches_authority(over):
     with pytest.raises(a.HostedByteHold):
         issue(issuer(events), **over)
     assert not events
+
+
+def test_reconcile_returns_the_one_committed_receipt_without_receipt_uuid():
+    events = []
+    assert reconcile(issuer(events)) == RECEIPT
+    assert events == ["authorize", "reconcile", "rollback", "close"]
+    assert "GET" not in events and "issue" not in events and "commit" not in events
+
+
+def test_lost_ack_commit_uncertainty_reconciles_without_retry_or_new_uuid():
+    events = []
+    with pytest.raises(a.HostedByteHold, match="commit_uncertain"):
+        issue(issuer(events, commit_error=True))
+    assert events.count("issue") == 1
+    # No automatic retry or invented replacement UUID; one exact readback.
+    assert reconcile(issuer(events)) == RECEIPT
+    assert events.count("issue") == 1 and events.count("reconcile") == 1
+
+
+def test_reconcile_rejects_absent_changed_or_forged_readback():
+    class Absent(Connection):
+        def execute(self, sql, args):
+            if "reconcile" in sql:
+                raise RuntimeError("no committed hosted byte receipt")
+            return super().execute(sql, args)
+    with pytest.raises(a.HostedByteHold, match="reconcile_unavailable"):
+        reconcile(a.GeneratedHostedByteAuthority(lambda: Absent([]), tenant_id=TENANT,
+                                                 reader=SyntheticReader([])))
+    for over in (dict(gym_id="gym-b"), dict(artifact_version_id=str(uuid.uuid4())),
+                 dict(hosted_url=URL + "changed"), dict(delivered_sha256="f" * 64),
+                 dict(render_manifest={"forged": True}), dict(extra="forged")):
+        with pytest.raises(a.HostedByteHold, match="receipt_binding_invalid"):
+            reconcile(issuer([], receipt={**RECEIPT, **over}))
+
+
+def test_reconcile_unauthorized_and_invalid_input_hold_statically():
+    events = []
+    with pytest.raises(a.HostedByteHold, match="identity_unavailable"):
+        reconcile(issuer(events, authorized=False))
+    assert "reconcile" not in events
+    for over in (dict(artifact_version_id="not-a-uuid"), dict(expected_sha256="F" * 64),
+                 dict(hosted_url="http://cdn.example/gym-a/generated/a.png"),
+                 dict(manifest_bytes=b"{}")):
+        fresh = []
+        with pytest.raises(a.HostedByteHold):
+            reconcile(issuer(fresh), **over)
+        assert not fresh
+
+
+def test_reconcile_database_error_is_static_and_leaks_no_detail():
+    class Broken(Connection):
+        def execute(self, sql, args):
+            if "reconcile" in sql:
+                raise RuntimeError("sensitive DSN password detail")
+            return super().execute(sql, args)
+    authority = a.GeneratedHostedByteAuthority(lambda: Broken([]), tenant_id=TENANT)
+    with pytest.raises(a.HostedByteHold, match="reconcile_unavailable") as error:
+        reconcile(authority)
+    assert "password" not in str(error.value) and "DSN" not in str(error.value)
 
 
 def test_reader_cannot_be_producer_callback():

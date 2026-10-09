@@ -92,6 +92,38 @@ to a matching authority issuance row. Producer-supplied receipt shape alone and
 even an otherwise well-formed preexisting portal row never pass this lookup.
 Every binding mismatch or missing receipt is a hold in the Python adapter.
 
+## Lost-ACK reconciliation (issuer-only)
+
+A successful `issue()` can commit the receipt while the dedicated issuer loses
+its response (for example a COMMIT acknowledgment dropped by the network).
+The receipt UUID is generated inside Postgres, so the issuer cannot call the
+exact pinned lookup without first recovering that UUID. `reconcile()` closes
+that gap without weakening any control:
+
+- New RPC `generated_hosted_byte_reconcile_20261009(tenant, version, URL,
+  delivered SHA, manifest SHA)` returns the ONE matching receipt, including
+  its UUID, whose receipt row and portal row both exactly match every supplied
+  binding and the recomputed canonical delivery receipt. Unique version and
+  hosted-URL constraints make an ambiguous match structurally impossible.
+- Authentication is `session_user` against the issuer principal's tenant grant
+  (`can_issue` plus issuer role membership), never a caller-provided actor,
+  receipt, service_role, owner or reader. The grant row is locked FOR SHARE so
+  reconciliation serializes with grant revocation, exactly like issuance.
+- It is issuer-only: dedicated readers keep the exact pinned lookup and cannot
+  enumerate receipt UUIDs. It issues nothing, mutates nothing and never
+  retries; absent, uncommitted, changed-binding or cross-tenant state raises
+  (`P0002`/`42501`/`23514`), surfaced by the Python adapter as a static hold
+  with no database, credential or DSN detail.
+- The Python `reconcile()` opens a fresh dedicated connection, revalidates the
+  frozen original manifest bytes and expected identity locally, and verifies
+  the returned receipt against all of them before returning it. The recovered
+  UUID can then be used with the ordinary exact lookup. Commit uncertainty
+  still never triggers an automatic retry of issuance.
+- PostgreSQL can show a caller its own uncommitted issuance within the same
+  transaction. Only a fresh post-issuance connection provides committed
+  readback; the issuer adapter enforces that boundary. Direct SQL callers with
+  issuer credentials do not get that guarantee from this RPC alone.
+
 Exact version replay returns the original receipt without changing its
 timestamp. The Python issuer independently GETs the object on every replay.
 Changed bytes, URL or manifest cannot rewrite a version. A hosted URL is unique
@@ -114,7 +146,17 @@ PYTHONPATH=/tmp/echo-pg-test-deps-20261009 python3 -m pytest -q \
   tests/test_generated_client_contract_transport.py
 ```
 
-Result after the independent-review origin-alias repair: **118 passed**. The PG
+Result after the independent-review origin-alias repair: **118 passed**.
+
+Reconciliation lane (2026-10-09): the bounded Kimi sandbox ran **67 unit tests**
+but could not start disposable PG17 (`initdb` bootstrap `shmget` denied). The
+lead then ran the unit and PG17 suites in the main task: **90 passed**. That run
+found and corrected a PostgreSQL volatility error: the new reconcile function
+must be `volatile` because it locks the issuer grant row `FOR SHARE`. The PG
+tests cover lost-ACK recovery, uncommitted invisibility across fresh connections,
+changed-binding and absent rejection, issuer-only/cross-tenant/revoked ACLs,
+and adapter flow. With transport and full release-manifest PG17 checks included,
+the affected run passed **130 tests**. The PG
 fixture starts a temporary local PG17 cluster on
 a private Unix socket with TCP listening disabled, then stops it and removes the
 temporary cluster. It reproduces only the portal immutable version table schema;
@@ -152,6 +194,12 @@ readback, replacement approval, tenant isolation and send gates. Consumers must
 not trust cached receipt JSON or portal-table existence as a substitute for the
 dedicated lookup. Production object storage must enforce immutable distinct
 version keys; no storage policy changes are part of this draft.
+
+Reconciliation limits: the recovered UUID still proves only the original
+committed observation; it does not prove current hosted bytes, and it does not
+authorize replaying or duplicating issuance. Reconciliation inherits the same
+trust boundary as issuance (the dedicated issuer credential can call the RPC
+directly) and adds no read access beyond the issuer role.
 
 Still required: independent source review, full composed stack testing, separate
 operator provisioning of least-privilege principals and tenant URL scopes,

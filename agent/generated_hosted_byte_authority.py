@@ -282,13 +282,39 @@ class GeneratedHostedByteAuthority:
         try:
             conn.commit()
         except Exception:
-            # COMMIT may have reached the server. Reconcile by exact lookup;
-            # never automatically retry or supply another UUID.
+            # COMMIT may have reached the server. Reconcile the exact binding
+            # through a fresh issuer connection; never retry or invent a UUID.
             raise HostedByteHold("generated_authority_commit_uncertain") from None
         finally:
             if not self._close(conn):
                 raise HostedByteHold("generated_authority_cleanup_uncertain") from None
         return receipt
+
+    def reconcile(self, *, artifact_version_id, hosted_url, expected_sha256,
+                  manifest_bytes):
+        """Issuer-only readback through a fresh connection after a lost ACK.
+
+        Same exact identity bindings as lookup, minus the unknown receipt UUID.
+        Never issues, mutates, retries or enumerates; an absent, changed or
+        cross-tenant binding is a static hold with no database detail.
+        """
+        version, sha = _uuid(artifact_version_id), _sha(expected_sha256)
+        _url(hosted_url)
+        manifest = _manifest(manifest_bytes, self.tenant_id, version, hosted_url, sha)
+        conn = self._open("reconcile")
+        try:
+            value = conn.execute(
+                "select public.generated_hosted_byte_reconcile_20261009(%s,%s,%s,%s,%s)",
+                (self.tenant_id, version, hosted_url, sha, _digest(manifest_bytes))
+            ).fetchone()[0]
+            return self._check_receipt(value, version, hosted_url, sha, manifest)
+        except HostedByteHold:
+            raise
+        except Exception:
+            raise HostedByteHold("generated_authority_reconcile_unavailable") from None
+        finally:
+            if not self._close(conn, rollback=True):
+                raise HostedByteHold("generated_authority_cleanup_uncertain") from None
 
     def lookup(self, *, artifact_version_id, hosted_url, expected_sha256,
                manifest_bytes, receipt_id):

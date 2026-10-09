@@ -99,6 +99,11 @@ def look(c, b, receipt):
                      (*b[:5], receipt)).fetchone()[0]
 
 
+def rec(c, b):
+    return c.execute("select public.generated_hosted_byte_reconcile_20261009(%s,%s,%s,%s,%s)",
+                     b[:5]).fetchone()[0]
+
+
 def denied(pg, fn, code=None):
     with pytest.raises(pg.Error) as error:
         fn()
@@ -231,6 +236,89 @@ def test_both_receipt_and_portal_rows_immutable_including_admin(local_pg):
         denied(pg, lambda: admin.execute(f"delete from public.{table} where {key}=%s", (b[1],)), "23514")
         denied(pg, lambda: admin.execute(f"truncate public.{table} cascade"), "23514")
         denied(pg, lambda: connect("service_role").execute(f"update public.{table} set gym_id='gym-b' where {key}=%s", (b[1],)), "42501")
+
+
+def test_lost_ack_reconcile_recovers_committed_receipt_without_receipt_uuid(local_pg):
+    _, connect, _ = local_pg
+    issuer = connect("issuer_a")
+    b = binding()
+    issued = rpc(issuer, b)
+    # The dedicated issuer lost the ACK and does not know the receipt UUID.
+    recovered = rec(connect("issuer_a"), b)
+    assert recovered == issued and recovered["receipt_id"] == issued["receipt_id"]
+    # Exact pinned lookup with the recovered UUID agrees.
+    assert look(connect("reader_a"), b, recovered["receipt_id"]) == issued
+
+
+def test_reconcile_rejects_uncommitted_then_accepts_committed_issuance(local_pg):
+    _, connect, pg = local_pg
+    pending = connect("issuer_a", False)
+    b = binding()
+    try:
+        issued = rpc(pending, b)
+        # Direct SQL can see its own uncommitted write. The adapter must open a
+        # different idle connection to establish committed readback.
+        assert rec(pending, b) == issued
+        # Uncommitted issuance is invisible to a fresh reconciliation.
+        denied(pg, lambda: rec(connect("issuer_a"), b), "P0002")
+        pending.commit()
+        assert rec(connect("issuer_a"), b)["artifact_version_id"] == b[1]
+    finally:
+        pending.rollback()
+
+
+def test_reconcile_rejects_absent_version_and_changed_bindings(local_pg):
+    _, connect, pg = local_pg
+    issuer = connect("issuer_a")
+    denied(pg, lambda: rec(issuer, binding()), "P0002")
+    b = binding()
+    rpc(issuer, b)
+    for index, value in ((2, b[2] + "changed"), (3, "f" * 64), (4, "f" * 64)):
+        bad = list(b)
+        bad[index] = value
+        denied(pg, lambda: rec(issuer, bad), "P0002")
+    denied(pg, lambda: rec(issuer, binding(tenant="gym-a", version=str(uuid.uuid4()))), "P0002")
+
+
+def test_reconcile_is_issuer_only_and_never_cross_tenant_or_revoked(local_pg):
+    admin, connect, pg = local_pg
+    b = binding()
+    rpc(connect("issuer_a"), b)
+    denied(pg, lambda: rec(connect("reader_a"), b), "42501")
+    denied(pg, lambda: rec(connect("issuer_b"), b), "42501")
+    for role in ("service_role", "anon", "authenticated"):
+        denied(pg, lambda: rec(connect(role), b))
+    admin.execute("update public.generated_hosted_byte_principals_20261009 set can_issue=false where principal='issuer_a'")
+    try:
+        denied(pg, lambda: rec(connect("issuer_a"), b), "42501")
+        # Revocation of the issuer grant does not disturb reader exact lookup.
+        rid = admin.execute("select receipt_id from public.generated_hosted_byte_receipts_20261009 where artifact_version_id=%s", (b[1],)).fetchone()[0]
+        assert look(connect("reader_a"), b, rid) is not None
+    finally:
+        admin.execute("update public.generated_hosted_byte_principals_20261009 set can_issue=true where principal='issuer_a'")
+    assert rec(connect("issuer_a"), b) is not None
+
+
+def test_adapter_lost_ack_flow_reconciles_exact_receipt(local_pg):
+    admin, connect, _ = local_pg
+    b = binding()
+    class Reader(a.HostedObjectReader):
+        def __init__(self):
+            super().__init__({"gym-a": ["https://cdn.example/gym-a/generated/"]})
+        def read(self, tenant, url):
+            return b[5]
+    authority = a.GeneratedHostedByteAuthority(lambda: connect("issuer_a", False), tenant_id="gym-a", reader=Reader())
+    args = dict(artifact_version_id=b[1], hosted_url=b[2], expected_sha256=b[3], manifest_bytes=b[-1])
+    issued = authority.issue(**args)
+    recovered = authority.reconcile(**args)
+    assert recovered == issued
+    reader_authority = a.GeneratedHostedByteAuthority(lambda: connect("reader_a", False), tenant_id="gym-a")
+    with pytest.raises(a.HostedByteHold):
+        reader_authority.reconcile(**args)
+    with pytest.raises(a.HostedByteHold):
+        authority.reconcile(artifact_version_id=str(uuid.uuid4()), hosted_url=b[2],
+                            expected_sha256=b[3], manifest_bytes=b[-1])
+    assert admin.execute("select count(*) from public.generated_hosted_byte_receipts_20261009 where artifact_version_id=%s", (b[1],)).fetchone()[0] == 1
 
 
 def test_concurrent_identical_replay_issues_one_receipt(local_pg):
