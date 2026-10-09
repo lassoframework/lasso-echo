@@ -21,12 +21,22 @@ MIGRATION = 'DRAFT_fixer_calendar_admission_guard_20261009.sql'
 
 def acceptance(*, sql, denied, seed, attest, dsn):
     import psycopg
-    # Non-PUBLIC default grants must not widen a recreated wrapper's ACL.
-    # Compare every explicit EXECUTE grantee and grant option against the
-    # original catalog, including a custom original grant with grant option.
+    # Non-PUBLIC defaults must not widen an existing entry or its private copy.
+    # Compare original OIDs and every explicit EXECUTE grantor, grantee and
+    # grant option, including an onward custom-role grant.
     assert sql('select count(*) from synthetic_original_entry_acl')[0][0] >= 4
+    assert sql("""select bool_and((to_jsonb(p)-'prosrc')=(before.catalog-'prosrc'))
+      from synthetic_original_entry_catalog before join pg_proc p on p.oid=before.function_oid
+    """)[0][0] is True, 'original entry catalog properties changed'
+    assert sql("""select bool_and(body.prosrc=before.catalog->>'prosrc'
+      and (to_jsonb(body)-array['prosrc','proacl','oid','proname'])=
+          (before.catalog-array['prosrc','proacl','oid','proname']))
+      from synthetic_original_entry_catalog before
+      join pg_proc body on body.proname='fixer_admission_body_'||before.function_oid::text
+    """)[0][0] is True, 'private copy body/config/security shape changed'
+
     assert sql("""with current_acl as (
-      select p.proname,a.grantee,a.privilege_type,a.is_grantable
+      select p.oid as function_oid,p.proname,a.grantor,a.grantee,a.privilege_type,a.is_grantable
       from pg_proc p join pg_namespace n on n.oid=p.pronamespace
       cross join lateral aclexplode(coalesce(p.proacl,acldefault('f',p.proowner))) a
       where n.nspname='public' and p.proname in (select proname from synthetic_original_entry_acl)
@@ -34,7 +44,7 @@ def acceptance(*, sql, denied, seed, attest, dsn):
       (select * from current_acl except select * from synthetic_original_entry_acl)
       union all
       (select * from synthetic_original_entry_acl except select * from current_acl)
-    ) select count(*) from difference""")[0][0] == 0, 'recreated entry EXECUTE ACL drift'
+    ) select count(*) from difference""")[0][0] == 0, 'original entry OID or exact grantor ACL drift'
     for role in ('anon','authenticated','synthetic_default_executor'):
         assert sql("select bool_and(not has_function_privilege(%s,p.oid,'execute')) from pg_proc p where p.proname in (select proname from synthetic_original_entry_acl)", (role,))[0][0] is True
     assert sql("select has_function_privilege('synthetic_original_executor','fixer_bind_forward_media_manifest_20261006(uuid)','execute with grant option')")[0][0] is True
@@ -49,6 +59,12 @@ def acceptance(*, sql, denied, seed, attest, dsn):
         union all
         (select * from synthetic_unrelated_acl_before except select * from current_acl)
       ) select count(*) from difference""")[0][0] == 0, 'unrelated function grant chain changed'
+    # PostgreSQL must still see the original grantor dependency, rather than
+    # attributing the downstream grant to postgres during wrapper install.
+    sql('revoke grant option for execute on function public.fixer_bind_forward_media_manifest_20261006(uuid) from synthetic_original_executor cascade')
+    assert sql("select has_function_privilege('synthetic_downstream_executor','fixer_bind_forward_media_manifest_20261006(uuid)','execute')")[0][0] is False
+    assert sql("select has_function_privilege('synthetic_original_executor','fixer_bind_forward_media_manifest_20261006(uuid)','execute')")[0][0] is True
+    assert sql("select has_function_privilege('synthetic_original_executor','fixer_bind_forward_media_manifest_20261006(uuid)','execute with grant option')")[0][0] is False
     assert sql('select synthetic_unrelated_acl()',role='synthetic_downstream_executor')[0][0] == 1
     assert sql('select enabled from fixer_calendar_admission_gate_20261009')[0][0] is False
     denied('update fixer_calendar_admission_gate_20261009 set enabled=true', fragment='permission denied')
@@ -175,7 +191,7 @@ def acceptance(*, sql, denied, seed, attest, dsn):
     assert archived['archived_old_row_ids']==[c['rid']]
     assert sql('select variant_status from content_calendar where id=%s',(c['rid'],))[0][0]=='archived'
     assert sql('select count(*) from fixer_calendar_admission_capability_20261009')[0][0]==0
-    print('PASS: real PG17 registered preparation/finalization; null logical insert; PATCH/backfill/clear/swap; definer/GUC/exact default-ACL/grant-chain isolation; borrowed/stale authority; tenant/date/source/derivative conflicts; concurrent refusal; nonmedia operations; exact persisted old-row archival')
+    print('PASS: real PG17 registered preparation/finalization; null logical insert; PATCH/backfill/clear/swap; definer/GUC/exact OID/config/default-ACL/grantor-cascade isolation; borrowed/stale authority; tenant/date/source/derivative conflicts; concurrent refusal; nonmedia operations; exact persisted old-row archival')
 
 
 def main():
@@ -202,12 +218,15 @@ def main():
                 select a.* from pg_proc p cross join lateral aclexplode(p.proacl) a
                 where p.oid='public.synthetic_unrelated_acl()'::regprocedure;
               create table synthetic_original_entry_acl as
-                select p.proname,a.grantee,a.privilege_type,a.is_grantable
+                select p.oid as function_oid,p.proname,a.grantor,a.grantee,a.privilege_type,a.is_grantable
                 from pg_proc p join pg_namespace n on n.oid=p.pronamespace
                 cross join lateral aclexplode(coalesce(p.proacl,acldefault('f',p.proowner))) a
                 where n.nspname='public' and p.proname=any(array[
                   'finalize_forward_schedule_batch_20261008','finalize_forward_schedule_staged_batch_20261008',
                   'fixer_bind_forward_media_manifest_20261006','fixer_bind_forward_schedule_staged_manifest_20261008']);
+              create table synthetic_original_entry_catalog as
+                select p.oid as function_oid,p.proname,to_jsonb(p) as catalog
+                from pg_proc p where p.oid in (select function_oid from synthetic_original_entry_acl);
               alter default privileges grant execute on functions to anon,authenticated,synthetic_default_executor;
             """ + source
         return source

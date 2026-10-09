@@ -25,14 +25,14 @@ alter table public.fixer_calendar_admission_capability_20261009 enable row level
 grant select on public.fixer_calendar_admission_gate_20261009 to service_role;
 create policy service_read on public.fixer_calendar_admission_gate_20261009 for select to service_role using(true);
 
--- Keep original signatures and grants on public entry points. Private renamed
+-- Keep original OIDs, signatures, config and exact ACLs on public entries. Private copied
 -- bodies keep the entire prior proof stack. A capability lives only around its
 -- exact trusted call, is bound to backend + xid + request row IDs, and is
 -- removed before return; SQL exception rollback removes it as well. Nested
 -- finalizers have independent capabilities. Old postgres-owned functions do
 -- not receive one simply because they have the same owner.
 do $wrap$
-declare f record; acl record; definition text; args text; signature text; body text;
+declare f record; acl record; definition text; args text; body text;
  internal_name text; scope text; mode text;
 begin
  for f in select p.*, pg_get_functiondef(p.oid) as definition,
@@ -44,7 +44,9 @@ begin
    'finalize_forward_schedule_batch_20261008','finalize_forward_schedule_staged_batch_20261008',
    'fixer_bind_forward_media_manifest_20261006','fixer_bind_forward_schedule_staged_manifest_20261008'])
  loop
-  if not f.prosecdef or f.proowner <> 'postgres'::regrole or f.result_type not in ('jsonb','boolean') then
+  if not f.prosecdef or f.proowner <> 'postgres'::regrole or f.result_type not in ('jsonb','boolean')
+    or f.prolang <> (select oid from pg_language where lanname='plpgsql')
+    or exists(select 1 from aclexplode(coalesce(f.proacl,acldefault('f',f.proowner))) a where a.grantee=0) then
    raise exception 'trusted admission entry shape drift: %',f.proname; end if;
   internal_name:='fixer_admission_body_'||f.oid::text;
   select string_agg(quote_ident(a),',') into args from unnest(f.proargnames) a;
@@ -52,14 +54,23 @@ begin
   scope:=case when mode='finalize' then
    'array(select (x->>''calendar_row_id'')::uuid from jsonb_array_elements(p_candidates) x) || array(select (x->>''id'')::uuid from jsonb_array_elements(p_expected_old_rows) x)'
    else 'array[p_calendar_row_id]' end;
-  execute format('alter function public.%I(%s) rename to %I',f.proname,f.identity_args,internal_name);
-  execute format('revoke all on function public.%I(%s) from public,anon,authenticated,service_role,fixer_forward_media_owner_20261006,fixer_forward_media_attester_20261006,fixer_forward_media_photo_auditor_20261007 cascade',internal_name,f.identity_args);
-  -- Revoke delegated grant chains only on this renamed body. The frozen
-  -- ACL above still includes every downstream executor and grant option for
-  -- restoration on the public wrapper; unrelated objects are never revoked.
-  for acl in select * from aclexplode(coalesce(f.proacl,acldefault('f',f.proowner))) loop
+  -- Clone the complete definition, retaining security/volatility/config and
+  -- frozen body bytes. CREATE (not OR REPLACE) refuses an existing body name.
+  definition:=replace(f.definition,
+    format('CREATE OR REPLACE FUNCTION public.%I(',f.proname),
+    format('CREATE FUNCTION public.%I(',internal_name));
+  if definition=f.definition then raise exception 'trusted entry header drift: %',f.proname; end if;
+  execute definition;
+  -- Only the new private copy receives default creation grants. Remove every
+  -- nonowner grantee before publishing the wrapper; original OID and ACL
+  -- grantor chains are never renamed, revoked or reconstructed.
+  execute format('revoke all on function public.%I(%s) from public',internal_name,f.identity_args);
+  for acl in select a.* from pg_proc p join pg_namespace n on n.oid=p.pronamespace
+   cross join lateral aclexplode(coalesce(p.proacl,acldefault('f',p.proowner))) a
+   where n.nspname='public' and p.proname=internal_name and p.proargtypes=f.proargtypes
+  loop
    if acl.grantee<>0 and acl.grantee<>f.proowner then
-    execute format('revoke all on function public.%I(%s) from %I cascade',internal_name,f.identity_args,pg_get_userbyid(acl.grantee));
+    execute format('revoke all on function public.%I(%s) from %I',internal_name,f.identity_args,pg_get_userbyid(acl.grantee));
    end if;
   end loop;
   body:=format($b$declare cap uuid:=gen_random_uuid(); result %s;
@@ -81,27 +92,10 @@ begin
     return public.%I(%s);
    end;$b$,internal_name,args);
   end if;
-  execute format('create function public.%I(%s) returns %s language plpgsql security definer set search_path=pg_catalog,public as %L',f.proname,f.declaration_args,f.result_type,body);
-  execute format('revoke all on function public.%I(%s) from public',f.proname,f.identity_args);
-  -- CREATE applies the installer's current ALTER DEFAULT PRIVILEGES.
-  -- Clear every newly created non-owner grant, including custom grantees,
-  -- before restoring the original entry ACL. REVOKE PUBLIC alone does not
-  -- remove non-PUBLIC defaults and would silently widen trusted entry access.
-  for acl in select a.* from pg_proc p join pg_namespace n on n.oid=p.pronamespace
-   cross join lateral aclexplode(coalesce(p.proacl,acldefault('f',p.proowner))) a
-   where n.nspname='public' and p.proname=f.proname and p.proargtypes=f.proargtypes
-  loop
-   if acl.grantee<>0 and acl.grantee<>f.proowner then
-    execute format('revoke all on function public.%I(%s) from %I',f.proname,f.identity_args,pg_get_userbyid(acl.grantee));
-   end if;
-  end loop;
-  -- Restore the frozen entry's exact caller EXECUTE ACL, not an assumed
-  -- role list. Renamed bodies remain inaccessible to every runtime role.
-  for acl in select * from aclexplode(coalesce(f.proacl,acldefault('f',f.proowner))) loop
-   if acl.grantee=0 then raise exception 'trusted entry unexpectedly PUBLIC: %',f.proname; end if;
-   execute format('grant execute on function public.%I(%s) to %I%s',f.proname,f.identity_args,
-    pg_get_userbyid(acl.grantee),case when acl.is_grantable then ' with grant option' else '' end);
-  end loop;
+  -- CREATE OR REPLACE changes only the body of the original function.
+  -- Its OID, signature, properties, config, ACL grantors/options and existing
+  -- dependent grants remain under PostgreSQL's original authority graph.
+  execute replace(f.definition,f.prosrc,body);
  end loop;
  if (select count(*) from pg_proc p join pg_namespace n on n.oid=p.pronamespace where n.nspname='public' and p.proname like 'fixer_admission_body_%') <> 4 then
   raise exception 'all four exact trusted entries required'; end if;

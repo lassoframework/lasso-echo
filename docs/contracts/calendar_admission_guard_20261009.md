@@ -22,12 +22,13 @@ refuse. Status, approval, claim and delivery bookkeeping remain writable under
 the preceding guards. Text-only rows remain writable.
 
 Capabilities are private database records bound to backend, transaction and
-request row IDs. Only four exact trusted entry wrappers manage them; renamed
-bodies lose all runtime execute grants, cascading only their delegated grant
-chains. Recreated entries retain original downstream executors and grant options;
-unrelated function grant chains remain unchanged. Entry signatures and prior execute
-ACLs are preserved after clearing every nonowner creation grant, including
-non-PUBLIC ALTER DEFAULT PRIVILEGES grants. Shared `postgres` ownership and caller-set session flags
+request row IDs. Only four exact trusted entry wrappers manage them. Their
+complete prior definitions are copied into private functions, whose creation
+grants are cleared for every nonowner, including non-PUBLIC default grantees.
+The wrappers replace only the original entry bodies in place, retaining OIDs,
+config, signatures, exact ACL grantors/options and onward-grant dependencies.
+Original and unrelated grant chains are never revoked or reconstructed.
+Shared `postgres` ownership and caller-set session flags
 are insufficient. A database superuser or schema owner remains an administrator
 who can disable triggers or change the gate; this is not an admin sandbox.
 Graph then census locks serialize armed operations at read committed isolation.
