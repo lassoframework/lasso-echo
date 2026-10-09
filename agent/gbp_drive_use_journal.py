@@ -20,7 +20,8 @@ States (forward-only except the prewrite cancel):
   consumption_pending landed proof persisted; remote consumption invoked by the
                       caller but its receipt is not yet recorded; durable
                       through crash so settlement can resume
-  receipt_confirmed   consumption receipt recorded; entry settled
+  receipt_confirmed   consumption receipt recorded; claim completion pending
+  claim_done          exact completed claim verified; entry settled
 
 Conflict rules:
   - prepare() for an existing (gym_id, logical_post_id) returns the SAME use
@@ -64,9 +65,10 @@ STATE_UNKNOWN = 'unknown_result'
 STATE_LANDED = 'confirmed_landed'
 STATE_CONSUMPTION_PENDING = 'consumption_pending'
 STATE_RECEIPT_CONFIRMED = 'receipt_confirmed'
+STATE_CLAIM_DONE = 'claim_done'
 
 _ACTIVE = (STATE_PREPARED, STATE_WRITE_INTENT, STATE_UNKNOWN,
-           STATE_LANDED, STATE_CONSUMPTION_PENDING, STATE_RECEIPT_CONFIRMED)
+           STATE_LANDED, STATE_CONSUMPTION_PENDING, STATE_RECEIPT_CONFIRMED, STATE_CLAIM_DONE)
 
 _GYM = re.compile(r'[a-z0-9][a-z0-9_-]{0,127}\Z')
 
@@ -382,6 +384,9 @@ _LANDED_OMITTED_DEFAULTS = dict.fromkeys((
     'gbp_cta_url', 'gbp_event', 'gbp_offer', 'gbp_location_id', 'reject_reason',
 ), None)
 _LANDED_OMITTED_DEFAULTS['variant_status'] = 'active'
+# Production content_calendar readback at 2026-10-09T00:25Z omitted mentions
+# as an empty array on both rows; accept only that exact server-added value.
+_LANDED_OMITTED_DEFAULTS['mentions'] = []
 
 
 def _landed_row_matches(persisted, proposed):
@@ -483,6 +488,27 @@ def confirm_receipt(use_id, receipt, *, path=None):
     return _with_entry(path, use_id, fn)
 
 
+def confirm_claim_done(use_id, *, path=None):
+    """Mark terminal only after exact claim status and asset binding readback."""
+    def fn(conn, row):
+        entry = _row_to_entry(row)
+        if entry['state'] not in (STATE_RECEIPT_CONFIRMED, STATE_CLAIM_DONE):
+            raise JournalHold('journal_claim_done_requires_receipt')
+        try:
+            claim = conn.execute(
+                'SELECT status,post_id FROM socialapi_claims WHERE draft_id=? AND account_key=?',
+                (entry['claim_id'], entry['gym_id'] + '_gbp')).fetchone()
+        except Exception:
+            raise JournalHold('journal_claim_readback_unavailable') from None
+        if claim != ('done', entry['asset_id']):
+            raise JournalHold('journal_claim_done_unverified')
+        if entry['state'] == STATE_CLAIM_DONE:
+            return entry
+        return _transition(conn, use_id, STATE_RECEIPT_CONFIRMED,
+                           'journal_claim_done_requires_receipt', state=STATE_CLAIM_DONE)
+    return _with_entry(path, use_id, fn)
+
+
 def get(use_id, *, path=None):
     conn = _connect(_resolve_path(path))
     try:
@@ -516,15 +542,15 @@ def get_by_logical_post(gym_id, logical_post_id, *, path=None):
 
 
 def unsettled(*, path=None):
-    """Active entries not yet receipt-confirmed; crash-recovery work list."""
+    """Active entries not yet claim-completed; crash-recovery work list."""
     conn = _connect(_resolve_path(path))
     try:
         _ensure_schema(conn)
         rows = conn.execute(
-            f'SELECT {_SELECT} FROM gbp_drive_use_journal WHERE state IN (?,?,?,?,?)'
+            f'SELECT {_SELECT} FROM gbp_drive_use_journal WHERE state IN (?,?,?,?,?,?)'
             ' ORDER BY created_at',
             (STATE_PREPARED, STATE_WRITE_INTENT, STATE_UNKNOWN,
-             STATE_LANDED, STATE_CONSUMPTION_PENDING)).fetchall()
+             STATE_LANDED, STATE_CONSUMPTION_PENDING, STATE_RECEIPT_CONFIRMED)).fetchall()
         return [_row_to_entry(r) for r in rows]
     except JournalHold:
         raise

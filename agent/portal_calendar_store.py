@@ -32,6 +32,32 @@ import time as _time
 
 from . import config
 
+def prepare_calendar_caption_payload(row):
+    """Copy a row with the deterministic persistence caption and safety hold.
+
+    Safe for callers to run before freezing a write journal: insert_rows uses
+    the same preparation, which is idempotent. This has no alerts or I/O and
+    does not clear an existing media hold. Protected URL text stays verbatim.
+    """
+    from .copy_gate import bound_opening_hook, format_caption
+    clean = dict(row or {})
+    if "caption" in clean and clean["caption"] is not None:
+        try:
+            caption = str(clean["caption"])
+            # format_caption treats each line as a paragraph, while the hook
+            # bound creates one soft line wrap. Rejoin only that exact canonical
+            # opening wrap before formatting so preparing twice is identical.
+            opening = caption.split("\n", 2)
+            if len(opening) > 1 and opening[0] and opening[1]:
+                joined = opening[0] + " " + opening[1]
+                if bound_opening_hook(joined) == opening[0] + "\n" + opening[1]:
+                    caption = joined + ("\n" + opening[2] if len(opening) > 2 else "")
+            clean["caption"] = bound_opening_hook(format_caption(caption))
+        except ValueError:
+            clean["media_not_ready_reason"] = "caption_url_semicolon"
+    return clean
+
+
 # base -> (gyms.id uuid, expires_at). POSITIVE resolutions only; see
 # SupabaseCalendarStore.resolve_gym_uuid for why a miss is deliberately never cached.
 # Six hours: a gym's uuid is effectively immutable, and re-slugging or archiving one is
@@ -4722,35 +4748,25 @@ class SupabaseCalendarStore:
         # per group before any row is staged.
         reservation_proofs = {}
         payload = []
-        from .copy_gate import bound_opening_hook, format_caption
         for row in (rows or []):
-            clean = {k: v for k, v in dict(row or {}).items()
-                     if k not in ("id", "scene_candidate",
-                                  _observation_bridge.METADATA, RESERVATION_PROOF)}
-            if "caption" in clean and clean["caption"] is not None:
-                # Every calendar-building lane converges here. Prompts and individual
-                # generators can miss the hook limit, so enforce the grader's exact
-                # first-line rule at the persistence boundary without dropping words.
-                # A semicolon glued inside a protected URL/handle span makes
-                # format_caption raise; ONE bad caption must not abort the whole
-                # batch. Retain an unpublishable hold so a month rebuild does
-                # not leave an invisible gap after it deleted the old month.
+            clean = prepare_calendar_caption_payload({
+                k: v for k, v in dict(row or {}).items()
+                if k not in ("id", "scene_candidate",
+                             _observation_bridge.METADATA, RESERVATION_PROOF)})
+            if clean.get("media_not_ready_reason") == "caption_url_semicolon":
+                # Retain one bad caption as an unpublishable hold without
+                # aborting the batch. Alerts stay at the persistence boundary.
+                print(f"[portal-calendar-store] insert_rows: {account_key} "
+                      f"{clean.get('post_date')} row held — semicolon "
+                      "inside a protected URL")
                 try:
-                    clean["caption"] = bound_opening_hook(
-                        format_caption(clean["caption"]))
-                except ValueError:
-                    print(f"[portal-calendar-store] insert_rows: {account_key} "
-                          f"{clean.get('post_date')} row held — semicolon "
-                          "inside a protected URL")
-                    clean["media_not_ready_reason"] = "caption_url_semicolon"
-                    try:
-                        from . import ops_alerts
-                        ops_alerts.alert(
-                            f"{account_key}: calendar row for {clean.get('post_date')} "
-                            "was staged on hold because its caption has a semicolon "
-                            "inside a URL. Edit the link and release the hold.")
-                    except Exception:
-                        pass
+                    from . import ops_alerts
+                    ops_alerts.alert(
+                        f"{account_key}: calendar row for {clean.get('post_date')} "
+                        "was staged on hold because its caption has a semicolon "
+                        "inside a URL. Edit the link and release the hold.")
+                except Exception:
+                    pass
             if preserve_ids:
                 import uuid
                 # Explicit stable UUIDs support crash-safe automatic render retries.
