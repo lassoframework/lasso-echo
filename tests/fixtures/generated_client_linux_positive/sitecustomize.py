@@ -123,7 +123,7 @@ RPCS={
 
 def send(self,request,**kwargs):
     import requests
-    from urllib.parse import urlsplit
+    from urllib.parse import urlsplit, parse_qs
     target=urlsplit(request.url)
     if target.hostname == HOST:
         assert request.method == 'GET' and target.scheme == 'https' and not target.query
@@ -134,9 +134,22 @@ def send(self,request,**kwargs):
         return response
     assert os.environ.get('SUPABASE_SERVICE_ROLE_KEY') == 'SYNTHETIC'
     assert target.scheme == 'https' and target.netloc == 'supabase.synthetic.example'
+    assert request.headers['apikey'] == 'SYNTHETIC' and request.headers['Authorization'] == 'Bearer SYNTHETIC'
+    if request.method == 'GET':
+        assert target.path == '/rest/v1/fixer_forward_media_tenant_alias_20261006'
+        assert parse_qs(target.query,strict_parsing=True) == {
+            'select':['alias_key,tenant_id'],'alias_key':['eq.fixture-gym'],'limit':['2']}
+        import psycopg
+        with psycopg.connect(config()['service_dsn'],autocommit=True) as conn:
+            rows=conn.execute('select alias_key,tenant_id from public.fixer_forward_media_tenant_alias_20261006 where alias_key=%s limit 2',('fixture-gym',)).fetchall()
+        assert all(alias == tenant == 'fixture-gym' for alias,tenant in rows)
+        record('tenant_alias_read')
+        response=requests.Response();response.status_code=200
+        response._content=json.dumps([dict(alias_key=alias,tenant_id=tenant) for alias,tenant in rows]).encode()
+        response.headers={'Content-Type':'application/json'}
+        return response
     assert request.method == 'POST' and target.path.startswith('/rest/v1/rpc/') and not target.query
     name=target.path.rsplit('/',1)[1];assert name in RPCS
-    assert request.headers['apikey'] == 'SYNTHETIC' and request.headers['Authorization'] == 'Bearer SYNTHETIC'
     args=json.loads(request.body)
     assert all(re.fullmatch('p_[a-z_]+',k) for k in args)
     import psycopg

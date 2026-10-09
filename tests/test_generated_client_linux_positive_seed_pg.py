@@ -30,3 +30,19 @@ def test_synthetic_source_census_pass_actual_runtime_loader():
                 assert admin.execute(f'select count(*) from public.{table}').fetchone()[0] == 0
         finally:
             conn.close()
+
+
+def test_service_alias_transport_reads_real_restricted_pg(tmp_path):
+    from tests.test_generated_client_linux_positive_transport import transport
+    from agent.portal_calendar_store import SupabaseCalendarStore
+    import json
+    import requests
+    fixture,_,_=transport(tmp_path)
+    with disposable_schema() as (admin,connect):
+        fixture.CONFIG.write_text(json.dumps({'service_dsn':
+            f'host={admin.info.host} port={admin.info.port} dbname=postgres user=positive_service'}))
+        env={'SUPABASE_SERVICE_ROLE_KEY':'SYNTHETIC'}
+        with patch.dict(os.environ,env,clear=True),patch.object(requests.sessions.Session,'send',fixture.send):
+            store=SupabaseCalendarStore(url='https://supabase.synthetic.example',service_key='SYNTHETIC')
+            assert store._forward_batch_tenant('fixture-gym') == 'fixture-gym'
+        assert json.loads((tmp_path/'calls.jsonl').read_text()) == {'kind':'tenant_alias_read'}

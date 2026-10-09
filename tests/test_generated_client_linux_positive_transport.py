@@ -67,3 +67,17 @@ def test_real_provider_and_reviewer_validate_synthetic_transport_responses(tmp_p
         reviewer=GymPaletteReviewer(AstraReviewer('SYNTHETIC'),{'colors':['#112233','#aabbcc']})
         grade=evaluate(data,headline='SYNTHETIC',facts=[],vision_client=reviewer)
         assert grade.passed
+
+
+@pytest.mark.parametrize('url',[
+    'https://supabase.synthetic.example/rest/v1/content_calendar',
+    'https://supabase.synthetic.example/rest/v1/fixer_forward_media_tenant_alias_20261006?select=alias_key,tenant_id&alias_key=eq.other-gym&limit=2',
+    'https://supabase.synthetic.example/rest/v1/fixer_forward_media_tenant_alias_20261006?select=alias_key,tenant_id&alias_key=eq.fixture-gym&limit=3',
+])
+def test_service_alias_read_refuses_other_paths_tenants_and_queries(tmp_path,url):
+    fixture,_,_=transport(tmp_path)
+    import requests
+    import os
+    request=requests.Request('GET',url,headers={'apikey':'SYNTHETIC','Authorization':'Bearer SYNTHETIC'}).prepare()
+    with patch.dict(os.environ,{'SUPABASE_SERVICE_ROLE_KEY':'SYNTHETIC'},clear=True):
+        with pytest.raises(AssertionError):fixture.send(None,request)
