@@ -639,7 +639,7 @@ def _settle_armed_drive_landing(portal_gym_key, row, pick, persisted_row, log, *
             log(f"{portal_gym_key}: batch {bound['batch_id']} lacks exact "
                 f"terminal proof; holding remote use for {use_id}")
             return False
-        if bound["tenant_id"] != current["gym_id"]:
+        if not journal.forward_stage_tenant_matches(current, bound):
             log(f"{portal_gym_key}: cross-tenant batch binding "
                 f"({bound['tenant_id']}); holding remote use for {use_id}")
             return False
@@ -669,8 +669,8 @@ def _settle_armed_drive_landing(portal_gym_key, row, pick, persisted_row, log, *
                 != current["logical_post_id"]
                 or not journal._landed_row_matches(persisted_row, expected_member,
                                                    manifest_digest=manifest_digest)
-                or not journal._landed_row_matches(persisted_row, current["calendar_row"],
-                                                   manifest_digest=manifest_digest)
+                or not journal.forward_landed_entry_matches(current, persisted_row, bound,
+                                                            manifest_digest=manifest_digest)
                 or (state in ("confirmed_landed", "consumption_pending")
                     and (not isinstance(proof, dict)
                          or proof.get("use_id") != use_id
@@ -764,7 +764,7 @@ def _forward_recovery_member_matches(entry, persisted, bound, *, provisional=Fal
     trusted snapshot and current active reservation proof for that digest.
     """
     from . import gbp_drive_use_journal as journal
-    if (not isinstance(bound, dict) or bound.get("tenant_id") != entry["gym_id"]
+    if (not isinstance(bound, dict) or not journal.forward_stage_tenant_matches(entry, bound)
             or persisted.get("gym_id") != entry["gym_id"]
             or persisted.get("variant_status") != "active"
             or persisted.get("media_not_ready_reason") is not None):
@@ -781,8 +781,8 @@ def _forward_recovery_member_matches(entry, persisted, bound, *, provisional=Fal
         if not journal.forward_manifest_evidence_matches(entry, persisted, bound, manifest_evidence):
             return False
     return (journal._landed_row_matches(persisted, expected, manifest_digest=manifest_digest)
-            and journal._landed_row_matches(persisted, entry["calendar_row"],
-                                           manifest_digest=manifest_digest))
+            and journal.forward_landed_entry_matches(entry, persisted, bound,
+                manifest_digest=manifest_digest, provisional=provisional))
 
 
 def _forward_recovery_manifest_evidence(store, entry, persisted, bound):

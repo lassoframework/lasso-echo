@@ -1880,7 +1880,8 @@ class SupabaseCalendarStore:
             raise ReservationArgumentError(
                 422, 'own unverified observation packet invalid before staging') from exc
 
-    def stage_forward_schedule_batch(self, account_key, rows, old_rows=None):
+    def stage_forward_schedule_batch(self, account_key, rows, old_rows=None, *,
+                                     before_forward_stage=None):
         """Atomically stage one immutable inactive batch; returns the receipt.
 
         The single service-role RPC registers the immutable batch (batch id,
@@ -1967,9 +1968,20 @@ class SupabaseCalendarStore:
                     "request_digest": digest, "request_text": request_text,
                     "member_row_ids": list(planned_ids),
                     "old_row_ids": list(old_ids)})
+                _stage_journal.record_forward_tenant_binding(batch_id, account_key, tenant)
             except _stage_journal.JournalHold as hold:
                 raise ReservationStoreError(
                     409, f"staged journal intent hold before stage RPC: {hold}")
+        if before_forward_stage is not None:
+            if not staged_journal or not callable(before_forward_stage):
+                raise CalendarInsertNotStartedError(503, "durable before-stage callback unavailable")
+            try:
+                # Independent JSON copy: a caller cannot mutate the frozen request.
+                import json as _json
+                before_forward_stage(_json.loads(request_text))
+            except Exception as exc:
+                raise CalendarInsertNotStartedError(
+                    409, "before-stage journal callback held; no stage RPC sent") from exc
         data = self._reservation_rpc(_STAGE_RPC, {
             "p_tenant_id": tenant, "p_batch_id": batch_id,
             "p_request": request_text, "p_request_digest": digest}, timeout=60)
@@ -2198,7 +2210,7 @@ class SupabaseCalendarStore:
 
     def _stage_forward_candidate_batch(self, account_key, payload,
                                        armed_observations, observation_bridge,
-                                       old_rows=None):
+                                       old_rows=None, before_forward_stage=None):
         """Derive deterministic identity, bind observation packets and stage the
         whole batch through ONE atomic RPC.
 
@@ -2252,7 +2264,8 @@ class SupabaseCalendarStore:
             raise CalendarInsertNotStartedError(
                 422, f"observation packaging failed before batch staging: "
                 f"{type(exc).__name__}") from exc
-        self.stage_forward_schedule_batch(account_key, payload, frozen_old)
+        self.stage_forward_schedule_batch(account_key, payload, frozen_old,
+                                          before_forward_stage=before_forward_stage)
         return [dict({k: v for k, v in row.items() if k != "observation"},
                      variant_status="candidate",
                      media_not_ready_reason="forward_reservation_staged")
@@ -4834,7 +4847,7 @@ class SupabaseCalendarStore:
     def insert_rows(self, account_key, rows, *, preserve_ids=False,
                     render_evidence_by_url=None, poster_render_evidence_by_url=None,
                     required_feed_slots=None, prevalidated_cadence=False,
-                    expected_old_rows=None):
+                    expected_old_rows=None, before_forward_stage=None):
         """INSERT content_calendar rows for account_key WITHOUT sending an `id`, so the
         DB generates the uuid primary key itself. content_calendar.id is a Postgres uuid
         (DB default gen_random_uuid); sending a non-uuid string (a draft_id) is what
@@ -5122,6 +5135,8 @@ class SupabaseCalendarStore:
         # silently take the legacy path and an armed gate refuses rows that
         # could never reserve BEFORE anything is written. With the flag OFF
         # this block is inert and the legacy path is byte-identical.
+        if before_forward_stage is not None and reservation_flag is not True:
+            raise CalendarInsertNotStartedError(503, "before-stage callback requires atomic staging")
         if forward_reservation_flag() is not reservation_flag:
             raise CalendarInsertNotStartedError(503, "forward reservation gate changed before insert")
         if reservation_flag:
@@ -5170,7 +5185,7 @@ class SupabaseCalendarStore:
             # resolved only through the batch status RPC.
             inserted = self._stage_forward_candidate_batch(
                 account_key, payload, armed_observations, _observation_bridge,
-                old_rows=expected_old_rows)
+                old_rows=expected_old_rows, before_forward_stage=before_forward_stage)
         else:
             r = self._client().post(
                 self._rest(_TABLE),

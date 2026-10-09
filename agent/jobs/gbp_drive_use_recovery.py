@@ -120,7 +120,7 @@ def _reader(path, *, write=False):
     return conn
 
 
-def _take_fair_ids(path, row_limit):
+def _take_fair_ids(path, row_limit, tenant_id=None):
     """Enumerate a bounded circular slice; admission alone advances cursor."""
     conn = _reader(path)
     try:
@@ -133,17 +133,24 @@ def _take_fair_ids(path, row_limit):
         sql = ("SELECT use_id,created_at FROM gbp_drive_use_journal "
                "WHERE state IN ('write_intent','unknown_result','confirmed_landed',"
                "'consumption_pending','receipt_confirmed') ")
+        scope_args = ()
+        if tenant_id is not None:
+            if (not isinstance(tenant_id, str) or not tenant_id
+                    or len(tenant_id) > 128):
+                raise ValueError("invalid recovery tenant")
+            sql += "AND gym_id=? "
+            scope_args = (tenant_id,)
         if cursor[0] is None:
             rows = conn.execute(sql + "ORDER BY created_at,use_id LIMIT ?",
-                                (row_limit,)).fetchall()
+                                (*scope_args, row_limit)).fetchall()
         else:
             rows = conn.execute(sql + "AND (created_at,use_id)>(?,?) "
                                 "ORDER BY created_at,use_id LIMIT ?",
-                                (*cursor, row_limit)).fetchall()
+                                (*scope_args, *cursor, row_limit)).fetchall()
             if len(rows) < row_limit:
                 rows += conn.execute(sql + "AND (created_at,use_id)<=(?,?) "
                                      "ORDER BY created_at,use_id LIMIT ?",
-                                     (*cursor, row_limit - len(rows))).fetchall()
+                                     (*scope_args, *cursor, row_limit - len(rows))).fetchall()
         return rows
     finally:
         conn.close()
@@ -211,7 +218,7 @@ def _claim_matches(path, entry):
         or claim == ("done", entry["asset_id"])))
 
 
-def run(*, store=None, media_store=None, logger=None, row_limit=MAX_ROWS):
+def run(*, store=None, media_store=None, logger=None, row_limit=MAX_ROWS, tenant_id=None):
     log = logger or (lambda message: print(f"[gbp-drive-recovery] {message}"))
     summary = dict(ok=True, recovered=0, held=0, examined=0, batches=0, tenants=0)
     if enabled() is False:
@@ -225,7 +232,7 @@ def run(*, store=None, media_store=None, logger=None, row_limit=MAX_ROWS):
         if type(row_limit) is not int or not 1 <= row_limit <= MAX_ROWS:
             raise ValueError("invalid recovery bound")
         path = _durable_path()
-        ids = _take_fair_ids(path, row_limit)
+        ids = _take_fair_ids(path, row_limit, tenant_id=tenant_id)
     except Exception:
         return dict(summary, ok=False, reason="original durable journal unavailable")
     if store is None:

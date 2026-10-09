@@ -167,7 +167,8 @@ class _PickedCreative:
 
 def build_gym_media_draft(account, day_key, pillar, voice, source, *, store=None,
                           drive=None, now=None, library_dir=None, exclude_ids=(),
-                          slot_index=0, rendition_budget=None, kind_prefs=None):
+                          slot_index=0, rendition_budget=None, kind_prefs=None,
+                          remote_writer_bound=False):
     """A PENDING Draft for `day_key` sourced from the gym's Drive media pool, or
     None (the planner then falls through to the existing uploaded-media logic).
     Only ever called when GYM_DRIVE_STAGE is ON AND the gym-drive lane is armed for
@@ -194,6 +195,11 @@ def build_gym_media_draft(account, day_key, pillar, voice, source, *, store=None
     None = one transcode allowed for this call (a single denied-slot replacement).
     Once spent, video picks are restricted to assets that ALREADY carry a
     rendition_url, then the slot falls back to photos."""
+    from . import remote_drive_use
+    if remote_drive_use.enabled() and remote_writer_bound is not True:
+        # Daily/backfill writers have no exact staged-member journal seam yet.
+        # Refuse before selecting or claiming an asset in those lanes.
+        return None
     from .integrations import drive_client as _dc
     from . import client_content, vision, media_host
 
@@ -596,6 +602,13 @@ def build_gym_media_draft(account, day_key, pillar, voice, source, *, store=None
                               f"{asset['id']} failed linked-source verification; "
                               "draft held before approval/card persistence")
                 return None
+            from . import remote_drive_use, feed_drive_use
+            if remote_drive_use.enabled():
+                # Hold the shared claim until exact finalized placement is proved.
+                # No counter stamp or claim-done receipt is created at build time.
+                draft._drive_use_pending = feed_drive_use.freeze_pick(
+                    gym_base, fresh, claim_id, day_key, store)
+                return draft
             _sel.stamp_use(fresh, gym_base, day_key, store=store, now=now)
         except Exception as e:  # noqa: BLE001
             # The card must never become durable while its media is still

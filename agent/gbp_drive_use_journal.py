@@ -428,6 +428,96 @@ def _landed_row_matches(persisted, proposed, *, manifest_digest=None):
     return True
 
 
+def record_forward_tenant_binding(batch_id, raw_tenant_id, tenant_id, *, path=None):
+    """Freeze the store's verified alias read against its exact stage attempt.
+
+    Calendar/source/claim ownership remains raw. Only PG batch routing is
+    canonical. Called by the trusted stage writer after alias resolution and
+    stage-intent persistence, before any use callback or stage RPC.
+    """
+    def fn(conn, row):
+        bound = _stage_row_to_entry(row)
+        request = json.loads(bound['request_text'])
+        if (not isinstance(raw_tenant_id, str) or not raw_tenant_id
+                or raw_tenant_id != raw_tenant_id.strip()
+                or tenant_id != bound['tenant_id']
+                or request.get('tenant_id') != tenant_id
+                or not request.get('members')
+                or any(m.get('row', {}).get('gym_id') != raw_tenant_id
+                       for m in request['members'])):
+            raise JournalHold('stage_tenant_binding_invalid')
+        frozen = (raw_tenant_id, tenant_id, bound['request_digest'])
+        existing = conn.execute(
+            'SELECT raw_tenant_id,tenant_id,request_digest '
+            'FROM gbp_forward_stage_tenant_binding WHERE batch_id=?', (batch_id,)).fetchone()
+        if existing is not None and existing != frozen:
+            raise JournalHold('stage_tenant_binding_conflict')
+        conn.execute('INSERT OR IGNORE INTO gbp_forward_stage_tenant_binding VALUES (?,?,?,?)',
+                     (batch_id, *frozen))
+        return bound
+    return _with_stage_entry(path, batch_id, fn)
+
+
+def forward_stage_tenant_matches(entry, bound, *, path=None):
+    """Aliases require an immutable writer-established raw/canonical binding."""
+    if not isinstance(bound, dict) or not isinstance(entry, dict):
+        return False
+    raw, tenant = entry.get('gym_id'), bound.get('tenant_id')
+    if not raw or not tenant:
+        return False
+    if raw == tenant:
+        return True  # Preserve the exact-key legacy contract.
+    conn = None
+    try:
+        request = json.loads(bound['request_text'])
+        if (request.get('tenant_id') != tenant or not request.get('members')
+                or any(m.get('row', {}).get('gym_id') != raw for m in request['members'])):
+            return False
+        conn = _connect(_resolve_path(path))
+        frozen = conn.execute(
+            'SELECT raw_tenant_id,tenant_id,request_digest '
+            'FROM gbp_forward_stage_tenant_binding WHERE batch_id=?',
+            (bound['batch_id'],)).fetchone()
+        return frozen == (raw, tenant, bound['request_digest'])
+    except Exception:
+        return False
+    finally:
+        if conn is not None:
+            _close(conn)
+
+
+def forward_landed_entry_matches(entry, persisted, bound, *, manifest_digest=None,
+                                 provisional=False):
+    """Project ONLY an exact staged candidate into its finalized active shape.
+
+    Provisional discovery checks identity before reading PG status, and never
+    authorizes consumption. Strict callers require the complete terminal proof.
+    Caption, media, source and generated-artifact columns remain byte exact.
+    """
+    proposed = entry.get('calendar_row')
+    if not isinstance(proposed, dict):
+        return False
+    if proposed.get('variant_status') != 'candidate':
+        return _landed_row_matches(persisted, proposed, manifest_digest=manifest_digest)
+    if (not isinstance(persisted, dict) or not isinstance(bound, dict)
+            or persisted.get('variant_status') != 'active'
+            or persisted.get('media_not_ready_reason') is not None
+            or proposed.get('media_not_ready_reason') is not None
+            or not forward_stage_tenant_matches(entry, bound)
+            or persisted.get('gym_id') != entry.get('gym_id')
+            or persisted.get('id') != proposed.get('id')
+            or persisted.get('logical_post_id') != entry.get('logical_post_id')
+            or (not provisional and not forward_finalized_proof_valid(bound))):
+        return False
+    member = forward_stage_member_row(bound, str(persisted['id']))
+    if (not isinstance(member, dict) or member.get('variant_status') != 'candidate'
+            or member.get('media_not_ready_reason') is not None
+            or not _landed_row_matches(member, proposed)):
+        return False
+    expected = dict(proposed, variant_status='active', media_not_ready_reason=None)
+    return _landed_row_matches(persisted, expected, manifest_digest=manifest_digest)
+
+
 def confirm_landed(use_id, evidence, *, path=None):
     """Persist the exact landed proof. Evidence must match the frozen identity.
 
@@ -452,6 +542,10 @@ def confirm_landed(use_id, evidence, *, path=None):
             raise JournalHold('journal_landed_requires_intent_or_unknown')
         entry = _row_to_entry(row)
         manifest_digest = None
+        bound = None
+        if entry['calendar_row'].get('variant_status') == 'candidate':
+            persisted = evidence.get('calendar_row') if type(evidence) is dict else None
+            bound = forward_stage_for_member(str((persisted or {}).get('id') or ''), path=path)
         if type(evidence) is dict and evidence.get('forward_manifest_evidence') is not None:
             persisted = evidence.get('calendar_row')
             bound = forward_stage_for_member(str((persisted or {}).get('id') or ''), path=path)
@@ -460,8 +554,8 @@ def confirm_landed(use_id, evidence, *, path=None):
                 raise JournalHold('journal_landed_evidence_mismatch')
             manifest_digest = evidence['forward_manifest_evidence']['snapshot']['render_manifest_digest']
         if (type(evidence) is not dict
-                or not _landed_row_matches(evidence.get('calendar_row'), entry['calendar_row'],
-                                           manifest_digest=manifest_digest)
+                or not forward_landed_entry_matches(entry, evidence.get('calendar_row'), bound,
+                                                    manifest_digest=manifest_digest)
                 or evidence.get('asset_id') != entry['asset_id']
                 or evidence.get('content_hash') != entry['content_hash']
                 or ('use_id' in evidence and evidence['use_id'] != use_id)
@@ -638,6 +732,9 @@ _SHA256_RE = re.compile(r'[0-9a-f]{64}\Z')
 
 def _ensure_stage_schema(conn):
     conn.execute(_STAGE_SCHEMA)
+    conn.execute("""CREATE TABLE IF NOT EXISTS gbp_forward_stage_tenant_binding (
+        batch_id TEXT PRIMARY KEY, raw_tenant_id TEXT NOT NULL,
+        tenant_id TEXT NOT NULL, request_digest TEXT NOT NULL)""")
 
 
 def _stage_row_to_entry(row):
@@ -1079,7 +1176,7 @@ def forward_manifest_evidence_matches(entry, persisted, bound, evidence):
     try:
         if (type(persisted) is not dict or type(evidence) is not dict
                 or not forward_finalized_proof_valid(bound)
-                or bound['tenant_id'] != entry['gym_id']
+                or not forward_stage_tenant_matches(entry, bound)
                 or persisted.get('variant_status') != 'active'
                 or persisted.get('media_not_ready_reason') is not None):
             return False
@@ -1099,12 +1196,12 @@ def forward_manifest_evidence_matches(entry, persisted, bound, evidence):
                   'image_url': 'image_url', 'thumbnail_url': 'thumbnail_url',
                   'render_manifest_digest': 'render_manifest_digest'}
         if (any(k not in snapshot or snapshot[k] != persisted.get(v) for k, v in fields.items())
-                or snapshot.get('tenant_id') != entry['gym_id']
+                or snapshot.get('tenant_id') != bound['tenant_id']
                 or not re.fullmatch(r'sha256:[0-9a-f]{64}', snapshot['render_manifest_digest'])
                 or not isinstance(snapshot.get('revision'), str)
                 or not re.fullmatch(r'[0-9a-f]{32}', snapshot['revision'])
                 or proof.get('row_revision') != snapshot['revision']
-                or proof.get('tenant_id') != entry['gym_id']
+                or proof.get('tenant_id') != bound['tenant_id']
                 or proof.get('post_date') != entry['post_date']
                 or proof.get('logical_post_id') != entry['logical_post_id']
                 or proof.get('source_sha256') != sha
