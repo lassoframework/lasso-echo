@@ -722,8 +722,18 @@ def run_calendar_row(base, account, row_id, *, persistence, loader=None, jobs=No
         from . import forward_media_guard as guard, forward_media_owner as owner
         if not guard.enabled():
             raise RuntimeHold('generated_forward_authority_disabled')
-        from .forward_media_owner_worker import settings_from_environment
-        tenants, _ = settings_from_environment()
+        if getattr(persistence, '_environment_lane', 'owner') == 'generated_owner':
+            # This finite command has its own exact environment contract. It
+            # never arms the ordinary photo owner's census/clearance worker.
+            owner.check_environment(lane='generated_owner')
+            tenant = os.getenv('ECHO_GENERATED_CLIENT_TENANT', '')
+            if (not re.fullmatch(r'[a-z0-9][a-z0-9_-]{0,127}', tenant)
+                    or os.getenv('AGENT_FORWARD_MEDIA_OWNER_TENANTS') != tenant):
+                raise RuntimeHold('generated_owner_tenant_not_allowed')
+            tenants = (tenant,)
+        else:
+            from .forward_media_owner_worker import settings_from_environment
+            tenants, _ = settings_from_environment()
         if base not in tenants:
             raise RuntimeHold('generated_owner_tenant_not_allowed')
         if type(persistence) is not owner.ForwardMediaOwnerPersistence:

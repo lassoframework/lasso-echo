@@ -116,10 +116,12 @@ class EnvironmentGuardError(OwnerPersistenceError):
     """Publisher/service credentials present, or no dedicated owner DSN."""
 
 
-def check_environment(environ=None):
+def check_environment(environ=None, *, lane='owner'):
     """Require the exact owner environment contract and dedicated DSN/role."""
     environ = os.environ if environ is None else environ
-    offenders = forbidden_credential_names(environ)
+    if lane not in ('owner', 'generated_owner'):
+        raise EnvironmentGuardError('unknown owner environment lane')
+    offenders = unknown_environment_names(environ, lane)
     if offenders:
         raise EnvironmentGuardError(
             'unrecognized owner environment names; refusing '
@@ -253,15 +255,21 @@ class ForwardMediaOwnerPersistence:
     owner); any other role fails closed before any write.
     """
 
-    def __init__(self, connection, expected_owner, reader):
+    def __init__(self, connection, expected_owner, reader, *, environment_lane='owner'):
+        if environment_lane not in ('owner', 'generated_owner'):
+            raise EnvironmentGuardError('unknown owner environment lane')
+        self._environment_lane = environment_lane
         self._conn = connection
         self._expected_owner = expected_owner
         self._reader = reader
 
     @classmethod
-    def connect_from_environment(cls, *, reader=None):
+    def connect_from_environment(cls, *, reader=None, environment_lane='owner'):
         """Only production construction path; never fall back to publisher DB."""
-        check_environment()
+        if environment_lane == 'owner':
+            check_environment()
+        else:
+            check_environment(lane=environment_lane)
         expected = os.environ.get('FORWARD_MEDIA_OWNER_ROLE', '').strip()
         if not expected or expected in ('service_role', 'anon', 'authenticated',
                                         'fixer_forward_media_attester_20261006'):
@@ -272,9 +280,12 @@ class ForwardMediaOwnerPersistence:
                                    options=DB_DEADLINE_OPTIONS)
         except Exception as exc:
             raise OwnerPersistenceError('dedicated owner database unavailable') from exc
-        return cls(conn, expected, reader or HostedObjectReader())
+        return cls(conn, expected, reader or HostedObjectReader(),
+                   environment_lane=environment_lane)
 
     def _assert_owner_identity(self):
+        if self._environment_lane == 'generated_owner':
+            check_environment(lane='generated_owner')
         with self._conn.cursor() as cur:
             cur.execute(CURRENT_USER)
             row = cur.fetchone()
@@ -326,7 +337,10 @@ class ForwardMediaOwnerPersistence:
         A failed SQL statement poisons the transaction: do not convert it to a
         successful hold. This method does not report durable persistence.
         """
-        check_environment()
+        if self._environment_lane == 'owner':
+            check_environment()
+        else:
+            check_environment(lane=self._environment_lane)
         if self._expected_owner != os.environ['FORWARD_MEDIA_OWNER_ROLE']:
             raise EnvironmentGuardError('owner role differs from configured lane')
         _validate_and_bind(original, clearance, manifest)
