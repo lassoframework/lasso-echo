@@ -1097,7 +1097,7 @@ def _bounded_alert_reason(reason, limit=300):
 def generate(headline, facts, client=None, out_path=None,
              aspect=None, pixels=None, surface=None, archetype=None,
              palette=None, canvas=None, layout=None, account_key=None,
-             bypass_cap=False, draft_id="", reference_kind=None, cta="", footer=None, art_direction="",
+             bypass_cap=False, draft_id="", reference_kind=None, paired_feed_reference=None, cta="", footer=None, art_direction="",
              failure_info=None):
     """
     Generate a LASSO infographic from APPROVED input. Returns {"path", "prompt"} on
@@ -1187,7 +1187,31 @@ def generate(headline, facts, client=None, out_path=None,
     # corrective note does.
     ref_kind, references = _reference_images_for(headline, account_key,
                                                  kind=reference_kind or "")
-    reference_note = _reference_note_for(ref_kind, references)
+    reference_note = _reference_note_for(ref_kind, references) or ""
+    paired_reference_receipt = None
+    if paired_feed_reference is not None:
+        from .lasso_current_artifact import artifact_current
+        feed=paired_feed_reference.get('feed') or {};art=paired_feed_reference.get('artifact') or {}
+        if (not config.lasso_infographic_quality_enabled(account_key) or 'story' not in str(surface).lower()
+                or not artifact_current(art,feed) or config.astra_reference_max()<1):
+            return None
+        import requests,hashlib,base64
+        try:
+            response=requests.get(feed['image_url'],timeout=30)
+            response.raise_for_status();raw=response.content
+            if len(raw)>20*1024*1024 or hashlib.sha256(raw).hexdigest()!=art['image_sha256']: return None
+            from PIL import Image
+            import io
+            with Image.open(io.BytesIO(raw)) as image:
+                image.load();mime=Image.MIME.get(image.format,'')
+            if mime not in ('image/png','image/jpeg','image/webp'): return None
+        except Exception:
+            return None
+        references=[{'id':'paired-feed:'+feed['id']+':'+art['image_sha256'],
+                     'bytes':raw,'b64':base64.b64encode(raw).decode(),'mime':mime},*references]
+        reference_note += '\nPAIRED FEED STYLE ONLY. Match the exact reviewed feed visual family, colors, imagery and hierarchy; recompose genuinely full-frame 9:16. Do not copy reference text or inset/paste its poster.'
+        paired_reference_receipt={k:art.get(k) for k in ('image_url','image_sha256')}
+        paired_reference_receipt.update(feed_id=feed['id'],review_response_id=art['evidence']['review_response_id'],source_hash=art['source_identity']['source_hash'])
     reference_ids = [r.get("id", "") for r in references]
 
     def _do_generate(p, corrective=None, repair_image_bytes=None):
@@ -1205,10 +1229,11 @@ def generate(headline, facts, client=None, out_path=None,
                 subject=headline, account_key=account_key or "", draft_id=draft_id,
                 failures=["Approved LASSO content brief is invalid"])
             return None
+        if paired_reference_receipt is not None: brief += "\n"+reference_note
         call_opts["engine_prompts"] = {"astra": brief, "gemini": p}
         story_quality = (config.lasso_infographic_quality_enabled(account_key)
                          and "story" in str(render_surface).lower())
-        if references and not story_quality:
+        if references and (not story_quality or paired_reference_receipt is not None):
             call_opts["reference_images"] = references
         # Feed-shaped craft examples remain with the independent reviewer;
         # Story generation chooses its own full-frame composition.
@@ -1279,7 +1304,10 @@ def generate(headline, facts, client=None, out_path=None,
                     "image_sha256": hashlib.sha256(image_bytes).hexdigest(),
                     "generation_response_id": getattr(result, "response_id", ""),
                     "review_response_id": getattr(_vision, "response_id", ""),
-                    "status": gr.status, "scores": gr.scores, "reason": gr.reason})
+                    "status": gr.status, "scores": gr.scores, "reason": gr.reason,
+                    "style_conformant":getattr(gr,'style_conformant',None),
+                    "style_violations":getattr(gr,'style_violations',None),
+                    "visual_standard_version":getattr(gr,'visual_standard_version',None)})
             grade_status, grade_scores, grade_reason = gr.status, gr.scores, gr.reason
             attempt_count = _attempt
             if gr.passed and gr.status == "PASS":
@@ -1449,6 +1477,10 @@ def generate(headline, facts, client=None, out_path=None,
         output["policy_version"] = POLICY_VERSION
         output["image_sha256"] = hashlib.sha256(image_bytes).hexdigest()
         output["reviews"] = review_history
+        output['style_conformant']=getattr(gr,'style_conformant',None)
+        output['style_violations']=getattr(gr,'style_violations',None)
+        output['visual_standard_version']=getattr(gr,'visual_standard_version',None)
+        if paired_reference_receipt is not None: output['paired_feed_reference']=paired_reference_receipt
         from pathlib import Path
         import json
         Path(str(out_path) + ".review.json").write_text(json.dumps(output, indent=2))

@@ -34,7 +34,8 @@ class Vision:
 def review_response(**overrides):
     data = dict(scores=dict(infographic_review.WEIGHTS), copy_complete=True,
                 copy_accurate=True, placement_safe=True,
-                placement_violations=[], issues=[])
+                placement_violations=[], issues=[],
+                style_conformant=True, style_violations=[])
     data.update(overrides)
     return json.dumps(data)
 
@@ -264,20 +265,27 @@ def test_display_copy_avoids_forbidden_punctuation_and_url_protocol():
     assert "lassoframework.com/summit" in text
 
 
-def test_creative_preference_allows_futuristic_but_bans_punctuation():
+def test_creative_preference_is_grounded_editorial_and_bans_rejected_treatments():
     prompt = astra_prompt.build_content_brief("Hook", ["Fact"])
-    assert "Futuristic graphics are welcome" in prompt
+    assert "Futuristic graphics are welcome" not in prompt
+    assert "VISUAL STANDARD" in prompt
+    for rejected in ("neon light trails", "glowing orange or blue ribbons",
+                     "holograms", "circuits"):
+        assert rejected in prompt.lower()
     assert "never render colons or semicolons" in prompt
 
 
 def test_reuse_requires_matching_bytes_model_and_current_review(tmp_path):
     import hashlib
+    from agent import lasso_visual_standard
     from agent.infographic_evidence import reviewed_asset, POLICY_VERSION, brain_snapshot
     image = tmp_path / 'card.png'
     image.write_bytes(b'approved pixels')
     sidecar = tmp_path / 'card.png.review.json'
     evidence = dict(policy_version=POLICY_VERSION, brain_snapshot=brain_snapshot(), brief_model='gpt-6-astra',
         grade_status='PASS', response_id='generation', review_response_id='review',
+        style_conformant=True, style_violations=[],
+        visual_standard_version=lasso_visual_standard.VERSION,
         image_sha256=hashlib.sha256(image.read_bytes()).hexdigest(),
         infographic_copy={'headline':'Hook','facts':['Fact'],'cta':'Save','footer':'lassoframework.com'})
     sidecar.write_text(json.dumps(evidence))
@@ -297,6 +305,7 @@ def test_reuse_requires_matching_bytes_model_and_current_review(tmp_path):
 def test_reuse_rejects_changed_brain_snapshot(tmp_path, monkeypatch):
     import hashlib
     from agent import infographic_evidence as evidence_module
+    from agent import lasso_visual_standard
     image = tmp_path / 'card.png'
     image.write_bytes(b'pixels')
     snapshot = {'brain.md': 'original'}
@@ -304,6 +313,8 @@ def test_reuse_rejects_changed_brain_snapshot(tmp_path, monkeypatch):
     evidence = dict(policy_version=evidence_module.POLICY_VERSION,
         brain_snapshot=dict(snapshot), brief_model='gpt-6-astra', grade_status='PASS',
         response_id='generation', review_response_id='review',
+        style_conformant=True, style_violations=[],
+        visual_standard_version=lasso_visual_standard.VERSION,
         image_sha256=hashlib.sha256(image.read_bytes()).hexdigest(),
         infographic_copy={'headline':'Hook','facts':['Fact']})
     (tmp_path / 'card.png.review.json').write_text(json.dumps(evidence))

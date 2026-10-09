@@ -579,6 +579,8 @@ def test_lasso_variant_requires_row_identity_for_artifact_provenance(monkeypatch
 
 
 def test_lasso_story_variant_keeps_caption_and_story_canvas(monkeypatch):
+    from agent import lasso_current_artifact
+    monkeypatch.setattr(lasso_current_artifact,"artifact_current",lambda *a,**k:True)
     monkeypatch.setenv("ECHO_VARIANT_PAIRING", "true")
     monkeypatch.setenv("AGENT_LASSO_INFOGRAPHIC_QUALITY", "true")
     from agent import infographic_artifacts
@@ -594,6 +596,7 @@ def test_lasso_story_variant_keeps_caption_and_story_canvas(monkeypatch):
     row = _row("lasso-story-1", gym_id="lasso", fmt="story",
         caption="A clear next step helps the team.")
     out = vr.generate_variant_image(row, "lasso_ig", generate_fn=fake_generate,
+        paired_feed_reference={"feed":dict(row, format="feed"),"artifact":{}},
         host_fn=lambda path, key: "https://cdn.example/story-v2.png")
 
     assert out["ok"] is True

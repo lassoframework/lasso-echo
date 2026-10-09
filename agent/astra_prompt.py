@@ -884,6 +884,19 @@ def build_content_brief(headline, facts, *, cta="", surface="feed post",
     if not str(headline or "").strip() or not facts:
         raise ValueError(f"{_brand_name} infographic requires {source_label} headline and facts")
     story = "story" in str(surface).lower()
+    # The owned grounded-editorial visual standard rides every LASSO brief,
+    # first generation and corrective edit alike. It FAILS CLOSED: a missing
+    # or malformed guide raises here so no LASSO card generates without the
+    # standard. Client gym briefs (_brand_name != "LASSO") are untouched: they
+    # keep their verified palette and brand latitude, no LASSO imposition.
+    if _brand_name == "LASSO":
+        from . import lasso_visual_standard as _lvs
+        visual_standard = (
+            f"VISUAL STANDARD (owned LASSO direction, version {_lvs.VERSION}; "
+            "the approved standard below is authoritative for this card's "
+            "visual treatment):\n" + _lvs.load_guidance())
+    else:
+        visual_standard = ""
     copy = {
         "headline": cs._scrub_dashes(str(headline)),
         "supporting_facts": [cs._scrub_dashes(str(f)) for f in facts if str(f).strip()],
@@ -921,6 +934,7 @@ def build_content_brief(headline, facts, *, cta="", surface="feed post",
             "accurately and legibly. Invent no claims, labels or URLs. Render no "
             "colons or semicolons, measurements or layout guides.\n" + json.dumps(copy, ensure_ascii=False),
             "INDEPENDENT REVIEW CORRECTIONS\n" + str(corrective),
+            visual_standard,
             # Keep the authoritative placement contract last. Reviewer prose can ask
             # for a minimal pixel shift that technically clears the outer boundary but
             # still leaves the lower group outside our buffered target bands. The edit
@@ -967,6 +981,7 @@ def build_content_brief(headline, facts, *, cta="", surface="feed post",
         "the verified colors. Let the visual explain the supported source facts, "
         "vary the structure, and avoid a fixed headline above object above footer "
         "arrangement."),
+        visual_standard if _brand_name == "LASSO" else
         "VISUAL TASTE: the user approves a varied mix of editorial, human, tactile "
         "and futuristic designs. Futuristic graphics are welcome when they explain "
         "the content. Choose freely without forcing every card into one style.",
