@@ -544,12 +544,24 @@ def test_automatic_retry_reuses_held_request_and_persists_single_calendar_card(m
     assert store.renders[rid]['status'] == 'pending'
     assert calendar.rows[('pierce', rid)]['status'] == 'pending'
 
-    replay = ss.create_story(request, candidates=_cands('pierce', n=3, seg=7),
+    changed = {**request, 'brief': 'Different footage and copy',
+               '_automatic_copy': {**request['_automatic_copy'],
+                                    'caption': 'This must not replace the card'}}
+    old_request = dict(store.requests[rid])
+    old_render = dict(store.renders[rid])
+    old_card = dict(calendar.rows[('pierce', rid)])
+    def no_second_render(*args, **kwargs):
+        raise AssertionError('existing calendar card must prevent a second render')
+    replay = ss.create_story(changed, candidates=_cands('pierce', n=3, seg=7),
                              store=store, music_library=_RealPathLibrary(str(audio)),
-                             render_fn=_fake_render, output_dir=str(tmp_path),
+                             render_fn=no_second_render, output_dir=str(tmp_path),
                              cal_store=calendar)
-    assert replay['status'] == 'staged'
+    assert replay['status'] == 'held'
+    assert 'already has a calendar card' in replay['reason']
     assert len(store.requests) == len(store.renders) == len(calendar.rows) == 1
+    assert store.requests[rid] == old_request
+    assert store.renders[rid] == old_render
+    assert calendar.rows[('pierce', rid)] == old_card
 
 
 def test_automatic_request_id_collision_in_foreign_gym_fails_closed(monkeypatch, tmp_path):
