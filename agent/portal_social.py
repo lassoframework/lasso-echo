@@ -43,6 +43,7 @@ import hashlib
 import json
 import os
 import re
+import uuid as _uuid
 from datetime import datetime, timezone
 
 from . import config, db as _db
@@ -366,7 +367,71 @@ def _calendar_post(row, is_lasso=False):
 
 _GBP_PROOF_KEYS = ("gym_id", "pillar", "gbp_topic_type", "gbp_cta_type",
                    "gbp_cta_url", "gbp_event", "gbp_offer", "gbp_location_id")
+_GENERATED_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
+
+_GENERATED_ROW_KEYS = ("creative_origin", "generated_artifact_version_id",
+                       "generated_artifact_sha256")
+
+
+def _generated_identity_present_in_row(row):
+    """True when ANY generated-contract field is set on the row, even
+    partially. Used to fail closed instead of silently downgrading a partial
+    generated card to an ordinary photo."""
+    if not isinstance(row, dict):
+        return False
+    if str(row.get("creative_origin") or "").strip():
+        return True
+    if any(str(row.get(key) or "").strip()
+           for key in ("generated_artifact_version_id",
+                       "generated_artifact_sha256")):
+        return True
+    return str(row.get("source_media_asset_id") or "").strip().startswith(
+        "generated-astra:")
+
+
+def _generated_from_row(row):
+    """GENERATED-CLIENT CONTRACT: the visible card's generated binding, with no
+    normalization or invented nulls. None unless the row IS a generated card
+    carrying its full, well-formed contract shape. A partial or spoofed marker
+    returns None here -- callers MUST also consult _generated_row_hold_reason
+    and hold the card, never downgrade it to an ordinary photo."""
+    if not isinstance(row, dict):
+        return None
+    if row.get("creative_origin") != "generated":
+        return None
+    if not all(key in row for key in _GENERATED_ROW_KEYS):
+        return None
+    version = str(row.get("generated_artifact_version_id") or "")
+    try:
+        version = str(_uuid.UUID(version))
+    except (ValueError, AttributeError, TypeError):
+        return None
+    sha = str(row.get("generated_artifact_sha256") or "")
+    if not _GENERATED_SHA256_RE.fullmatch(sha):
+        return None
+    return {"creative_origin": "generated",
+            "generated_artifact_version_id": version,
+            "generated_artifact_sha256": sha}
+
+
+def _generated_row_hold_reason(row):
+    """Fail-closed media-hold reason for a row carrying a partial, malformed
+    or unsupported generated identity, else None. A well-formed complete
+    generated row and a row with no generated identity at all return None."""
+    if not isinstance(row, dict):
+        return None
+    if _generated_from_row(row) is not None:
+        return None
+    if not _generated_identity_present_in_row(row):
+        return None
+    origin = str(row.get("creative_origin") or "").strip()
+    if origin and origin != "generated":
+        return f"unsupported creative_origin {origin!r} on calendar row"
+    if origin != "generated":
+        return ("partial generated identity on calendar row without "
+                "creative_origin (fail closed)")
+    return "partial or malformed generated identity on calendar row (fail closed)"
 
 def _gbp_proof_from_row(row):
     """Raw provider fields, with no display normalization or invented nulls.
@@ -437,6 +502,24 @@ def _content_calendar_post(row, is_lasso=False):
         "needs_media": bool((row.get("media_not_ready_reason") or "").strip())
                        or not (row.get("image_url") or "").strip(),
     }
+    _generated = _generated_from_row(row)
+    if _generated is not None:
+        # The displayed post carries the exact generated binding the portal
+        # must send back in expected_creative; approval proof for a generated
+        # card always comes from THIS displayed snapshot, never a hidden value.
+        post.update(_generated)
+    else:
+        # FAIL CLOSED (safety repair, 2026-10-09): a partial, malformed or
+        # unsupported generated identity must NOT silently drop its marker and
+        # downgrade to an ordinary photo with needs_media=False. Set the shared
+        # media hold so the card shows the truthful reason and stays out of
+        # approval / publish lanes.
+        _gen_hold = _generated_row_hold_reason(row)
+        if _gen_hold:
+            existing = (post.get("media_not_ready_reason") or "").strip()
+            post["media_not_ready_reason"] = (
+                f"{existing}; {_gen_hold}" if existing else _gen_hold)
+            post["needs_media"] = True
     if platform == "googlebusiness":
         post["gbp_proof"] = _gbp_proof_from_row(row)
     # gym_id scopes the hosted fallback card (media_host tenant isolation).
@@ -947,6 +1030,28 @@ def _validate_expected_creative(expected):
         normalized["gbp_proof"] = proof
     elif "gbp_proof" in expected:
         return None, "gbp_proof is only valid for googlebusiness"
+    # GENERATED-CLIENT CONTRACT: a generated row's snapshot must carry the exact
+    # generated marker, artifact version UUID and delivered SHA. Missing or
+    # malformed generated identity on a row claiming to be generated fails
+    # closed; rows WITHOUT the marker keep the legacy wire byte-for-byte.
+    if any(key in expected for key in (
+            "creative_origin", "generated_artifact_version_id",
+            "generated_artifact_sha256")):
+        origin = expected.get("creative_origin")
+        if origin != "generated":
+            return None, ("creative_origin must be 'generated' when generated "
+                          "identity fields are present")
+        version = str(expected.get("generated_artifact_version_id") or "").strip()
+        try:
+            version = str(_uuid.UUID(version))
+        except (ValueError, AttributeError, TypeError):
+            return None, "generated_artifact_version_id must be a valid UUID"
+        sha = str(expected.get("generated_artifact_sha256") or "").strip()
+        if not _GENERATED_SHA256_RE.fullmatch(sha):
+            return None, "generated_artifact_sha256 must be lowercase 64-hex"
+        normalized["creative_origin"] = "generated"
+        normalized["generated_artifact_version_id"] = version
+        normalized["generated_artifact_sha256"] = sha
     return normalized, None
 
 
@@ -963,6 +1068,16 @@ def _handle_approve_supabase(account_key, draft_id, actor_id, reader, sb_store,
         row, miss = _sb_load_owned_row(account_key, draft_id, sb_store)
         if miss is not None:
             return miss
+        # GENERATED-CLIENT CONTRACT: approval remains fail-closed until the
+        # trusted receipt/SQL composition is available. This applies with
+        # proof flags both on and off, including malformed or partial identity
+        # and generated source markers. Keep it before idempotent/terminal
+        # branches so an old approved row cannot bypass the hold either.
+        _source_asset_id = str(row.get("source_media_asset_id") or "").strip()
+        if (_generated_identity_present_in_row(row)
+                or _source_asset_id.startswith("generated-astra:")):
+            return 409, {"ok": False, "action": "approve", "draft_id": draft_id,
+                         "error": "generated creative approval is unavailable until trusted verification is enabled"}
         # idempotent: an already approved row is a clean no-op (never a re-publish);
         # an already PUBLISHED row is also a clean no-op (the approval already ran its
         # course), never a status rewrite back to 'approved'.

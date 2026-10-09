@@ -59,7 +59,25 @@ def _to_dict(d: Draft):
         # rehydrated Draft keeps the SAME identity across the mirror's
         # delete/reinsert cycle; never inferred from date/photo/caption.
         "logical_post_id": getattr(d, "logical_post_id", "") or "",
+        # GENERATED-CLIENT CONTRACT: exact portal draft fields. Round-trip
+        # UNCONDITIONALLY (like logical_post_id) so a SQLite reload can never
+        # silently drop generated identity; the trusted receipt rides in the
+        # draft JSON only and is never synthesized here.
+        "creative_origin": getattr(d, "creative_origin", "") or "",
+        "generated_artifact_version_id":
+            getattr(d, "generated_artifact_version_id", "") or "",
+        "generated_artifact_sha256":
+            getattr(d, "generated_artifact_sha256", "") or "",
+        "generated_receipt": (d.generated_receipt
+                              if isinstance(getattr(d, "generated_receipt", None), dict)
+                              else {}),
     }
+    # Preserve the generated-astra provenance marker even on Draft instances
+    # that have never acquired media_materialization_observations. Ordinary
+    # photo source IDs keep the historical observation-gated serialization.
+    source_asset_id = str(getattr(d, "source_media_asset_id", "") or "")
+    if source_asset_id.strip().startswith("generated-astra:"):
+        record["source_media_asset_id"] = source_asset_id
     if hasattr(d, "media_materialization_observations"):
         # Untrusted producer metadata must survive the mirror's reload. Preserve
         # the explicit asset field independently; never infer it from observations.
@@ -136,6 +154,11 @@ def _from_dict(r):
         day_key=r.get("day_key", ""),
         draft_type=r.get("draft_type", ""),
         logical_post_id=r.get("logical_post_id", "") or "",
+        creative_origin=r.get("creative_origin", "") or "",
+        generated_artifact_version_id=r.get("generated_artifact_version_id", "") or "",
+        generated_artifact_sha256=r.get("generated_artifact_sha256", "") or "",
+        generated_receipt=(r.get("generated_receipt")
+                           if isinstance(r.get("generated_receipt"), dict) else {}),
         slack_channel=r.get("slack_channel", ""),
         slack_ts=r.get("slack_ts", ""),
         needs_media=bool(r.get("needs_media", False)),
@@ -155,6 +178,9 @@ def _from_dict(r):
         draft.poster_render_evidence = poster_evidence
     if "media_materialization_observations" in r:
         draft.media_materialization_observations = r["media_materialization_observations"]
+    source_asset_id = str(r.get("source_media_asset_id") or "")
+    if ("media_materialization_observations" in r
+            or source_asset_id.strip().startswith("generated-astra:")):
         draft.source_media_asset_id = r.get("source_media_asset_id", "")
     return draft
 
