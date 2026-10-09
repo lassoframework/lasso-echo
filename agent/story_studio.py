@@ -74,11 +74,6 @@ def create_story(request, *, candidates=None, assets_by_id=None, analysis=None,
     injectable Drive fetch used to bind each picked segment to a local source file (the
     live default is drive_client.download); only used on the default renderer path.
     """
-    if request.get("auto_reel") and not request.get("_moments_prepared"):
-        from .auto_reel_prepare import create_automatic_reel
-        return create_automatic_reel(request, candidates=candidates, assets_by_id=assets_by_id,
-            analysis=analysis, store=store, music_library=music_library, render_fn=render_fn,
-            output_dir=output_dir, now=now, downloader=downloader, cal_store=cal_store)
     gym_id = _base_gym(request.get("gym_id"))
     if not config.story_studio_render_active_for(gym_id):
         return {"status": "off", "reason": "STORY_STUDIO_RENDER not armed for this gym",
@@ -89,6 +84,29 @@ def create_story(request, *, candidates=None, assets_by_id=None, analysis=None,
 
     store = store or _default_store()
     request_id = request.get("id") or str(uuid.uuid4())
+    if request.get("auto_reel"):
+        # The calendar card is the durable result for this deterministic UUID. A
+        # replay may produce different bytes or copy, so never render or rewrite
+        # its request/render ledger when that card already exists.
+        try:
+            if cal_store is None:
+                if not config.portal_calendar_supabase_enabled():
+                    raise ValueError("calendar store unavailable")
+                from .portal_calendar_store import SupabaseCalendarStore
+                cal_store = SupabaseCalendarStore()
+            if cal_store.get_row(gym_id, request_id):
+                return {"status": "held", "reason": "Automatic reel already has a calendar card; "
+                        "use the existing card", "draft": None, "story_render": None,
+                        "request_id": request_id}
+        except Exception:  # noqa: BLE001 - ambiguous calendar reads must not re-render
+            return {"status": "held", "reason": "Automatic reel calendar state is unavailable; "
+                    "nothing was staged", "draft": None, "story_render": None,
+                    "request_id": request_id}
+        if not request.get("_moments_prepared"):
+            from .auto_reel_prepare import create_automatic_reel
+            return create_automatic_reel(request, candidates=candidates, assets_by_id=assets_by_id,
+                analysis=analysis, store=store, music_library=music_library, render_fn=render_fn,
+                output_dir=output_dir, now=now, downloader=downloader, cal_store=cal_store)
 
     # 0. LIVE candidate discovery. When candidates are not injected (a REAL coach tap
     #    or the event one-tap both reach here with candidates=None), discover the gym's
@@ -295,7 +313,25 @@ def create_story(request, *, candidates=None, assets_by_id=None, analysis=None,
         "status": STATUS_PENDING,
         "created_at": _now_iso(),
     }
-    _persist(store, request, request_id, gym_id, tmpl_name, music_sel, story_render)
+    if request.get("auto_reel"):
+        try:
+            if cal_store.get_row(gym_id, request_id):
+                return {"status": "held", "reason": "Automatic reel already has a calendar card; "
+                        "use the existing card", "draft": None, "story_render": None,
+                        "request_id": request_id}
+        except Exception:  # noqa: BLE001
+            return {"status": "held", "reason": "Automatic reel calendar state is unavailable; "
+                    "nothing was staged", "draft": None, "story_render": None,
+                    "request_id": request_id}
+    persisted = _persist(store, request, request_id, gym_id, tmpl_name, music_sel,
+                         story_render)
+    if request.get("auto_reel") and not persisted:
+        # Automatic reels reuse a deterministic request UUID across bounded retries.
+        # A foreign or unavailable ledger must not produce an approval card with
+        # missing provenance, even though the ordinary Story tap is best effort.
+        return _held(request_id, gym_id, "Automatic reel request ledger is unavailable; "
+                     "nothing was staged", store, request, tmpl_name,
+                     music_sel.shelf, already_persisted=True)
 
     # 8b. WRITE THE APPROVAL ROW. Without this the whole lane was a promise it never
     # kept: the video rendered, the clips were stamped used, story_render recorded a
@@ -305,6 +341,13 @@ def create_story(request, *, candidates=None, assets_by_id=None, analysis=None,
     row_id, cal_err = _stage_calendar_row(gym_id, draft, request_id,
                                                   cal_store=cal_store)
     if cal_err:
+        if (request.get("auto_reel") and
+                cal_err == "this automatic reel request already has a calendar card"):
+            # Another worker may have staged the deterministic card after our
+            # last read. Never label this newly rendered draft as staged or
+            # deny the card that won the race.
+            return {"status": "held", "reason": cal_err, "draft": None,
+                    "story_render": None, "request_id": request_id}
         # Never claim staged when the client-visible artifact was not created. The
         # segments are stamped at step 9 (below), so nothing needs rolling back here.
         #
@@ -462,13 +505,17 @@ def _stage_calendar_row(gym_id, draft, request_id=None, *, cal_store=None):
             row["id"] = str(uuid.UUID(draft.draft_id))
             existing = cal_store.get_row(gym_id, row["id"])
             if existing:
-                return existing["id"], None
+                if _same_auto_reel_card(existing, row):
+                    return existing["id"], None
+                return None, "this automatic reel request already has a calendar card"
             try:
                 written = cal_store.insert_rows(gym_id, [row], preserve_ids=True) or []
             except Exception:
                 existing = cal_store.get_row(gym_id, row["id"])
                 if existing:
-                    return existing["id"], None
+                    if _same_auto_reel_card(existing, row):
+                        return existing["id"], None
+                    return None, "this automatic reel request already has a calendar card"
                 raise
         else:
             written = cal_store.insert_rows(gym_id, [row]) or []
@@ -477,6 +524,15 @@ def _stage_calendar_row(gym_id, draft, request_id=None, *, cal_store=None):
     if not written:
         return None, "the calendar store accepted no rows"
     return (written[0] or {}).get("id"), None
+
+
+def _same_auto_reel_card(existing, planned):
+    """Only recover an ambiguous insert when the readback is the same card."""
+    return (str(existing.get("id")) == str(planned.get("id"))
+            and str(existing.get("status") or "").lower() == "pending"
+            and all(existing.get(key) == planned.get(key)
+                    for key in ("account", "image_url", "caption", "format",
+                                "logical_post_id")))
 
 
 def _held(request_id, gym_id, reason, store, request, tmpl_name, shelf,
@@ -498,12 +554,17 @@ def _held(request_id, gym_id, reason, store, request, tmpl_name, shelf,
     from . import db
     try:
         if store is not None and store.available():
-            if already_persisted:
+            existing = (store.get_request(request_id, gym_id=gym_id)
+                        if callable(getattr(store, "get_request", None)) else None)
+            if already_persisted or existing:
                 store.update_request(
                     request_id, {"status": STATUS_HELD, "hold_reason": reason},
                     gym_id=gym_id)
-                store.update_render(
-                    request_id, {"status": STATUS_DENIED}, gym_id=gym_id)
+                existing_render = (store.get_render(request_id, gym_id=gym_id)
+                                   if callable(getattr(store, "get_render", None)) else None)
+                if already_persisted or existing_render:
+                    store.update_render(
+                        request_id, {"status": STATUS_DENIED}, gym_id=gym_id)
             else:
                 store.insert_request({
                     "id": request_id, "gym_id": gym_id,
@@ -524,18 +585,38 @@ def _held(request_id, gym_id, reason, store, request, tmpl_name, shelf,
 def _persist(store, request, request_id, gym_id, tmpl_name, music_sel, story_render):
     try:
         if store is None or not store.available():
-            return
-        store.insert_request({
+            return False
+        request_row = {
             "id": request_id, "gym_id": gym_id,
             "asset_ids": request.get("asset_ids") or [],
             "brief": request.get("brief") or "",
             "template": tmpl_name,
             "music_mood": music_sel.shelf,
             "requested_by": request.get("requested_by") or "",
-            "status": STATUS_PENDING, "created_at": _now_iso()})
-        store.insert_render(story_render)
+            "status": STATUS_PENDING, "hold_reason": None,
+            "created_at": _now_iso()}
+        existing = (store.get_request(request_id, gym_id=gym_id)
+                    if callable(getattr(store, "get_request", None)) else None)
+        if existing:
+            store.update_request(request_id,
+                                 {k: v for k, v in request_row.items()
+                                  if k not in ("id", "gym_id", "created_at")},
+                                 gym_id=gym_id)
+        else:
+            store.insert_request(request_row)
+        old_render = (store.get_render(request_id, gym_id=gym_id)
+                      if callable(getattr(store, "get_render", None)) else None)
+        if old_render:
+            store.update_render(request_id,
+                                {k: v for k, v in story_render.items()
+                                 if k not in ("id", "request_id", "gym_id", "created_at")},
+                                gym_id=gym_id)
+        else:
+            store.insert_render(story_render)
+        return True
     except Exception as e:  # noqa: BLE001
         print(f"[story-studio] persist failed: {type(e).__name__}: {e}")
+        return False
 
 
 def _derived_identity(path):
