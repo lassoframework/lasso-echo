@@ -222,6 +222,20 @@ begin
  definition:=replace(definition,'admit_prospective_photo_occupancy_20261008','admit_prospective_still_v2_20261008');
  definition:=replace(definition,'perform public.fixer_assert_photo_no_exclusions_20261008();','perform public.fixer_assert_still_row_v2_or_v1_20261008(p_calendar_row_id);');
  definition:=replace(definition,'''reviewed_no_prior_visual_use''','''no_prior_published_still_image_or_derivative_use''');
+ if position('or candidate->>''tenant_id'' is distinct from tenant' in definition)=0
+   or position('or candidate->>''tenant_id'' is distinct from r.gym_id' in definition)=0
+   or position('s.calendar_row_id=r.id and s.tenant_id=tenant' in definition)=0 then
+  raise exception 'prospective raw-owner alias admission contract changed; review required';
+ end if;
+ -- Signed certificates/source receipts retain the RAW asset owner. Canonical
+ -- graph identity requires owner-controlled alias mapping AND an immutable
+ -- authorized staged member. The following exact raw-row equality is retained.
+ definition:=replace(definition,
+   'or candidate->>''tenant_id'' is distinct from tenant',
+   'or public.fixer_forward_schedule_canonical_tenant_20261008(candidate->>''tenant_id'') is distinct from tenant or (candidate->>''tenant_id'' is distinct from tenant and not exists(select 1 from public.forward_schedule_stage_member_20261008 sm where sm.calendar_row_id=r.id and sm.gym_id=r.gym_id and sm.tenant_id=tenant and public.fixer_forward_schedule_staged_authorized_20261008(r.id,tenant,sm.batch_id)))');
+ definition:=replace(definition,'s.calendar_row_id=r.id and s.tenant_id=tenant',
+   's.calendar_row_id=r.id and s.tenant_id=candidate->>''tenant_id''');
+
  definition:=replace(definition,'or r.variant_status is distinct from ''active''',
    'or not (r.variant_status=''active'' or (r.variant_status=''candidate'' and r.media_not_ready_reason=''forward_reservation_staged'' and exists(select 1 from public.forward_schedule_stage_member_20261008 sm join public.forward_schedule_stage_batch_20261008 sb on sb.batch_id=sm.batch_id where sm.calendar_row_id=r.id and sb.state=''staged'')))');
  definition:=replace(definition,'or r.media_not_ready_reason is not null',
