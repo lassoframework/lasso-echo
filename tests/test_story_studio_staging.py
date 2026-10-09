@@ -470,8 +470,16 @@ class _UniqueIdStore:
         self.renders[rid] = dict(row)
         return dict(row)
 
+    def get_request(self, rid, gym_id=None):
+        row = self.requests.get(rid)
+        return dict(row) if row and row["gym_id"] == gym_id else None
+
+    def get_render(self, rid, gym_id=None):
+        row = self.renders.get(rid)
+        return dict(row) if row and row["gym_id"] == gym_id else None
+
     def update_request(self, rid, fields, gym_id=None):
-        if rid in self.requests:
+        if rid in self.requests and self.requests[rid]["gym_id"] == gym_id:
             self.requests[rid].update(fields)
         return True
 
@@ -484,9 +492,101 @@ class _UniqueIdStore:
             raise RuntimeError(
                 f"new row for relation \"story_render\" violates check constraint "
                 f"\"story_render_status_check\": {fields['status']!r}")
-        if rid in self.renders:
+        if rid in self.renders and self.renders[rid]["gym_id"] == gym_id:
             self.renders[rid].update(fields)
         return True
+
+
+def test_automatic_retry_reuses_held_request_and_persists_single_calendar_card(monkeypatch, tmp_path):
+    import uuid
+    _arm(monkeypatch)
+    rid = str(uuid.uuid4())
+    store = _UniqueIdStore()
+    request = {'id': rid, 'gym_id': 'pierce', 'auto_reel': True,
+               '_moments_prepared': True, 'asset_ids': ['a0', 'a1', 'a2'],
+               'brief': 'Expert coaching for busy adults',
+               'identity_tokens': ['Pierce'], 'ask': 'No Sweat Intro',
+               '_automatic_copy': {'held': False, 'ask': 'No Sweat Intro',
+                   'caption': 'Expert coaching for busy adults. No Sweat Intro',
+                   'provenance': {'gym': 'pierce', 'approved_cta': 'No Sweat Intro',
+                                  'ask_source': {'kind': 'approved_voice'}}}}
+    audio = tmp_path / 'hype.mp3'
+    audio.write_bytes(b'ID3fake')
+
+    class Calendar:
+        def __init__(self):
+            self.rows = {}
+        def get_row(self, gym, row_id):
+            return self.rows.get((gym, row_id))
+        def insert_rows(self, gym, rows, **kwargs):
+            assert kwargs == {'preserve_ids': True}
+            assert len(rows) == 1
+            row = dict(rows[0])
+            assert (gym, row['id']) not in self.rows
+            self.rows[(gym, row['id'])] = row
+            return [row]
+    calendar = Calendar()
+
+    ss._held(rid, 'pierce', 'Old CTA hold', store, request, 'hype_montage', '')
+    ss._held(rid, 'pierce', 'Portrait verification incomplete', store, request,
+             'hype_montage', '')
+    assert len(store.requests) == 1
+    assert store.requests[rid]['hold_reason'] == 'Portrait verification incomplete'
+
+    result = ss.create_story(request, candidates=_cands('pierce', n=3, seg=7),
+                             store=store, music_library=_RealPathLibrary(str(audio)),
+                             render_fn=_fake_render, output_dir=str(tmp_path),
+                             cal_store=calendar)
+    assert result['status'] == 'staged', result
+    assert len(store.requests) == len(store.renders) == len(calendar.rows) == 1
+    assert store.requests[rid]['status'] == 'pending'
+    assert store.requests[rid]['hold_reason'] is None
+    assert store.renders[rid]['status'] == 'pending'
+    assert calendar.rows[('pierce', rid)]['status'] == 'pending'
+
+    replay = ss.create_story(request, candidates=_cands('pierce', n=3, seg=7),
+                             store=store, music_library=_RealPathLibrary(str(audio)),
+                             render_fn=_fake_render, output_dir=str(tmp_path),
+                             cal_store=calendar)
+    assert replay['status'] == 'staged'
+    assert len(store.requests) == len(store.renders) == len(calendar.rows) == 1
+
+
+def test_automatic_request_id_collision_in_foreign_gym_fails_closed(monkeypatch, tmp_path):
+    import uuid
+    _arm(monkeypatch)
+    rid = str(uuid.uuid4())
+    store = _UniqueIdStore()
+    foreign = {'id': rid, 'gym_id': 'other', 'status': 'held',
+               'hold_reason': 'Foreign gym hold'}
+    store.insert_request(foreign)
+    audio = tmp_path / 'hype.mp3'
+    audio.write_bytes(b'ID3fake')
+
+    class Calendar:
+        calls = 0
+        def get_row(self, gym, row_id):
+            return None
+        def insert_rows(self, gym, rows, **kwargs):
+            self.calls += 1
+            raise AssertionError('foreign request must never stage')
+    calendar = Calendar()
+    result = ss.create_story(
+        {'id': rid, 'gym_id': 'pierce', 'auto_reel': True,
+         '_moments_prepared': True, 'asset_ids': ['a0', 'a1', 'a2'],
+         'brief': 'Expert coaching for busy adults',
+         'identity_tokens': ['Pierce'], 'ask': 'No Sweat Intro',
+         '_automatic_copy': {'held': False, 'ask': 'No Sweat Intro',
+             'caption': 'Expert coaching for busy adults. No Sweat Intro',
+             'provenance': {'gym': 'pierce', 'approved_cta': 'No Sweat Intro',
+                            'ask_source': {'kind': 'approved_voice'}}}},
+        candidates=_cands('pierce', n=3, seg=7), store=store,
+        music_library=_RealPathLibrary(str(audio)), render_fn=_fake_render,
+        output_dir=str(tmp_path), cal_store=calendar)
+    assert result['status'] == 'held'
+    assert 'ledger' in result['reason']
+    assert calendar.calls == 0
+    assert store.requests[rid] == foreign
 
 
 def test_calendar_insert_failure_corrects_the_persisted_rows_to_held(monkeypatch, tmp_path):
