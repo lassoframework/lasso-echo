@@ -437,12 +437,23 @@ def test_thumbnail_prefers_drive_thumbnail():
                                              mime="video/mp4")])
     # A video asset: the FULL asset would be a huge mislabeled stream. With a real
     # Drive thumbnail seeded, the proxy serves THAT small image/jpeg instead.
-    drive = FakeDrive(files=[], thumbs={"a1": b"SMALLJPEGTHUMB"})
+    # Real, plausibly-sized informative JPEG (the old b"SMALLJPEGTHUMB" fixture
+    # was undecodable garbage, which the hardened video path correctly refuses
+    # to serve as a 200 image).
+    import io as _io
+    from PIL import Image as _Image
+    _img = _Image.new("RGB", (240, 240))
+    _img.putdata([((x * 4) % 256, (y * 4 + x) % 256, ((x + y) * 2) % 256)
+                  for y in range(240) for x in range(240)])
+    _buf = _io.BytesIO(); _img.save(_buf, format="JPEG")
+    small_thumb = _buf.getvalue()
+    assert len(small_thumb) >= 4096
+    drive = FakeDrive(files=[], thumbs={"a1": small_thumb})
     status, ctype, data = gm.handle_thumbnail("pierce", "a1", store=store,
                                               drive=drive)
     assert status == 200
     assert ctype == "image/jpeg"                     # correctly typed, not video/mp4
-    assert data == b"SMALLJPEGTHUMB"                 # the small rendition, not the full file
+    assert data == small_thumb                       # the small rendition, not the full file
     assert "a1" not in drive.downloads               # never streamed the full original
 
 
