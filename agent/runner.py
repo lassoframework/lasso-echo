@@ -1154,7 +1154,8 @@ def run_daily(poster=None, voice_path=None, library_path=None,
         # agent disarmed. say nothing publicly; just report state to the caller.
         return {"status": "disabled", "drafts": []}
 
-    # Recover on the listener's original durable journal even when planning skips
+    # Recover shared GBP and primary-feed uses on the listener's original
+    # durable journal even when planning skips
     # existing months, lacks voice/city, or has no connected locations.
     from .jobs.gbp_drive_use_recovery import run as _gbp_use_recovery_run
     try:
