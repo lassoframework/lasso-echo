@@ -130,7 +130,7 @@ or data deletion.
 
 - `agent/generated_issuer_dispatch_entrypoint.py` — `104a6aed72849c127439d70ca31a404028913749fb826355b38ed3c092cd6238`
 - `tests/test_generated_issuer_dispatch_entrypoint.py` — `c05793011c4b6e70567e3d645ae8d57ea03fb7e78baaf525b35b6c1c527207d6`
-- `tests/test_generated_client_release_manifest_pg.py` — `f92318c2dcfb288b72b0742dafe3ede85e8f83580c8d23305de4c5a1be4e236f`
+- `tests/test_generated_client_release_manifest_pg.py` — `633bc5757d96207701a0cd41776730a922699c89003999d54a057104129a4636`
 - `tests/test_generated_client_full_dispatch_pg.py` — `a88f6452ce63bf5193da7fc6abaad5fe9e4375eaab57aee8488ad0b565bb4bd4`
 - `tests/test_forward_corpus_atomic_cutover_pg.py` (source of entry extraction semantics) — `b4a454597d4fded3dd21eade69eabf39c600e37d8d2b3174cc489a29e51b422a`
 - `tests/fixtures/generated_client_release_manifest/README.md` documents portal fixture provenance.
