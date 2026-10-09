@@ -8,7 +8,7 @@ the test before execution.
 
 | Fixture | Source provenance | SHA-256 |
 | --- | --- | --- |
-| `../portal_0611_echo_source_brand_bundle_held_20261008.sql` | Existing checked-in held 0611 fixture; byte-identical to `portal-brand-source-bundle-20261008/supabase/migrations/0611_echo_source_brand_bundle.sql` | `5277e3d1192a56454f4a3233fb87756a24b1977ded898649c55883d06e1eb8ef` |
+| `../portal_0611_echo_source_brand_bundle_held_20261008.sql` | Existing checked-in held 0611 fixture; byte-identical to `portal-brand-source-bundle-20261008/supabase/migrations/0611_echo_source_brand_bundle.sql` at portal commit `ad3feba3` | `d3a3b22d62f2ebc0376f89552a994d785947eb5309dff6e3d655ebf4c0f71178` |
 | `0611_echo_source_brand_bundle.verify.sql` | `portal-brand-source-bundle-20261008/supabase/migrations/0611_echo_source_brand_bundle.verify.sql` | `c57bd51f871e1a3eef142c9f69b5a474830b47c946d449a35fdd8f135b833c54` |
 | `DRAFT_0625_generated_client_approval.sql` | `portal-generated-client-contract-20261009/supabase/migrations/DRAFT_0625_generated_client_approval.sql` | `d54a5b9e1f857d31912540f38f626b59c891296a4aebd7b3c2d55a1f4abdc705` |
 | `DRAFT_0625_generated_client_approval.verify.sql` | `portal-generated-client-contract-20261009/supabase/migrations/DRAFT_0625_generated_client_approval.verify.sql` | `19fd8aa6b031bd9fd80aa70a64b34b737daf1ae02d03d0e04bfa6d3bf4953ee7` |

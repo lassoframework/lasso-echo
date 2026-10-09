@@ -125,13 +125,13 @@ def finalizer_process(dsn, batch):
 
 
 PORTAL_0611_FIXTURE = ROOT / 'tests' / 'fixtures' / 'portal_0611_echo_source_brand_bundle_held_20261008.sql'
-PORTAL_0611_FIXTURE_SHA256 = '5277e3d1192a56454f4a3233fb87756a24b1977ded898649c55883d06e1eb8ef'
+PORTAL_0611_FIXTURE_SHA256 = 'd3a3b22d62f2ebc0376f89552a994d785947eb5309dff6e3d655ebf4c0f71178'
 
 
 def portal_0611_fixture():
     """Frozen test-only snapshot of the HELD portal 0611 source-brand migration.
 
-    Exact bytes of portal-brand-source-bundle-20261008 portal git HEAD 82c174c9
+    Exact bytes of portal-brand-source-bundle-20261008 portal git HEAD ad3feba3
     supabase/migrations/0611_echo_source_brand_bundle.sql, pinned by hash so a
     changed real migration cannot silently alter this composition evidence.
     This fixture is disposable-PG test evidence only: it is not deployed SQL,

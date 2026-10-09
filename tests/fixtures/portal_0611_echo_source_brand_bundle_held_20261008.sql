@@ -1,6 +1,9 @@
 -- Scoped source-brand schema. Release requires the normal migration gate.
 -- No historical backfill, default brand, coach approval, or publication action.
-create extension if not exists pgcrypto;
+-- Supabase installs pgcrypto in extensions; qualify hashes even inside the
+-- security-definer functions whose trusted search_path excludes that schema.
+create schema if not exists extensions;
+create extension if not exists pgcrypto with schema extensions;
 
 -- A trusted server capture adapter writes these; the browser cannot create captures.
 -- raw_bytes are the exact fetched response bytes, not an excerpt or reconstructed text.
@@ -19,7 +22,7 @@ create table if not exists public.echo_source_captures (
   mapping_evidence jsonb not null check (jsonb_typeof(mapping_evidence) = 'object' and mapping_evidence <> '{}'::jsonb),
   fetched_at timestamptz not null,
   raw_bytes bytea not null check (octet_length(raw_bytes) between 1 and 2000000),
-  bytes_sha256 text generated always as (encode(digest(raw_bytes,'sha256'),'hex')) stored,
+  bytes_sha256 text generated always as (encode(extensions.digest(raw_bytes,'sha256'),'hex')) stored,
   captured_at timestamptz not null default clock_timestamp(),
   check (source_kind <> 'social' or (provider_account_id is not null and length(provider_account_id) > 0 and source_locator is not null and source_locator ~ '^https://[^[:space:]]+$')),
   check (capture_provider <> 'apify' or (source_kind='social' and source_url ~ '^https://api[.]apify[.]com/' and provider_response_id is not null and length(provider_response_id)>0)),
@@ -54,7 +57,7 @@ create table if not exists public.echo_source_brand_bundles (
   predecessor_id uuid references public.echo_source_brand_bundles(id),
   capture_ids uuid[] not null,
   snapshot_bytes text not null,
-  content_sha256 text generated always as (encode(digest(snapshot_bytes,'sha256'),'hex')) stored,
+  content_sha256 text generated always as (encode(extensions.digest(snapshot_bytes,'sha256'),'hex')) stored,
   source_revision text not null,
   palette_revision text not null,
   created_at timestamptz not null default clock_timestamp(),
@@ -69,7 +72,7 @@ create table if not exists public.echo_source_brand_observations (
   bundle_id uuid not null,
   configuration_sha256 text not null,
   snapshot_bytes text not null,
-  content_sha256 text generated always as (encode(digest(snapshot_bytes,'sha256'),'hex')) stored,
+  content_sha256 text generated always as (encode(extensions.digest(snapshot_bytes,'sha256'),'hex')) stored,
   validator_revision text not null check(length(validator_revision)>0),
   validation_report jsonb not null,
   created_at timestamptz not null default clock_timestamp(),
@@ -306,7 +309,7 @@ begin
   if policy is not null then frozen:=frozen||jsonb_build_object('schema_version',2,'source_policy',policy,'provider_status_receipt',echo_source_brand_provider_receipt(p_gym,k)); end if;
   insert into public.echo_source_brand_bundles(gym_id,echo_account_key,schema_version,version,predecessor_id,capture_ids,snapshot_bytes,source_revision,palette_revision)
   values(p_gym,k,(frozen->>'schema_version')::integer,coalesce(previous.version,0)+1,previous.id,p_capture_ids,frozen::text,
-    encode(digest(convert_to(snapshots::text,'UTF8'),'sha256'),'hex'),pal.bytes_sha256 || ':' || p_primary_offset || ':' || p_secondary_offset)
+    encode(extensions.digest(convert_to(snapshots::text,'UTF8'),'sha256'),'hex'),pal.bytes_sha256 || ':' || p_primary_offset || ':' || p_secondary_offset)
   returning * into result;
   return result;
 end $$;

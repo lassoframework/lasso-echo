@@ -33,7 +33,7 @@ HASHES = {
  'DRAFT_0625_generated_client_approval.sql': 'd54a5b9e1f857d31912540f38f626b59c891296a4aebd7b3c2d55a1f4abdc705',
  'DRAFT_0625_generated_client_approval.verify.sql': '19fd8aa6b031bd9fd80aa70a64b34b737daf1ae02d03d0e04bfa6d3bf4953ee7',
  'generated_client_seed_20261009.py': 'd00b1a98c4fe413f84c859ac664682aa61fddb2a32c3d5d5a59f77b55969a4e8',
- 'portal_0611_echo_source_brand_bundle_held_20261008.sql': '5277e3d1192a56454f4a3233fb87756a24b1977ded898649c55883d06e1eb8ef',
+ 'portal_0611_echo_source_brand_bundle_held_20261008.sql': 'd3a3b22d62f2ebc0376f89552a994d785947eb5309dff6e3d655ebf4c0f71178',
 }
 FOUNDATIONS = (
  'DRAFT_fixer_forward_media_claim_20261006.sql',
@@ -112,6 +112,8 @@ def install(db):
   and n.args and isinstance(n.args[0],ast.Constant) and isinstance(n.args[0].value,str)
   and 'create role anon;create role authenticated' in n.args[0].value)
  db.execute(bootstrap)
+ # Match Supabase's production extension placement before any migration runs.
+ db.execute('create schema extensions; create extension pgcrypto with schema extensions')
  db.execute('''alter table content_calendar add column pillar text,add column slot_index integer,
   add column scheduled_at timestamptz,add column byte_hash text,add column gbp_topic_type text,
   add column gbp_cta_type text,add column gbp_cta_url text,add column gbp_event jsonb,add column gbp_offer jsonb;

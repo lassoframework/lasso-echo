@@ -5,9 +5,9 @@ File: `portal_0611_echo_source_brand_bundle_held_20261008.sql`
 This is an exact byte-for-byte test fixture snapshot of the portal
 migration `supabase/migrations/0611_echo_source_brand_bundle.sql`, copied
 from the sibling checkout `portal-brand-source-bundle-20261008`
-(portal git HEAD `82c174c9` at copy time, 2026-10-08).
+(portal commit `ad3feba3` at copy time, 2026-10-09).
 
-- SHA-256: `5277e3d1192a56454f4a3233fb87756a24b1977ded898649c55883d06e1eb8ef`
+- SHA-256: `d3a3b22d62f2ebc0376f89552a994d785947eb5309dff6e3d655ebf4c0f71178`
 - Purpose: let the composed PG test
   `tests/test_gbp_staged_drive_recovery_composed_pg.py` run in ordinary
   Echo CI without a sibling portal checkout.
