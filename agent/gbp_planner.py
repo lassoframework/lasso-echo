@@ -406,8 +406,280 @@ def _release_drive_claim(pick):
 
 def _complete_drive_claim(pick):
     from . import db
-    db.socialapi_claim_done(
-        pick["claim_id"], pick["claim_account"], str(pick["asset"]["id"]))
+    if pick.get("journal_entry"):
+        # An armed retry may complete only its original exact claim; never
+        # overwrite a completed claim or a foreign in-flight asset binding.
+        asset_id = str(pick["asset"]["id"])
+        with db.connect() as conn:
+            conn.execute(
+                "UPDATE socialapi_claims SET status='done',post_id=? "
+                "WHERE draft_id=? AND account_key=? AND status='in_flight' "
+                "AND (post_id IS NULL OR post_id='' OR post_id=?)",
+                (asset_id, pick["claim_id"], pick["claim_account"], asset_id))
+            conn.commit()
+    else:
+        db.socialapi_claim_done(
+            pick["claim_id"], pick["claim_account"], str(pick["asset"]["id"]))
+
+# ---- armed remote Drive use caller (AGENT_REMOTE_DRIVE_USE_CAS_ENABLED) -----
+# Default OFF. When armed, every Drive row carries a durable source-bound use
+# identity in the local gbp_drive_use_journal BEFORE the calendar POST: exact
+# gym/logical id, frozen authoritative zero-use asset + source snapshots, epoch,
+# date, the proposed row, and one stable use UUID. Write intent is persisted for
+# every Drive row before the batch send; any journal hold fails closed before
+# the POST. Only exact landed rows are consumed, through the remote atomic CAS
+# with the SAME UUID and full snapshots, and a Drive claim completes only after
+# an authoritative receipt is verified. When the flag is off every path below
+# is inert and the legacy stamp flow is byte-for-byte unchanged.
+
+
+def _remote_drive_cas_enabled():
+    """True only when the remote Drive use CAS is explicitly armed. A flag read
+    failure holds when the environment explicitly arms the lane."""
+    try:
+        from . import remote_drive_use
+        return bool(remote_drive_use.enabled())
+    except Exception:  # noqa: BLE001
+        if os.environ.get("AGENT_REMOTE_DRIVE_USE_CAS_ENABLED", "").strip().lower() in ("true", "1", "yes", "on"):
+            raise RuntimeError("remote Drive use flag unavailable while armed") from None
+        return False
+
+
+def _drive_use_epoch_id(base):
+    """The deployment's explicit mutation epoch for this gym (the same binding
+    remote_drive_use.apply enforces). Raises when unconfigured: the caller holds."""
+    from . import local_inventory_mutation as lim
+    cfg = lim.configured(base, Path(config.LIBRARY_PATH) / base)
+    return cfg.epoch_id
+
+
+def _authoritative_drive_snapshots(pick):
+    """Exact authoritative asset + source rows for one armed Drive pick, or None.
+
+    The armed lane never trusts the picker-time dict: it re-reads the exact
+    current rows from the media store and requires the eligible zero-use proof
+    the remote CAS contract binds (same-gym, active gym_drive source, eligible,
+    never used). Any missing/ambiguous snapshot is None — fail closed, the row
+    is held before the POST, never guessed."""
+    store = pick.get("store")
+    base = pick.get("base")
+    asset = pick.get("asset") or {}
+    get_asset = getattr(store, "get_asset", None)
+    get_source = getattr(store, "get_source", None)
+    if not callable(get_asset) or not callable(get_source) or not base:
+        return None
+    try:
+        asset_row = get_asset(str(asset.get("id") or ""))
+        source_row = (get_source(str(asset_row.get("source_id") or ""))
+                      if isinstance(asset_row, dict) else None)
+    except Exception:  # noqa: BLE001 - unreadable snapshot is unavailable proof
+        return None
+    if not isinstance(asset_row, dict) or not isinstance(source_row, dict):
+        return None
+    if (asset_row.get("gym_id") != base or source_row.get("gym_id") != base
+            or asset_row.get("used_count") != 0
+            or asset_row.get("last_used_at") is not None
+            or asset_row.get("eligible") is not True
+            or asset_row.get("excluded_by_coach") is not False
+            or source_row.get("kind") != "gym_drive"
+            or source_row.get("active") is not True
+            or not str(asset_row.get("content_hash") or "")):
+        return None
+    return asset_row, source_row
+
+
+def _prepare_drive_use_journal(portal_gym_key, row, pick):
+    """Freeze the durable source-bound use identity for one armed Drive row.
+
+    Returns the journal entry (stable UUID; a same-identity retry resumes the
+    existing entry) or None — HOLD, fail closed before the POST — when the
+    claim, logical id, epoch, or authoritative snapshots are unavailable, or
+    the journal itself holds (e.g. an identity conflict under the same logical
+    post id)."""
+    from . import gbp_drive_use_journal as journal
+    asset = pick.get("asset") or {}
+    asset_id = str(asset.get("id") or "")
+    if not asset_id or not pick.get("claim_id"):
+        return None
+    existing = row.get("source_media_asset_id")
+    if existing is not None and str(existing) != asset_id:
+        return None
+    # The journal contract binds the asset id ON the proposed row, so the exact
+    # landed readback must carry it too.
+    row["source_media_asset_id"] = asset_id
+    snapshots = _authoritative_drive_snapshots(pick)
+    if snapshots is None:
+        return None
+    asset_row, source_row = snapshots
+    try:
+        epoch_id = _drive_use_epoch_id(pick["base"])
+    except Exception:  # noqa: BLE001 - no explicit epoch: hold, never invent one
+        return None
+    try:
+        logical = _ensure_logical_post_id(row)
+    except ValueError:
+        return None
+    request = dict(
+        gym_id=pick["base"], logical_post_id=logical,
+        claim_id=str(pick["claim_id"]), post_date=row["post_date"],
+        content_hash=str(asset_row.get("content_hash") or ""),
+        asset_id=asset_id, source_id=str(source_row.get("id") or ""),
+        calendar_row=dict(row), payload=dict(row),
+        asset_before=asset_row, source_before=source_row, epoch_id=epoch_id)
+    try:
+        return journal.prepare(request)
+    except journal.JournalHold:
+        return None
+
+
+def _recorded_remote_receipt(use_id):
+    """The durably recorded authoritative remote receipt for one use UUID, read
+    back from the remote_drive_use attempt ledger. None when missing, not yet
+    confirmed, or unreadable — the caller holds rather than trusting counters."""
+    import json as _json
+    import sqlite3 as _sqlite3
+    from . import db as _db
+    try:
+        conn = _sqlite3.connect(str(_db.db_path()), timeout=30)
+        try:
+            row = conn.execute(
+                "SELECT state, receipt FROM remote_drive_use_attempt"
+                " WHERE use_id=?", (str(use_id),)).fetchone()
+        finally:
+            conn.close()
+    except Exception:  # noqa: BLE001
+        return None
+    if not row or row[0] != "confirmed" or not row[1]:
+        return None
+    try:
+        receipt = _json.loads(row[1])
+    except Exception:  # noqa: BLE001
+        return None
+    return receipt if isinstance(receipt, dict) else None
+
+
+def _settle_armed_drive_landing(portal_gym_key, row, pick, persisted_row, log):
+    """Consume one exact landed armed Drive row to a verified receipt.
+
+    Sequence: confirm_landed (exact same logical row + asset + payload) ->
+    begin_consumption -> remote atomic Drive use with the SAME journal UUID and
+    the frozen full snapshots -> authoritative receipt readback ->
+    confirm_receipt -> complete the Drive claim. Any hold leaves the journal
+    entry unsettled and the claim in-flight (non-reofferable); nothing is
+    released on an unknown outcome. Resumable: a retry of the same logical post
+    replays the recorded receipt with the same UUID and never double-consumes.
+    Returns True only when the receipt is durably confirmed and the claim done.
+    """
+    from . import gbp_drive_use_journal as journal
+    entry = pick.get("journal_entry")
+    if not entry:
+        log(f"{portal_gym_key}: armed Drive row landed without a journal entry; "
+            "holding claim")
+        return False
+    use_id = entry["use_id"]
+    try:
+        current = journal.get(use_id)
+    except journal.JournalHold:
+        return False
+    if current is None:
+        return False
+    state = current["state"]
+    if state in ("write_intent", "unknown_result"):
+        if persisted_row is None:
+            # An unseen row is never settled from counters or absence.
+            return False
+        evidence = {"calendar_row": persisted_row,
+                    "asset_id": str((pick.get("asset") or {}).get("id") or ""),
+                    "content_hash": str(current.get("content_hash") or "")}
+        try:
+            journal.confirm_landed(use_id, evidence)
+            journal.begin_consumption(use_id)
+        except journal.JournalHold as hold:
+            log(f"{portal_gym_key}: armed Drive landing hold for {use_id}: {hold}")
+            return False
+        state = "consumption_pending"
+    elif state == "confirmed_landed":
+        try:
+            journal.begin_consumption(use_id)
+        except journal.JournalHold:
+            return False
+        state = "consumption_pending"
+    if state == "consumption_pending":
+        try:
+            from . import gym_media_selector
+            gym_media_selector.stamp_use(
+                pick["asset"], pick["base"], pick["day_key"], store=pick["store"],
+                use_id=use_id, asset_row=current["asset_before"],
+                source_row=current["source_before"])
+        except Exception as exc:  # noqa: BLE001 - unknown remote outcome: hold
+            log(f"{portal_gym_key}: armed remote Drive use held for {use_id}: "
+                f"{type(exc).__name__}")
+            return False
+        receipt = _recorded_remote_receipt(use_id)
+        if receipt is None:
+            log(f"{portal_gym_key}: no authoritative receipt recorded for {use_id}")
+            return False
+        try:
+            journal.confirm_receipt(use_id, receipt)
+        except journal.JournalHold as hold:
+            log(f"{portal_gym_key}: armed Drive receipt hold for {use_id}: {hold}")
+            return False
+    elif state == "claim_done":
+        try:
+            journal.confirm_claim_done(use_id)
+            return True
+        except journal.JournalHold:
+            return False
+    elif state != "receipt_confirmed":
+        # prepared/abandoned here means the caller violated the send protocol.
+        return False
+    try:
+        # Never create or overwrite a mismatched claim during crash recovery.
+        from . import db
+        with db.connect() as conn:
+            claim = conn.execute(
+                "SELECT status,post_id FROM socialapi_claims WHERE draft_id=? AND account_key=?",
+                (current["claim_id"], current["gym_id"] + "_gbp")).fetchone()
+        if claim is None or (claim[0] == "done" and claim[1] != current["asset_id"]):
+            return False
+        if claim[0] not in ("in_flight", "done"):
+            return False
+        _complete_drive_claim(pick)
+        journal.confirm_claim_done(use_id)
+    except Exception as exc:  # noqa: BLE001 - claim remains non-reofferable
+        log(f"{portal_gym_key}: armed Drive claim completion failed for {use_id}: "
+            f"{type(exc).__name__}")
+        return False
+    return True
+
+
+def _recover_armed_drive_uses(portal_gym_key, account_gen_key, store, log):
+    """Recover frozen uses before selection. Never resend a calendar POST."""
+    from . import gbp_drive_use_journal as journal, gym_media_index
+    base = gym_media_selector.base_gym_key(account_gen_key)
+    entries = [e for e in journal.unsettled() if e["gym_id"] == base]
+    if not entries:
+        return None
+    media_store = gym_media_index.default_store()
+    held = []
+    for entry in entries:
+        row = entry["calendar_row"]
+        pick = dict(kind="drive", base=base, asset=entry["asset_before"],
+                    store=media_store, day_key=entry["post_date"],
+                    claim_id=entry["claim_id"], claim_account=f"{base}_gbp",
+                    journal_entry=entry)
+        persisted = None
+        if entry["state"] in ("write_intent", "unknown_result"):
+            readback = _readback_inserted_rows(store, portal_gym_key, [row])
+            matches = [r for r in (readback or [])
+                       if r.get("logical_post_id") == entry["logical_post_id"]]
+            if len(matches) == 1:
+                persisted = matches[0]
+        if not _settle_armed_drive_landing(portal_gym_key, row, pick, persisted, log):
+            held.append(entry["use_id"])
+    return dict(ok=not held, planned=0, recovered=len(entries)-len(held),
+                operational_hold=bool(held), use_ids=held,
+                reason="remote Drive use recovery hold" if held else "remote Drive uses recovered")
 
 
 def _release_local_reservation(binding):
@@ -651,6 +923,15 @@ def plan_gbp_month(portal_gym_key, account_gen_key, *, voice, library_path, city
     but every new row is pending for the gym's own approval; coach review is retired."""
     log = logger or (lambda m: print(f"[gbp-planner] {m}"))
     initial_status = "pending"
+    try:
+        armed = _remote_drive_cas_enabled()
+        if armed:
+            recovery = _recover_armed_drive_uses(portal_gym_key, account_gen_key, store, log)
+            if recovery is not None:
+                return recovery
+    except Exception:
+        return {"ok": False, "planned": 0, "operational_hold": True,
+                "reason": "remote Drive use recovery or flag unavailable"}
     start = start or date.today()
     caption_fn = caption_fn or (lambda fact: generate_gbp_caption(fact, voice, city))
     facts = list(facts or [])
@@ -910,6 +1191,54 @@ def plan_gbp_month(portal_gym_key, account_gen_key, *, voice, library_path, city
         local_reservations[id(row)] = (rid, _gbp_rotation_key,
                                        pick.get("rotation_key"),
                                        canonical or path, digest)
+    if armed:
+        # Persist durable source-bound identity + write intent for EVERY Drive row
+        # before the batch POST. Any journal hold fails closed: nothing is sent.
+        from . import gbp_drive_use_journal as _journal
+        drive_pairs = [(r, p) for r, p in media_claims if p.get("kind") == "drive"]
+        journal_ok = True
+        for row, pick in drive_pairs:
+            entry = _prepare_drive_use_journal(portal_gym_key, row, pick)
+            if entry is None:
+                journal_ok = False
+                break
+            pick["journal_entry"] = entry
+        if journal_ok:
+            for row, pick in drive_pairs:
+                entry = pick["journal_entry"]
+                try:
+                    if entry["state"] == "prepared":
+                        pick["journal_entry"] = _journal.record_write_intent(
+                            entry["use_id"])
+                    elif entry["state"] not in ("write_intent", "unknown_result"):
+                        # A landed/settled entry must never be re-sent.
+                        journal_ok = False
+                        break
+                except _journal.JournalHold:
+                    journal_ok = False
+                    break
+        if not journal_ok:
+            # Preserve every claim and entry when any intent may be ambiguous.
+            # Only a fully prepared batch can be abandoned and released safely.
+            ambiguous = any(p.get("journal_entry", {}).get("state") != "prepared"
+                            for _, p in drive_pairs if p.get("journal_entry"))
+            safe_release = not ambiguous
+            if safe_release:
+                for row, pick in drive_pairs:
+                    entry = pick.get("journal_entry")
+                    if entry:
+                        try:
+                            _journal.abandon(entry["use_id"])
+                        except _journal.JournalHold:
+                            safe_release = False
+                if safe_release:
+                    for prior in drive_claims:
+                        _release_drive_claim(prior)
+            for binding in local_reservations.values():
+                _release_local_reservation(binding)
+            return {"ok": False,
+                    "reason": "remote Drive use journal hold before send",
+                    "planned": 0, "skips": dict(skips), **counts}
     try:
         if _global_writer_enabled():
             # Render evidence is NOT a row column; it binds source/delivered bytes at
@@ -926,6 +1255,24 @@ def plan_gbp_month(portal_gym_key, account_gen_key, *, voice, library_path, city
             inserted = store.insert_rows(portal_gym_key, rows) or []
     except Exception as exc:
         readback = _readback_inserted_rows(store, portal_gym_key, rows)
+        if armed:
+            # The POST outcome is missing/ambiguous: every armed Drive entry goes
+            # unknown_result; an exact zero readback is recorded but NEVER settles.
+            from . import gbp_drive_use_journal as _journal
+            for _row_obj, pick in media_claims:
+                if pick.get("kind") != "drive":
+                    continue
+                entry = pick.get("journal_entry")
+                if not entry:
+                    continue
+                try:
+                    current = _journal.get(entry["use_id"])
+                    if current and current["state"] == "write_intent":
+                        _journal.mark_unknown(entry["use_id"])
+                        if readback == []:
+                            _journal.record_zero_readback(entry["use_id"])
+                except _journal.JournalHold:
+                    pass
         if readback is None:
             # The remote may have committed. Releasing would make landed media
             # immediately reofferable, so retain all claims/reservations.
@@ -949,14 +1296,39 @@ def plan_gbp_month(portal_gym_key, account_gen_key, *, voice, library_path, city
             {_calendar_row_key(r) for r in inserted}
             == {_calendar_row_key(r) for r in rows})
     inserted_keys = {_calendar_row_key(r) for r in inserted}
+    inserted_by_key = ({_calendar_row_key(r): r for r in inserted}
+                       if armed else {})
+    armed_unseen = []
     for row, pick in media_claims:
         landed = _calendar_row_key(row) in inserted_keys
         if pick.get("kind") == "local" and not landed and not insert_readback_recovered:
             _release_local_reservation(
                 local_reservations.get(id(row), (None, None, None, None, None)))
         if pick.get("kind") == "drive" and not landed and not insert_readback_recovered:
-            _release_drive_claim(pick)
-        if pick.get("kind") == "drive" and landed:
+            if armed:
+                # An unseen armed row is never released: a late commit can still
+                # follow, so it stays held and non-reofferable in unknown_result.
+                from . import gbp_drive_use_journal as _journal
+                entry = pick.get("journal_entry")
+                if entry:
+                    try:
+                        current = _journal.get(entry["use_id"])
+                        if current and current["state"] == "write_intent":
+                            _journal.mark_unknown(entry["use_id"])
+                    except _journal.JournalHold:
+                        pass
+                armed_unseen.append(str(pick.get("asset", {}).get("id") or ""))
+            else:
+                _release_drive_claim(pick)
+        if pick.get("kind") == "drive" and landed and armed:
+            # Exact landed rows only: durable landed proof, remote atomic use
+            # with the SAME UUID + frozen snapshots, verified receipt, then the
+            # claim completes. Any hold keeps the claim in-flight.
+            if not _settle_armed_drive_landing(
+                    portal_gym_key, row, pick,
+                    inserted_by_key.get(_calendar_row_key(row)), log):
+                stamp_failures.append(str(pick["asset"].get("id") or ""))
+        if pick.get("kind") == "drive" and landed and not armed:
             # A transient usage write gets one bounded retry. Never stamp a
             # caption-rejected or unpersisted candidate. stamp_use spans the
             # media store and its kv receipt, so inspect the asset after an
@@ -1031,6 +1403,18 @@ def plan_gbp_month(portal_gym_key, account_gen_key, *, voice, library_path, city
                 "planned": len(inserted), "operational_hold": True,
                 "claim_ids": [p.get("claim_id") for p in drive_claims
                               if p.get("claim_id")],
+                "skips": dict(skips), **counts}
+    if armed_unseen:
+        _alert_drive_claim_hold(
+            portal_gym_key,
+            [pick for row, pick in media_claims
+             if pick.get("kind") == "drive"
+             and str(pick.get("asset", {}).get("id") or "") in armed_unseen],
+            "armed Drive row unseen after send; held pending authoritative readback")
+        return {"ok": False,
+                "reason": "armed Drive rows unseen after send; held and "
+                          "non-reofferable: " + ", ".join(armed_unseen),
+                "planned": len(inserted), "operational_hold": True,
                 "skips": dict(skips), **counts}
     if insert_readback_recovered and not insert_readback_complete:
         _alert_drive_claim_hold(

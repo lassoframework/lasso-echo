@@ -173,7 +173,9 @@ def test_receipt_pending_and_same_uuid_recovery(db):
                                       _receipt(entry), path=db)
     assert settled['state'] == 'receipt_confirmed'
     assert settled['receipt']['request']['use_id'] == entry['use_id']
-    assert journal.unsettled(path=db) == []
+    assert journal.unsettled(path=db)[0]['state'] == 'receipt_confirmed'
+    with pytest.raises(JournalHold, match='journal_claim_readback_unavailable'):
+        journal.confirm_claim_done(entry['use_id'], path=db)
 
 
 def test_local_write_failure_holds_prior_state(db, monkeypatch):
@@ -548,3 +550,25 @@ def test_heterogeneous_batch_key_union_keeps_exact_member_projection(db):
     # Non-null fields from another member cannot bleed into this member.
     assert normalized[0]['gbp_offer'] is None
     assert normalized[1]['gbp_cta_type'] is None
+
+
+def test_claim_terminal_requires_exact_durable_readback(db):
+    import sqlite3
+    entry = journal.prepare(make_request(), path=db)
+    use_id = entry['use_id']
+    journal.record_write_intent(use_id, path=db)
+    journal.confirm_landed(use_id, _evidence(entry), path=db)
+    journal.begin_consumption(use_id, path=db)
+    journal.confirm_receipt(use_id, _receipt(entry), path=db)
+    with sqlite3.connect(db) as conn:
+        conn.execute('CREATE TABLE socialapi_claims (draft_id TEXT,account_key TEXT,status TEXT,post_id TEXT)')
+        conn.execute('INSERT INTO socialapi_claims VALUES (?,?,?,?)',
+                     (entry['claim_id'], entry['gym_id']+'_gbp', 'done', 'wrong-asset'))
+    with pytest.raises(JournalHold, match='journal_claim_done_unverified'):
+        journal.confirm_claim_done(use_id, path=db)
+    assert journal.get(use_id, path=db)['state'] == 'receipt_confirmed'
+    with sqlite3.connect(db) as conn:
+        conn.execute('UPDATE socialapi_claims SET post_id=?', (entry['asset_id'],))
+    assert journal.confirm_claim_done(use_id, path=db)['state'] == 'claim_done'
+    assert journal.confirm_claim_done(use_id, path=db)['use_id'] == use_id
+    assert journal.unsettled(path=db) == []
