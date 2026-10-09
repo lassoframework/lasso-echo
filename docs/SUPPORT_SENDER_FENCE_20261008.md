@@ -26,9 +26,12 @@ SHA from RAILWAY_GIT_COMMIT_SHA (or explicitly provisioned
 SUPPORT_MESSAGES_DEPLOYED_SHA), process UUID, PID, hostname, optional
 RAILWAY_REPLICA_ID, exact generation, active operations, and database blockers.
 Replica ID is null when the platform does not provide it; hostname and UUID are
-process identifiers, not an invented fleet identity. Portal-only processes need
-an in-process receipt hook or must be accounted for through the operational
-shutdown boundary below; they do not emit listener health.
+process identifiers, not an invented fleet identity. Portal-only Echo and Scout
+ticket passes emit the same process-local receipt to their own log when paused,
+after admission exits. That log is an in-process receipt, not listener health;
+the operator must still identify every actual sender process and reconcile the
+durable outbox before accepting a fleet drain. A sender without a receipt hook
+must be accounted for through the operational shutdown boundary below.
 
 `local_drained` requires paused valid control, no admitted operations, a known
 SHA, and successful complete bounded scans with no posting rows or held delivery

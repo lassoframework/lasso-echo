@@ -11,6 +11,7 @@ import socket
 import threading
 import uuid
 from contextlib import contextmanager
+from datetime import datetime, timezone
 
 _LOCK = threading.RLock()
 _LOCAL = threading.local()
@@ -64,14 +65,31 @@ def admission(lane):
                         del _ACTIVE[lane]
 
 
-def guarded(lane, refused):
+def guarded(lane, refused, *, receipt_on_pause=False):
+    """Optionally log the paused receipt from the actual bus-owning process.
+
+    Portal passes run even when Slack conversation listener health is disabled.
+    Emit after admission exits so the completed pass does not count itself active.
+    Receipt collection is read-only and never replaces the guarded return value.
+    """
     def decorate(fn):
         @functools.wraps(fn)
         def wrapped(*args, **kwargs):
-            with admission(lane) as allowed:
-                if not allowed:
-                    return refused()
-                return fn(*args, **kwargs)
+            try:
+                with admission(lane) as allowed:
+                    if not allowed:
+                        return refused()
+                    return fn(*args, **kwargs)
+            finally:
+                if receipt_on_pause and control()["paused"]:
+                    bus = args[0] if args else kwargs.get("bus")
+                    log = kwargs.get("log", print)
+                    try:
+                        log("[support-sender-fence] " + json.dumps(
+                            {"lane": lane, **receipt(bus)}, sort_keys=True))
+                    except Exception:
+                        # A failed health sink cannot replay or change a send outcome.
+                        pass
         return wrapped
     return decorate
 
@@ -124,6 +142,7 @@ def receipt(bus=None):
     local_drained = (state["enabled"] and state["paused"] and not state["error"]
                      and not active and not blockers and bool(sha))
     return {**state, "process_id": _PROCESS, "pid": os.getpid(),
+            "observed_at": datetime.now(timezone.utc).isoformat(),
             "hostname": socket.gethostname(), "replica_id": replica,
             "deployed_sha": sha, "active": active, "blockers": blockers,
             "local_drained": bool(local_drained), "fleet_drained": False}
