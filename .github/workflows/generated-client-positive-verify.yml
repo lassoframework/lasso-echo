@@ -47,6 +47,7 @@ jobs:
           cp "$GITHUB_WORKSPACE/target/.github/fixer-verifier/generated-client-positive.Dockerfile" "$RUNNER_TEMP/generated-positive-build/Dockerfile"
           docker build --tag generated-positive:"${{ github.run_id }}" "$RUNNER_TEMP/generated-positive-build"
           sudo chown 999:999 "$RUNNER_TEMP/generated-positive-data"
+          sudo chmod 1777 "$RUNNER_TEMP/generated-positive-data"
       - name: Create finite network disabled mounted rehearsal
         run: |
           docker create --name generated-positive --network none --cap-drop ALL --security-opt no-new-privileges \
