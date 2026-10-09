@@ -1963,12 +1963,22 @@ class SupabaseCalendarStore:
             try:
                 # Freeze the exact canonical stage attempt DURABLY before the
                 # RPC; a hold here means nothing was sent (definite no-write).
-                _stage_journal.record_forward_stage_intent({
+                attempt = {
                     "batch_id": batch_id, "tenant_id": tenant,
                     "request_digest": digest, "request_text": request_text,
                     "member_row_ids": list(planned_ids),
-                    "old_row_ids": list(old_ids)})
-                _stage_journal.record_forward_tenant_binding(batch_id, account_key, tenant)
+                    "old_row_ids": list(old_ids)}
+                atomic_freezer = getattr(before_forward_stage, "freeze_atomic", None)
+                if atomic_freezer is not None:
+                    if not callable(atomic_freezer):
+                        raise _stage_journal.JournalHold("atomic_stage_freezer_invalid")
+                    # Event claims may exist only in the SAME SQLite commit as
+                    # their exact stage request and use journal. The callback
+                    # freezes everything before this writer sends any RPC.
+                    atomic_freezer(attempt, account_key)
+                else:
+                    _stage_journal.record_forward_stage_intent(attempt)
+                    _stage_journal.record_forward_tenant_binding(batch_id, account_key, tenant)
             except _stage_journal.JournalHold as hold:
                 raise ReservationStoreError(
                     409, f"staged journal intent hold before stage RPC: {hold}")
@@ -2012,6 +2022,54 @@ class SupabaseCalendarStore:
                     "forward_schedule_batch_status, never calendar rows")
         self.last_forward_stage = data
         return data
+
+    def replay_frozen_event_stage(self, batch_id, account_key):
+        """Replay only the original SQLite bytes, never replan or refreeze.
+
+        Same batch UUID/digest makes lost-ack replay idempotent in SQL. This
+        method has no finalizer authority; terminal state uses the exact
+        status RPC and listener settlement remains separate.
+        """
+        from . import gbp_drive_use_journal as journal, remote_drive_use
+        from .jobs import gbp_drive_use_recovery as recovery
+        if (not remote_drive_use.enabled() or forward_reservation_flag() is not True
+                or gbp_staged_journal_flag() is not True or recovery.enabled() is not True):
+            raise ReservationStoreError(503, "event frozen replay authority unavailable")
+        recovery._durable_path()
+        bound = journal.get_forward_stage(batch_id)
+        if (bound is None or not journal.forward_stage_tenant_matches(
+                dict(gym_id=account_key), bound)):
+            raise ReservationStoreError(409, "event frozen replay tenant mismatch")
+        request = __import__('json').loads(bound['request_text'])
+        if (len(request['members']) != 1
+                or not request['members'][0]['row'].get('event_id')):
+            raise ReservationStoreError(409, "event frozen replay membership mismatch")
+        row = request['members'][0]['row']
+        use = journal.get_by_logical_post(account_key, row['logical_post_id'])
+        if (use is None or use['calendar_row'] != row
+                or use['state'] not in ('write_intent', 'unknown_result')):
+            raise ReservationStoreError(409, "event frozen replay use mismatch")
+        if not recovery._claim_matches(recovery._durable_path(), use):
+            raise ReservationStoreError(409, "event frozen replay original claim mismatch")
+        if bound['state'] != 'stage_intent':
+            return bound
+        attempt = {k: bound[k] for k in
+                   ('batch_id', 'tenant_id', 'request_digest', 'member_row_ids', 'old_row_ids')}
+        self.last_forward_stage_attempt = attempt
+        data = self._reservation_rpc(_STAGE_RPC, {
+            'p_tenant_id': bound['tenant_id'], 'p_batch_id': batch_id,
+            'p_request': bound['request_text'], 'p_request_digest': bound['request_digest']}, timeout=60)
+        expected_observed = [m['row']['id'] for m in request['members']
+                             if m.get('observation') is not None]
+        if (journal._receipt_matches_attempt(data, bound, 'staged')
+                and data.get('observation_row_ids') == expected_observed
+                and data.get('finalize_receipt') is None):
+            journal.record_forward_stage_receipt(batch_id, data)
+            self.last_forward_stage = data
+            return data
+        # Already finalized replays and malformed acknowledgments resolve
+        # through bound status, never infer activation from stage response.
+        return self.resolve_forward_stage_attempt()
 
     def forward_schedule_batch_status(self, batch_id, *, tenant_id=None,
                                       request_digest=None, member_row_ids=None,

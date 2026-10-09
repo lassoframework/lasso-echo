@@ -1157,8 +1157,14 @@ def run_daily(poster=None, voice_path=None, library_path=None,
     # Recover shared GBP and primary-feed uses on the listener's original
     # durable journal even when planning skips
     # existing months, lacks voice/city, or has no connected locations.
+    from .jobs.event_drive_use_recovery import run as _event_use_recovery_run
     from .jobs.gbp_drive_use_recovery import run as _gbp_use_recovery_run
     try:
+        event_recovery = _event_use_recovery_run(settle=False)
+        if event_recovery.get("reason") != "disabled":
+            print(f"[event-drive-recovery] {event_recovery}")
+        # Existing feed/GBP settlement remains available even while event
+        # producer gates are OFF or unavailable.
         recovery = _gbp_use_recovery_run()
         if recovery.get("reason") != "disabled":
             print(f"[gbp-drive-recovery] {recovery}")
