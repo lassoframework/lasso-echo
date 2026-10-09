@@ -94,7 +94,7 @@ def _stub_pipeline(monkeypatch, palette=None):
     from agent import astra_prompt, client_infographic_fill, media_host
 
     monkeypatch.setattr(astra_prompt, "load_gym_brand_palette",
-                        lambda key: palette if palette is not None else {
+                        lambda key, **kw: palette if palette is not None else {
                             "canvas": "#111111", "ink": "#FFFFFF",
                             "accent": "#C8102E"})
     monkeypatch.setattr(client_infographic_fill, "_generate_astra_only",
@@ -348,7 +348,7 @@ def test_missing_verified_palette_fails_closed(monkeypatch):
     _stub_pipeline(monkeypatch, palette=None)
     _stub_deep_brain(monkeypatch, [_Fact("Real fact about Chateau")])
     from agent import astra_prompt
-    monkeypatch.setattr(astra_prompt, "load_gym_brand_palette", lambda key: None)
+    monkeypatch.setattr(astra_prompt, "load_gym_brand_palette", lambda key, **kw: None)
     store = _Store()
     n = nmas.seed_gaps("chateau", _acct(), store, max_rows=1, days_ahead=1)
     assert n == 0
@@ -380,7 +380,7 @@ def test_astra_only_with_gym_palette_in_brief(monkeypatch):
         return "BRIEF:" + headline
     monkeypatch.setattr(astra_prompt, "build_infographic_brief", _fake_brief)
     monkeypatch.setattr(astra_prompt, "load_gym_brand_palette",
-                        lambda key: {"canvas": "#0A1B2C", "accent": "#C8102E"})
+                        lambda key, **kw: {"canvas": "#0A1B2C", "accent": "#C8102E"})
 
     def _no_gemini(*a, **k):
         raise AssertionError("creative_studio.generate must not be called")

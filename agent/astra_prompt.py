@@ -342,8 +342,31 @@ def accent_law_free(placement: str) -> str:
 # gym's generated infographic is a LAST RESORT behind approved client photos,
 # and when it does render it must use THAT GYM'S ACTUAL verified brand colors
 # -- never colors inferred from the voice doc's tone, never LASSO's hex, never
-# an invented palette. The verified colors live in a small JSON file next to
-# the gym's durable brand bible:
+# an invented palette.
+#
+# PRIMARY SOURCE for the ordinary infographic fallback callers
+# (client_infographic_fill.fill_gaps, no_media_astra_seed.seed_gaps): the
+# ACTIVE APPROVED source-brand bundle for this exact gym, read back through
+# the narrow SCHEDULER READ-ONLY ADAPTER
+# (astra_prompt.scheduler_source_brand_bundle against the caller's existing
+# SupabaseCalendarStore service-role credentials -- the ordinary scheduler
+# NEVER uses dedicated owner credentials): echo_intake_tokens maps the exact
+# echo_account_key to its unique gym_id (verified reciprocally), then the
+# existing production read-only RPC echo_source_brand_active(p_gym) returns
+# the active bundle for exactly that gym. The result is validated by the same
+# evidence chain the
+# generated-infographic runtime uses
+# (generated_infographic_runtime.delegated_palette): same-gym identity, owner
+# approval receipt, and a fresh same-bundle observation whose retained website
+# capture bytes still carry the palette tokens. The palette derived there is
+# pulled from the gym's verified WEBSITE captures. A bundle claim that is
+# missing, unreadable, or fails ANY of that validation (stale, cross-tenant,
+# tampered, unapproved) FAILS CLOSED: no palette is returned and the local
+# file is NOT consulted, so bad evidence can never be laundered into colors.
+#
+# SECONDARY SOURCE (legacy loader only for other callers that supply no
+# bundle_reader; the ordinary fallback callers above never reach it): a small
+# JSON file next to the gym's durable brand bible:
 #   <DATA_DIR>/brand_voice/<base>/brand_colors.json   (durable, wins)
 #   brand_voice/<base>/brand_colors.json              (repo fallback)
 # Accepted shapes:
@@ -379,17 +402,177 @@ def _gym_brand_colors_path(base) -> str:
     return durable or repo
 
 
-def load_gym_brand_palette(account_key):
+def scheduler_source_brand_bundle(store, base):
+    """Narrow SCHEDULER read-only adapter: the ACTIVE APPROVED source-brand
+    bundle for one exact echo_account_key, using ONLY the caller's existing
+    SupabaseCalendarStore service-role credentials (no owner credentials, no
+    draft bridge RPC, no URL fetch).
+
+    Mapping (rpc/fixer_generated_source_brand_active_20261007 is NOT deployed,
+    so no base-keyed bundle bridge exists):
+      1. GET echo_intake_tokens?echo_account_key=eq.<base>
+         &select=gym_id,echo_account_key&limit=2 -- require EXACTLY ONE row
+         with a valid UUID gym_id and echo_account_key == base.
+      2. Reciprocal GET echo_intake_tokens?gym_id=eq.<uuid> with the same
+         select/limit -- require the SAME single pair (unique indexes on both
+         columns make a second row on either side ambiguity, which HOLDS).
+      3. POST rpc/echo_source_brand_active {"p_gym": <uuid>} (the existing
+         production RPC with service_role EXECUTE) -- require the active
+         bundle's gym_id == <uuid> AND echo_account_key == base.
+
+    The returned `active` payload is then byte/evidence-validated by the
+    caller through generated_infographic_runtime.delegated_palette. ANY
+    null/error/ambiguous/mismatched/stale step raises RuntimeHold so the
+    ordinary fallback callers HOLD and never fall back to a local file.
+    """
+    import uuid as _uuid
+    from . import generated_infographic_runtime as _gir
+    try:
+        if store is None or not isinstance(base, str) or not base.strip():
+            raise ValueError()
+        base = base.strip()
+        client = store._client()
+        select = "gym_id,echo_account_key"
+
+        def _token_rows(key, value):
+            response = client.get(
+                store._rest("echo_intake_tokens"),
+                params={key: f"eq.{value}", "select": select, "limit": "2"},
+                headers=store._headers(), timeout=30)
+            if response.status_code != 200:
+                raise ValueError()
+            rows = response.json()
+            if not isinstance(rows, list):
+                raise ValueError()
+            return rows
+
+        rows = _token_rows("echo_account_key", base)
+        if len(rows) != 1 or not isinstance(rows[0], dict) \
+                or rows[0].get("echo_account_key") != base:
+            raise ValueError()
+        gym = str(_uuid.UUID(str(rows[0].get("gym_id"))))
+        back = _token_rows("gym_id", gym)
+        if len(back) != 1 or not isinstance(back[0], dict) \
+                or back[0].get("echo_account_key") != base \
+                or str(_uuid.UUID(str(back[0].get("gym_id")))) != gym:
+            raise ValueError()
+        response = client.post(
+            store._rest("rpc/echo_source_brand_active"),
+            headers=store._headers({"Content-Type": "application/json"}),
+            json={"p_gym": gym}, timeout=30)
+        result = response.json()
+        if not 200 <= response.status_code < 300 or not isinstance(result, dict):
+            raise ValueError()
+        active = result.get("active")
+        if not isinstance(active, dict):
+            active = result if isinstance(result.get("bundle"), dict) else None
+        bundle = active.get("bundle") if isinstance(active, dict) else None
+        if (not isinstance(bundle, dict)
+                or str(_uuid.UUID(str(bundle.get("gym_id")))) != gym
+                or bundle.get("echo_account_key") != base):
+            raise ValueError()
+        return active
+    except Exception:
+        raise _gir.RuntimeHold(
+            "generated_bundle_publish_bridge_unavailable") from None
+
+
+def _source_brand_bundle_palette(base, bundle_reader, *, now=None):
+    """(palette|None, state) for the ACTIVE APPROVED same-gym source-brand
+    bundle, where state is 'ok' or 'invalid'.
+
+    A caller-supplied bundle_reader is REQUIRED: the ordinary scheduler never
+    opens dedicated owner credentials; the approved reader is the narrow
+    scheduler read-only adapter (scheduler_source_brand_bundle) bound to the
+    caller's existing SupabaseCalendarStore service-role credentials. A
+    missing, errored, stale, cross-tenant,
+    unapproved or tampered readback is 'invalid' -- the ordinary fallback
+    callers fail CLOSED on it and never rescue via the local file. Validation
+    is delegated to generated_infographic_runtime.delegated_palette, which
+    runs the same tenant/approval/observation/byte/freshness/provider evidence
+    checks as delegated_copy and byte-checks the palette tokens against
+    retained website captures WITHOUT date-selecting a fact or enforcing copy
+    style (approved colors must be available even when facts are punctuated).
+    """
+    from datetime import date, datetime, time, timezone
+    from . import generated_infographic_runtime as _gir
+    try:
+        active = bundle_reader(base)
+    except Exception:
+        return None, "invalid"
+    if not isinstance(active, dict):
+        return None, "invalid"
+    if now is None:
+        moment = datetime.now(timezone.utc)
+    elif isinstance(now, date) and not isinstance(now, datetime):
+        # Upstream no-media callers also accept a calendar date. A current
+        # gym-local date means the actual current instant; a past date means
+        # its local end. Future dates cannot prove a current observation.
+        clock = datetime.now(timezone.utc)
+        try:
+            from zoneinfo import ZoneInfo
+            zone = ZoneInfo(config.posting_timezone_for(base))
+        except Exception:
+            return None, "invalid"
+        local_today = clock.astimezone(zone).date()
+        if now > local_today:
+            return None, "invalid"
+        moment = (clock if now == local_today else
+                  datetime.combine(now, time.max, tzinfo=zone).astimezone(timezone.utc))
+    elif isinstance(now, str):
+        try:
+            moment = datetime.fromisoformat(now.replace("Z", "+00:00"))
+        except ValueError:
+            return None, "invalid"
+    elif isinstance(now, datetime):
+        moment = now
+    else:
+        return None, "invalid"
+    if moment.tzinfo is None:
+        return None, "invalid"
+    try:
+        palette = _gir.delegated_palette(active, base, now=moment).get("palette")
+        if (not isinstance(palette, dict) or palette.get("gym_id") != base
+                or palette.get("verified") is not True):
+            raise ValueError()
+        colors = [str(c).strip() for c in palette.get("colors") or []]
+        colors = [c for c in colors if _HEX_RE.match(c or "")]
+        if not colors:
+            raise ValueError()
+    except Exception:
+        return None, "invalid"
+    return {"colors": colors,
+            "path": str(palette.get("evidence_ref") or "source-brand-bundle"),
+            "source": "source_brand_bundle"}, "ok"
+
+
+def load_gym_brand_palette(account_key, *, bundle_reader=None, now=None):
     """The VERIFIED brand palette for a CLIENT gym, or None.
 
-    Returns {"colors": ["#...", ...], "path": <where it came from>} on a
-    verified hit; None when the account is LASSO's own (its locked V3 palette
-    governs instead), when no brand_colors.json exists, or when the file is
-    unreadable / carries no valid hex colors. Never raises: an unverifiable
-    palette must be indistinguishable from an absent one so the caller fails
-    closed either way."""
+    When bundle_reader is supplied (the ordinary infographic fallback callers
+    bind their existing store's authenticated service-role read-only RPC
+    readback), the active approved same-gym source-brand bundle's
+    website-derived palette is the ONLY source: a missing, errored, stale,
+    cross-tenant, unapproved or tampered bundle readback fails CLOSED and the
+    local brand_colors.json file is NOT consulted. Without a bundle_reader
+    (legacy callers only), the verified brand_colors.json file applies as
+    before.
+
+    Returns {"colors": ["#...", ...], "path": <evidence ref or file path>} on
+    a verified hit; None when the account is LASSO's own (its locked V3
+    palette governs instead) or when no verified palette exists. Never raises:
+    an unverifiable palette must be indistinguishable from an absent one so
+    the caller fails closed either way."""
     base = _account_base(account_key)
     if base == "lasso":
+        return None
+    if bundle_reader is not None:
+        bundle_palette, bundle_state = _source_brand_bundle_palette(
+            base, bundle_reader, now=now)
+        if bundle_state == "ok":
+            return bundle_palette
+        # Fail CLOSED on missing/error/stale/cross-tenant bundle evidence:
+        # never launder bad evidence into colors via the local file.
         return None
     import json
     path = _gym_brand_colors_path(base)
@@ -423,7 +606,6 @@ def load_gym_brand_palette(account_key):
             seen.add(key)
             uniq.append(c.upper() if len(c) == 7 else c)
     return {"colors": uniq, "path": path}
-
 
 def gym_brand_palette_section(palette) -> str:
     """The palette section for a CLIENT GYM card with VERIFIED brand colors:

@@ -240,11 +240,19 @@ def seed_gaps(base, account, store, *, log=None, today=None,
         log(f"{base}: account/gym mismatch ({account_base!r} account); "
             "no-media Astra seed held")
         return 0
-    gym_palette = _ap.load_gym_brand_palette(account_key)
+    # Same contract as client_infographic_fill.fill_gaps: the active approved
+    # same-gym source-brand bundle via the narrow scheduler read-only adapter
+    # on this caller's existing store credentials (never dedicated owner
+    # credentials). Missing/error/ambiguous/stale/cross-tenant readback fails
+    # closed (no local-file rescue).
+    gym_palette = _ap.load_gym_brand_palette(
+        account_key,
+        bundle_reader=lambda b: _ap.scheduler_source_brand_bundle(store, b),
+        now=today)
     if not gym_palette:
-        log(f"{base}: no verified brand colors for no-media Astra seed "
-            f"(expected {_ap._gym_brand_colors_path(base)}); held (no generic "
-            "palette fallback)")
+        log(f"{base}: no verified brand colors for no-media Astra seed (no "
+            "valid active approved source-brand bundle palette); held (no "
+            "generic palette fallback)")
         return 0
     from .client_infographic_fill import _generate_astra_only
 
