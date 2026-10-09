@@ -191,6 +191,11 @@ def adopt_release(bus, expected, plan, review_bytes, *, write=False, release_rea
             or plan.get('superseded_pr_url') != expected.get('fix_pr_url')
             or not be.automatic_reel_params_valid(plan.get('business_params'))):
         raise AdoptionRefused('adoption_identity_mismatch')
+    limitations = plan.get('limitations')
+    if (not isinstance(plan.get('client_note'), str) or not 1 <= len(plan['client_note'].strip()) <= 1500
+            or not isinstance(limitations, list) or len(limitations) > 20
+            or any(not isinstance(item, str) or not 1 <= len(item.strip()) <= 500 for item in limitations)):
+        raise AdoptionRefused('reviewed_client_scope_required')
     key = _current_fixer_request_key(bus, expected)
     if not key:
         raise AdoptionRefused('current_request_unavailable')
@@ -210,6 +215,8 @@ def adopt_release(bus, expected, plan, review_bytes, *, write=False, release_rea
             or review['reviewer_id'] == review['builder_id']
             or review.get('release_identifiers') != plan.get('releases')
             or review.get('business_params') != plan['business_params']
+            or review.get('client_note') != plan['client_note']
+            or review.get('limitations') != limitations
             or review.get('essential_failures') != []):
         raise AdoptionRefused('independent_review_not_current')
     releases = release_reader(plan)
@@ -253,9 +260,8 @@ def adopt_release(bus, expected, plan, review_bytes, *, write=False, release_rea
         'adopted_at':now.isoformat()})
     adoption = {'source':SOURCE, 'reviewer_id':review['reviewer_id'], 'builder_id':review['builder_id'],
         'review_sha256':hashlib.sha256(review_bytes).hexdigest(), 'reviewed_at':review['checked_at'],
-        'limitations':review.get('limitations', []), 'release_manifest':releases}
-    if not isinstance(plan.get('client_note'), str) or not 1 <= len(plan['client_note'].strip()) <= 1500:
-        raise AdoptionRefused('truthful_client_note_required')
+        'client_note_sha256':hashlib.sha256(plan['client_note'].encode()).hexdigest(),
+        'limitations':copy.deepcopy(limitations), 'release_manifest':releases}
     after = {'phase':'independent_release_adoption', 'verifier':SOURCE, 'exit_code':0,
         'at':now.isoformat(), 'sha':primary['head_sha'], 'pr_url':primary['pr_url'],
         'independent_adoption':adoption,

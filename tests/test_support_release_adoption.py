@@ -83,11 +83,13 @@ def setup():
     bus = FakeBus()
     releases = [{'pr_url':PRIMARY, 'merge_sha':SHA}, {'pr_url':PORTAL, 'merge_sha':'c' * 40}]
     plan = {'ticket_id':TID, 'request_version':1, 'superseded_pr_url':OLD, 'releases':releases,
-            'business_params':copy.deepcopy(PARAMS), 'client_note':'The fixes were independently verified. This ticket is closed.'}
+            'business_params':copy.deepcopy(PARAMS), 'client_note':'The fixes were independently verified. This ticket is closed.',
+            'limitations':['Client approval is still required.']}
     review = {'schema_version':1, 'ticket_id':TID, 'request_version':1,
               'request_key':_current_fixer_request_key(bus, bus.current), 'verified':True,
               'reviewer_id':'independent-reviewer', 'builder_id':'builder', 'checked_at':NOW.isoformat(),
-              'release_identifiers':releases, 'business_params':PARAMS, 'essential_failures':[], 'limitations':['Client approval is still required.']}
+              'release_identifiers':releases, 'business_params':PARAMS, 'essential_failures':[],
+              'client_note':plan['client_note'], 'limitations':copy.deepcopy(plan['limitations'])}
     receipts = [{**r, 'repo':repo, 'head_sha':'d' * 40,
                  'deployment_check':{'verified':True, 'sha':r['merge_sha'], 'evidence':[{'sha':'e' * 40}]}}
                 for r, repo in zip(releases, ['lassoframework/lasso-echo', 'lasso-framework/lasso-ops-portal'])]
@@ -256,3 +258,39 @@ def test_adoption_provider_reader_refuses_unconfirmed_release(fault):
         raise AssertionError(args)
     with pytest.raises(adoption.AdoptionRefused):
         adoption.verify_releases(plan,command=command,http=SimpleNamespace(get=lambda *a,**k:Response()))
+
+
+@pytest.mark.parametrize('reason', ['overlay rejected: end-frame carries 0 ask(s)',
+    'No approved gym call to action contains exactly one ask',
+    'Caption needs exactly one approved call to action'])
+@pytest.mark.parametrize('status', ['exhausted', 'held', 'running'])
+def test_original_cta_symptom_cannot_be_certified_by_truthful_stopped_status(reason, status):
+    bus, plan, review, receipts, deps = setup()
+    bus.data['auto_reel_status'][0]['snapshot']['jobs'][0].update(status=status, reason=reason)
+    result = be.observe(adoption.CHECK, gym_key=GYM, request_key='a' * 64, merged_sha=SHA,
+                        ticket_id=TID, params=PARAMS, deps=deps, now=NOW)
+    assert result['outcome'] == be.UNVERIFIED
+    assert result['reason'] == 'original_cta_failure_remaining'
+    with pytest.raises(adoption.AdoptionRefused, match='business_postcondition_not_verified'):
+        run_adopt(bus, plan, review, receipts, deps, write=True)
+    assert not bus.patch_calls
+
+
+@pytest.mark.parametrize('change', ['client_note', 'limitations'])
+def test_same_review_cannot_release_changed_customer_claims_or_remaining_limits(change):
+    bus, plan, review, receipts, deps = setup()
+    if change == 'client_note':
+        plan['client_note'] = 'Your reel was published successfully and all problems are fixed.'
+    else:
+        plan['limitations'] = []
+    with pytest.raises(adoption.AdoptionRefused, match='independent_review_not_current'):
+        run_adopt(bus, plan, review, receipts, deps, write=True)
+    assert not bus.patch_calls
+
+
+def test_adopted_client_note_digest_and_limits_are_bound_to_review_receipt():
+    bus, plan, review, receipts, deps = setup()
+    run_adopt(bus, plan, review, receipts, deps, write=True)
+    receipt = bus.current['verification_after']['independent_adoption']
+    assert receipt['client_note_sha256'] == hashlib.sha256(review['client_note'].encode()).hexdigest()
+    assert receipt['limitations'] == review['limitations']

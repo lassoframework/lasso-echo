@@ -617,6 +617,14 @@ def _check_automatic_reel_and_thumbnails_ready(ctx):
     status_fields = ('status', 'reason', 'updated_at', 'clip_count', 'next_attempt_at')
     if any(actual.get(field) != jobs[0].get(field) for field in status_fields):
         raise CheckUnavailable('worker_mirror_status_mismatch')
+    # A truthful stopped label alone cannot certify that the reported CTA bug
+    # was repaired. Require a new authoritative outcome beyond those exact copy
+    # failures; distinct framing/media safety holds remain explicit follow-ups.
+    if re.search(r'end-frame carries 0 ask\(s\)|no approved gym call to action|'
+                 r'caption needs (?:exactly one approved|its single approved)|'
+                 r'approved call to action violates', str(actual.get('reason') or ''), re.I):
+        return Observation(True, False, f'reel:{rid}:cta_failure_remaining',
+                           'original_cta_failure_remaining')
     from .story_studio_routes import _automatic_job_for_client
     projected = _automatic_job_for_client(jobs[0])
     if projected is None or re.search(r'team|reviewing', projected.get('reason', ''), re.I):

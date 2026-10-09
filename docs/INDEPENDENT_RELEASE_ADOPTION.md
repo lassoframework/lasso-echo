@@ -15,7 +15,7 @@ SHA256, reviewer and builder IDs, limitations and actual provider readbacks.
 
 The manifest has `ticket_id`, `request_version`, `superseded_pr_url`,
 `railway_project_id`, optional absolute `railway_directory` pointing to an already
-linked project context, `client_note`, `releases` and `business_params`.
+linked project context, `client_note`, `limitations`, `releases` and `business_params`.
 
 `releases` must contain exactly one Echo PR and one portal PR, each with only
 `pr_url` and the **actual PR merge commit** as `merge_sha`. GitHub is queried for
@@ -34,7 +34,9 @@ The separate JSON review file has `schema_version: 1`, `ticket_id`,
 distinct `reviewer_id` and `builder_id`, an explicit UTC `checked_at`,
 `release_identifiers` exactly equal to the manifest's releases,
 `business_params` exactly equal to the manifest's expectations,
-`essential_failures: []`, and `limitations`. Preserve actual review identity;
+`essential_failures: []`, and `client_note` and `limitations` exactly equal to the
+manifest's reviewed message and remaining limits. Changing either requires a new
+review receipt. Preserve actual review identity;
 the command validates this receipt's bindings but cannot authenticate a human's
 claim that two reviewer names represent independent people.
 
@@ -56,7 +58,9 @@ python3 -m agent.support_release_adoption --manifest /absolute/manifest.json --r
 
 This is a dry run. The worker observer compares the fresh shared portal mirror
 against worker-owned job state for the original UUID. Missing, stale or divergent
-state refuses adoption. Actual thumbnail responses must decode as bounded images
+state refuses adoption. A job still reporting the original zero-ask/approved-CTA
+failure also refuses adoption even if its client stopped message is truthful.
+Actual thumbnail responses must decode as bounded images
 through the tenant's token-scoped endpoint; the capability token never enters
 the returned evidence. A genuine safety hold can coexist with verified status
 and picker repairs. This check does **not** prove reel completion.
