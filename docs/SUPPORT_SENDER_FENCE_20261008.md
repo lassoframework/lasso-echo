@@ -53,3 +53,48 @@ process exit and reconcile all ambiguous durable claims before cutover. Process
 exit alone does not prove a provider request was never accepted. This code adds
 no migration, remote writer fence, fleet coordinator, flag activation or live
 proof; those remain operational prerequisites.
+
+## Producer admission coverage (2026-10-08 local follow-up)
+
+Pausing also refuses new support outbox producers before their poll or write.
+The client DM lane's per-identity pass and direct delivery helper share admission.
+The Slack adapter preserves ticket creation and inbound event capture, then refuses
+its outbound dispatch phase when paused. Its standalone hold-answer, client notice,
+follow-up routing and hold-card helpers are admitted separately. A new paused event
+returns `support_sender_paused` with its captured ticket and no outbound rows;
+inbound event deduplication remains effective.
+
+**PARTIAL / release blocker:** resume does not automatically replay captured inbound
+events. The listener submits only newly received events, and an exact duplicate is
+ignored before dispatch. The client DM poll covers only a subset of those requests
+and cannot establish generic question/code-fix/staff request replay. A durable,
+request-bound pending/replay path must be implemented and verified before accepting
+this adapter pause/resume capability. The producer guards alone are not full intake
+continuity proof.
+
+The production `record_outbound` call-site census is:
+
+| Producer | Admission owner |
+| --- | --- |
+| `client_dm_support/lane.py` client reply and staff card | `client_dm_producer`, nested `client_dm_delivery_producer` |
+| `slack_convo/adapter.py` emit, client hold notice, follow-up card, hold card | Outbound phase `slack_adapter_producer`; standalone helper guards |
+| `slack_convo/listener_wiring.py` outreach-release refusal card | Entire `outreach_release_handler`, including refusal |
+| `slack_convo/outreach.py` direct row and held approval request | Existing `direct_outreach`; new `outreach_approval_producer` (no production request-approval caller found) |
+| `slack_convo/outbox.py` recovery/suppression/uncertainty cards, shared delivery receipt and resolve notices | Existing `outbox` / `operator_resolve` admissions; shared receipt called from admitted outbox or portal passes |
+| `slack_convo/bus.py` suppressed-current-notice alert | Called inside admitted outbox or direct/portal outreach operations |
+| `echo_ticket_worker.py` intake cards, client-details rows and completion records | Existing `portal_intake` / `portal_fixed` admissions |
+| `jobs/stale_escalation_reminder.py` ready reminder | `stale_reminder_producer`, before poll and kv dedup reads/writes |
+| `fixer_ops.py::_ticket_note` | Explicit limit: unchanged audit-only INSERT, `record_only=true`, `kind=escalation`, `delivery_status=None`; never a ready/held/posting sender row or posted answer/status CAS proof |
+
+Already admitted operations retain nested admission after pause and finish their
+exact owned ticket/identity writes; their active count prevents drain acknowledgment
+until they exit. Default-OFF behavior, tenant ownership checks, source classification
+and outbound metadata remain unchanged. This fence controls outbox producers, not
+all audit or inbound support_messages writes. Other service owners and old replicas
+still require the operational inventory and cutover receipts above.
+
+Local validation: 955 focused tests passed using the existing Echo environment.
+Added checks cover paused no-poll/no-write producer refusal, preserved inbound
+source/tenant/identity and event deduplication for Echo/Scout/Ranger/Wrangler,
+already-admitted adapter and client DM writes after pause, and standalone approval,
+release, hold and reminder refusal. No production mutation or send occurred.

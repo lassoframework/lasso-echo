@@ -1118,6 +1118,9 @@ def _claim(bus, row, log):
     claimed_at = datetime.now(timezone.utc).isoformat()
     modern_claim = getattr(bus, "claim_fixer_message", None)
     try:
+        if "slack_replay_id" in (row.get("attachments") or {}):
+            from . import replay
+            return replay.claim_delivery(bus, row)
         if _fixer_client_row(row) and callable(modern_claim):
             claimed = modern_claim(
                 row["id"], row.get("attachments"), claimed_at,
@@ -1152,6 +1155,20 @@ def _claim(bus, row, log):
     return current or True
 
 
+def _hold_uncertain_replay(bus, row, why, log):
+    """A legacy replay send can have reached Slack. Never turn it back to ready."""
+    current = bus.message(row["id"])
+    if not current or current.get("delivery_status") != "posting":
+        return False
+    from . import replay
+    held = replay.hold_delivery(bus, current, why)
+    quarantined = bool(held and held.get("delivery_status") == "held")
+    if quarantined:
+        log(f"[slack-convo/outbox] replay delivery requires reconciliation "
+            f"row={row['id']}: {why}")
+    return quarantined
+
+
 def _recover_stale_claims(bus, identity, log, now=None, readback=None, summary=None):
     """Reconcile rows orphaned in ``posting`` after CLAIM_TIMEOUT_SECONDS.
 
@@ -1183,6 +1200,12 @@ def _recover_stale_claims(bus, identity, log, now=None, readback=None, summary=N
         if _age_seconds(row, now) < CLAIM_TIMEOUT_SECONDS:
             continue  # plausibly still in flight; do not steal it
         try:
+            if (row.get("attachments") or {}).get("slack_replay_id"):
+                if _hold_uncertain_replay(
+                        bus, row, "Replay claim expired; prior Slack outcome is unknown", log):
+                    n += 1
+                    count("quarantined_held")
+                continue
             if _fixer_client_row(row):
                 att = row.get("attachments") or {}
                 intent = att.get("fixer_slack_delivery_intent")
@@ -1926,6 +1949,16 @@ def run_once(bus, post, *, identity, log=print, limit=50, now=None,
                 summary["skipped"] += 1
         except Exception as e:  # noqa: BLE001 - one row never stalls the queue
             log(f"[slack-convo/outbox] row {row.get('id')} failed: {type(e).__name__}")
+            if (row.get("attachments") or {}).get("slack_replay_id"):
+                try:
+                    if _hold_uncertain_replay(
+                            bus, row, "Replay send or receipt outcome requires reconciliation", log):
+                        summary["held"] += 1
+                    else:
+                        summary["skipped"] += 1
+                except Exception:  # leave the durable claim for stale quarantine
+                    summary["skipped"] += 1
+                continue
             try:
                 bus.mark_message(row["id"], "failed")
             except Exception:  # noqa: BLE001
@@ -2177,6 +2210,12 @@ def _dispatch_one(bus, post, row, *, identity, log, summary, now=None,
             blocks = escalation_blocks(row, ticket)
         else:
             blocks = None
+        from . import replay as _replay
+        if not _replay.dispatch_allowed(bus, row, identity.name):
+            bus.mark_message(row["id"], "held", meta_update={
+                "held_why": "Slack replay request or safety authority changed before dispatch"})
+            summary["held"] += 1
+            return
         try:
             ts = post(channel, row["body"], thread_ts=None, blocks=blocks)
         except Exception as e:  # noqa: BLE001
@@ -2187,7 +2226,13 @@ def _dispatch_one(bus, post, row, *, identity, log, summary, now=None,
                 f"{channel} for ticket {ticket['id']}: {type(e).__name__}: {e}. "
                 f"Nobody has been told about this ticket.")
             raise
-        bus.mark_message(row["id"], "posted", slack_ts=ts)
+        if "slack_replay_id" in (row.get("attachments") or {}):
+            finished = _replay.finish_delivery(bus, row, ts)
+            if not finished or finished.get("delivery_status") != "posted":
+                summary["held"] += 1
+                return
+        else:
+            bus.mark_message(row["id"], "posted", slack_ts=ts)
         summary["posted"] += 1
         return
 
@@ -2477,6 +2522,12 @@ def _dispatch_one(bus, post, row, *, identity, log, summary, now=None,
                  where="released into the portal support thread they wrote from",
                  summary=summary)
         return
+    from . import replay as _replay
+    if not _replay.dispatch_allowed(bus, row, identity.name):
+        bus.mark_message(row["id"], "held", meta_update={
+            "held_why": "Slack replay request or safety authority changed before dispatch"})
+        summary["held"] += 1
+        return
     sent_body = row["body"]
     if fixer_customer_slack:
         mention = f"<@{config.APPROVER_SLACK_ID}>"
@@ -2681,8 +2732,19 @@ def _dispatch_one(bus, post, row, *, identity, log, summary, now=None,
                 or (posted.get("attachments") or {}).get("delivery_readback_verified") is not True):
             raise UncertainFixerDelivery("Slack verified but posted state unconfirmed")
     else:
+        if not _replay.dispatch_allowed(bus, row, identity.name):
+            bus.mark_message(row["id"], "held", meta_update={
+                "held_why": "Slack replay request or safety authority changed before Slack delivery"})
+            summary["held"] += 1
+            return
         ts = post(channel, sent_body, thread_ts=thread_ts, blocks=None)
-        bus.mark_message(row["id"], "posted", slack_ts=ts)
+        if "slack_replay_id" in (row.get("attachments") or {}):
+            finished = _replay.finish_delivery(bus, row, ts)
+            if not finished or finished.get("delivery_status") != "posted":
+                summary["held"] += 1
+                return
+        else:
+            bus.mark_message(row["id"], "posted", slack_ts=ts)
     summary["posted"] += 1
     if fixer_customer_slack:
         _finalize_fixer_post(bus, ticket, posted, identity, log, summary)
@@ -2775,6 +2837,11 @@ def _after_answer_posted(bus, ticket, row, kind, summary, att, identity, log=pri
     with the person. An answer that promised a HUMAN follow-up does not close the ticket --
     it is routed to the FIXER with adapter.FOLLOW_UP_MARKER (idempotent: the Slack adapter
     may already have done this at draft time). Every other answer resolves as before."""
+    if "slack_replay_id" in (row.get("attachments") or {}):
+        # Replay's draft-time routing already committed atomically. An older
+        # posted answer may neither resolve nor re-route a newer human request.
+        _resolve_on_answer(bus, ticket, row, kind, summary, att, row.get("body") or "")
+        return
     if kind == _a.KIND_ANSWER and (att or {}).get("recipient_kind") not in ("staff", "coach") \
             and _a.promises_human_follow_up(row.get("body") or ""):
         _a.route_follow_up_promise(bus, ticket, ident_name=identity.name,
@@ -2803,6 +2870,15 @@ def _resolve_on_answer(bus, ticket, row, kind, summary, att=None, body=""):
         kind == _a.KIND_ANSWER and ticket.get("status") == "verification"
         or kind == _a.KIND_STATUS and meta.get("resolve_notice") is True
         and ticket.get("status") != "resolved")
+    if "slack_replay_id" in (row.get("attachments") or {}):
+        if should_resolve:
+            from . import replay
+            try:
+                if replay.resolve_delivery(bus, row).get("resolved") is True:
+                    summary["resolved"] += 1
+            except Exception:  # failed or unreadable CAS leaves the ticket open
+                pass
+        return
     if fixer and should_resolve:
         # Slack (or the portal thread) may accept a delivery while the requester
         # corrects it or an operator changes its eligibility. Keep the receipt for
@@ -2897,6 +2973,7 @@ def release_held(bus, message_id, *, approved_by, identity=None, log=print):
         return False
     if (att.get("fixer_slack_delivery_intent") is not None
             or att.get("fixer_slack_delivery_uncertain")
+            or att.get("slack_replay_delivery_uncertain")
             or att.get("fixer_slack_route_missing")):
         log(f"[slack-convo/outbox] release refused: FIXER delivery row {message_id} "
             "requires route or Slack readback reconciliation")

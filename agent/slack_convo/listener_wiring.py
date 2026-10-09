@@ -37,6 +37,7 @@ from . import classifier as _cls
 from . import identity_gate as _ig
 from . import identities as _ids
 from . import outbox as _outbox
+from . import replay as _replay
 from .. import support_sender_fence as _fence
 from . import outreach as _outreach
 
@@ -431,6 +432,7 @@ class ConvoWiring:
                  f"{self.deps.identity_enabled()})")
         return self
 
+    @_fence.guarded("outreach_release_handler", lambda: False)
     def _release_outreach(self, message_id, row, actor):
         """Tap handler for a KIND_OUTREACH_REQUEST hold card. Reconstructs `ticket` and
         `who` from the held row and its parent ticket, then calls
@@ -494,6 +496,10 @@ class ConvoWiring:
         while not self._stop.is_set():
             try:
                 if self.deps.identity_enabled():
+                    replayed = _replay.run_once(self.deps)
+                    for k, v in replayed.items():
+                        if v:
+                            self.counts[f"replay:{k}"] += v
                     s = _outbox.run_once(self.deps.bus, self._post, identity=self.identity,
                                          log=self.log, readback=self._readback)
                     for k, v in s.items():

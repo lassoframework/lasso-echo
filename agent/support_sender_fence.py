@@ -109,6 +109,20 @@ def receipt(bus=None):
             blockers.append("database_not_checked")
         else:
             try:
+                uncertain = bus.support_uncertain_outbound(limit=1000)
+                if not isinstance(uncertain, list) or len(uncertain) >= 1000:
+                    blockers.append("uncertain_scan_incomplete")
+                else:
+                    for row in uncertain:
+                        if (not isinstance(row, dict) or not isinstance(row.get("id"), str)
+                                or not row["id"].strip() or row.get("direction") != "outbound"
+                                or not isinstance(row.get("attachments"), dict)):
+                            blockers.append("uncertain_row_malformed")
+                        elif any(row["attachments"].get(key) for key in (
+                                "fixer_slack_delivery_uncertain", "fixer_route_uncertain",
+                                "fixer_route_pending", "outreach_delivery_uncertain",
+                                "slack_replay_delivery_uncertain")):
+                            blockers.append(f"uncertain:{row['id']}")
                 for status in ("posting", "held"):
                     rows = bus.outbox(status, limit=1000)
                     if not isinstance(rows, list) or len(rows) >= 1000:
@@ -130,7 +144,8 @@ def receipt(bus=None):
                                     "fixer_slack_delivery_intent", "outreach_slack_delivery_intent"))
                                 or any(att.get(key) for key in (
                                     "fixer_slack_delivery_uncertain", "fixer_route_uncertain",
-                                    "fixer_route_pending", "outreach_delivery_uncertain"))):
+                                    "fixer_route_pending", "outreach_delivery_uncertain",
+                                    "slack_replay_delivery_uncertain"))):
                             blockers.append(f"{status}:{row.get('id', 'unknown')}")
             except Exception as exc:
                 blockers.append(f"database_read:{type(exc).__name__}")

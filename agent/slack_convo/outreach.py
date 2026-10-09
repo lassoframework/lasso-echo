@@ -665,6 +665,8 @@ class ApprovalRequestResult:
     reason: str = ""
 
 
+@_fence.guarded("outreach_approval_producer", lambda: ApprovalRequestResult(
+    requested=False, reason="support_sender_paused"))
 def request_approval(ticket, who, ident, *, record_outbound, write_hold_notice,
                      message_text=None, log=print):
     """Write the held outreach content (the actual first-message text, kind

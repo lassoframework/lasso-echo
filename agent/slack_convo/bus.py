@@ -814,6 +814,17 @@ class Bus:
             "created_at": f"gte.{since_iso}", "select": "id"})
         return len(rows)
 
+    def support_uncertain_outbound(self, limit=1000):
+        """Status-independent read: uncertainty survives even a mistaken status edit."""
+        markers = ("fixer_slack_delivery_uncertain", "fixer_route_uncertain",
+                   "fixer_route_pending", "outreach_delivery_uncertain",
+                   "slack_replay_delivery_uncertain")
+        return self._get(_MESSAGES, {
+            "direction": "eq.outbound", "select": "*", "order": "created_at.asc,id.asc",
+            "limit": str(int(limit)),
+            "or": "(" + ",".join(f"attachments->>{key}.not.is.null" for key in markers) + ")",
+        })
+
     def outbox(self, status="ready", limit=50, identity=None):
         """Outbound rows in one delivery state, oldest first. `identity` narrows to rows this
         bot wrote (attachments.identity), so two identities' loops never read each other's
