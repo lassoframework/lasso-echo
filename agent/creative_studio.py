@@ -1292,7 +1292,7 @@ def generate(headline, facts, client=None, out_path=None,
                 gr = infographic_review.evaluate(
                     image_bytes, headline=headline or "", facts=facts, cta=cta,
                     footer=footer if footer is not None else _astra_url_footer(),
-                    surface=surface, vision_client=_vision)
+                    surface=surface, vision_client=_vision, owned_lasso=True)
             else:
                 gr = _gg.evaluate(image_bytes, prompt_text=prompt, headline=headline or "",
                                   facts=facts, cta=cta,

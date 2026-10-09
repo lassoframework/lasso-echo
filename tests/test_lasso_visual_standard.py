@@ -109,7 +109,7 @@ def _review_json(**overrides):
 
 def test_high_score_with_style_violation_fails_closed():
     grade = infographic_review.evaluate(
-        b'candidate', headline='Hook', facts=['Fact'],
+        b'candidate', owned_lasso=True, headline='Hook', facts=['Fact'],
         vision_client=_Vision(_review_json(
             style_conformant=False,
             style_violations=[{'element': 'glowing orange ribbon',
@@ -124,7 +124,7 @@ def test_high_score_with_style_violation_fails_closed():
 
 def test_conformant_clean_review_passes_and_surfaces_style_evidence():
     grade = infographic_review.evaluate(
-        b'candidate', headline='Hook', facts=['Fact'],
+        b'candidate', owned_lasso=True, headline='Hook', facts=['Fact'],
         vision_client=_Vision(_review_json()))
     assert grade.passed
     assert grade.style_conformant is True
@@ -136,7 +136,7 @@ def test_missing_style_evidence_fails_closed_and_never_claims_true():
     data = json.loads(_review_json())
     del data['style_conformant']
     grade = infographic_review.evaluate(
-        b'candidate', headline='Hook', facts=['Fact'],
+        b'candidate', owned_lasso=True, headline='Hook', facts=['Fact'],
         vision_client=_Vision(json.dumps(data)))
     assert grade.status == 'UNGRADED'
     assert not grade.passed
@@ -145,7 +145,7 @@ def test_missing_style_evidence_fails_closed_and_never_claims_true():
 
 def test_contradictory_style_evidence_fails_closed():
     grade = infographic_review.evaluate(
-        b'candidate', headline='Hook', facts=['Fact'],
+        b'candidate', owned_lasso=True, headline='Hook', facts=['Fact'],
         vision_client=_Vision(_review_json(
             style_conformant=True,
             style_violations=[{'element': 'circuit traces',
@@ -208,7 +208,7 @@ def test_required_guide_failure_stops_actual_reviewer_request(monkeypatch, tmp_p
             pytest.fail('Unavailable guide must stop the paid vision request')
 
     result = infographic_review.evaluate(
-        b'candidate', headline='Hook', facts=['Fact'], vision_client=NeverRequested())
+        b'candidate', owned_lasso=True, headline='Hook', facts=['Fact'], vision_client=NeverRequested())
     assert result.status == 'UNGRADED'
     assert result.passed is False
     assert result.style_conformant is False
@@ -227,7 +227,7 @@ def test_reviewer_consumes_current_guide_text(monkeypatch, tmp_path):
     for marker in ('First physical paper direction', 'Revised warm workshop direction'):
         path.write_text(lvs.VERSION + '\n' + marker, encoding='utf-8')
         infographic_review.evaluate(
-            b'candidate', headline='Hook', facts=['Fact'], vision_client=Capture())
+            b'candidate', owned_lasso=True, headline='Hook', facts=['Fact'], vision_client=Capture())
         assert marker in questions[-1]
     assert 'First physical paper direction' not in questions[-1]
 
