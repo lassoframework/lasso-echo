@@ -164,7 +164,8 @@ begin
       order by created_at,id limit 1;
     if found then
       select string_agg(context->>'text',E'\n\n' order by created_at,id) into combined
-        from public.support_slack_replay where ticket_id=p_ticket_id and bot_identity=p_identity;
+        from public.support_slack_replay where ticket_id=p_ticket_id and bot_identity=p_identity
+          and context->'event'->>'channel'=t.slack_channel_id;
       p_context:=p_context||jsonb_build_object('dispatch',jsonb_build_object(
         'classification',first_context->'classification','request_type',first_context->'request_type',
         'who',first_context->'who','event',first_context->'event','surface',first_context->'surface',

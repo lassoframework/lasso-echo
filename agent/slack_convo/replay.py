@@ -182,17 +182,15 @@ def process(deps, replay_id):
             # rolled back with this replay plan and is not safe to auto-retry.
             return _held(deps.bus, item, token, "external_cancel_requires_reconciliation")
         else:
-            planning_item = item
-            if context["event"]["channel"] != dispatch["event"]["channel"]:
-                # The SQL replay carries a pending request from its original
-                # channel across a capped note. Do not expose the other
-                # channel's inbound text to answer/model planning.
-                planning_item = copy.deepcopy(item)
-                origin = dispatch["event"]["channel"] + ":"
-                planning_item["messages_snapshot"] = [
-                    row for row in item["messages_snapshot"]
-                    if row.get("direction") != "inbound"
-                    or str(row.get("slack_event_id") or "").startswith(origin)]
+            # A later original-channel follow-up may follow a capped private
+            # note from another channel. Always scope inbound planning history
+            # to the dispatch channel, not just when the newest event differs.
+            planning_item = copy.deepcopy(item)
+            origin = dispatch["event"]["channel"] + ":"
+            planning_item["messages_snapshot"] = [
+                row for row in item["messages_snapshot"]
+                if row.get("direction") != "inbound"
+                or str(row.get("slack_event_id") or "").startswith(origin)]
             planner = PlanningBus(planning_item)
             planned_deps = replace(deps, bus=planner)
             try:

@@ -340,6 +340,30 @@ def test_capped_other_channel_text_never_reaches_original_answer_context(pg_bus,
     assert any((row.get('attachments') or {}).get('kind') == 'ack' for row in pg_bus.msgs)
 
 
+def test_later_original_channel_followup_does_not_compose_private_other_channel_note(pg_bus, paused):
+    seen = []
+    def answer(_ticket, _who, messages, question):
+        seen.append((messages, question))
+        return {'body': 'Your calendar is loaded.', 'grounding': {'drafts': 3}}
+    deps = _deps(pg_bus, cap=1, client_armed=True, auto_answer=True, answer=answer)
+    adapter.handle_event(_ev('is the calendar loaded?', channel='G0', ts='0.0'),
+                         'G0:0.0', deps)
+    adapter.handle_event(_ev('private note from another channel', channel='G1', ts='1.0'),
+                         'G1:1.0', deps)
+    adapter.handle_event(_ev('please check the calendar again', channel='G0', ts='2.0'),
+                         'G0:2.0', deps)
+    latest = next(item for item in queue(pg_bus) if item['event_key'] == 'G0:2.0')
+    assert 'private note' not in latest['context']['dispatch']['text']
+    assert 'is the calendar loaded?' in latest['context']['dispatch']['text']
+    assert 'please check the calendar again' in latest['context']['dispatch']['text']
+    resume(paused)
+    replay.run_once(deps)
+    assert seen
+    assert all('private note' not in question for _, question in seen)
+    assert all('private note' not in row.get('body', '')
+               for messages, _ in seen for row in messages)
+
+
 def test_pause_restart_resume_and_duplicate_never_strand_or_repeat(pg_bus, paused):
     deps,item = capture_one(pg_bus,paused)
     assert item['context']['event'] == _ev('my photos are broken')
