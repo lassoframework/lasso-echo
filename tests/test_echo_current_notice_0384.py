@@ -945,6 +945,10 @@ def test_real_bus_fixer_answer_selects_armed_close_contract(monkeypatch, enabled
         meta["fixer_current_attempt_token"] = token
     row = {"id": "70164909-16b5-43df-b6a3-8d7499d51485", "ticket_id": TICKET_ID,
            "delivery_status": "posted", "attachments": meta}
+    # Closeout now re-reads the persisted outbound row before using the
+    # atomic FIXER resolver. Model that durable read alongside the RPC.
+    monkeypatch.setattr(bus, "message", lambda mid: deepcopy(row)
+                        if mid == row["id"] else None)
     summary = {"resolved": 0}
     outbox._resolve_on_answer(bus, deepcopy(ticket), row, "answer", summary,
                               att=meta, body="Your account is connected.")
@@ -975,8 +979,16 @@ def test_real_bus_generic_resolve_tap_uses_actual_notice_flag(
     monkeypatch.setattr(bus, "ticket", lambda _tid: deepcopy(ticket))
     written = []
     monkeypatch.setattr(bus, "recent_messages", lambda *_a, **_kw: deepcopy(written))
-    monkeypatch.setattr(bus, "_insert", lambda _table, row:
-                        (written.append(deepcopy(row)) or deepcopy(row), False))
+
+    def insert(_table, row):
+        # PostgREST supplies the durable row ID on INSERT; downstream closeout
+        # now reads that exact persisted row before resolving.
+        persisted = {"id": "70164909-16b5-43df-b6a3-8d7499d51485",
+                     **deepcopy(row)}
+        written.append(persisted)
+        return deepcopy(persisted), False
+
+    monkeypatch.setattr(bus, "_insert", insert)
     monkeypatch.setattr(bus, "set_ticket", lambda _tid, **fields: ticket.update(fields))
     monkeypatch.setattr(bus, "_client", lambda: pytest.fail("generic tap used notice RPC"))
     monkeypatch.setattr(outbox, "_recipient_armed", lambda *_a: True)
@@ -999,6 +1011,8 @@ def test_real_bus_generic_resolve_tap_uses_actual_notice_flag(
         assert not outbox.resolve_and_notify(bus, TICKET_ID, approved_by="U_BLAKE",
                                              identity=identity, log=lambda _msg: None)
         row = {**written[0], "delivery_status": "posted"}
+        monkeypatch.setattr(bus, "message", lambda mid: deepcopy(row)
+                            if mid == row["id"] else None)
         summary = {"resolved": 0}
         outbox._resolve_on_answer(bus, ticket, row, "status", summary,
                                   att=row["attachments"], body=row["body"])

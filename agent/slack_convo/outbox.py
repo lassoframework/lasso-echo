@@ -3467,12 +3467,14 @@ def resolve_and_notify(bus, ticket_id, *, approved_by, identity, log=print):
         release_key = ((ticket.get("verification_after") or {}).get("fixer") or {}).get("request_key")
         if not current_key or release_key != current_key:
             return refuse_resolve("customer request changed or could not be verified")
-        request_version = ticket.get("request_version")
-        if (not isinstance(request_version, int) or isinstance(request_version, bool)
-                or request_version < 0):
-            return refuse_resolve("customer request version is unavailable")
         if not str(ticket.get("slack_channel_id") or "").startswith(("C", "G")):
             return refuse_resolve("customer fix has no group conversation for Blake to join")
+    # Every resolution notice must carry the same immutable requester cycle that
+    # the send boundary verifies. Bind it at INSERT so a new request cannot inherit
+    # this human tap, including notices outside the 0384 reservation path.
+    request_version = ticket.get("request_version")
+    if type(request_version) is not int or request_version < 0:
+        return refuse_resolve("customer request version is unavailable")
     # MINOR 4 (audit 7): `surface` was the ticket's SOURCE ("website_tab"), which is not one
     # of the surfaces gate 7 knows, so the notice was posted as a THREAD REPLY inside a DM --
     # a place people do not look. The real surface is on the ticket's own inbound rows.
@@ -3481,6 +3483,7 @@ def resolve_and_notify(bus, ticket_id, *, approved_by, identity, log=print):
         bus.record_outbound(
             ticket_id=ticket_id, author_type=getattr(identity, "name", "system"),
             body=RESOLVED_NOTICE, delivery_status="ready", kind=_a.KIND_STATUS,
+            expected_request_version=request_version,
             # Match the recipient checked by the trust ladder above.
             meta={"identity": getattr(identity, "name", ""), "recipient_kind": recipient_kind,
                   "surface": surface, "resolved_by": approved_by, "resolve_notice": True,

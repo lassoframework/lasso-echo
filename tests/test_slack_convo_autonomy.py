@@ -43,6 +43,45 @@ from agent.slack_convo import outbox as OB  # noqa: E402
 from tests.test_slack_convo import FakeBus, _deps, _ev, _posted, _who  # noqa: E402
 
 
+def _plan_event(event, event_id, deps):
+    """Exercise the replay planner against a synthetic, already-captured inbound.
+
+    Adapter intake/capture/reconciliation is covered by the PostgreSQL-backed replay
+    suite. These autonomy cases focus on the deterministic dispatch plan (copy, flags,
+    and ticket effects), so they seed that planner input directly instead of pretending
+    FakeBus implements the durable replay RPC contract.
+    """
+    user = str(event.get("user") or "")
+    text = str(event.get("text") or "").strip()
+    channel = str(event.get("channel") or "")
+    surface = A.match_surface(event, deps)
+    who = deps.resolve_identity(user)
+    thread_root = event.get("thread_ts") or str(event.get("ts") or "")
+    ticket, created = deps.bus.get_or_create_ticket(
+        channel_id=channel, thread_ts=thread_root, product=deps.identity.product,
+        bot_identity=deps.identity.name, slack_user_id=user,
+        identity_kind=who.kind if who.kind != IG.BOT else IG.UNKNOWN,
+        client_id=who.gym_id or None, reporter=who.email or user, raw_text=text,
+        classification=C.classify(text, has_open_ticket=False,
+                                   identity_product=deps.identity.product),
+        request_type=None)
+    deps.bus.record_inbound(
+        ticket_id=ticket["id"], slack_event_id=event_id,
+        slack_ts=event.get("ts"), author_type=A.author_type_for(who),
+        author_id=who.email or user, body=text,
+        meta={"surface": surface, "identity_reason": who.reason})
+    classification = C.classify(text, has_open_ticket=False,
+                                 identity_product=deps.identity.product,
+                                 llm=deps.classify_llm)
+    request_type = C.request_type_for(text) if classification == C.ACTION_REQUEST else None
+    return A._dispatch_recorded_event(
+        deps=deps, ident=deps.identity, who=who, user=user, text=text,
+        surface=surface, channel=channel, tid=ticket["id"],
+        ticket=deps.bus.ticket(ticket["id"]), created=created,
+        classification=classification, unknown_in_channel=False,
+        rate_limited=False, request_type=request_type)
+
+
 # =========================================================================================
 # RTF-1: the deterministic gap that made ordinary breakage reports escalate
 # =========================================================================================
@@ -260,7 +299,7 @@ def test_the_false_promise_template_is_gone_and_cannot_come_back():
 
 def test_undecided_message_gets_an_honest_template_and_a_no_draft_card():
     bus = FakeBus()
-    d = A.handle_event(_ev("hmm, thinking about the whole thing"), "k",
+    d = _plan_event(_ev("hmm, thinking about the whole thing"), "k",
                        _deps(bus, client_armed=False))
     rows = [m for m in bus.messages_for(d.ticket_id) if m["direction"] == "outbound"]
     templates = [m for m in rows if m["attachments"]["kind"] == A.KIND_TEMPLATE]
@@ -277,7 +316,7 @@ def test_undecided_message_gets_an_honest_template_and_a_no_draft_card():
 
 def test_escalation_card_says_plainly_that_nothing_was_drafted():
     bus = FakeBus()
-    d = A.handle_event(_ev("hmm, thinking about the whole thing"), "k", _deps(bus))
+    d = _plan_event(_ev("hmm, thinking about the whole thing"), "k", _deps(bus))
     esc = [m for m in bus.messages_for(d.ticket_id)
            if m["direction"] == "outbound"
            and m["attachments"]["kind"] == A.KIND_ESCALATION][0]
@@ -288,7 +327,7 @@ def test_escalation_card_says_plainly_that_nothing_was_drafted():
 
 def test_unanswerable_question_card_says_no_grounded_facts():
     bus = FakeBus()
-    d = A.handle_event(_ev("what does the moon weigh?"), "k",
+    d = _plan_event(_ev("what does the moon weigh?"), "k",
                        _deps(bus, answer=lambda *a, **k: None))
     esc = [m for m in bus.messages_for(d.ticket_id)
            if m["direction"] == "outbound"
@@ -311,7 +350,7 @@ def test_card_names_the_person_and_the_gym_not_a_raw_slack_id():
     bus = FakeBus()
     deps = _deps(bus, describe_gym=lambda gid: "Bird Dog CrossFit")
     deps.resolve_identity = lambda uid: _client_who(uid)
-    d = A.handle_event(_ev("hmm, thinking about the whole thing"), "k", deps)
+    d = _plan_event(_ev("hmm, thinking about the whole thing"), "k", deps)
     esc = [m for m in bus.messages_for(d.ticket_id)
            if m["direction"] == "outbound"
            and m["attachments"]["kind"] == A.KIND_ESCALATION][0]
@@ -327,7 +366,7 @@ def test_card_falls_back_through_account_key_then_id_and_never_blank():
     bus = FakeBus()
     deps = _deps(bus, describe_gym=lambda gid: "")   # name lookup finds nothing
     deps.resolve_identity = lambda uid: _client_who(uid)
-    d = A.handle_event(_ev("hmm, thinking"), "k", deps)
+    d = _plan_event(_ev("hmm, thinking"), "k", deps)
     esc = [m for m in bus.messages_for(d.ticket_id)
            if m["attachments"].get("kind") == A.KIND_ESCALATION][0]
     assert "gym birddog" in esc["body"]
@@ -341,7 +380,7 @@ def test_gym_lookup_failure_never_blocks_the_card():
 
     deps = _deps(bus, describe_gym=boom)
     deps.resolve_identity = lambda uid: _client_who(uid)
-    d = A.handle_event(_ev("hmm, thinking"), "k", deps)
+    d = _plan_event(_ev("hmm, thinking"), "k", deps)
     assert any(m["attachments"].get("kind") == A.KIND_ESCALATION
                for m in bus.messages_for(d.ticket_id))
 
@@ -391,7 +430,7 @@ def test_confident_website_question_is_answered_with_wrangler_knowledge():
         return {"body": "Yes, we can add that.", "grounding": {"site": "live"}}
 
     deps = _deps(bus, identity="scout", answer=ans, cross_product=True)
-    d = A.handle_event(_ev(REAL_A9EFA713), "k", deps)
+    d = _plan_event(_ev(REAL_A9EFA713), "k", deps)
     assert seen == {"identity": "wrangler", "product": "websites"}
     t = bus.ticket(d.ticket_id)
     # FRAME 2: everything that decides WHERE this lands is untouched.
@@ -415,7 +454,7 @@ def test_cross_product_routing_does_not_fire_when_the_flag_is_off():
         seen["identity"] = answer_identity.name
         return {"body": "x", "grounding": {"a": 1}}
 
-    A.handle_event(_ev(REAL_A9EFA713), "k",
+    _plan_event(_ev(REAL_A9EFA713), "k",
                    _deps(bus, identity="scout", answer=ans, cross_product=False))
     assert seen["identity"] == "scout"
 
@@ -428,7 +467,7 @@ def test_low_confidence_stays_with_the_entry_point_identity():
         seen["identity"] = answer_identity.name
         return {"body": "x", "grounding": {"a": 1}}
 
-    A.handle_event(_ev("should i put that on instagram or the website?"), "k",
+    _plan_event(_ev("should i put that on instagram or the website?"), "k",
                    _deps(bus, identity="scout", answer=ans, cross_product=True))
     assert seen["identity"] == "scout"
 
@@ -459,7 +498,7 @@ def test_cross_product_answer_still_uses_only_the_asking_gyms_account():
 
     deps = _deps(bus, identity="scout", answer=ans, cross_product=True)
     deps.resolve_identity = lambda uid: _client_who(uid)
-    A.handle_event(_ev(REAL_A9EFA713), "k", deps)
+    _plan_event(_ev(REAL_A9EFA713), "k", deps)
     assert captured == {"account_key": "birddog", "gym_id": "gym-uuid-1"}
 
 
@@ -476,7 +515,7 @@ def test_grounded_answer_holds_when_auto_answer_is_off_even_with_client_reply_ar
     """The permission Blake actually reviewed when he armed CLIENT_REPLY did not include
     sending model-written answers unattended. It does not now."""
     bus = FakeBus()
-    d = A.handle_event(_ev("is my instagram connected?"), "k",
+    d = _plan_event(_ev("is my instagram connected?"), "k",
                        _answering_deps(bus, client_armed=True, auto_answer=False))
     ans = [m for m in bus.messages_for(d.ticket_id)
            if m["attachments"].get("kind") == A.KIND_ANSWER][0]
@@ -488,7 +527,7 @@ def test_grounded_answer_holds_when_auto_answer_is_off_even_with_client_reply_ar
 
 def test_grounded_answer_is_ready_when_auto_answer_is_armed():
     bus = FakeBus()
-    d = A.handle_event(_ev("is my instagram connected?"), "k",
+    d = _plan_event(_ev("is my instagram connected?"), "k",
                        _answering_deps(bus, client_armed=True, auto_answer=True))
     ans = [m for m in bus.messages_for(d.ticket_id)
            if m["attachments"].get("kind") == A.KIND_ANSWER][0]
@@ -497,7 +536,7 @@ def test_grounded_answer_is_ready_when_auto_answer_is_armed():
 
 def test_acks_and_templates_are_unaffected_by_the_auto_answer_flag():
     bus = FakeBus()
-    d = A.handle_event(_ev("is my instagram connected?"), "k",
+    d = _plan_event(_ev("is my instagram connected?"), "k",
                        _answering_deps(bus, client_armed=True, auto_answer=False))
     ack = [m for m in bus.messages_for(d.ticket_id)
            if m["attachments"].get("kind") == A.KIND_ACK][0]
@@ -517,7 +556,7 @@ HARD_LINE_QUESTIONS = [
 @pytest.mark.parametrize("text", HARD_LINE_QUESTIONS)
 def test_hard_lines_never_auto_answer_whatever_the_flags_say(text):
     bus = FakeBus()
-    d = A.handle_event(_ev(text), "k",
+    d = _plan_event(_ev(text), "k",
                        _answering_deps(bus, client_armed=True, auto_answer=True))
     rows = [m for m in bus.messages_for(d.ticket_id)
             if m["attachments"].get("kind") == A.KIND_ANSWER]
@@ -534,7 +573,7 @@ def test_hard_line_is_re_checked_at_post_time_not_only_at_draft_time(monkeypatch
     monkeypatch.setenv("SLACK_CONVO_AUTO_ANSWER_OVERRIDE_UNSAFE_GATE", "true")
     monkeypatch.setenv("AGENT_FIXER_CHANNEL_ID", "C_FIXER")
     bus = FakeBus()
-    d = A.handle_event(_ev("is my instagram connected?"), "k",
+    d = _plan_event(_ev("is my instagram connected?"), "k",
                        _answering_deps(bus, client_armed=True, auto_answer=True))
     row = [m for m in bus.messages_for(d.ticket_id)
            if m["attachments"].get("kind") == A.KIND_ANSWER][0]
@@ -554,7 +593,7 @@ def test_post_time_gate_holds_an_answer_when_auto_answer_is_off(monkeypatch):
     monkeypatch.delenv("SLACK_CONVO_ECHO_AUTO_ANSWER", raising=False)
     monkeypatch.setenv("AGENT_FIXER_CHANNEL_ID", "C_FIXER")
     bus = FakeBus()
-    d = A.handle_event(_ev("is my instagram connected?"), "k",
+    d = _plan_event(_ev("is my instagram connected?"), "k",
                        _answering_deps(bus, client_armed=True, auto_answer=True))
     row = [m for m in bus.messages_for(d.ticket_id)
            if m["attachments"].get("kind") == A.KIND_ANSWER][0]
@@ -571,7 +610,7 @@ def test_a_released_answer_still_posts_after_a_human_tap(monkeypatch):
     monkeypatch.setenv("SLACK_CONVO_ECHO_CLIENT_REPLY", "true")
     monkeypatch.setenv("AGENT_FIXER_CHANNEL_ID", "C_FIXER")
     bus = FakeBus()
-    d = A.handle_event(_ev("is my instagram connected?"), "k",
+    d = _plan_event(_ev("is my instagram connected?"), "k",
                        _answering_deps(bus, client_armed=True, auto_answer=False))
     row = [m for m in bus.messages_for(d.ticket_id)
            if m["attachments"].get("kind") == A.KIND_ANSWER][0]
@@ -603,7 +642,7 @@ def test_an_auto_answer_posts_a_receipt_naming_what_was_sent(monkeypatch):
     monkeypatch.setenv("SLACK_CONVO_AUTO_ANSWER_OVERRIDE_UNSAFE_GATE", "true")
     monkeypatch.setenv("AGENT_FIXER_CHANNEL_ID", "C_FIXER")
     bus = FakeBus()
-    d = A.handle_event(_ev("is my instagram connected?"), "k",
+    d = _plan_event(_ev("is my instagram connected?"), "k",
                        _answering_deps(bus, client_armed=True, auto_answer=True))
     post, calls = _posted()
     OB.run_once(bus, post, identity=IDS.get("echo"), log=lambda *a: None)
@@ -629,7 +668,7 @@ def test_a_receipt_is_never_written_before_the_post_succeeds(monkeypatch):
     monkeypatch.setenv("SLACK_CONVO_AUTO_ANSWER_OVERRIDE_UNSAFE_GATE", "true")
     monkeypatch.setenv("AGENT_FIXER_CHANNEL_ID", "C_FIXER")
     bus = FakeBus()
-    d = A.handle_event(_ev("is my instagram connected?"), "k",
+    d = _plan_event(_ev("is my instagram connected?"), "k",
                        _answering_deps(bus, client_armed=True, auto_answer=True))
 
     def failing_post(channel, text, thread_ts=None, blocks=None):
@@ -702,7 +741,7 @@ def test_a_receipt_never_uses_a_kind_the_portal_would_show(monkeypatch):
     monkeypatch.setenv("SLACK_CONVO_AUTO_ANSWER_OVERRIDE_UNSAFE_GATE", "true")
     monkeypatch.setenv("AGENT_FIXER_CHANNEL_ID", "C_FIXER")
     bus = FakeBus()
-    d = A.handle_event(_ev("is my instagram connected?"), "k",
+    d = _plan_event(_ev("is my instagram connected?"), "k",
                        _answering_deps(bus, client_armed=True, auto_answer=True))
     post, _calls = _posted()
     OB.run_once(bus, post, identity=IDS.get("echo"), log=lambda *a: None)
@@ -716,7 +755,7 @@ def test_acks_get_no_receipt(monkeypatch):
     monkeypatch.setenv("SLACK_CONVO_ECHO_CLIENT_REPLY", "true")
     monkeypatch.setenv("AGENT_FIXER_CHANNEL_ID", "C_FIXER")
     bus = FakeBus()
-    d = A.handle_event(_ev("my posts are not going out"), "k",
+    d = _plan_event(_ev("my posts are not going out"), "k",
                        _deps(bus, client_armed=True))
     post, _calls = _posted()
     OB.run_once(bus, post, identity=IDS.get("echo"), log=lambda *a: None)
@@ -730,7 +769,7 @@ def test_the_honest_template_gets_a_receipt_so_blake_sees_what_landed(monkeypatc
     monkeypatch.setenv("SLACK_CONVO_ECHO_CLIENT_REPLY", "true")
     monkeypatch.setenv("AGENT_FIXER_CHANNEL_ID", "C_FIXER")
     bus = FakeBus()
-    d = A.handle_event(_ev("hmm, thinking about the whole thing"), "k",
+    d = _plan_event(_ev("hmm, thinking about the whole thing"), "k",
                        _deps(bus, client_armed=True))
     post, _calls = _posted()
     OB.run_once(bus, post, identity=IDS.get("echo"), log=lambda *a: None)
@@ -744,7 +783,7 @@ def test_a_human_resolution_is_receipted_too(monkeypatch):
     monkeypatch.setenv("SLACK_CONVO_ECHO_CLIENT_REPLY", "true")
     monkeypatch.setenv("AGENT_FIXER_CHANNEL_ID", "C_FIXER")
     bus = FakeBus()
-    d = A.handle_event(_ev("hmm, thinking about the whole thing"), "k",
+    d = _plan_event(_ev("hmm, thinking about the whole thing"), "k",
                        _deps(bus, client_armed=True))
     assert OB.resolve_and_notify(bus, d.ticket_id, approved_by="U06EPUUCL13",
                                  identity=IDS.get("echo"), log=lambda *a: None)
@@ -1105,7 +1144,7 @@ def test_post_time_hard_line_re_reads_the_body_not_just_the_marker(monkeypatch):
     monkeypatch.setenv("SLACK_CONVO_AUTO_ANSWER_OVERRIDE_UNSAFE_GATE", "true")
     monkeypatch.setenv("AGENT_FIXER_CHANNEL_ID", "C_FIXER")
     bus = FakeBus()
-    d = A.handle_event(_ev("is my instagram connected?"), "k",
+    d = _plan_event(_ev("is my instagram connected?"), "k",
                        _answering_deps(bus, client_armed=True, auto_answer=True))
     row = [m for m in bus.messages_for(d.ticket_id)
            if m["attachments"].get("kind") == A.KIND_ANSWER][0]
@@ -1379,7 +1418,7 @@ def test_the_post_time_gate_runs_the_whole_rule_not_half(monkeypatch):
     monkeypatch.setenv("SLACK_CONVO_AUTO_ANSWER_OVERRIDE_UNSAFE_GATE", "true")
     monkeypatch.setenv("AGENT_FIXER_CHANNEL_ID", "C_FIXER")
     bus = FakeBus()
-    d = A.handle_event(_ev("is my instagram connected?"), "k",
+    d = _plan_event(_ev("is my instagram connected?"), "k",
                        _answering_deps(bus, client_armed=True, auto_answer=True))
     # rewrite the ticket's question to one the whole rule rejects, and strip the marker, as a
     # process that predates D54 would have left it
@@ -1481,7 +1520,7 @@ def test_resolve_refuses_when_the_client_notice_would_be_held(monkeypatch):
     monkeypatch.setenv("SLACK_CONVO_ECHO_ENABLED", "true")
     monkeypatch.delenv("SLACK_CONVO_ECHO_CLIENT_REPLY", raising=False)
     bus = FakeBus()
-    d = A.handle_event(_ev("my posts are not going out"), "k", _deps(bus))
+    d = _plan_event(_ev("my posts are not going out"), "k", _deps(bus))
     bus.tickets[d.ticket_id]["slack_channel_id"] = "G0MPIM"
     assert OB.resolve_and_notify(bus, d.ticket_id, approved_by="U06EPUUCL13",
                                  identity=IDS.get("echo"), log=lambda *a: None) is False
@@ -1571,7 +1610,7 @@ def test_a_staff_resolve_tap_does_not_lie_either(monkeypatch):
     bus = FakeBus()
     # V-M1: staff in a group DM with no open ticket is two humans talking; a 1:1 DM is where
     # a staff message opens a ticket.
-    d = A.handle_event(_ev("my posts are not going out", channel="D_STAFF",
+    d = _plan_event(_ev("my posts are not going out", channel="D_STAFF",
                            channel_type="im", user="U_STAFF"), "k",
                        _deps(bus, who=IG.STAFF))
     bus.tickets[d.ticket_id]["slack_channel_id"] = "D_STAFF"
@@ -1590,7 +1629,7 @@ def test_a_refused_resolve_tap_is_visible_to_the_person_who_tapped_it(monkeypatc
     monkeypatch.setenv("SLACK_CONVO_ECHO_ENABLED", "true")
     monkeypatch.delenv("SLACK_CONVO_ECHO_CLIENT_REPLY", raising=False)
     bus = FakeBus()
-    d = A.handle_event(_ev("my posts are not going out"), "k", _deps(bus))
+    d = _plan_event(_ev("my posts are not going out"), "k", _deps(bus))
     bus.tickets[d.ticket_id]["slack_channel_id"] = "G0MPIM"
     assert OB.resolve_and_notify(bus, d.ticket_id, approved_by="U06EPUUCL13",
                                  identity=IDS.get("echo"), log=lambda *a: None) is False
@@ -1806,7 +1845,7 @@ def test_a_refused_outreach_release_writes_a_card_a_human_can_see():
             return lambda f: f
 
     bus = FakeBus()
-    d = A.handle_event(_ev("my posts are not going out"), "k", _deps(bus))
+    d = _plan_event(_ev("my posts are not going out"), "k", _deps(bus))
     row = bus.record_outbound(ticket_id=d.ticket_id, author_type="echo", body="hello",
                               delivery_status="held", kind=A.KIND_OUTREACH_REQUEST,
                               meta={"identity": "echo", "slack_user_id": "U_CLIENT"})
@@ -1836,7 +1875,7 @@ def test_the_resolve_notice_goes_top_level_in_a_dm_not_threaded():
     recognise, so the notice posted as a thread reply inside a DM -- where nobody looks."""
     from agent.slack_convo import outbox as OB2
     bus = FakeBus()
-    d = A.handle_event(_ev("my posts are not going out"), "k", _deps(bus))
+    d = _plan_event(_ev("my posts are not going out"), "k", _deps(bus))
     assert OB2._surface_of(bus, d.ticket_id) == A.SURFACE_MPIM
 
 
@@ -1902,9 +1941,14 @@ def test_the_resolve_notice_on_a_portal_ticket_is_not_threaded(monkeypatch):
     monkeypatch.setenv("SLACK_CONVO_ENABLED", "true")
     monkeypatch.setenv("SLACK_CONVO_ECHO_ENABLED", "true")
     monkeypatch.setenv("SLACK_CONVO_ECHO_CLIENT_REPLY", "true")
+    monkeypatch.setenv("AGENT_SLACK_BOT_USER_ID", "U_ECHO_BOT")
+    monkeypatch.setenv("RAILWAY_DEPLOYMENT_ID", "test-deployment")
+    monkeypatch.setenv("RAILWAY_GIT_COMMIT_SHA", "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678")
     bus = FakeBus()
     ticket, _ = bus.get_or_create_ticket(
-        channel_id="D_GROUP", thread_ts="111.222", product="echo", bot_identity="echo",
+        # Slack MPIM/group conversations use G-prefixed channel ids. The
+        # support-send lane must be able to verify Blake's membership there.
+        channel_id="G_GROUP", thread_ts="111.222", product="echo", bot_identity="echo",
         slack_user_id="U_C", identity_kind=IG.CLIENT, client_id="g-1",
         reporter="o@g.com", raw_text="is my instagram connected?")
     bus.tickets[ticket["id"]]["status"] = "hold"
@@ -1917,12 +1961,28 @@ def test_the_resolve_notice_on_a_portal_ticket_is_not_threaded(monkeypatch):
     calls = []
 
     def post(channel, text, thread_ts=None, blocks=None):
-        calls.append({"channel": channel, "text": text, "thread_ts": thread_ts})
-        return "1.0"
+        from datetime import datetime, timezone
+        ts = str(datetime.now(timezone.utc).timestamp() + 1)
+        calls.append({"channel": channel, "text": text, "thread_ts": thread_ts, "ts": ts})
+        return ts
 
-    OB.run_once(bus, post, identity=IDS.get("echo"), log=lambda *a: None)
+    post.verify_sender = lambda: {"ok": True, "user_id": "U_ECHO_BOT"}
+
+    def readback(channel, *, thread_ts=None, ts=None, oldest=None):
+        return {"ok": True, "channel": channel,
+                "messages": [{"ts": item["ts"], "text": item["text"],
+                              "user": "U_ECHO_BOT", "thread_ts": item["thread_ts"]}
+                             for item in calls if item["channel"] == channel
+                             and item["ts"] == ts and item["thread_ts"] == thread_ts]}
+
+    post.readback = readback
+
+    logs = []
+    OB.run_once(bus, post, identity=IDS.get("echo"), log=logs.append,
+                member_check=lambda channel, user: channel == "G_GROUP" and bool(user))
     notice = [c for c in calls if OB.RESOLVED_NOTICE[:30] in c["text"]]
-    assert notice, "the notice must actually post"
+    assert notice, ("the notice must actually post", logs,
+                    bus.outbound_kinds(ticket["id"]))
     assert notice[0]["thread_ts"] is None, \
         "people do not thread in a DM, whatever brought the ticket there"
 

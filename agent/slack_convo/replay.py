@@ -1,6 +1,7 @@
-"""Durable Slack intake replay, enabled with the support sender cutover fence.
+"""Durable Slack intake replay, mandatory for new Slack adapter intake.
 
-The DRAFT migration is required before enabling that fence. No local fallback:
+The DRAFT migration is required before deploying this adapter, with the sender
+fence either off or on. No local fallback:
 an unavailable capture/claim/commit RPC is an intake error, never permission to
 produce source-less rows. Planning buffers ALL bus writes; the database commits
 the whole plan under an expiring token and exact ticket/message snapshots.
@@ -102,7 +103,8 @@ class PlanningBus:
         self.current.update(copy.deepcopy(fields))
         return self.ticket(tid)
 
-    def record_outbound(self, *, ticket_id, author_type, body, delivery_status, kind, meta=None):
+    def record_outbound(self, *, ticket_id, author_type, body, delivery_status, kind,
+                        meta=None, expected_request_version=None):
         if ticket_id != self.current["id"]:
             raise ValueError("replay outbound ticket mismatch")
         row = {
@@ -111,6 +113,11 @@ class PlanningBus:
             "author_id": None, "body": (body or "")[:8000],
             "delivery_status": delivery_status, "attachments": {"kind": kind, **(meta or {})},
         }
+        if expected_request_version is not None:
+            if (type(expected_request_version) is not int or expected_request_version < 0
+                    or expected_request_version != self.current.get("request_version")):
+                raise ValueError("replay outbound request version mismatch")
+            row["delivery_request_version"] = expected_request_version
         self.rows.append(row)
         return copy.deepcopy(row)
 

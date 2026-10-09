@@ -1,5 +1,6 @@
 -- DRAFT / UNAPPLIED. Apply only through the portal's normal migration/release gate,
--- before enabling SUPPORT_MESSAGES_FENCE_ENABLED. No historical backfill/replay.
+-- before deploying mandatory atomic Slack intake, whether
+-- SUPPORT_MESSAGES_FENCE_ENABLED is false or true. No historical backfill/replay.
 -- service_role only. Inbound capture remains available while the local sender pauses.
 -- Capture and commit lock the ticket before queue/message rows, preserving the
 -- support request-cycle trigger's lock order. External sends NEVER occur here.

@@ -970,27 +970,36 @@ def test_delivery_token_and_identity_cannot_complete_another_claim(pg_bus,paused
     assert pg_bus.message(row['id'])['delivery_status']=='posting'
 
 
-def test_ordinary_untagged_claim_completion_keeps_existing_behavior(monkeypatch):
-    from tests.test_slack_convo import FakeBus
+def test_atomic_capture_waits_for_replay_flag_then_reconciles(monkeypatch, pg_bus):
+    # Intake is durably captured even before replay is enabled. Nothing takes
+    # the old direct reply path while the fence flag is off.
     monkeypatch.setenv('SUPPORT_MESSAGES_FENCE_ENABLED','false')
     monkeypatch.setenv('AGENT_SLACK_BOT_USER_ID','U_ECHO_BOT')
-    bus=FakeBus()
+    monkeypatch.delenv('SUPPORT_MESSAGES_FENCE_CONTROL_FILE', raising=False)
+    bus=pg_bus
     deps=_deps(bus,client_armed=True,auto_answer=True,
         answer=lambda *args:{'body':'There are three draft posts.','grounding':{'drafts':3}})
-    adapter.handle_event(_ev('is the calendar loaded?'),'ordinary',deps)
-    row=next(m for m in bus.msgs if (m.get('attachments') or {}).get('kind')=='ack')
-    assert 'slack_replay_id' not in row['attachments']
-    monkeypatch.setattr(outbox,'_recipient_armed',lambda *args:True)
-    sent=[]
-    def post(*args,**kw):
-        sent.append(args)
-        return '2.001'
-    post.verify_sender = lambda: {"ok": True, "user_id": "U_ECHO_BOT"}
-    summary=Counter()
-    outbox._dispatch_one(bus,post,row,identity=deps.identity,summary=summary,log=lambda *args:None)
-    assert len(sent)==1 and summary['posted']==1
-    assert bus.message(row['id'])['delivery_status']=='posted'
-    assert 'slack_replay_delivery_token' not in bus.message(row['id'])['attachments']
+    result=adapter.handle_event(_ev('is the calendar loaded?'),'G0MPIM:1.001',deps)
+    assert result.reason=='support_atomic_replay_required'
+    pending=queue(bus)
+    assert len(pending)==1 and pending[0]['state']=='pending'
+    assert pending[0]['event_key']=='G0MPIM:1.001'
+    assert len([m for m in bus.msgs if m['direction']=='inbound'])==1
+    assert not [m for m in bus.msgs if m['direction']=='outbound']
+
+    # Enabling replay reconciles that exact capture into its durable plan; it
+    # still does not simulate a Slack post or mint a delivery receipt.
+    monkeypatch.setenv('SUPPORT_MESSAGES_FENCE_ENABLED','true')
+    monkeypatch.setenv('SUPPORT_MESSAGES_FENCE_PAUSED','false')
+    monkeypatch.setenv('SUPPORT_MESSAGES_FENCE_GENERATION','replay-acceptance')
+    assert replay.run_once(deps)=={'committed':1}
+    stored=queue(bus)[0]
+    assert stored['state']=='committed'
+    outbound=[m for m in bus.msgs if m['direction']=='outbound']
+    assert outbound and all(m['attachments'].get('slack_replay_id')==stored['id']
+                            for m in outbound)
+    assert all(m['delivery_status'] in {'ready','held'} for m in outbound)
+    assert all('slack_replay_delivery_token' not in m['attachments'] for m in outbound)
 
 
 def enable_support_admission(pg_bus):

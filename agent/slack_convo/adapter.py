@@ -1138,20 +1138,11 @@ def handle_event(event, event_id, deps):
     if chatter:
         if existing is None:
             return _ignore("chatter", surface, who.kind)
-        if _fence.control()["enabled"]:
-            return _capture_and_replay(
-                deps=deps, event=event, event_id=event_id, ticket=existing, who=who,
-                surface=surface, text=text, created=False, classification=_cls.FOLLOW_UP,
-                unknown_in_channel=not who.is_human_known and surface == SURFACE_MENTION,
-                rate_limited=False, request_type=None, chatter=True)
-        _, dup = deps.bus.record_inbound(
-            ticket_id=existing["id"], slack_event_id=event_id, slack_ts=event.get("ts"),
-            author_type=author_type_for(who) if who.is_human_known else "client",
-            author_id=user, body=text, meta={"surface": surface, "chatter": True,
-                                             "raw_event_id": event.get("_raw_event_id") or ""})
-        return Decision("ticketed" if not dup else "ignored",
-                        "chatter_noted" if not dup else "duplicate_event", surface, who.kind,
-                        existing["id"], False, "", [], duplicate=dup)
+        return _capture_and_replay(
+            deps=deps, event=event, event_id=event_id, ticket=existing, who=who,
+            surface=surface, text=text, created=False, classification=_cls.FOLLOW_UP,
+            unknown_in_channel=not who.is_human_known and surface == SURFACE_MENTION,
+            rate_limited=False, request_type=None, chatter=True)
 
     # RT-m6: an unknown person @mentioning us in a channel: internal escalation only, never a
     # template into a public channel. In a DM / group DM the template is written (held).
@@ -1227,36 +1218,13 @@ def handle_event(event, event_id, deps):
         return _ignore("other_ticket_identity", surface, who.kind)
     tid = ticket["id"]
 
-    # The explicitly enabled cutover fence uses durable transactional intake.
-    # A duplicate inbound is not proof that its outbound plan committed.
-    if _fence.control()["enabled"]:
-        return _capture_and_replay(
-            deps=deps, event=event, event_id=event_id, ticket=ticket, who=who,
-            surface=surface, text=text, created=created, classification=classification,
-            unknown_in_channel=unknown_in_channel, rate_limited=rate_limited,
-            request_type=request_type)
-
-    # 8) THE INBOUND ROW FIRST. Ordinary intake retains its event-id no-op.
-    _, dup = deps.bus.record_inbound(
-        ticket_id=tid, slack_event_id=event_id, slack_ts=event.get("ts"),
-        author_type=author_type_for(who) if who.is_human_known else "client",
-        author_id=user, body=text,
-        meta={"surface": surface, "raw_event_id": event.get("_raw_event_id") or "",
-              "identity_reason": who.reason})
-    if dup:
-        return Decision(action="ignored", reason="duplicate_event", surface=surface,
-                        identity_kind=who.kind, ticket_id=tid, duplicate=True)
-
-    # Preserve inbound capture while pausing the outbound producer operation.
-    with _fence.admission("slack_adapter_producer") as allowed:
-        if not allowed:
-            return Decision("ticketed", "support_sender_paused", surface, who.kind,
-                            tid, created, classification or "", [])
-        return _dispatch_recorded_event(
-            deps=deps, ident=ident, who=who, user=user, text=text, surface=surface,
-            channel=channel, tid=tid, ticket=ticket, created=created,
-            classification=classification, unknown_in_channel=unknown_in_channel,
-            rate_limited=rate_limited, request_type=request_type)
+    # Atomic capture owns the inbound event and its requester cycle even while
+    # reply production is disabled. Pending replay remains recoverable at cutover.
+    return _capture_and_replay(
+        deps=deps, event=event, event_id=event_id, ticket=ticket, who=who,
+        surface=surface, text=text, created=created, classification=classification,
+        unknown_in_channel=unknown_in_channel, rate_limited=rate_limited,
+        request_type=request_type)
 
 
 def _capture_and_replay(*, deps, event, event_id, ticket, who, surface, text, created,
@@ -1270,6 +1238,10 @@ def _capture_and_replay(*, deps, event, event_id, ticket, who, surface, text, cr
         unknown_in_channel=unknown_in_channel, rate_limited=rate_limited,
         request_type=request_type, chatter=chatter)
     item = captured["item"]
+    if not _fence.control()["enabled"]:
+        return Decision("ticketed", "support_atomic_replay_required", surface, who.kind,
+                        tid, created, classification or "", [],
+                        duplicate=captured.get("duplicate") is True)
     with _fence.admission("slack_adapter_producer") as allowed:
         if not allowed:
             return Decision("ticketed", "support_sender_paused", surface, who.kind,
@@ -1316,8 +1288,15 @@ def _dispatch_recorded_event(*, deps, ident, who, user, text, surface, channel, 
         # them; INTERNAL_KINDS (escalation/hold_notice/fixer_request) are untouched here --
         # fixer_request_text already escapes its own untrusted text (RT-M1/RA-M1).
         safe_body = _slack_escape(body) if kind in CONVERSATIONAL_KINDS else body
+        outbound_fence = {}
+        if kind in CONVERSATIONAL_KINDS:
+            version = ticket.get("request_version")
+            if type(version) is not int or version < 0:
+                raise ValueError("conversational reply request version unavailable")
+            outbound_fence["expected_request_version"] = version
         row = deps.bus.record_outbound(ticket_id=tid, author_type=author_type or ident.name,
-                                       body=safe_body, delivery_status=status, kind=kind, meta=m)
+                                       body=safe_body, delivery_status=status, kind=kind, meta=m,
+                                       **outbound_fence)
         out.append(kind)
         if status == "held" and hold_handled:
             # D72: the caller runs hold_answer_for_team (card + client notice + ticket).
