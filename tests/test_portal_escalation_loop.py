@@ -639,6 +639,7 @@ def test_code_fix_resolve_requires_release_and_blake_in_conversation():
 def test_verified_fix_notice_names_blake_in_group_dm(monkeypatch):
     bus = Bus([_ticket(classification="code_fix", status="merged",
                        client_id=BUSINESS_PORTAL_GYM_ID,
+                       slack_user_id="U_CLIENT",
                        fix_pr_url="https://example.test/pr/1",
                        verification_after=_fix_proof(), slack_channel_id="G_CLIENT")])
     bus.record_inbound(ticket_id="t-1", slack_event_id=None, slack_ts=None,
@@ -666,6 +667,7 @@ def test_verified_fix_notice_names_blake_in_group_dm(monkeypatch):
     bus.calls = []
     bus._support_lane_generation = 1
     bus._support_lane_invocations = {}
+    bus._support_lane_receipts = {}
     for name in ("_client", "_rest", "_headers", "post", "_patch"):
         setattr(bus, name, MethodType(getattr(AdmissionBus, name), bus))
     monkeypatch.setenv("RAILWAY_DEPLOYMENT_ID", "test-deployment")
