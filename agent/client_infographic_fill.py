@@ -21,6 +21,7 @@ Scope guards:
     stall alerts already cover those).
 """
 
+import hashlib
 import os
 import time
 import uuid
@@ -648,6 +649,16 @@ def fill_gaps(base, account, store, *, voice, logger=None, now=None,
         if not _ensure_logical_post_id(draft):
             log(f"{base} {day}: logical post identity unavailable; holding infographic")
             continue
+        # GENERATED-CLIENT CONTRACT: this card is GENERATED. Bind a fresh
+        # immutable artifact version UUID and the lowercase 64-hex SHA of the
+        # exact final rendered bytes (the same bytes hosting uploads). There is
+        # NO trusted hosted-byte readback writer yet, so generated_receipt stays
+        # EMPTY: the local bytes are not proof of the hosted bytes. The pre-insert
+        # hold below keeps every such card out of content_calendar until a
+        # trusted receipt binds gym + version + hosted URL + delivered SHA.
+        draft.creative_origin = "generated"
+        draft.generated_artifact_version_id = str(uuid.uuid4())
+        draft.generated_artifact_sha256 = hashlib.sha256(img).hexdigest()
         draft.is_story = False
         if not _stamp_same_object_source(draft, hosted, log, f"{base} {day}"):
             continue
@@ -686,6 +697,20 @@ def fill_gaps(base, account, store, *, voice, logger=None, now=None,
         log(f"{base}: infographic day taken before insert; holding drafts")
         return {"ok": True, "filled": 0, "gaps": len(gaps),
                 "reason": "calendar day taken before insert"}
+    # GENERATED-CLIENT CONTRACT (fail-closed pre-insert hold): every card this
+    # lane builds is a generated card, and none can carry a trusted hosted-byte
+    # receipt (that writer does not exist yet). Report the dependency and hold
+    # the whole batch rather than writing a generated row that any consumer
+    # could mistake for an approved, publishable card.
+    from .drafter import generated_hold_reason
+    for _held_draft in drafts:
+        _why = generated_hold_reason(_held_draft)
+        if _why:
+            log(f"{base}: {_why}; holding all generated infographic card(s) "
+                "(no trusted hosted-byte receipt writer deployed)")
+            return {"ok": True, "filled": 0, "gaps": len(gaps),
+                    "reason": f"generated cards held: {_why}"}
+
     # Convert each generated draft independently. _to_rows explicitly creates
     # the Instagram feed and its Facebook cross-post together; carrying the
     # draft's ID onto those rows preserves that known relationship without
@@ -740,3 +765,25 @@ def prepare_verified_infographic_candidate(request, snapshot, *, jobs, provider,
                 else "generated_photo_inventory_uncertain"}
     return prepare_candidate(request, snapshot, jobs=jobs, provider=provider,
                              reviewer=reviewer, storage=storage, enabled=True)
+
+
+def fill_verified_client_row(base, account, row_id, *, persistence, jobs,
+                             client_admission, loader=None, provider=None,
+                             reviewer=None, storage=None):
+    """Default-OFF owner composition for an already canonically bound gap row.
+
+    Legacy fill/mirror cannot lift their hold. This dedicated lane reuses the
+    current owner snapshot, candidate preparation and permanent reservation,
+    freezes a detached preparation for ordinary forward staging, and waits for
+    a separately issued committed receipt. The returned stage plan is consumed
+    by the separately authorized service stage/finalizer processes; this owner
+    never inserts, activates or approves a calendar row.
+    Reader dependency is injected; no issuer credential or approval is used.
+    """
+    from .generated_client_admission import enabled
+    if not enabled():
+        return dict(ok=False, held=True, reason='generated_client_admission_disabled')
+    from .generated_infographic_runtime import run_calendar_row
+    return run_calendar_row(base, account, row_id, persistence=persistence, jobs=jobs,
+                            client_admission=client_admission, loader=loader,
+                            provider=provider, reviewer=reviewer, storage=storage)

@@ -32,6 +32,32 @@ import time as _time
 
 from . import config
 
+def prepare_calendar_caption_payload(row):
+    """Copy a row with the deterministic persistence caption and safety hold.
+
+    Safe for callers to run before freezing a write journal: insert_rows uses
+    the same preparation, which is idempotent. This has no alerts or I/O and
+    does not clear an existing media hold. Protected URL text stays verbatim.
+    """
+    from .copy_gate import bound_opening_hook, format_caption
+    clean = dict(row or {})
+    if "caption" in clean and clean["caption"] is not None:
+        try:
+            caption = str(clean["caption"])
+            # format_caption treats each line as a paragraph, while the hook
+            # bound creates one soft line wrap. Rejoin only that exact canonical
+            # opening wrap before formatting so preparing twice is identical.
+            opening = caption.split("\n", 2)
+            if len(opening) > 1 and opening[0] and opening[1]:
+                joined = opening[0] + " " + opening[1]
+                if bound_opening_hook(joined) == opening[0] + "\n" + opening[1]:
+                    caption = joined + ("\n" + opening[2] if len(opening) > 2 else "")
+            clean["caption"] = bound_opening_hook(format_caption(caption))
+        except ValueError:
+            clean["media_not_ready_reason"] = "caption_url_semicolon"
+    return clean
+
+
 # base -> (gyms.id uuid, expires_at). POSITIVE resolutions only; see
 # SupabaseCalendarStore.resolve_gym_uuid for why a miss is deliberately never cached.
 # Six hours: a gym's uuid is effectively immutable, and re-slugging or archiving one is
@@ -411,6 +437,31 @@ def forward_reservation_flag():
     the other visual flags; anything else is not a silent default."""
     import os
     raw = (os.environ.get(FORWARD_RESERVATION_FLAG_ENV, "") or "").strip().lower()
+    if raw in ("1", "true", "yes", "on"):
+        return True
+    if raw in ("", "0", "false", "no", "off"):
+        return False
+    return None
+
+
+# GBP staged-journal binding (2026-10-09, default OFF). When armed alongside
+# the forward reservation lane, stage_forward_schedule_batch freezes the exact
+# canonical stage attempt (batch id, tenant, request digest, exact request
+# text, member/old-row sets) in the durable local gbp_forward_stage_journal
+# BEFORE the stage RPC, binds the exact `staged` receipt afterwards, and a
+# lost acknowledgment or restart recovers through the batch-status RPC bound
+# to that durable identity -- never calendar presence or a regenerated
+# request. Remote Drive use may settle only after the durable journal holds an
+# exact terminal `finalized` receipt. With the flag OFF the legacy in-memory
+# attempt behavior is byte-identical.
+GBP_STAGED_JOURNAL_FLAG_ENV = "AGENT_GBP_STAGED_JOURNAL"
+
+
+def gbp_staged_journal_flag():
+    """Tri-state read of AGENT_GBP_STAGED_JOURNAL: True (on), False (off or
+    unset), None (ambiguous -- fail closed on the armed lane)."""
+    import os
+    raw = (os.environ.get(GBP_STAGED_JOURNAL_FLAG_ENV, "") or "").strip().lower()
     if raw in ("1", "true", "yes", "on"):
         return True
     if raw in ("", "0", "false", "no", "off"):
@@ -1842,7 +1893,8 @@ class SupabaseCalendarStore:
             raise ReservationArgumentError(
                 422, 'own unverified observation packet invalid before staging') from exc
 
-    def stage_forward_schedule_batch(self, account_key, rows, old_rows=None):
+    def stage_forward_schedule_batch(self, account_key, rows, old_rows=None, *,
+                                     before_forward_stage=None):
         """Atomically stage one immutable inactive batch; returns the receipt.
 
         The single service-role RPC registers the immutable batch (batch id,
@@ -1914,6 +1966,45 @@ class SupabaseCalendarStore:
         self.last_forward_stage_attempt = {
             "batch_id": batch_id, "tenant_id": tenant, "request_digest": digest,
             "member_row_ids": list(planned_ids), "old_row_ids": list(old_ids)}
+        staged_journal = gbp_staged_journal_flag()
+        if staged_journal is None:
+            # Ambiguous flag on an armed lane: fail closed before any write.
+            raise ReservationStoreError(
+                502, "staged journal flag unreadable; refusing to stage")
+        if staged_journal:
+            from . import gbp_drive_use_journal as _stage_journal
+            try:
+                # Freeze the exact canonical stage attempt DURABLY before the
+                # RPC; a hold here means nothing was sent (definite no-write).
+                attempt = {
+                    "batch_id": batch_id, "tenant_id": tenant,
+                    "request_digest": digest, "request_text": request_text,
+                    "member_row_ids": list(planned_ids),
+                    "old_row_ids": list(old_ids)}
+                atomic_freezer = getattr(before_forward_stage, "freeze_atomic", None)
+                if atomic_freezer is not None:
+                    if not callable(atomic_freezer):
+                        raise _stage_journal.JournalHold("atomic_stage_freezer_invalid")
+                    # Event claims may exist only in the SAME SQLite commit as
+                    # their exact stage request and use journal. The callback
+                    # freezes everything before this writer sends any RPC.
+                    atomic_freezer(attempt, account_key)
+                else:
+                    _stage_journal.record_forward_stage_intent(attempt)
+                    _stage_journal.record_forward_tenant_binding(batch_id, account_key, tenant)
+            except _stage_journal.JournalHold as hold:
+                raise ReservationStoreError(
+                    409, f"staged journal intent hold before stage RPC: {hold}")
+        if before_forward_stage is not None:
+            if not staged_journal or not callable(before_forward_stage):
+                raise CalendarInsertNotStartedError(503, "durable before-stage callback unavailable")
+            try:
+                # Independent JSON copy: a caller cannot mutate the frozen request.
+                import json as _json
+                before_forward_stage(_json.loads(request_text))
+            except Exception as exc:
+                raise CalendarInsertNotStartedError(
+                    409, "before-stage journal callback held; no stage RPC sent") from exc
         data = self._reservation_rpc(_STAGE_RPC, {
             "p_tenant_id": tenant, "p_batch_id": batch_id,
             "p_request": request_text, "p_request_digest": digest}, timeout=60)
@@ -1931,8 +2022,67 @@ class SupabaseCalendarStore:
             raise ReservationStoreError(
                 502, "batch stage receipt mismatch; outcome unknown -- resolve "
                 "through forward_schedule_batch_status, never calendar rows")
+        if staged_journal:
+            try:
+                _stage_journal.record_forward_stage_receipt(batch_id, data)
+            except _stage_journal.JournalHold as hold:
+                # The stage DID commit server-side but its exact receipt could
+                # not be durably bound: UNKNOWN to this caller. Resolve only
+                # through the batch status RPC, never by resending.
+                raise ReservationStoreError(
+                    502, f"staged journal receipt hold after stage RPC: {hold}; "
+                    "outcome unknown -- resolve through "
+                    "forward_schedule_batch_status, never calendar rows")
         self.last_forward_stage = data
         return data
+
+    def replay_frozen_event_stage(self, batch_id, account_key):
+        """Replay only the original SQLite bytes, never replan or refreeze.
+
+        Same batch UUID/digest makes lost-ack replay idempotent in SQL. This
+        method has no finalizer authority; terminal state uses the exact
+        status RPC and listener settlement remains separate.
+        """
+        from . import gbp_drive_use_journal as journal, remote_drive_use
+        from .jobs import gbp_drive_use_recovery as recovery
+        if (not remote_drive_use.enabled() or forward_reservation_flag() is not True
+                or gbp_staged_journal_flag() is not True or recovery.enabled() is not True):
+            raise ReservationStoreError(503, "event frozen replay authority unavailable")
+        recovery._durable_path()
+        bound = journal.get_forward_stage(batch_id)
+        if (bound is None or not journal.forward_stage_tenant_matches(
+                dict(gym_id=account_key), bound)):
+            raise ReservationStoreError(409, "event frozen replay tenant mismatch")
+        request = __import__('json').loads(bound['request_text'])
+        if (len(request['members']) != 1
+                or not request['members'][0]['row'].get('event_id')):
+            raise ReservationStoreError(409, "event frozen replay membership mismatch")
+        row = request['members'][0]['row']
+        use = journal.get_by_logical_post(account_key, row['logical_post_id'])
+        if (use is None or use['calendar_row'] != row
+                or use['state'] not in ('write_intent', 'unknown_result')):
+            raise ReservationStoreError(409, "event frozen replay use mismatch")
+        if not recovery._claim_matches(recovery._durable_path(), use):
+            raise ReservationStoreError(409, "event frozen replay original claim mismatch")
+        if bound['state'] != 'stage_intent':
+            return bound
+        attempt = {k: bound[k] for k in
+                   ('batch_id', 'tenant_id', 'request_digest', 'member_row_ids', 'old_row_ids')}
+        self.last_forward_stage_attempt = attempt
+        data = self._reservation_rpc(_STAGE_RPC, {
+            'p_tenant_id': bound['tenant_id'], 'p_batch_id': batch_id,
+            'p_request': bound['request_text'], 'p_request_digest': bound['request_digest']}, timeout=60)
+        expected_observed = [m['row']['id'] for m in request['members']
+                             if m.get('observation') is not None]
+        if (journal._receipt_matches_attempt(data, bound, 'staged')
+                and data.get('observation_row_ids') == expected_observed
+                and data.get('finalize_receipt') is None):
+            journal.record_forward_stage_receipt(batch_id, data)
+            self.last_forward_stage = data
+            return data
+        # Already finalized replays and malformed acknowledgments resolve
+        # through bound status, never infer activation from stage response.
+        return self.resolve_forward_stage_attempt()
 
     def forward_schedule_batch_status(self, batch_id, *, tenant_id=None,
                                       request_digest=None, member_row_ids=None,
@@ -2019,13 +2169,95 @@ class SupabaseCalendarStore:
         ReservationStoreError when no attempt was recorded or the readback
         does not match it exactly; never consults calendar rows."""
         attempt = self.last_forward_stage_attempt
-        if not isinstance(attempt, dict) or not attempt.get("batch_id"):
-            raise ReservationStoreError(502, "no forward stage attempt recorded")
-        return self.forward_schedule_batch_status(
+        if (not isinstance(attempt, dict) or not attempt.get("batch_id")):
+            if gbp_staged_journal_flag():
+                # Restart / lost process memory: the DURABLE journal is the
+                # only handle. Exactly one pending attempt may be resolved
+                # unbound; anything else is ambiguous and holds.
+                from . import gbp_drive_use_journal as _stage_journal
+                try:
+                    pending = _stage_journal.pending_forward_stages()
+                except _stage_journal.JournalHold as hold:
+                    raise ReservationStoreError(
+                        502, f"durable stage attempt unreadable: {hold}")
+                if len(pending) != 1:
+                    raise ReservationStoreError(
+                        502, "durable forward stage attempt missing or ambiguous")
+                entry = pending[0]
+                attempt = {"batch_id": entry["batch_id"],
+                           "tenant_id": entry["tenant_id"],
+                           "request_digest": entry["request_digest"],
+                           "member_row_ids": list(entry["member_row_ids"]),
+                           "old_row_ids": list(entry["old_row_ids"])}
+            else:
+                raise ReservationStoreError(502, "no forward stage attempt recorded")
+        data = self.forward_schedule_batch_status(
             attempt["batch_id"], tenant_id=attempt.get("tenant_id"),
             request_digest=attempt.get("request_digest"),
             member_row_ids=attempt.get("member_row_ids"),
             old_row_ids=attempt.get("old_row_ids"))
+        if gbp_staged_journal_flag():
+            # Keep the durable binding in step with the authority readback:
+            # an exact `staged` state binds the receipt; an exact terminal
+            # `finalized` proof binds finalization. A binding hold makes the
+            # outcome UNKNOWN to the caller -- never inferred from rows.
+            from . import gbp_drive_use_journal as _stage_journal
+            try:
+                if data["state"] == "staged":
+                    _stage_journal.record_forward_stage_receipt(
+                        attempt["batch_id"], data)
+                else:
+                    _stage_journal.record_forward_finalized(
+                        attempt["batch_id"], data)
+            except _stage_journal.JournalHold as hold:
+                raise ReservationStoreError(
+                    502, f"staged journal binding hold on resolve: {hold}")
+        return data
+
+    def bind_forward_finalization(self, batch_id):
+        """Bind an exact terminal finalize receipt into the durable journal.
+
+        Reads the batch-status RPC bound to the DURABLE frozen attempt
+        identity (never a caller-supplied snapshot) and records `finalized`
+        only when the complete terminal proof matches exactly. Any mismatch,
+        non-final state or unreadable journal raises and leaves the entry
+        staged_pending: remote use stays forbidden. Requires the staged
+        journal flag; the legacy OFF lane is untouched."""
+        if not gbp_staged_journal_flag():
+            raise ReservationStoreError(502, "staged journal binding is OFF")
+        from . import gbp_drive_use_journal as _stage_journal
+        try:
+            entry = _stage_journal.get_forward_stage(batch_id)
+        except _stage_journal.JournalHold as hold:
+            raise ReservationStoreError(
+                502, f"durable stage binding unreadable: {hold}")
+        if entry is None:
+            raise ReservationStoreError(502, "no durable stage attempt bound")
+        data = self.forward_schedule_batch_status(
+            entry["batch_id"], tenant_id=entry["tenant_id"],
+            request_digest=entry["request_digest"],
+            member_row_ids=entry["member_row_ids"],
+            old_row_ids=entry["old_row_ids"])
+        if data["state"] != "finalized":
+            raise ReservationStoreError(
+                409, "batch is not finalized; terminal receipt required")
+        try:
+            _stage_journal.record_forward_finalized(entry["batch_id"], data)
+        except _stage_journal.JournalHold as hold:
+            raise ReservationStoreError(
+                502, f"terminal receipt binding hold: {hold}")
+        return data
+
+    def forward_remote_use_settlement_allowed(self, batch_id):
+        """True ONLY when the durable staged journal holds an exact terminal
+        `finalized` receipt for this batch. A staged candidate, an unknown
+        stage outcome, a missing/ambiguous binding or an unreadable journal
+        is never consumption evidence. The flag-OFF legacy lane never calls
+        this; it answers False rather than guessing."""
+        if not gbp_staged_journal_flag():
+            return False
+        from . import gbp_drive_use_journal as _stage_journal
+        return _stage_journal.forward_remote_use_allowed(batch_id)
 
     def forward_preparation_eligible(self, calendar_row_id):
         """Strictly parsed read of the SQL preparation-eligibility predicate.
@@ -2049,7 +2281,7 @@ class SupabaseCalendarStore:
 
     def _stage_forward_candidate_batch(self, account_key, payload,
                                        armed_observations, observation_bridge,
-                                       old_rows=None):
+                                       old_rows=None, before_forward_stage=None):
         """Derive deterministic identity, bind observation packets and stage the
         whole batch through ONE atomic RPC.
 
@@ -2103,7 +2335,8 @@ class SupabaseCalendarStore:
             raise CalendarInsertNotStartedError(
                 422, f"observation packaging failed before batch staging: "
                 f"{type(exc).__name__}") from exc
-        self.stage_forward_schedule_batch(account_key, payload, frozen_old)
+        self.stage_forward_schedule_batch(account_key, payload, frozen_old,
+                                          before_forward_stage=before_forward_stage)
         return [dict({k: v for k, v in row.items() if k != "observation"},
                      variant_status="candidate",
                      media_not_ready_reason="forward_reservation_staged")
@@ -4699,7 +4932,7 @@ class SupabaseCalendarStore:
     def insert_rows(self, account_key, rows, *, preserve_ids=False,
                     render_evidence_by_url=None, poster_render_evidence_by_url=None,
                     required_feed_slots=None, prevalidated_cadence=False,
-                    expected_old_rows=None):
+                    expected_old_rows=None, before_forward_stage=None):
         """INSERT content_calendar rows for account_key WITHOUT sending an `id`, so the
         DB generates the uuid primary key itself. content_calendar.id is a Postgres uuid
         (DB default gen_random_uuid); sending a non-uuid string (a draft_id) is what
@@ -4749,35 +4982,25 @@ class SupabaseCalendarStore:
         # per group before any row is staged.
         reservation_proofs = {}
         payload = []
-        from .copy_gate import bound_opening_hook, format_caption
         for row in (rows or []):
-            clean = {k: v for k, v in dict(row or {}).items()
-                     if k not in ("id", "scene_candidate",
-                                  _observation_bridge.METADATA, RESERVATION_PROOF)}
-            if "caption" in clean and clean["caption"] is not None:
-                # Every calendar-building lane converges here. Prompts and individual
-                # generators can miss the hook limit, so enforce the grader's exact
-                # first-line rule at the persistence boundary without dropping words.
-                # A semicolon glued inside a protected URL/handle span makes
-                # format_caption raise; ONE bad caption must not abort the whole
-                # batch. Retain an unpublishable hold so a month rebuild does
-                # not leave an invisible gap after it deleted the old month.
+            clean = prepare_calendar_caption_payload({
+                k: v for k, v in dict(row or {}).items()
+                if k not in ("id", "scene_candidate",
+                             _observation_bridge.METADATA, RESERVATION_PROOF)})
+            if clean.get("media_not_ready_reason") == "caption_url_semicolon":
+                # Retain one bad caption as an unpublishable hold without
+                # aborting the batch. Alerts stay at the persistence boundary.
+                print(f"[portal-calendar-store] insert_rows: {account_key} "
+                      f"{clean.get('post_date')} row held — semicolon "
+                      "inside a protected URL")
                 try:
-                    clean["caption"] = bound_opening_hook(
-                        format_caption(clean["caption"]))
-                except ValueError:
-                    print(f"[portal-calendar-store] insert_rows: {account_key} "
-                          f"{clean.get('post_date')} row held — semicolon "
-                          "inside a protected URL")
-                    clean["media_not_ready_reason"] = "caption_url_semicolon"
-                    try:
-                        from . import ops_alerts
-                        ops_alerts.alert(
-                            f"{account_key}: calendar row for {clean.get('post_date')} "
-                            "was staged on hold because its caption has a semicolon "
-                            "inside a URL. Edit the link and release the hold.")
-                    except Exception:
-                        pass
+                    from . import ops_alerts
+                    ops_alerts.alert(
+                        f"{account_key}: calendar row for {clean.get('post_date')} "
+                        "was staged on hold because its caption has a semicolon "
+                        "inside a URL. Edit the link and release the hold.")
+                except Exception:
+                    pass
             if preserve_ids:
                 import uuid
                 # Explicit stable UUIDs support crash-safe automatic render retries.
@@ -4997,6 +5220,8 @@ class SupabaseCalendarStore:
         # silently take the legacy path and an armed gate refuses rows that
         # could never reserve BEFORE anything is written. With the flag OFF
         # this block is inert and the legacy path is byte-identical.
+        if before_forward_stage is not None and reservation_flag is not True:
+            raise CalendarInsertNotStartedError(503, "before-stage callback requires atomic staging")
         if forward_reservation_flag() is not reservation_flag:
             raise CalendarInsertNotStartedError(503, "forward reservation gate changed before insert")
         if reservation_flag:
@@ -5045,7 +5270,7 @@ class SupabaseCalendarStore:
             # resolved only through the batch status RPC.
             inserted = self._stage_forward_candidate_batch(
                 account_key, payload, armed_observations, _observation_bridge,
-                old_rows=expected_old_rows)
+                old_rows=expected_old_rows, before_forward_stage=before_forward_stage)
         else:
             r = self._client().post(
                 self._rest(_TABLE),

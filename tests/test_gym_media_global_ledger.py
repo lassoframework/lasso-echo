@@ -69,6 +69,10 @@ class FakeLedgerHttp:
             requested = set(params["fingerprint"][4:-1].split(","))
             return _Resp([row for row in self._usage
                           if row["fingerprint"] in requested])
+        if "visual_global_historical_incident" in url:
+            # This legacy fake models only visual_global_usage; the incident
+            # table it never populated reads back empty (proven via */0).
+            return _Resp([])
         raise AssertionError(f"unexpected ledger URL: {url}")
 
 

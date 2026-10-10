@@ -1,17 +1,9 @@
 """Disposable local PostgreSQL regression for global historical import fixes.
 
-Covers the two independent-review historical one-use ledger fixes on the
-unapplied DRAFT_visual_global_history_20261002.sql:
-
-P1 -- two attested published null-key rows with DISTINCT fingerprints in one
-manually linked scene must hit a component-wide date barrier when their dates
-differ (importer, historical-claim RPC and calendar coverage); same-date
-siblings pass.
-
-P2 -- when a keyed same-date reserved owner/member already exists, historical
-attribution adds a durable append-only published-row receipt without promoting
-or overwriting the keyed reservation; deleting the receipt is impossible and
-calendar deletion plus re-import never erases the proof.
+Historical published rows are immutable incidents, including distinct dates
+inside a linked scene. Import is idempotent and does not manufacture a single
+runtime owner for conflicting past uses. The keyed reservation case continues
+to verify that an actual live owner remains unchanged while history is imported.
 
 Requires psql and VISUAL_GROUP_TEST_DSN (libpq keyword DSN, absolute Unix
 socket host, dbname=echo_visual_ledger_test), exactly as in
@@ -149,7 +141,7 @@ def history_issues():
     return out
 
 
-def test_import_rejects_component_wide_date_conflict_but_passes_same_date_siblings():
+def test_import_records_cross_date_scene_incidents_idempotently():
     tenant = ("g_" + uuid.uuid4().hex, str(uuid.uuid4()))
     a = attest_same_object("a", tenant)
     b = attest_same_object("b", tenant)
@@ -158,26 +150,22 @@ def test_import_rejects_component_wide_date_conflict_but_passes_same_date_siblin
     insert_null_key_row(a, D1)
     insert_null_key_row(b, D2)
 
-    err = sql_error("select public.visual_global_import_history()")
-    assert "component-wide usage date" in err
-    # The refused import is atomic: no partial owner, member or receipt remains.
+    result = json.loads(sql("select public.visual_global_import_history()"))
+    assert result["imported_published_rows"] == 2
+    assert result["historical_incidents"] == 2
+    # Past conflicts remain separate immutable evidence, not a fabricated
+    # global owner/member or a refusal to import unrelated historical facts.
     assert sql("select count(*) from public.visual_global_usage") == "0"
     assert sql("select count(*) from public.visual_global_usage_member") == "0"
     assert sql("select count(*) from public.visual_global_published_attribution") == "0"
-
-    # Same-date siblings import cleanly.
-    sql(f"update public.content_calendar set post_date={q(D1)} where image_url={q(b['url'])}")
-    result = json.loads(sql("select public.visual_global_import_history()"))
-    assert result["imported_null_key_rows"] == 2
-    assert result["global_fingerprints"] == 2
-    assert sql("select count(*) from public.visual_global_usage where state='published'") == "2"
-    assert sql("select count(*) from public.visual_global_usage_member where state='published'") == "2"
-    assert sql("select count(*) from public.visual_global_published_attribution") == "2"
     assert coverage_issues() == "ready,ready"
     assert history_issues() == "ready,ready"
+    second = json.loads(sql("select public.visual_global_import_history()"))
+    assert second["historical_incidents"] == 2
+    assert sql("select count(*) from public.visual_global_historical_incident") == "2"
 
 
-def test_historical_claim_rpc_and_coverage_flag_component_conflict():
+def test_historical_claim_rpc_and_coverage_accept_cross_date_incidents():
     tenant = ("g_" + uuid.uuid4().hex, str(uuid.uuid4()))
     a = attest_same_object("a", tenant)
     b = attest_same_object("b", tenant)
@@ -189,26 +177,19 @@ def test_historical_claim_rpc_and_coverage_flag_component_conflict():
     sql("select public.visual_global_claim_historical_row("
         f"{q(a['tid'])},{q(a['group'])},{q(D1)},{q(row_a)}::uuid,'ig',"
         f"array[{q(a['fingerprint'])}])")
-    # A different-date sibling in the same linked scene is barred, even though
-    # its byte has no owner conflict of its own.
-    err = sql_error("select public.visual_global_claim_historical_row("
-                    f"{q(b['tid'])},{q(b['group'])},{q(D2)},{q(row_b)}::uuid,'ig',"
-                    f"array[{q(b['fingerprint'])}])")
-    assert "component-wide usage date" in err
-    # Calendar coverage flags the conflict, so the importer barrier refuses
-    # before any write; activation's coverage re-read sees it too.
-    assert "component_usage_date_conflict" in coverage_issues()
-    err = sql_error("select public.visual_global_import_history()")
-    assert "calendar coverage incomplete" in err
-    # The same-date sibling claim passes and coverage returns to ready.
+    # A different-date sibling in the same linked scene is its own historical
+    # incident and does not rewrite the first incident or create an owner.
     sql("select public.visual_global_claim_historical_row("
-        f"{q(b['tid'])},{q(b['group'])},{q(D1)},{q(row_b)}::uuid,'ig',"
+        f"{q(b['tid'])},{q(b['group'])},{q(D2)},{q(row_b)}::uuid,'ig',"
         f"array[{q(b['fingerprint'])}])")
-    sql(f"update public.content_calendar set post_date={q(D1)} where id={q(row_b)}::uuid")
     assert coverage_issues() == "ready,ready"
+    assert history_issues() == "ready,ready"
+    result = json.loads(sql("select public.visual_global_import_history()"))
+    assert result["historical_incidents"] == 2
+    assert sql("select count(*) from public.visual_global_usage") == "0"
 
 
-def test_keyed_same_date_reservation_keeps_state_and_gains_durable_attribution():
+def test_keyed_same_date_reservation_keeps_state_and_gains_historical_incident():
     k = attest_same_object("k")
     keyed_row = str(uuid.uuid4())
     sql("insert into public.content_calendar"
@@ -231,19 +212,20 @@ def test_keyed_same_date_reservation_keeps_state_and_gains_durable_attribution()
     member = sql("select state||'|'||calendar_row_id::text from public.visual_global_usage_member "
                  f"where fingerprint={q(k['fingerprint'])}")
     assert member == f"reserved|{keyed_row}"
-    # ...but the published row leaves durable append-only proof.
+    # ...and both sources retain separate durable incident proofs.
     receipt = sql("select used_date::text||'|'||coalesce(channel,'') from "
-                  "public.visual_global_published_attribution "
-                  f"where tenant_id={q(k['tid'])} and group_key={q(k['group'])} "
+                  "public.visual_global_historical_incident "
+                  f"where source_kind='calendar' and source_key={q(null_key_row)} "
+                  f"and tenant_id={q(k['tid'])} and group_key={q(k['group'])} "
                   f"and fingerprint={q(k['fingerprint'])} and calendar_row_id={q(null_key_row)}::uuid")
     assert receipt == f"{D1}|ig"
     assert coverage_issues() == "ready,ready"
-    assert history_issues() == "ready"
+    assert set(history_issues().split(",")) == {"ready"}
 
-    # The receipt is immutable: no update, no delete.
-    err = sql_error("delete from public.visual_global_published_attribution")
+    # Historical incident evidence is immutable: no update, no delete.
+    err = sql_error("delete from public.visual_global_historical_incident")
     assert "immutable" in err
-    err = sql_error("update public.visual_global_published_attribution set used_date=used_date+1")
+    err = sql_error("update public.visual_global_historical_incident set used_date=used_date+1")
     assert "immutable" in err
 
     # Deleting the published calendar row and re-importing never erases or
@@ -252,10 +234,11 @@ def test_keyed_same_date_reservation_keeps_state_and_gains_durable_attribution()
     result = json.loads(sql("select public.visual_global_import_history()"))
     assert result["imported_local_groups"] == 1
     assert result["imported_null_key_rows"] == 0
-    assert sql("select count(*) from public.visual_global_published_attribution") == "1"
+    assert sql("select count(*) from public.visual_global_historical_incident "
+               f"where source_key={q(null_key_row)}") == "1"
     assert sql("select state from public.visual_global_usage "
                f"where fingerprint={q(k['fingerprint'])}") == "reserved"
     member = sql("select state||'|'||calendar_row_id::text from public.visual_global_usage_member "
                  f"where fingerprint={q(k['fingerprint'])}")
     assert member == f"reserved|{keyed_row}"
-    assert history_issues() == "ready"
+    assert set(history_issues().split(",")) == {"ready"}

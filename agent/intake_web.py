@@ -41,6 +41,7 @@ import time
 from datetime import datetime, timezone
 
 from . import config, ghl_intake, intake_tokens, whatsapp_intake
+from .local_inventory_mutation import MutationHold as _MutationHold
 from . import gym_media_routes as _gm
 from . import portal_routes as _pr
 from . import portal_social as _ps
@@ -391,6 +392,89 @@ def _safe_name(filename):
     return re.sub(r"[^A-Za-z0-9._-]+", "_", base) or "upload"
 
 
+# ---- inventory mutation guard (agent/local_inventory_mutation.py) -------------
+# Tenant-bound R2 writes (upload media bytes, upload/intake manifests) can be
+# fenced by the begin/complete inventory mutation receipt protocol. The fence is
+# OFF unless AGENT_LOCAL_INVENTORY_MUTATIONS_ENABLED=true. When ON it FAILS
+# CLOSED: an incomplete local inventory (missing durable library/db paths, no
+# dedicated mutator login, an unsettled pending mutation) raises MutationHold
+# BEFORE any byte is written, and an uncertain begin/complete keeps the exact
+# mutation pending — callers must return an honest failure, never certify
+# success for a write the protocol could not settle. Bytes pass through
+# untouched: the protocol receipts digests of the exact original content and
+# never re-encodes it.
+def _inventory_guarded_write(client, kind, request_payload, write_fn,
+                             authority=None):
+    """Run write_fn() under the mutation receipt protocol and return its
+    canonical result. Fence OFF (default): write_fn runs directly. Fence ON:
+    MutationHold propagates (hold, never fake success)."""
+    from . import local_inventory_mutation as mutation
+    if not mutation.enabled():
+        return write_fn()
+    from pathlib import Path
+    cfg = mutation.configured(client, (Path(config.LIBRARY_PATH) / client).absolute())
+    owns = authority is None
+    if owns:
+        authority = mutation.MutationAuthority.from_environment()
+    try:
+        return mutation.run(cfg, authority, kind, request_payload,
+                            lambda conn: write_fn())
+    finally:
+        if owns:
+            authority.close()
+
+
+def _sha256(data):
+    return hashlib.sha256(data).hexdigest()
+
+
+def _prepare_inventory_r2_writes(r2, objects):
+    """Validate the whole key plan before begin; require atomic create when fenced.
+
+    A read followed by an unconditional put cannot prevent another request from
+    overwriting the same timestamp key. Wrappers must provide a conditional
+    create capability, so fenced requests hold if their wrapper lacks it.
+    """
+    from . import local_inventory_mutation as mutation
+    if not mutation.enabled():
+        return
+    keys = [key for key, _ctype, _data in objects]
+    if len(keys) != len(set(keys)):
+        raise _MutationHold("r2_duplicate_planned_key")
+    if not callable(getattr(r2, "put_bytes_if_absent", None)):
+        raise _MutationHold("r2_conditional_create_unavailable")
+    if not callable(getattr(r2, "get_bytes", None)):
+        raise _MutationHold("r2_readback_unavailable")
+    try:
+        for key in keys:
+            if r2.get_bytes(key) is not None:
+                raise _MutationHold("r2_key_collision")
+    except _MutationHold:
+        raise
+    except Exception:
+        raise _MutationHold("r2_collision_read_failed") from None
+
+
+def _write_inventory_r2_object(r2, key, data, content_type):
+    """Fenced writes certify only exact-key, exact-length and SHA readback."""
+    from . import local_inventory_mutation as mutation
+    if not mutation.enabled():
+        r2.put_bytes(key, data, content_type=content_type)
+        return
+    # Contract: this method must atomically refuse an existing key, including a
+    # key created after preflight. It must never be implemented as check-then-put.
+    r2.put_bytes_if_absent(key, data, content_type=content_type)
+    try:
+        actual = r2.get_bytes(key)
+        if (not isinstance(actual, bytes) or len(actual) != len(data)
+                or _sha256(actual) != _sha256(data)):
+            raise _MutationHold("r2_readback_identity_mismatch")
+    except _MutationHold:
+        raise
+    except Exception:
+        raise _MutationHold("r2_readback_failed") from None
+
+
 def handle_upload(token, files, note="", captions=None, r2=None, now=None,
                   client_contexts=None, consents=None):
     """
@@ -448,43 +532,77 @@ def handle_upload(token, files, note="", captions=None, r2=None, now=None,
     # must never bubble out of the HTTP handler as an unhandled 500/503 with a
     # misleading "not found" body. We return an honest 503 the UI can show. The
     # exception is logged (scrubbed) so a live misconfig is diagnosable.
+    planned = [
+        (f"intake/{client}/incoming/{stamp}_{_safe_name(filename)}", ctype, data)
+        for filename, ctype, data in files
+    ]
+    # Digest the exact original bytes BEFORE any write; the mutation receipt
+    # binds this identity so stored content can never drift from what the
+    # client sent (no re-encoding, no digest drift).
+    media_digests = [
+        {"key": key, "bytes": len(data), "content_type": ctype,
+         "sha256": _sha256(data)}
+        for key, ctype, data in planned
+    ]
+    manifest_key = f"intake/{client}/incoming/{stamp}_upload.json"
+
+    # Construct the complete manifest before begin so captions, context and
+    # consent are bound to the same request identity as the original bytes.
+    for idx, (key, ctype, data) in enumerate(planned):
+        base = os.path.basename(key)
+        stored.append(base)
+        cap = ""
+        if idx < len(captions):
+            cap = (captions[idx] or "").strip()[:200]
+        if cap:
+            caption_map[base] = cap
+        # §8: the gym's free-text about THIS photo (raw material, never verbatim output)
+        if idx < len(client_contexts):
+            ctx = (client_contexts[idx] or "").strip()[:500]
+            if ctx:
+                context_map[base] = ctx
+        # §8: consent is the CHECKBOX only — never inferred from context text. Consent
+        # laundering guard: a name typed in the context is NOT permission.
+        if idx < len(consents) and bool(consents[idx]):
+            consent_map[base] = True
+    sidecar = {
+        "note": (note or "").strip()[:500],
+        "client": client,
+        # never the raw token: a fingerprint traces which link was used
+        "token_sha256": hashlib.sha256(token.encode()).hexdigest(),
+        "timestamp": stamp,
+        "filenames": stored,
+        # per-file caption map (STORED basename -> the gym's one line about it);
+        # backward compatible: absent/empty when only a batch note was sent.
+        "captions": caption_map,
+        # §8 per-file client_context + consent (checkbox); absent/empty by default.
+        "client_context": context_map,
+        "consent": consent_map,
+    }
+    manifest = json.dumps(sidecar).encode("utf-8")
+    manifest_identity = {"key": manifest_key, "bytes": len(manifest),
+                         "sha256": _sha256(manifest)}
+    objects = planned + [(manifest_key, "application/json", manifest)]
+
+    def _write_batch():
+        for key, ctype, data in objects:
+            _write_inventory_r2_object(r2, key, data, ctype)
+        return {"media": media_digests, "stored": len(stored),
+                "manifest": manifest_identity}
+
     try:
-        for idx, (filename, ctype, data) in enumerate(files):
-            key = f"intake/{client}/incoming/{stamp}_{_safe_name(filename)}"
-            r2.put_bytes(key, data, content_type=ctype)
-            base = os.path.basename(key)
-            stored.append(base)
-            cap = ""
-            if idx < len(captions):
-                cap = (captions[idx] or "").strip()[:200]
-            if cap:
-                caption_map[base] = cap
-            # §8: the gym's free-text about THIS photo (raw material, never verbatim output)
-            if idx < len(client_contexts):
-                ctx = (client_contexts[idx] or "").strip()[:500]
-                if ctx:
-                    context_map[base] = ctx
-            # §8: consent is the CHECKBOX only — never inferred from context text. Consent
-            # laundering guard: a name typed in the context is NOT permission.
-            if idx < len(consents) and bool(consents[idx]):
-                consent_map[base] = True
-        sidecar = {
-            "note": (note or "").strip()[:500],
-            "client": client,
-            # never the raw token: a fingerprint traces which link was used
-            "token_sha256": hashlib.sha256(token.encode()).hexdigest(),
-            "timestamp": stamp,
-            "filenames": stored,
-            # per-file caption map (STORED basename -> the gym's one line about it);
-            # backward compatible: absent/empty when only a batch note was sent.
-            "captions": caption_map,
-            # §8 per-file client_context + consent (checkbox); absent/empty by default.
-            "client_context": context_map,
-            "consent": consent_map,
-        }
-        r2.put_bytes(f"intake/{client}/incoming/{stamp}_upload.json",
-                     json.dumps(sidecar).encode("utf-8"),
-                     content_type="application/json")
+        _prepare_inventory_r2_writes(r2, objects)
+        _inventory_guarded_write(
+            client, "intake_upload",
+            {"client": client, "timestamp": stamp, "media": media_digests,
+             "manifest": manifest_identity},
+            _write_batch)
+    except _MutationHold as hold:
+        # FAIL CLOSED: the write did not settle. It may be pending with the exact
+        # mutation retained; never report success.
+        print(f"[intake-web] upload write HELD for {client}: {hold}")
+        return 503, {"error": "upload held for inventory reconciliation",
+                     "code": str(hold), "pending": True}
     except Exception as e:
         from . import ops_alerts as _oa
         print(f"[intake-web] upload write failed for {client}: "
@@ -541,9 +659,27 @@ def handle_intake_form(token, fields, r2=None, now=None):
         "token_sha256": hashlib.sha256(token.encode()).hexdigest(),
         "timestamp": stamp,
     }
-    r2.put_bytes(f"intake/{client}/incoming/{stamp}_intake.json",
-                 json.dumps(payload).encode("utf-8"),
-                 content_type="application/json")
+    manifest = json.dumps(payload).encode("utf-8")
+    manifest_key = f"intake/{client}/incoming/{stamp}_intake.json"
+
+    def _write_manifest():
+        _write_inventory_r2_object(r2, manifest_key, manifest, "application/json")
+        return {"manifest": manifest_key, "bytes": len(manifest),
+                "sha256": _sha256(manifest)}
+
+    try:
+        _prepare_inventory_r2_writes(
+            r2, [(manifest_key, "application/json", manifest)])
+        _inventory_guarded_write(
+            client, "intake_manifest",
+            {"client": client, "manifest": manifest_key, "bytes": len(manifest),
+             "sha256": _sha256(manifest)},
+            _write_manifest)
+    except _MutationHold as hold:
+        # FAIL CLOSED: never claim receipt for a manifest the protocol did not settle.
+        print(f"[intake-web] intake manifest write HELD for {client}: {hold}")
+        return 503, {"error": "intake held for inventory reconciliation",
+                     "code": str(hold), "pending": True}
     return 200, {"ok": True, "client": client}
 
 
@@ -765,10 +901,32 @@ def handle_portal_intake(token, body, r2=None, now=None):
     # "POST -> done" so a crashed intake looked identical to a delivered one.
     if r2 is None:
         return 503, {"error": "storage unavailable"}
+    manifest = json.dumps(payload).encode("utf-8")
+    manifest_key = f"intake/{client}/incoming/{stamp}_intake.json"
+
+    def _write_manifest():
+        _write_inventory_r2_object(r2, manifest_key, manifest, "application/json")
+        return {"manifest": manifest_key, "bytes": len(manifest),
+                "sha256": _sha256(manifest)}
+
     try:
-        r2.put_bytes(f"intake/{client}/incoming/{stamp}_intake.json",
-                     json.dumps(payload).encode("utf-8"),
-                     content_type="application/json")
+        _prepare_inventory_r2_writes(
+            r2, [(manifest_key, "application/json", manifest)])
+        _inventory_guarded_write(
+            client, "intake_manifest",
+            {"client": client, "manifest": manifest_key, "bytes": len(manifest),
+             "sha256": _sha256(manifest)},
+            _write_manifest)
+    except _MutationHold as hold:
+        # FAIL CLOSED: pending/held is not receipt; the portal keeps
+        # echo_forwarded=false and re-forwards.
+        import logging
+        logging.getLogger(__name__).error(
+            "intake archive HELD, returning 503: client=%s stamp=%s code=%s",
+            client, stamp, hold,
+        )
+        return 503, {"error": "intake held for inventory reconciliation",
+                     "code": str(hold), "pending": True}
     except Exception as exc:  # noqa: BLE001 - never claim receipt we cannot back up
         import logging
         logging.getLogger(__name__).error(
@@ -1179,6 +1337,15 @@ class _R2:
     def put_bytes(self, key, data, content_type="application/octet-stream"):
         self._s3.put_object(Bucket=self._bucket, Key=key, Body=data,
                             ContentType=content_type)
+
+    def put_bytes_if_absent(self, key, data, content_type="application/octet-stream"):
+        """Atomically create only; use the existing media_host R2/S3 contract.
+
+        Unsupported SDK/provider conditional requests raise and hold the fenced
+        mutation. Never retry this operation with an unconditional put.
+        """
+        self._s3.put_object(Bucket=self._bucket, Key=key, Body=data,
+                            ContentType=content_type, IfNoneMatch="*")
 
     def get_bytes(self, key):
         """Bytes at a key, or None ONLY when the key does not exist. Re-raises any

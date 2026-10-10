@@ -956,3 +956,587 @@ def test_transformed_evidence_uses_real_bytes_not_invented(monkeypatch, tmp_path
     src.write_bytes(b"s")
     assert gp._render_evidence_dict("https://r2/a", "https://r2/b",
                                     src, tmp_path / "missing") is None
+
+
+# ---- guarded local reservation release (binding propagation) ----------------------
+class _MutationAuthority:
+    """In-memory mutation authority; mirrors tests/test_rotation_inventory_mutation."""
+
+    def __init__(self):
+        self.events = []
+
+    def begin(self, request):
+        self.events.append("begin")
+        self.receipt = dict(request, state="pending", generation=1,
+                            result_digest=None, begun_at="now")
+        return dict(self.receipt)
+
+    def complete(self, request, result_digest):
+        self.events.append("complete")
+        return dict(self.receipt, state="complete", result_digest=result_digest,
+                    completed_at="later")
+
+    def close(self):
+        pass
+
+
+def _arm_local_mutation(monkeypatch, tmp_path, gym="gymx"):
+    """Arm the local-inventory mutation fence with one real gym library photo."""
+    import uuid
+    from agent import config, db, local_inventory_mutation as mutation
+    library = tmp_path / "library"
+    gym_dir = library / gym
+    gym_dir.mkdir(parents=True)
+    monkeypatch.setattr(config, "LIBRARY_PATH", str(library))
+    monkeypatch.setenv("AGENT_LOCAL_INVENTORY_MUTATIONS_ENABLED", "true")
+    monkeypatch.setenv("AGENT_DB_PATH", str(tmp_path / "mutation.db"))
+    monkeypatch.setenv("AGENT_ROTATION_STATE_DIR", str(tmp_path))
+    monkeypatch.setenv("LOCAL_INVENTORY_MUTATION_EPOCH", str(uuid.uuid4()))
+    db.connect().close()
+    asset = gym_dir / "class.jpg"
+    asset.write_bytes(b"gbp local photo bytes")
+    auth = _MutationAuthority()
+    monkeypatch.setattr(mutation.MutationAuthority, "from_environment", lambda: auth)
+    return asset
+
+
+def _plan_one_local_row(monkeypatch, store, asset):
+    """Plan a single-slot GBP month whose one row reserves the armed local photo."""
+    from types import SimpleNamespace
+    _seed("gymx_ig")
+    monkeypatch.delenv("AGENT_VISUAL_GLOBAL_WRITER_PREP", raising=False)
+    monkeypatch.setattr(gp, "_drive_photo_candidate", lambda *a, **k: None)
+    monkeypatch.setattr(gp.client_content, "pick_image",
+                        lambda *a, **k: SimpleNamespace(path=str(asset),
+                                                        media_type="image"))
+    monkeypatch.setattr(gp, "_cropped_image_url",
+                        lambda *a, **k: "https://r2/gbp-class.jpg")
+    return gp.plan_gbp_month(
+        "gymx", "gymx_ig", voice=_voice(), library_path=str(asset.parent.parent),
+        city="Carmel", store=store, start=date(2026, 9, 1), days=1,
+        offer=None, events=[], caption_fn=_cap)
+
+
+def test_gbp_guarded_release_with_complete_binding(monkeypatch, tmp_path):
+    """Mutation fence ON: a proven never-landed row (the store durably inserted
+    zero rows) releases its reservation with the full reserve-time binding, and
+    the exact served row is deleted."""
+    from agent import rotation
+    asset = _arm_local_mutation(monkeypatch, tmp_path)
+
+    class ZeroStore:
+        def insert_rows(self, _key, _rows):
+            return []
+
+    out = _plan_one_local_row(monkeypatch, ZeroStore(), asset)
+
+    assert out["ok"] is False and out["reason"] == "store inserted zero rows"
+    assert rotation.load_served_strict().get("gymx_gbp", []) == []
+
+
+def test_gbp_guarded_release_wrong_hash_holds_and_retains(monkeypatch, tmp_path):
+    """When the reserved file's bytes no longer match the reserve-time SHA-256,
+    the guarded release cannot prove the row: it holds and the reservation is
+    retained even though the calendar insert durably landed nothing."""
+    from agent import rotation
+    asset = _arm_local_mutation(monkeypatch, tmp_path)
+
+    class TamperingZeroStore:
+        def insert_rows(self, _key, _rows):
+            asset.write_bytes(b"different bytes after the reservation")
+            return []
+
+    out = _plan_one_local_row(monkeypatch, TamperingZeroStore(), asset)
+
+    assert out["ok"] is False
+    served = rotation.load_served_strict().get("gymx_gbp", [])
+    assert len(served) == 1, "a hash-mismatched release must retain the reservation"
+
+
+def test_gbp_unknown_insert_outcome_retains_local_reservation(monkeypatch, tmp_path):
+    """Insert raised and the authoritative readback is unreadable: the write may
+    have committed, so no reservation is released."""
+    from agent import rotation
+    asset = _arm_local_mutation(monkeypatch, tmp_path)
+
+    class UnknownStore:
+        def insert_rows(self, _key, _rows):
+            raise TimeoutError("insert response lost")
+
+        def authoritative_rows_for_keys(self, _key, _rows):
+            return None
+
+    with pytest.raises(TimeoutError, match="response lost"):
+        _plan_one_local_row(monkeypatch, UnknownStore(), asset)
+    served = rotation.load_served_strict().get("gymx_gbp", [])
+    assert len(served) == 1, "an unknown insert outcome retains the reservation"
+
+
+# ---- armed remote Drive use caller (AGENT_REMOTE_DRIVE_USE_CAS_ENABLED) -----
+# Offline: fake authority + tmp SQLite journals only; no provider calls.
+
+import json as _json
+import sqlite3 as _sqlite3
+import uuid as _uuid
+
+from agent import gbp_drive_use_journal as _journal  # noqa: E402
+
+_ARMED_EPOCH = str(_uuid.uuid4())
+_ARMED_STAMPED = "2026-10-08T12:00:00+00:00"
+
+
+def _armed_asset(asset_id="drive-1", source_id="src1"):
+    from tests.gym_media_fakes import make_asset as _mk
+    row = _mk(asset_id, gym_id="gymx", source_id=source_id)
+    row["drive_use_version"] = 1
+    return row
+
+
+def _armed_source(source_id="src1"):
+    from tests.gym_media_fakes import make_source as _mk
+    row = _mk(source_id, gym_id="gymx")
+    row["drive_use_version"] = 2
+    return row
+
+
+class _ArmedAuthority:
+    """remote_drive_use.DriveUseAuthority stand-in (never any network)."""
+
+    def __init__(self, lose_apply=False):
+        self.calls = []
+        self.result = None
+        self.lose_apply = lose_apply
+
+    def apply_use(self, request):
+        self.calls.append("apply")
+        after = dict(request["asset_before"], used_count=1,
+                     last_used_at=_ARMED_STAMPED,
+                     drive_use_version=request["asset_before"]["drive_use_version"] + 1)
+        self.result = {"state": "applied", "request": dict(request),
+                       "asset_after": after,
+                       "source_after": dict(request["source_before"])}
+        if self.lose_apply:
+            raise OSError("lost commit ack")
+        return self.result
+
+    def use_receipt(self, request):
+        self.calls.append("receipt")
+        if self.result is None:
+            raise OSError("no authoritative receipt")
+        return self.result
+
+    def close(self):
+        pass
+
+
+@pytest.fixture
+def armed_cas(monkeypatch, tmp_path):
+    from agent import config as settings
+    from agent import remote_drive_use as remote
+    (tmp_path / "library" / "gymx").mkdir(parents=True)
+    db_file = tmp_path / "echo.db"
+    _sqlite3.connect(db_file).close()
+    monkeypatch.setenv("AGENT_DB_PATH", str(db_file))
+    monkeypatch.setenv("AGENT_REMOTE_DRIVE_USE_CAS_ENABLED", "true")
+    monkeypatch.setenv("LOCAL_INVENTORY_MUTATION_EPOCH", _ARMED_EPOCH)
+    monkeypatch.setattr(settings, "LIBRARY_PATH", str(tmp_path / "library"))
+    authority = _ArmedAuthority()
+    monkeypatch.setattr(remote.DriveUseAuthority, "from_environment",
+                        classmethod(lambda cls: authority))
+    source = _armed_source()
+    asset = _armed_asset()
+    media = FakeMediaStore(sources=[source], assets=[asset])
+    picks = []
+
+    def candidate(account, day, used):
+        pick = {"url": f"https://r2/{day}.jpg", "kind": "drive", "day_key": day,
+                "asset": dict(asset), "base": "gymx", "store": media}
+        picks.append(pick)
+        return pick
+
+    monkeypatch.setattr(gp, "_drive_photo_candidate", candidate)
+    _seed("gymx_ig")
+    return {"authority": authority, "media": media, "asset": asset,
+            "source": source, "picks": picks, "db_file": str(db_file)}
+
+
+def _journal_entry_for(row):
+    return _journal.get_by_logical_post("gymx", row["logical_post_id"])
+
+
+def test_off_path_drive_stamp_parity(monkeypatch, tmp_path):
+    from agent import gym_media_selector
+    monkeypatch.delenv("AGENT_REMOTE_DRIVE_USE_CAS_ENABLED", raising=False)
+    _seed("gymx_ig")
+    asset = make_asset("drive-1", gym_id="gymx")
+    seen = {}
+
+    def _stamp(*args, **kwargs):
+        seen["args"] = args
+        seen["kwargs"] = kwargs
+
+    monkeypatch.setattr(gym_media_selector, "stamp_use", _stamp)
+    monkeypatch.setattr(
+        gp, "_drive_photo_candidate",
+        lambda account, day, used: {"url": f"https://r2/{day}.jpg",
+                                    "kind": "drive", "day_key": day,
+                                    "asset": asset, "base": "gymx",
+                                    "store": FakeMediaStore(assets=[asset])})
+    store = _Store()
+    out = gp.plan_gbp_month("gymx", "gymx_ig", voice=_voice(), library_path="/x",
+                            city="Carmel", store=store, start=date(2026, 9, 1),
+                            days=1, offer=None, events=[], caption_fn=_cap)
+    assert out["ok"] is True
+    # Legacy stamp signature: no caller use identity, no journal side effects.
+    assert seen["kwargs"].get("use_id") is None
+    assert seen["kwargs"].get("asset_row") is None
+    assert seen["kwargs"].get("source_row") is None
+    assert "logical_post_id" not in store.rows[0]
+    assert _journal.unsettled() == []
+
+
+def test_armed_valid_full_snapshot_exact_landing(armed_cas, monkeypatch):
+    claim_states = []
+
+    real_complete = gp._complete_drive_claim
+
+    def _spy_complete(pick):
+        entry = pick["journal_entry"]
+        claim_states.append(_journal.get(entry["use_id"])["state"])
+        return real_complete(pick)
+
+    monkeypatch.setattr(gp, "_complete_drive_claim", _spy_complete)
+    store = _Store()
+    out = gp.plan_gbp_month("gymx", "gymx_ig", voice=_voice(), library_path="/x",
+                            city="Carmel", store=store, start=date(2026, 9, 1),
+                            days=1, offer=None, events=[], caption_fn=_cap)
+    assert out["ok"] is True and out["planned"] == 1
+    assert armed_cas["authority"].calls == ["apply"]
+    entry = _journal_entry_for(store.rows[0])
+    assert entry["state"] == "claim_done"
+    assert entry["asset_before"]["id"] == "drive-1"
+    assert entry["source_before"]["id"] == "src1"
+    assert entry["epoch_id"] == _ARMED_EPOCH
+    assert entry["landed_proof"]["asset_id"] == "drive-1"
+    # The claim completes only after the receipt is durably confirmed.
+    assert claim_states == ["receipt_confirmed"]
+    from agent import db
+    state, _ = db.socialapi_claim(
+        gp._drive_claim_id("gymx", armed_cas["asset"]), "gymx_gbp")
+    assert state == "done"
+    records = _json.loads(db.kv_get("gym_media_use:gymx:2026-09-01"))
+    assert records[0]["use_id"] == entry["use_id"]
+    # Same logical post retry resumes the SAME use identity and does not
+    # double-consume: settling again replays the recorded receipt, no new apply.
+    pick = armed_cas["picks"][0]
+    assert gp._settle_armed_drive_landing(
+        "gymx", store.rows[0], pick, store.rows[0], print) is True
+    assert armed_cas["authority"].calls == ["apply"]
+    again = _journal_entry_for(store.rows[0])
+    assert again["use_id"] == entry["use_id"]
+
+
+def test_armed_missing_snapshot_fails_before_post(armed_cas, monkeypatch):
+    monkeypatch.setattr(armed_cas["media"], "get_asset", lambda _id: None)
+    released = []
+    monkeypatch.setattr(gp, "_release_drive_claim",
+                        lambda pick: released.append(pick) or True)
+    store = _Store()
+    out = gp.plan_gbp_month("gymx", "gymx_ig", voice=_voice(), library_path="/x",
+                            city="Carmel", store=store, start=date(2026, 9, 1),
+                            days=1, offer=None, events=[], caption_fn=_cap)
+    assert out["ok"] is False and out["planned"] == 0
+    assert "journal hold before send" in out["reason"]
+    assert store.rows == []                      # no POST was attempted
+    assert armed_cas["authority"].calls == []    # no remote use
+    assert released, "a never-sent claim is released"
+
+
+def test_armed_write_intent_failure_fails_before_post(armed_cas, monkeypatch):
+    def _fail(*a, **k):
+        raise _journal.JournalHold("journal_local_write_failed")
+    monkeypatch.setattr(_journal, "record_write_intent", _fail)
+    store = _Store()
+    out = gp.plan_gbp_month("gymx", "gymx_ig", voice=_voice(), library_path="/x",
+                            city="Carmel", store=store, start=date(2026, 9, 1),
+                            days=1, offer=None, events=[], caption_fn=_cap)
+    assert out["ok"] is False and "journal hold before send" in out["reason"]
+    assert store.rows == []
+    assert armed_cas["authority"].calls == []
+
+
+def test_armed_partial_batch_settles_only_exact_landed(armed_cas, monkeypatch):
+    asset2 = _armed_asset("drive-2")
+    armed_cas["media"].assets["drive-2"] = dict(asset2)
+    by_day = {"2026-09-01": armed_cas["asset"], "2026-09-04": asset2}
+
+    def candidate(account, day, used):
+        pick = {"url": f"https://r2/{day}.jpg", "kind": "drive", "day_key": day,
+                "asset": dict(by_day.get(day, armed_cas["asset"])), "base": "gymx",
+                "store": armed_cas["media"]}
+        armed_cas["picks"].append(pick)
+        return pick
+
+    monkeypatch.setattr(gp, "_drive_photo_candidate", candidate)
+
+    class PartialStore(_Store):
+        def insert_rows(self, key, rows):
+            super().insert_rows(key, rows)
+            return rows[:1]                      # second row's outcome unseen
+
+    store = PartialStore()
+    out = gp.plan_gbp_month("gymx", "gymx_ig", voice=_voice(), library_path="/x",
+                            city="Carmel", store=store, start=date(2026, 9, 1),
+                            days=4, offer=None, events=[], caption_fn=_cap)
+    assert out["ok"] is False and out["operational_hold"] is True
+    assert out["planned"] == 1
+    landed = _journal_entry_for(store.rows[0])
+    unseen = _journal_entry_for(store.rows[1])
+    assert landed["state"] == "claim_done"
+    assert unseen["state"] == "unknown_result"   # held, never settled by absence
+    assert armed_cas["authority"].calls == ["apply"]  # only the landed row consumed
+    from agent import db
+    state_done, _ = db.socialapi_claim(
+        gp._drive_claim_id("gymx", armed_cas["asset"]), "gymx_gbp")
+    state_held, _ = db.socialapi_claim(
+        gp._drive_claim_id("gymx", asset2), "gymx_gbp")
+    assert state_done == "done"
+    assert state_held == "in_flight"             # unseen row stays non-reofferable
+
+
+def test_armed_lost_post_ack_zero_readback_stays_unknown(armed_cas):
+    class LostStore:
+        def insert_rows(self, _key, rows):
+            self.rows = list(rows)
+            raise TimeoutError("response lost after request")
+
+        def authoritative_rows_for_keys(self, _key, _proposed):
+            return []
+
+    store = LostStore()
+    with pytest.raises(TimeoutError):
+        gp.plan_gbp_month("gymx", "gymx_ig", voice=_voice(), library_path="/x",
+                          city="Carmel", store=store, start=date(2026, 9, 1),
+                          days=1, offer=None, events=[], caption_fn=_cap)
+    entry = _journal_entry_for(store.rows[0])
+    assert entry["state"] == "unknown_result"
+    assert entry["zero_readbacks"] == 1          # zero readback NEVER settles
+    assert armed_cas["authority"].calls == []    # nothing consumed
+    from agent import db
+    state, _ = db.socialapi_claim(
+        gp._drive_claim_id("gymx", armed_cas["asset"]), "gymx_gbp")
+    assert state == "in_flight"
+
+
+def test_armed_lost_post_ack_exact_readback_settles(armed_cas):
+    class LostStore:
+        def insert_rows(self, _key, rows):
+            self.rows = list(rows)
+            raise TimeoutError("response lost after commit")
+
+        def authoritative_rows_for_keys(self, _key, _proposed):
+            return self.rows
+
+    store = LostStore()
+    out = gp.plan_gbp_month("gymx", "gymx_ig", voice=_voice(), library_path="/x",
+                            city="Carmel", store=store, start=date(2026, 9, 1),
+                            days=1, offer=None, events=[], caption_fn=_cap)
+    assert out["ok"] is True and out["planned"] == 1
+    entry = _journal_entry_for(store.rows[0])
+    assert entry["state"] == "claim_done"
+    assert armed_cas["authority"].calls == ["apply"]
+
+
+def test_armed_remote_receipt_lost_ack_resumes_same_uuid(armed_cas, monkeypatch):
+    authority = armed_cas["authority"]
+    authority.lose_apply = True
+    store = _Store()
+    out = gp.plan_gbp_month("gymx", "gymx_ig", voice=_voice(), library_path="/x",
+                            city="Carmel", store=store, start=date(2026, 9, 1),
+                            days=1, offer=None, events=[], caption_fn=_cap)
+    assert out["ok"] is False and out["operational_hold"] is True
+    entry = _journal_entry_for(store.rows[0])
+    assert entry["state"] == "consumption_pending"
+    assert authority.calls == ["apply"]
+    # Resume the same logical post: the SAME use UUID re-reads the receipt
+    # instead of re-applying, and the row settles exactly once.
+    authority.lose_apply = False
+    pick = armed_cas["picks"][0]
+    assert gp._settle_armed_drive_landing(
+        "gymx", store.rows[0], pick, store.rows[0], print) is True
+    assert authority.calls == ["apply", "receipt"]
+    settled = _journal_entry_for(store.rows[0])
+    assert settled["use_id"] == entry["use_id"]
+    assert settled["state"] == "claim_done"
+    from agent import db
+    state, _ = db.socialapi_claim(
+        gp._drive_claim_id("gymx", armed_cas["asset"]), "gymx_gbp")
+    assert state == "done"
+
+
+def test_armed_contradictory_receipt_holds(armed_cas, monkeypatch):
+    class BadAuthority(_ArmedAuthority):
+        def apply_use(self, request):
+            self.calls.append("apply")
+            receipt = super().apply_use(request)
+            receipt["request"] = dict(receipt["request"],
+                                      use_id=str(_uuid.uuid4()))
+            return receipt
+
+    authority = BadAuthority()
+    from agent import remote_drive_use as remote
+    monkeypatch.setattr(remote.DriveUseAuthority, "from_environment",
+                        classmethod(lambda cls: authority))
+    store = _Store()
+    out = gp.plan_gbp_month("gymx", "gymx_ig", voice=_voice(), library_path="/x",
+                            city="Carmel", store=store, start=date(2026, 9, 1),
+                            days=1, offer=None, events=[], caption_fn=_cap)
+    assert out["ok"] is False and out["operational_hold"] is True
+    entry = _journal_entry_for(store.rows[0])
+    # Landed proof is durable, but the contradictory receipt never settles the
+    # claim: consumption stays pending and the asset stays non-reofferable.
+    assert entry["state"] == "consumption_pending"
+    from agent import db
+    state, _ = db.socialapi_claim(
+        gp._drive_claim_id("gymx", armed_cas["asset"]), "gymx_gbp")
+    assert state == "in_flight"
+
+
+def test_armed_identity_conflict_under_same_logical_id_holds(armed_cas):
+    store = _Store()
+    out = gp.plan_gbp_month("gymx", "gymx_ig", voice=_voice(), library_path="/x",
+                            city="Carmel", store=store, start=date(2026, 9, 1),
+                            days=1, offer=None, events=[], caption_fn=_cap)
+    assert out["ok"] is True
+    row = dict(store.rows[0])
+    pick = dict(armed_cas["picks"][0])
+    # Same logical id, identical identity -> same UUID resumed.
+    again = gp._prepare_drive_use_journal("gymx", dict(row), pick)
+    assert again is not None
+    assert again["use_id"] == _journal_entry_for(store.rows[0])["use_id"]
+    # Same logical id, changed payload -> identity conflict -> HOLD (None).
+    changed = dict(row, caption="a different Carmel caption entirely")
+    assert gp._prepare_drive_use_journal("gymx", changed, pick) is None
+
+
+def test_armed_restart_recovers_before_candidate_selection(armed_cas, monkeypatch):
+    authority = armed_cas['authority']
+    authority.lose_apply = True
+    store = _Store()
+    args = dict(voice=_voice(), library_path='/x', city='Carmel', store=store,
+                start=date(2026, 9, 1), days=1, offer=None, events=[], caption_fn=_cap)
+    assert gp.plan_gbp_month('gymx', 'gymx_ig', **args)['operational_hold']
+    original = _journal_entry_for(store.rows[0])
+    authority.lose_apply = False
+    from agent import gym_media_index
+    monkeypatch.setattr(gym_media_index, 'default_store', lambda: armed_cas['media'])
+    monkeypatch.setattr(gp, '_drive_photo_candidate', lambda *a: pytest.fail('selection during recovery'))
+    out = gp.plan_gbp_month('gymx', 'gymx_ig', **args)
+    assert out['ok'] and out['recovered'] == 1
+    assert len(store.rows) == 1
+    assert authority.calls == ['apply', 'receipt']
+    assert _journal.get(original['use_id'])['state'] == 'claim_done'
+
+
+def test_armed_enabled_failure_holds_before_selection(armed_cas, monkeypatch):
+    from agent import remote_drive_use
+    def fail():
+        raise OSError('flag read failed')
+    monkeypatch.setattr(remote_drive_use, 'enabled', fail)
+    monkeypatch.setattr(gp, '_drive_photo_candidate', lambda *a: pytest.fail('selected'))
+    store = _Store()
+    out = gp.plan_gbp_month('gymx', 'gymx_ig', voice=_voice(), library_path='/x',
+                            city='Carmel', store=store, days=1, caption_fn=_cap)
+    assert out['operational_hold'] and not store.rows
+
+
+def test_armed_restart_zero_readback_keeps_original_identity(armed_cas, monkeypatch):
+    class LostStore(_Store):
+        def insert_rows(self, key, rows):
+            self.proposed = [dict(r) for r in rows]
+            raise OSError('unknown outcome')
+        def authoritative_rows_for_keys(self, key, proposed):
+            return []
+    store = LostStore()
+    args = dict(voice=_voice(), library_path='/x', city='Carmel', store=store,
+                start=date(2026, 9, 1), days=1, offer=None, events=[], caption_fn=_cap)
+    with pytest.raises(OSError):
+        gp.plan_gbp_month('gymx', 'gymx_ig', **args)
+    entry = _journal_entry_for(store.proposed[0])
+    from agent import gym_media_index
+    monkeypatch.setattr(gym_media_index, 'default_store', lambda: armed_cas['media'])
+    monkeypatch.setattr(gp, '_drive_photo_candidate', lambda *a: pytest.fail('selected'))
+    out = gp.plan_gbp_month('gymx', 'gymx_ig', **args)
+    assert out['operational_hold'] and out['use_ids'] == [entry['use_id']]
+    assert _journal.get(entry['use_id'])['state'] == 'unknown_result'
+
+
+def test_second_intent_failure_retains_all_claims(armed_cas, monkeypatch):
+    asset2 = _armed_asset('drive-2')
+    armed_cas['media'].assets['drive-2'] = dict(asset2)
+    def candidate(account, day, used):
+        asset = asset2 if day == '2026-09-04' else armed_cas['asset']
+        return dict(url=f'https://r2/{day}.jpg', kind='drive', day_key=day,
+                    asset=dict(asset), base='gymx', store=armed_cas['media'])
+    monkeypatch.setattr(gp, '_drive_photo_candidate', candidate)
+    real = _journal.record_write_intent
+    calls = []
+    def intent(use_id):
+        calls.append(use_id)
+        if len(calls) == 2:
+            raise _journal.JournalHold('second failure')
+        return real(use_id)
+    monkeypatch.setattr(_journal, 'record_write_intent', intent)
+    monkeypatch.setattr(gp, '_release_drive_claim', lambda *a: pytest.fail('released'))
+    store = _Store()
+    out = gp.plan_gbp_month('gymx', 'gymx_ig', voice=_voice(), library_path='/x',
+                            city='Carmel', store=store, start=date(2026, 9, 1),
+                            days=4, offer=None, events=[], caption_fn=_cap)
+    assert not out['ok'] and not store.rows
+    assert [e['state'] for e in _journal.unsettled()] == ['write_intent', 'prepared']
+
+
+def test_armed_full_portal_defaults_settle(armed_cas):
+    class FullStore(_Store):
+        def insert_rows(self, key, rows):
+            super().insert_rows(key, rows)
+            return [dict(_journal._LANDED_OMITTED_DEFAULTS, **row,
+                         id='portal-row', created_at='2026-10-08T12:00:00Z',
+                         updated_at='2026-10-08T12:00:00Z') for row in rows]
+    store = FullStore()
+    out = gp.plan_gbp_month('gymx', 'gymx_ig', voice=_voice(), library_path='/x',
+                            city='Carmel', store=store, start=date(2026, 9, 1),
+                            days=1, offer=None, events=[], caption_fn=_cap)
+    assert out['ok'] and _journal_entry_for(store.rows[0])['state'] == 'claim_done'
+
+
+def test_restart_receipt_confirmed_completes_claim_without_remote_replay(armed_cas, monkeypatch):
+    real_complete = gp._complete_drive_claim
+    def fail(pick):
+        raise OSError('crash before claim done')
+    monkeypatch.setattr(gp, '_complete_drive_claim', fail)
+    store = _Store()
+    args = dict(voice=_voice(), library_path='/x', city='Carmel', store=store,
+                start=date(2026, 9, 1), days=1, caption_fn=_cap)
+    assert gp.plan_gbp_month('gymx', 'gymx_ig', **args)['operational_hold']
+    entry = _journal_entry_for(store.rows[0])
+    assert entry['state'] == 'receipt_confirmed'
+    from agent import gym_media_index, db
+    assert db.socialapi_claim(entry['claim_id'], 'gymx_gbp')[0] == 'in_flight'
+    monkeypatch.setattr(gp, '_complete_drive_claim', real_complete)
+    monkeypatch.setattr(gym_media_index, 'default_store', lambda: armed_cas['media'])
+    monkeypatch.setattr(gp, '_drive_photo_candidate', lambda *a: pytest.fail('selected'))
+    assert gp.plan_gbp_month('gymx', 'gymx_ig', **args)['ok']
+    assert _journal.get(entry['use_id'])['state'] == 'claim_done'
+    assert _journal.unsettled() == []
+    assert armed_cas['authority'].calls == ['apply']
+
+
+def test_claim_update_noop_does_not_mark_terminal(armed_cas, monkeypatch):
+    monkeypatch.setattr(gp, '_complete_drive_claim', lambda pick: None)
+    store = _Store()
+    out = gp.plan_gbp_month('gymx', 'gymx_ig', voice=_voice(), library_path='/x',
+                            city='Carmel', store=store, start=date(2026, 9, 1),
+                            days=1, caption_fn=_cap)
+    assert out['operational_hold']
+    assert _journal_entry_for(store.rows[0])['state'] == 'receipt_confirmed'

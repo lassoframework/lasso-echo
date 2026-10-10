@@ -223,6 +223,7 @@ def test_missing_owner_bridge_holds_before_provider(active,case,monkeypatch):
     monkeypatch.setattr('agent.forward_media_owner_worker.settings_from_environment',lambda:(('same-gym',),25))
     conn=Conn();persistence=owner.ForwardMediaOwnerPersistence(conn,'owner',SimpleNamespace(read=lambda u:case.data))
     snap={**case.request,'account':'instagram','format':'feed','group_key':'vg',
+        'local_census_current':True,
         'copy':dict(gym_id='same-gym',local_date=case.request['local_date'],logical_post_id=case.request['logical_post_id'],group_key='vg',caption=derive(active)['caption'])}
     monkeypatch.setattr(guard,'generated_snapshot',lambda p,r:snap)
     result=runtime.run_calendar_row('same-gym',SimpleNamespace(key='same-gym_ig',platform='instagram'),identity(),
@@ -234,7 +235,7 @@ def test_missing_owner_bridge_holds_before_provider(active,case,monkeypatch):
 def test_owner_snapshot_consumes_bundle_without_local_sources(active,case,monkeypatch):
     conn=Conn();p=SimpleNamespace(_conn=conn,_reader=SimpleNamespace(read=lambda u:case.data))
     snap={**case.request,'account':'instagram','format':'feed','group_key':'vg','history_complete':True,
-        'photo_inventory_complete':True,'eligible_photo_count':0,
+        'photo_inventory_complete':True,'local_census_current':True,'eligible_photo_count':0,
         'history':dict(rows=[],scope_complete=True,spine_digest=case.request['history_revision']),
         'copy':dict(gym_id='same-gym',local_date=case.request['local_date'],logical_post_id=case.request['logical_post_id'],group_key='vg',caption=derive(active)['caption'])}
     monkeypatch.setattr(guard,'generated_snapshot',lambda p,r:copy.deepcopy(snap))
@@ -259,7 +260,7 @@ def test_full_owner_generation_replay_and_current_publish_binding(active,case,mo
     row_id=identity();account=SimpleNamespace(key='same-gym_ig',platform='instagram')
     a=derive(active)
     snap={**case.request,'account':'instagram','format':'feed','group_key':'vg_bound',
-        'photo_inventory_complete':True,'eligible_photo_count':0,'history_complete':True,
+        'photo_inventory_complete':True,'local_census_current':True,'eligible_photo_count':0,'history_complete':True,
         'history':dict(rows=[],scope_complete=True,spine_digest=case.request['history_revision']),
         'copy':dict(gym_id='same-gym',local_date=case.request['local_date'],logical_post_id=case.request['logical_post_id'],group_key='vg_bound',caption=a['caption'])}
     monkeypatch.setattr(guard,'generated_snapshot',lambda p,r:copy.deepcopy(snap))
@@ -345,7 +346,8 @@ def test_real_python_B_seam_uses_canonical_reservation_and_fresh_authority(activ
     case.snapshot.update(copy=authority['copy'],palette=authority['palette'],copy_approved=False,
         copy_verified=True,copy_digest=prep.digest(authority['copy']),authority_pins=authority['authority_pins'],
         copy_derivation_receipt=authority['copy_derivation_receipt'],palette_digest=prep.digest(authority['palette']),
-        palette_verified=True,approved_source_revision=authority['source_revision'],palette_revision=authority['palette_revision'])
+        palette_verified=True,local_census_current=True,
+        approved_source_revision=authority['source_revision'],palette_revision=authority['palette_revision'])
     case.request['palette_revision']=authority['palette_revision']
     result=prep.prepare_candidate(case.request,case.snapshot,jobs=case.jobs,provider=case.provider,
         reviewer=case.reviewer,storage=case.storage,enabled=True)
@@ -361,7 +363,8 @@ def test_real_python_B_seam_uses_canonical_reservation_and_fresh_authority(activ
     conn=ReservationConn();p=owner.ForwardMediaOwnerPersistence(conn,'owner',None)
     monkeypatch.setattr(p,'_assert_owner_identity',lambda:None)
     monkeypatch.setattr(runtime,'_owner_bundle_readback',lambda persistence,base:copy.deepcopy(active))
-    db={**case.request,'photo_inventory_complete':True,'eligible_photo_count':0,'history_complete':True,'history':{'rows':[]}}
+    db={**case.request,'photo_inventory_complete':True,'local_census_current':True,
+        'eligible_photo_count':0,'history_complete':True,'history':{'rows':[]}}
     monkeypatch.setattr(guard,'generated_snapshot',lambda p,r:db)
     monkeypatch.setattr('agent.visual_writer_prepare._own_media_url',lambda u:u.startswith('https://images.example.test/'))
     reads=[]

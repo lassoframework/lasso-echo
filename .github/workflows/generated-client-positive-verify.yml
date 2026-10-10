@@ -1,0 +1,87 @@
+name: Generated client isolated positive CLI rehearsal
+run-name: Generated client positive ${{ inputs.verification_id || github.run_id }}
+on:
+  push:
+    branches:
+      - codex/echo-image-combined-20261009
+    paths:
+      - .github/workflows/generated-client-positive-verify.yml
+      - .github/fixer-verifier/generated-client-positive.Dockerfile
+      - tests/fixtures/generated_client_linux_positive/**
+      - tests/test_generated_client_linux_positive*.py
+  workflow_dispatch:
+    inputs:
+      target_sha:
+        description: Exact accepted candidate commit to rehearse
+        required: true
+        type: string
+      verification_id:
+        description: Unique evidence correlation identifier
+        required: true
+        type: string
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Validate exact candidate
+        env:
+          TARGET_SHA: ${{ inputs.target_sha || github.sha }}
+          WORKFLOW_SHA: ${{ github.sha }}
+        run: |
+          case "$TARGET_SHA" in (*[!0-9a-fA-F]*|'') exit 1;; esac
+          test "${#TARGET_SHA}" -eq 40
+          test "$TARGET_SHA" = "$WORKFLOW_SHA"
+      - name: Check out exact candidate
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.target_sha || github.sha }}
+          path: target
+          persist-credentials: false
+      - name: Build disposable PG17 verifier
+        run: |
+          mkdir -p "$RUNNER_TEMP/generated-positive-build/src" "$RUNNER_TEMP/generated-positive-data"
+          rsync -a --exclude=.git "$GITHUB_WORKSPACE/target/" "$RUNNER_TEMP/generated-positive-build/src/"
+          cp "$GITHUB_WORKSPACE/target/.github/fixer-verifier/generated-client-positive.Dockerfile" "$RUNNER_TEMP/generated-positive-build/Dockerfile"
+          docker build --tag generated-positive:"${{ github.run_id }}" "$RUNNER_TEMP/generated-positive-build"
+          sudo chown 999:999 "$RUNNER_TEMP/generated-positive-data"
+          sudo chmod 1777 "$RUNNER_TEMP/generated-positive-data"
+      - name: Create finite network disabled mounted rehearsal
+        run: |
+          docker create --name generated-positive --network none --cap-drop ALL --security-opt no-new-privileges \
+            --pids-limit 256 --memory 3g --tmpfs /tmp:rw,nosuid,size=512m \
+            --mount "type=bind,source=$RUNNER_TEMP/generated-positive-data,target=/data" \
+            generated-positive:"${{ github.run_id }}"
+          test "$(docker inspect -f '{{.HostConfig.NetworkMode}}' generated-positive)" = none
+          docker inspect -f '{{json .HostConfig}}' generated-positive > "$RUNNER_TEMP/generated-positive-data/container-config.json"
+          docker start --attach generated-positive
+          test "$(docker inspect -f '{{.State.ExitCode}}' generated-positive)" = 0
+      - name: Preserve raw container output
+        if: always()
+        run: docker logs generated-positive > "$RUNNER_TEMP/generated-positive-data/rehearsal.log" 2>&1
+      - name: Require positive CLI receipt
+        env:
+          TARGET_SHA: ${{ inputs.target_sha || github.sha }}
+          WORKFLOW_SHA: ${{ github.sha }}
+        run: |
+          python3 -c 'import json,sys; r=json.load(open(sys.argv[1])); assert r["positive_cli"] is True and r["production"] is False' "$RUNNER_TEMP/generated-positive-data/positive-cli-receipt.json"
+          printf '%s\n' "$TARGET_SHA" > "$RUNNER_TEMP/generated-positive-data/target-sha.txt"
+          printf '%s\n' "$WORKFLOW_SHA" > "$RUNNER_TEMP/generated-positive-data/workflow-sha.txt"
+      - name: Preserve synthetic receipt
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: generated-positive-${{ inputs.verification_id || github.run_id }}
+          path: |
+            ${{ runner.temp }}/generated-positive-data/positive-cli-receipt.json
+            ${{ runner.temp }}/generated-positive-data/container-config.json
+            ${{ runner.temp }}/generated-positive-data/target-sha.txt
+            ${{ runner.temp }}/generated-positive-data/workflow-sha.txt
+            ${{ runner.temp }}/generated-positive-data/rehearsal.log
+            ${{ runner.temp }}/generated-positive-data/positive-transport/calls.jsonl
+          if-no-files-found: error
+      - name: Remove disposable container
+        if: always()
+        run: docker rm -f generated-positive || true

@@ -82,7 +82,7 @@ def test_static_business_refusals_unchanged():
     for fragment in (
         "global history import requires READ COMMITTED",
         "global history import refused: published event lacks ledger owner",
-        "global history import refused: staged history has no original date",
+        "global history import refused: consumed history has no verified original date",
         "global history import refused: occupied scene has incomplete byte evidence",
         "global history import refused: calendar coverage incomplete",
         "global history import refused: published history is unresolved",
@@ -90,9 +90,9 @@ def test_static_business_refusals_unchanged():
         "global history import refused: post-import coverage incomplete",
     ):
         assert fragment in body, fragment
-    # Keyed full-set import still runs before null-key historical attribution.
-    assert body.index("visual_global_claim_fingerprint_set") < body.index(
-        "visual_global_claim_historical_row")
+    # Published history is bound before live reserved claims are admitted.
+    assert body.index("perform public.visual_global_claim_historical_row(") < body.index(
+        "perform public.visual_global_claim_fingerprint_set(")
     assert body.index("visual_global_coverage()") < body.index(
         "visual_global_claim_fingerprint_set")
     # Return shape unchanged.
@@ -249,8 +249,15 @@ def test_import_business_behavior_unchanged(database):
     result = json.loads(sql("select public.visual_global_import_history()"))
     assert result["imported_null_key_rows"] == 1
     assert result["global_fingerprints"] == 1
-    assert sql("select state from public.visual_global_usage "
-               f"where fingerprint={q(scene['fingerprint'])}") == "published"
+    assert sql("select count(*) from public.visual_global_historical_incident "
+               "where source_kind='calendar' and source_state='published' "
+               f"and tenant_id={q(scene['tid'])} and group_key={q(scene['group'])} "
+               f"and fingerprint={q(scene['fingerprint'])} and used_date={q(D1)} "
+               "and channel='ig' and jsonb_array_length(byte_evidence)>0") == "1"
+    # Import records the actual published incident without inventing a
+    # runtime owner for an old null-key calendar row.
+    assert sql("select count(*) from public.visual_global_usage "
+               f"where fingerprint={q(scene['fingerprint'])}") == "0"
     assert sql("select coalesce(string_agg(issue,',' order by issue),'') "
                "from public.visual_global_coverage()") == "ready"
     # Re-import reports the one already-attributed historical row again;

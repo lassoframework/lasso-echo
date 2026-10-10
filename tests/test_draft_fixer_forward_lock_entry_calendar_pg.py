@@ -80,11 +80,15 @@ def main():
         # bodies are the authority under test, so catalog validation is off
         # (the evidence references the full production schema).
         sql("set check_function_bodies=off;\n" + EVIDENCE.read_text())
+        # Current live claim prerequisite supersedes only the older claim body.
+        current_claim = (ROOT / 'migrations/lasso_october7_catchup_capacity_20261008.sql').read_text()
+        sql("set check_function_bodies=off;\n" + current_claim)
 
         # The evidence install must reproduce the inventory hashes; this pins
         # the migration's precondition constants to the captured production
         # bodies before any replace runs.
         inventory = {r['proname']: r['body_md5'] for r in json.loads(INVENTORY.read_text())['rows']}
+        inventory['claim_calendar_publish_slot_owned'] = 'c624eedcee819496129639108be991f6'
         for name in TARGETS:
             actual = sql(f"select md5(prosrc) from pg_proc p join pg_namespace n "
                          f"on n.oid=p.pronamespace where n.nspname='public' and p.proname='{name}';")

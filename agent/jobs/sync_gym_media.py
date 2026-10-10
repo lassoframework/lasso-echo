@@ -26,6 +26,17 @@ Degrades cleanly: no SA key / no Supabase creds -> the identity check fails clos
 here stages, publishes, or writes calendar rows (beyond flipping a pending row
 whose media vanished). NOTHING here logs a secret.
 
+INVENTORY MUTATION RECEIPT FENCE (default OFF, DRAFT): when
+AGENT_LOCAL_INVENTORY_MUTATIONS_ENABLED=true, every per-source index/asset
+mutation (steps 2-6b) runs under ONE begin/complete receipt from
+agent/local_inventory_mutation.py, and every effect is re-read from the store
+BEFORE the receipt may COMPLETE (_verify_index_readback). An uncertain
+configuration, duplicate/collision, write, flip, or readback holds the exact
+mutation pending and the source returns {"ok": False, "held": True} — no
+digest, no certified success. Drive itself stays read-only (walk/download
+only); originals, source aliases, approvals, and consent/hold gates are never
+rewritten. Fence OFF: byte-identical legacy behavior.
+
 GAP 3 (audit of PR #68, client_dm_support): "the coach channel" in steps 1 and 7
 above is a CLIENT-FACING Slack channel, and this module used to post straight to
 it with no reference to conditions.compose(), the outbox, or the client_dm_support
@@ -42,10 +53,12 @@ import os
 import tempfile
 import time
 from collections import Counter
+from contextvars import ContextVar
 from datetime import datetime, timezone
 from pathlib import Path
 
 from .. import config, gym_media_index as _idx
+from .. import local_inventory_mutation as _mutation
 
 # The indexer-owned columns compared for the changed-row PATCH. Probe columns
 # (duration/width/height/aspect/crop_hint), vision_json, rendition_*, and selector
@@ -55,6 +68,165 @@ _OWNED_FIELDS = ("kind", "title", "mime_type", "size_bytes", "content_hash",
                  "drive_modified", "source_id")
 
 _STAGGER_SEC = 30.0
+
+
+# ---- inventory mutation receipt fence (default OFF) -------------------------
+# Mirrors the guard in agent/intake_ingest.py / agent/intake_web.py: when
+# AGENT_LOCAL_INVENTORY_MUTATIONS_ENABLED=true, the whole per-source index
+# mutation (inserts, owned-field patches, the removed-sweep + pending flip,
+# probe writes, pre-render persistence, classifier quarantine) runs under ONE
+# begin/complete receipt, and every effect is re-read from the store BEFORE the
+# receipt may COMPLETE. Any uncertain configuration, collision, write, or
+# readback holds the exact mutation pending for operator reconciliation and the
+# source returns a held summary — no digest, no COMPLETE. Fence OFF (default):
+# every write runs exactly as it always has.
+_active_mutation = ContextVar("gym_media_sync_inventory_mutation", default=None)
+
+
+def _fence_config(gym_id):
+    """MutationConfig for this gym's fence, or None when the fence is OFF."""
+    if not _mutation.enabled():
+        return None
+    root = (Path(config.LIBRARY_PATH) / gym_id).absolute()
+    root.mkdir(parents=True, exist_ok=True)
+    return _mutation.configured(gym_id, root)
+
+
+def _run_mutation(gym_id, kind, request_payload, apply):
+    """Run apply(conn) under the mutation receipt protocol when armed, else
+    directly. MutationHold propagates (hold, never fake success)."""
+    active = _active_mutation.get()
+    if active is not None:
+        if active["cfg"].gym_id != gym_id:
+            raise _mutation.MutationHold("gym_media_mutation_binding_invalid")
+        # The whole source disposition already owns the canonical lock. Nested
+        # effects belong to that receipt and must never reacquire its flock.
+        return apply(active["conn"])
+    cfg = _fence_config(gym_id)
+    if cfg is None:
+        return apply(None)
+    authority = _mutation.MutationAuthority.from_environment()
+
+    def _apply(conn):
+        token = _active_mutation.set({"cfg": cfg, "conn": conn})
+        try:
+            return apply(conn)
+        finally:
+            _active_mutation.reset(token)
+
+    try:
+        return _mutation.run(cfg, authority, kind, request_payload, _apply)
+    finally:
+        authority.close()
+
+
+class _EffectReadbackStore:
+    """Track inserted rows and attempted patches, including swallowed errors.
+
+    Final readback compares every written field after subsequent effects have
+    overridden earlier ones. A failed write remains sticky until verification.
+    """
+    def __init__(self, store, gym_id, source_id):
+        self.store, self.gym_id, self.source_id = store, gym_id, source_id
+        self.expected = {}
+        self.failed = False
+
+    def __getattr__(self, name):
+        return getattr(self.store, name)
+
+    def _write(self, kind, identifier, fields, apply):
+        self.expected.setdefault((kind, identifier), {}).update(fields)
+        try:
+            return apply()
+        except Exception:
+            self.failed = True
+            raise
+
+    def insert_assets_ignore_conflicts(self, rows):
+        # A conflict is not an insert effect: preserve the existing owner's
+        # probe/consent/selector state. Snapshot input before the store call so
+        # a store mutating its arguments cannot rewrite the expected readback.
+        expected = {row["id"]: dict(row) for row in rows}
+        try:
+            inserted = self.store.insert_assets_ignore_conflicts(rows)
+            for identifier in inserted:
+                self.expected.setdefault(("asset", identifier), {}).update(
+                    expected[identifier])
+            return inserted
+        except Exception:
+            self.failed = True
+            raise
+
+    def update_asset(self, identifier, fields):
+        return self._write("asset", identifier, fields,
+                           lambda: self.store.update_asset(identifier, fields))
+
+    def update_indexed_asset_if_hash(self, gym_id, identifier, old_hash, fields):
+        return self._write("asset", identifier, fields,
+                           lambda: self.store.update_indexed_asset_if_hash(
+                               gym_id, identifier, old_hash, fields))
+
+    def update_source(self, identifier, fields):
+        return self._write("source", identifier, fields,
+                           lambda: self.store.update_source(identifier, fields))
+
+    def verify(self):
+        if self.failed:
+            raise _mutation.MutationHold("gym_media_write_effect_uncertain")
+        try:
+            for (kind, identifier), fields in self.expected.items():
+                current = (self.store.get_asset(identifier) if kind == "asset"
+                           else self.store.get_source(identifier))
+                if (not current or current.get("gym_id") != self.gym_id
+                        or (kind == "asset" and current.get("source_id") != self.source_id)
+                        or (kind == "source" and current.get("id") != self.source_id)
+                        or any(current.get(key) != value for key, value in fields.items())):
+                    raise _mutation.MutationHold("gym_media_readback_mismatch")
+        except _mutation.MutationHold:
+            raise
+        except Exception:
+            raise _mutation.MutationHold("gym_media_readback_failed") from None
+
+
+def _update_source_verified(store, gym_id, source_id, fields):
+    if _active_mutation.get() is None:
+        return store.update_source(source_id, fields)
+    effects = _EffectReadbackStore(store, gym_id, source_id)
+    result = effects.update_source(source_id, fields)
+    effects.verify()
+    return result
+
+
+def _verify_index_readback(store, gym_id, rows, vanished, probed_ids):
+    """Fenced mode only: re-read every index effect BEFORE the receipt may
+    COMPLETE. A missing row, a tenant/source drift, an owned-field mismatch, a
+    vanished asset still eligible, or a probed video still without a duration
+    holds the whole receipt for reconciliation. Never certifies from the
+    in-memory view alone."""
+    try:
+        for r in rows:
+            current = store.get_asset(r["id"])
+            if not current:
+                raise _mutation.MutationHold("gym_media_readback_missing")
+            if (current.get("gym_id") != gym_id
+                    or current.get("source_id") != r.get("source_id")):
+                raise _mutation.MutationHold("gym_media_readback_mismatch")
+            for f in _OWNED_FIELDS:
+                if current.get(f) != r.get(f):
+                    raise _mutation.MutationHold("gym_media_readback_mismatch")
+        for aid in vanished:
+            current = store.get_asset(aid)
+            if (not current or current.get("eligible") is not False
+                    or current.get("reject_reason") != _idx.REJECT_REMOVED):
+                raise _mutation.MutationHold("gym_media_readback_mismatch")
+        for aid in probed_ids:
+            current = store.get_asset(aid)
+            if not current or current.get("duration_sec") is None:
+                raise _mutation.MutationHold("gym_media_readback_mismatch")
+    except _mutation.MutationHold:
+        raise
+    except Exception:
+        raise _mutation.MutationHold("gym_media_readback_failed") from None
 
 
 def _tenant_identity(gym_id):
@@ -328,6 +500,8 @@ def _flip_pending_for_missing(gym_id, asset_ids, log):
     url = config.supabase_url()
     key = config.supabase_service_key()
     if not url or not key:
+        if _active_mutation.get() is not None:
+            raise _mutation.MutationHold("gym_media_flip_effect_uncertain")
         return 0
     import requests  # lazy
     flipped = 0
@@ -346,15 +520,280 @@ def _flip_pending_for_missing(gym_id, asset_ids, log):
                          "Prefer": "return=minimal"},
                 timeout=30)
             if r.status_code < 400:
+                if _active_mutation.get() is not None:
+                    readback = requests.get(
+                        f"{url.rstrip('/')}/rest/v1/content_calendar",
+                        params={"gym_id": f"eq.{gym_id}", "status": "eq.pending",
+                                "source_media_asset_id": f"eq.{aid}", "select": "id"},
+                        headers={"apikey": key, "Authorization": f"Bearer {key}"},
+                        timeout=30)
+                    remaining = readback.json() if readback.status_code < 400 else None
+                    if not isinstance(remaining, list) or remaining:
+                        raise _mutation.MutationHold("gym_media_flip_effect_uncertain")
                 flipped += 1
             else:
                 # A 4xx here used to be invisible: only exceptions were logged, so a
                 # rejected flip looked exactly like "no row was using that asset".
                 log(f"flip-pending REJECTED {r.status_code} for {aid}: "
                     f"{(r.text or '')[:200]}")
+                if _active_mutation.get() is not None:
+                    # Fenced: a rejected calendar effect is an uncertain effect.
+                    # Hold the whole receipt; never certify the index mutation
+                    # while a pending post still points at vanished media.
+                    raise _mutation.MutationHold("gym_media_flip_effect_uncertain")
+        except _mutation.MutationHold:
+            raise
         except Exception as e:  # noqa: BLE001
+            if _active_mutation.get() is not None:
+                raise _mutation.MutationHold("gym_media_flip_effect_uncertain") from None
             log(f"flip-pending failed for {aid}: {type(e).__name__}: {e}")
     return flipped
+
+
+def _index_effects(source, *, files, drive, store, probe_fn, log, now_iso,
+                   probe_budget, render_budget, host_fn, sweep_missing):
+    """All index/asset mutations for ONE verified source walk. Runs inside the
+    inventory mutation receipt fence when armed (sync_source wraps this in
+    _run_mutation), directly when the fence is OFF. Any exception propagates:
+    under the fence it holds the whole receipt pending; unfenced it behaves
+    exactly as it always has."""
+    gym_id = source.get("gym_id")
+    source_id = source.get("id")
+
+    if _active_mutation.get() is not None:
+        store = _EffectReadbackStore(store, gym_id, source_id)
+
+    # A source that had been marked revoked but now reads fine is restored.
+    if source.get("revoked_externally"):
+        try:
+            store.update_source(source_id, {"revoked_externally": False})
+        except Exception:
+            pass
+
+    # 2. classify + dedupe
+    rows, skipped = _idx.build_rows(files, source_id, gym_id, now_iso=now_iso, log=log)
+
+    # 2b. RE-INGEST GUARD (Story Studio §0 / the EP124 lesson): a file whose
+    # content_hash matches one of Echo's OWN past Story renders was saved back into
+    # the client's Drive by the coach. It must NEVER be re-indexed as raw media (or
+    # Echo would eat its own output and repost it). Drop those rows here, before
+    # insert, and log the skip. Uses the shared render_ledger (Supabase, kv
+    # fallback); a not-configured ledger returns False (no skip), so this is inert
+    # until the first Story render is recorded.
+    rows, reingest_skipped = _drop_reingested(rows, gym_id, log)
+    skipped += [(t, "echo_render_reingest_skipped") for t in reingest_skipped]
+
+    existing = {a["id"]: a for a in store.list_assets(gym_id, source_id=source_id)}
+    # Drive may expose the same file through two bound folders. The asset PK is
+    # global by Drive ID; the first source owns it. Never reassign it or let the
+    # second source's disappearance sweep change its eligibility. A cross-tenant
+    # collision is an error, not permission to read or mutate that tenant's row.
+    owned_rows = []
+    for row in rows:
+        if row["id"] not in existing:
+            owner = store.get_asset(row["id"])
+            if owner:
+                if owner.get("gym_id") != gym_id:
+                    raise ValueError("Drive file is already indexed for another gym")
+                log(f"shared Drive file {row['id']} already belongs to source "
+                    f"{owner.get('source_id')}; skipping duplicate")
+                continue
+        owned_rows.append(row)
+    rows = owned_rows
+    seen_ids = {r["id"] for r in rows}
+
+    # 3. insert new / patch changed indexer-owned fields
+    candidates = [r for r in rows if r["id"] not in existing]
+    inserted_ids = store.insert_assets_ignore_conflicts(candidates)
+    # Another source can win between the ownership precheck and this insert.
+    # Re-read every candidate before any probe/update/classification. Unique
+    # files still insert even when one shared ID loses the race.
+    skipped_ids = set()
+    for row in candidates:
+        owner = store.get_asset(row["id"])
+        if not owner:
+            raise RuntimeError("Drive asset insert could not be verified")
+        if owner.get("gym_id") != gym_id:
+            raise ValueError("Drive file is already indexed for another gym")
+        if owner.get("source_id") != source_id:
+            skipped_ids.add(row["id"])
+    if skipped_ids:
+        rows = [r for r in rows if r["id"] not in skipped_ids]
+        seen_ids.difference_update(skipped_ids)
+    new_rows = [r for r in candidates if r["id"] in inserted_ids]
+    inserted = len(new_rows)
+    updated = 0
+    for r in rows:
+        old = existing.get(r["id"])
+        if old is None:
+            continue
+        changes = {f: r[f] for f in _OWNED_FIELDS if old.get(f) != r.get(f)}
+        if old.get("reject_reason") == _idx.REJECT_REMOVED and r["id"] in seen_ids:
+            # An asset that came back: recompute eligibility from what is known.
+            changes["eligible"] = r.get("eligible")
+            changes["reject_reason"] = r.get("reject_reason")
+        if changes:
+            changes["indexed_at"] = now_iso
+            if old.get("content_hash") != r.get("content_hash"):
+                # Drive IDs survive byte replacement. All inspection and
+                # consent decisions for the old bytes must be invalidated in
+                # the same conditional write as the new hash. A concurrent
+                # operator review locks/checks the old hash and cannot revive
+                # this asset after this patch.
+                changes.update(
+                    review_status="pending_review", reviewed_by=None,
+                    reviewed_at=None, review_note=None,
+                    review_content_hash=None,
+                    moderation_status="pending", moderation_json=None,
+                    people_detected=None, consent_status="pending",
+                    consent_member_ref=None, release_ref=None,
+                    consent_expires_at=None,
+                    eligible=r.get("eligible"),
+                    duration_sec=None, width=r.get("width"),
+                    height=r.get("height"), aspect=r.get("aspect"),
+                    vision_json=None, rendition_key=None, rendition_url=None)
+                store.update_indexed_asset_if_hash(
+                    gym_id, r["id"], old.get("content_hash"), changes)
+            else:
+                store.update_asset(r["id"], changes)
+            updated += 1
+
+    # 4. Nightly reconciliation only. The queued post-bind import must never
+    # mutate existing assets or pending calendar rows because a temporarily
+    # incomplete Drive walk could otherwise rewrite a pending post.
+    removed = 0
+    vanished = []
+    if sweep_missing:
+        for asset_id, old in existing.items():
+            if asset_id in seen_ids:
+                continue
+            if old.get("reject_reason") == _idx.REJECT_REMOVED:
+                continue  # already marked; idempotent
+            store.update_asset(asset_id, {"eligible": False,
+                                          "reject_reason": _idx.REJECT_REMOVED,
+                                          "indexed_at": now_iso})
+            vanished.append(asset_id)
+            removed += 1
+        _flip_pending_for_missing(gym_id, vanished, log)
+
+    # 5. budgeted probe pass over unprobed VIDEO candidates
+    probe_fn = probe_fn or _idx.probe_video
+    budget = config.gym_drive_probe_max_per_run() if probe_budget is None \
+        else int(probe_budget)
+    merged = {a["id"]: dict(a) for a in existing.values()}
+    for r in rows:
+        merged.setdefault(r["id"], dict(r))
+        merged[r["id"]]["id"] = r["id"]
+    candidates = [a for a in merged.values()
+                  if a["id"] in seen_ids
+                  and a.get("kind") == _idx.KIND_VIDEO
+                  and a.get("duration_sec") is None
+                  and a.get("eligible") is not False]
+    probed = newly_eligible = 0
+    probed_ids = []
+    reject_counts = Counter()
+    # LIVE classifier signals (2026-09-01 hardening): the OCR / cut-density probes
+    # ride the SAME downloaded bytes this loop already fetches for ffprobe — no
+    # second download, no new budget. {asset_id: (has_burned_text, cut_density)}.
+    # Gated on story_classifier_enabled (the classifier's own flag; this closes a
+    # gap in an already-armed lane, not a new capability) AND on the classifier's
+    # OCR reader actually being armed (agent/ocr_check reuses the existing Gemini
+    # vision path, itself gated on AGENT_NANO_ENABLED) — a no-op, not a crash, when
+    # that is off.
+    ocr_signals = {}
+    run_ocr = config.story_classifier_enabled()
+    for asset in candidates[:budget]:
+        tmp_dir = tempfile.mkdtemp(prefix="gymprobe_")
+        tmp_path = Path(tmp_dir) / "probe.bin"
+        try:
+            drive.download(asset["id"], tmp_path)
+            info = probe_fn(tmp_path)
+            if run_ocr and info:
+                try:
+                    from .. import story_classifier as _sc
+                    has_text = _sc.default_ocr_reader(str(tmp_path))
+                    cuts = _sc.default_cut_probe(str(tmp_path))
+                    if has_text is not None or cuts is not None:
+                        ocr_signals[asset["id"]] = (has_text, cuts)
+                except Exception as e:  # noqa: BLE001 - a probe failure never blocks
+                    log(f"classifier probe failed for {asset.get('title')!r}: "
+                        f"{type(e).__name__}: {e}")
+        except Exception as e:  # noqa: BLE001 - one bad file never sinks the pass
+            log(f"probe failed for {asset.get('title')!r}: {type(e).__name__}: {e}")
+            info = None
+        finally:
+            try:
+                if tmp_path.exists():
+                    tmp_path.unlink()
+                os.rmdir(tmp_dir)
+            except OSError:
+                pass
+        if not info:
+            continue  # stays unprobed -> stays unselectable (fail closed)
+        el, reason, label = _idx.video_eligibility(
+            asset.get("size_bytes"), info["duration_sec"], info["width"],
+            info["height"])
+        probe_fields = {
+            "duration_sec": info["duration_sec"], "width": info["width"],
+            "height": info["height"], "aspect": label,
+            "eligible": el, "reject_reason": reason, "indexed_at": now_iso}
+        store.update_asset(asset["id"], probe_fields)
+        # reflect the probe back onto the local merged view so the classifier sort
+        # (6b) sees real aspect + duration, not the pre-probe NULLs.
+        asset.update(probe_fields)
+        probed += 1
+        probed_ids.append(asset["id"])
+        if el:
+            newly_eligible += 1
+        elif reason:
+            reject_counts[reason] += 1
+
+    for r in new_rows:
+        if r.get("eligible") is False and r.get("reject_reason"):
+            reject_counts[r["reject_reason"]] += 1
+
+    # 5b. budgeted PRE-RENDER pass (audit R-D1 #5): eligible videos with no
+    # rendition_url are downloaded, probed for codec, and either transcoded to an
+    # H.264 .mp4 (HEVC / odd container, counts against RENDITION_MAX_PER_SYNC) or,
+    # when already web-playable, hosted as-is and persisted as their own rendition so
+    # the month build never re-hosts them and this pass never re-downloads them.
+    # Bounded: at most 2x the transcode budget in candidates per source per run;
+    # converges across nights. Runs on the same synced-asset view as the probe pass.
+    rendered, prehosted, render_skipped = _prerender_pass(
+        gym_id, drive, store, merged, seen_ids, probe_fn, log,
+        budget_n=(config.rendition_max_per_sync() if render_budget is None
+                  else int(render_budget)),
+        host_fn=host_fn)
+
+    # 6b. STORY_CLASSIFIER sort (default ON, spec §0): tag freshly-seen assets raw /
+    # finished / ambiguous. AMBIGUOUS queues for a human (or auto-sorts); a
+    # CONFIDENT FINISHED verdict is quarantined out of the raw pool (see
+    # _sort_ambiguous / _quarantine_finished — the 2026-09-01 fix). Uses the
+    # post-probe view (merged) so a probed video classifies on real aspect/duration
+    # AND the live OCR/cut signals gathered above. Only NEW rows are sorted (a
+    # re-sync never re-queues a file a coach already resolved). Sorts + quarantines
+    # only; posts/stages/composes nothing.
+    to_sort = [merged.get(r["id"], r) for r in new_rows]
+    queued_ambiguous = _sort_ambiguous(to_sort, gym_id, log, store=store,
+                                       ocr_signals=ocr_signals)
+
+    # READBACK VERIFICATION (fenced mode only): the receipt may COMPLETE only
+    # after every effect re-reads clean from the store. Unfenced this is a
+    # no-op and the legacy counters stand as they always have.
+    if _active_mutation.get() is not None:
+        _verify_index_readback(store, gym_id, rows, vanished, probed_ids)
+        store.verify()
+
+    photos = sum(1 for r in rows if r["kind"] == _idx.KIND_PHOTO)
+    videos = sum(1 for r in rows if r["kind"] == _idx.KIND_VIDEO)
+    return {
+        "photos": photos, "videos": videos, "inserted": inserted,
+        "updated": updated, "probed": probed, "newly_eligible": newly_eligible,
+        "removed": removed, "skipped": len(skipped),
+        "rejected": dict(reject_counts), "new_rows": len(new_rows),
+        "queued_ambiguous": queued_ambiguous,
+        "rendered": rendered, "prehosted": prehosted,
+        "render_skipped": render_skipped}
 
 
 def _prerender_pass(gym_id, drive, store, merged, seen_ids, probe_fn, log, *,
@@ -568,8 +1007,24 @@ def sync_source(source, *, drive=None, store=None, probe_fn=None, log=None,
     except Exception as e:  # noqa: BLE001
         status = _dc._http_status(e)  # noqa: SLF001 - shared status classifier
         if status in (403, 404):
+            revoke_hold = None
             try:
-                store.update_source(source_id, {"revoked_externally": True})
+                # Fenced when armed: the revoked-mark is a source-row effect and
+                # settles under its own receipt; unfenced it runs directly as it
+                # always has. A hold still notifies + reports revoked (the walk
+                # 403s again next pass); the row is never certified from an
+                # uncertain write.
+                _run_mutation(gym_id, "gym_media_source_revoke",
+                              {"gym_id": gym_id, "source_id": source_id,
+                               "drive_status": status},
+                              lambda conn: _update_source_verified(
+                                  store, gym_id, source_id,
+                                  {"revoked_externally": True}))
+            except _mutation.MutationHold as hold:
+                revoke_hold = str(hold)
+                log(f"source {source_id}: revoked-mark write HELD for "
+                    f"reconciliation ({hold}); notice still fires and the next "
+                    f"pass re-checks")
             except Exception:
                 pass
             msg = (f"Google Drive access for {gym_id} was revoked (the shared "
@@ -578,232 +1033,44 @@ def sync_source(source, *, drive=None, store=None, probe_fn=None, log=None,
             if emit_digest:
                 _post_digest(msg, channel=_client_channel_if_armed(gym_id))
             log(f"source {source_id} for {gym_id} revoked_externally (Drive {status})")
-            return {"ok": False, "revoked": True, "gym_id": gym_id}
+            result = {"ok": False, "revoked": True, "gym_id": gym_id}
+            if revoke_hold is not None:
+                result.update(held=True, hold_reason=revoke_hold, source_id=source_id)
+            return result
         log(f"walk failed for {gym_id}: {type(e).__name__}: {e}")
         return {"ok": False, "error": type(e).__name__, "gym_id": gym_id}
 
-    # A source that had been marked revoked but now reads fine is restored.
-    if source.get("revoked_externally"):
-        try:
-            store.update_source(source_id, {"revoked_externally": False})
-        except Exception:
-            pass
+    # Steps 2-6b (classify/dedupe, insert/patch, removed-sweep + pending flip,
+    # probe, pre-render, classifier sort) are ALL the index/asset mutations of
+    # this pass. They run inside _index_effects, fenced by ONE inventory
+    # mutation receipt when AGENT_LOCAL_INVENTORY_MUTATIONS_ENABLED=true: any
+    # uncertain listing/read, write, duplicate/collision, or readback holds the
+    # exact mutation pending and this source returns a held summary -- no
+    # digest, no COMPLETE. Fence OFF (default): identical legacy behavior.
+    try:
+        effects = _run_mutation(
+            gym_id, "gym_media_sync",
+            {"gym_id": gym_id, "source_id": source_id, "folder_id": folder_id,
+             "now_iso": now_iso,
+             "walked": sorted(str(getattr(f, "id", "")) for f in files)},
+            lambda conn: _index_effects(
+                source, files=files, drive=drive, store=store,
+                probe_fn=probe_fn, log=log, now_iso=now_iso,
+                probe_budget=probe_budget, render_budget=render_budget,
+                host_fn=host_fn, sweep_missing=sweep_missing))
+    except _mutation.MutationHold as hold:
+        log(f"source {source_id} for {gym_id}: index mutation HELD for "
+            f"reconciliation ({hold}); no digest, no complete -- the exact "
+            f"mutation stays pending until an operator settles it")
+        return {"ok": False, "held": True, "gym_id": gym_id,
+                "source_id": source_id, "hold_reason": str(hold)}
 
-    # 2. classify + dedupe
-    rows, skipped = _idx.build_rows(files, source_id, gym_id, now_iso=now_iso, log=log)
-
-    # 2b. RE-INGEST GUARD (Story Studio §0 / the EP124 lesson): a file whose
-    # content_hash matches one of Echo's OWN past Story renders was saved back into
-    # the client's Drive by the coach. It must NEVER be re-indexed as raw media (or
-    # Echo would eat its own output and repost it). Drop those rows here, before
-    # insert, and log the skip. Uses the shared render_ledger (Supabase, kv
-    # fallback); a not-configured ledger returns False (no skip), so this is inert
-    # until the first Story render is recorded.
-    rows, reingest_skipped = _drop_reingested(rows, gym_id, log)
-    skipped += [(t, "echo_render_reingest_skipped") for t in reingest_skipped]
-
-    existing = {a["id"]: a for a in store.list_assets(gym_id, source_id=source_id)}
-    # Drive may expose the same file through two bound folders. The asset PK is
-    # global by Drive ID; the first source owns it. Never reassign it or let the
-    # second source's disappearance sweep change its eligibility. A cross-tenant
-    # collision is an error, not permission to read or mutate that tenant's row.
-    owned_rows = []
-    for row in rows:
-        if row["id"] not in existing:
-            owner = store.get_asset(row["id"])
-            if owner:
-                if owner.get("gym_id") != gym_id:
-                    raise ValueError("Drive file is already indexed for another gym")
-                log(f"shared Drive file {row['id']} already belongs to source "
-                    f"{owner.get('source_id')}; skipping duplicate")
-                continue
-        owned_rows.append(row)
-    rows = owned_rows
-    seen_ids = {r["id"] for r in rows}
-
-    # 3. insert new / patch changed indexer-owned fields
-    candidates = [r for r in rows if r["id"] not in existing]
-    inserted_ids = store.insert_assets_ignore_conflicts(candidates)
-    # Another source can win between the ownership precheck and this insert.
-    # Re-read every candidate before any probe/update/classification. Unique
-    # files still insert even when one shared ID loses the race.
-    skipped_ids = set()
-    for row in candidates:
-        owner = store.get_asset(row["id"])
-        if not owner:
-            raise RuntimeError("Drive asset insert could not be verified")
-        if owner.get("gym_id") != gym_id:
-            raise ValueError("Drive file is already indexed for another gym")
-        if owner.get("source_id") != source_id:
-            skipped_ids.add(row["id"])
-    if skipped_ids:
-        rows = [r for r in rows if r["id"] not in skipped_ids]
-        seen_ids.difference_update(skipped_ids)
-    new_rows = [r for r in candidates if r["id"] in inserted_ids]
-    inserted = len(new_rows)
-    updated = 0
-    for r in rows:
-        old = existing.get(r["id"])
-        if old is None:
-            continue
-        changes = {f: r[f] for f in _OWNED_FIELDS if old.get(f) != r.get(f)}
-        if old.get("reject_reason") == _idx.REJECT_REMOVED and r["id"] in seen_ids:
-            # An asset that came back: recompute eligibility from what is known.
-            changes["eligible"] = r.get("eligible")
-            changes["reject_reason"] = r.get("reject_reason")
-        if changes:
-            changes["indexed_at"] = now_iso
-            if old.get("content_hash") != r.get("content_hash"):
-                # Drive IDs survive byte replacement. All inspection and
-                # consent decisions for the old bytes must be invalidated in
-                # the same conditional write as the new hash. A concurrent
-                # operator review locks/checks the old hash and cannot revive
-                # this asset after this patch.
-                changes.update(
-                    review_status="pending_review", reviewed_by=None,
-                    reviewed_at=None, review_note=None,
-                    review_content_hash=None,
-                    moderation_status="pending", moderation_json=None,
-                    people_detected=None, consent_status="pending",
-                    consent_member_ref=None, release_ref=None,
-                    consent_expires_at=None,
-                    eligible=r.get("eligible"),
-                    duration_sec=None, width=r.get("width"),
-                    height=r.get("height"), aspect=r.get("aspect"),
-                    vision_json=None, rendition_key=None, rendition_url=None)
-                store.update_indexed_asset_if_hash(
-                    gym_id, r["id"], old.get("content_hash"), changes)
-            else:
-                store.update_asset(r["id"], changes)
-            updated += 1
-
-    # 4. Nightly reconciliation only. The queued post-bind import must never
-    # mutate existing assets or pending calendar rows because a temporarily
-    # incomplete Drive walk could otherwise rewrite a pending post.
-    removed = 0
-    vanished = []
-    if sweep_missing:
-        for asset_id, old in existing.items():
-            if asset_id in seen_ids:
-                continue
-            if old.get("reject_reason") == _idx.REJECT_REMOVED:
-                continue  # already marked; idempotent
-            store.update_asset(asset_id, {"eligible": False,
-                                          "reject_reason": _idx.REJECT_REMOVED,
-                                          "indexed_at": now_iso})
-            vanished.append(asset_id)
-            removed += 1
-        _flip_pending_for_missing(gym_id, vanished, log)
-
-    # 5. budgeted probe pass over unprobed VIDEO candidates
-    probe_fn = probe_fn or _idx.probe_video
-    budget = config.gym_drive_probe_max_per_run() if probe_budget is None \
-        else int(probe_budget)
-    merged = {a["id"]: dict(a) for a in existing.values()}
-    for r in rows:
-        merged.setdefault(r["id"], dict(r))
-        merged[r["id"]]["id"] = r["id"]
-    candidates = [a for a in merged.values()
-                  if a["id"] in seen_ids
-                  and a.get("kind") == _idx.KIND_VIDEO
-                  and a.get("duration_sec") is None
-                  and a.get("eligible") is not False]
-    probed = newly_eligible = 0
-    reject_counts = Counter()
-    # LIVE classifier signals (2026-09-01 hardening): the OCR / cut-density probes
-    # ride the SAME downloaded bytes this loop already fetches for ffprobe — no
-    # second download, no new budget. {asset_id: (has_burned_text, cut_density)}.
-    # Gated on story_classifier_enabled (the classifier's own flag; this closes a
-    # gap in an already-armed lane, not a new capability) AND on the classifier's
-    # OCR reader actually being armed (agent/ocr_check reuses the existing Gemini
-    # vision path, itself gated on AGENT_NANO_ENABLED) — a no-op, not a crash, when
-    # that is off.
-    ocr_signals = {}
-    run_ocr = config.story_classifier_enabled()
-    for asset in candidates[:budget]:
-        tmp_dir = tempfile.mkdtemp(prefix="gymprobe_")
-        tmp_path = Path(tmp_dir) / "probe.bin"
-        try:
-            drive.download(asset["id"], tmp_path)
-            info = probe_fn(tmp_path)
-            if run_ocr and info:
-                try:
-                    from .. import story_classifier as _sc
-                    has_text = _sc.default_ocr_reader(str(tmp_path))
-                    cuts = _sc.default_cut_probe(str(tmp_path))
-                    if has_text is not None or cuts is not None:
-                        ocr_signals[asset["id"]] = (has_text, cuts)
-                except Exception as e:  # noqa: BLE001 - a probe failure never blocks
-                    log(f"classifier probe failed for {asset.get('title')!r}: "
-                        f"{type(e).__name__}: {e}")
-        except Exception as e:  # noqa: BLE001 - one bad file never sinks the pass
-            log(f"probe failed for {asset.get('title')!r}: {type(e).__name__}: {e}")
-            info = None
-        finally:
-            try:
-                if tmp_path.exists():
-                    tmp_path.unlink()
-                os.rmdir(tmp_dir)
-            except OSError:
-                pass
-        if not info:
-            continue  # stays unprobed -> stays unselectable (fail closed)
-        el, reason, label = _idx.video_eligibility(
-            asset.get("size_bytes"), info["duration_sec"], info["width"],
-            info["height"])
-        probe_fields = {
-            "duration_sec": info["duration_sec"], "width": info["width"],
-            "height": info["height"], "aspect": label,
-            "eligible": el, "reject_reason": reason, "indexed_at": now_iso}
-        store.update_asset(asset["id"], probe_fields)
-        # reflect the probe back onto the local merged view so the classifier sort
-        # (6b) sees real aspect + duration, not the pre-probe NULLs.
-        asset.update(probe_fields)
-        probed += 1
-        if el:
-            newly_eligible += 1
-        elif reason:
-            reject_counts[reason] += 1
-
-    for r in new_rows:
-        if r.get("eligible") is False and r.get("reject_reason"):
-            reject_counts[r["reject_reason"]] += 1
-
-    # 5b. budgeted PRE-RENDER pass (audit R-D1 #5): eligible videos with no
-    # rendition_url are downloaded, probed for codec, and either transcoded to an
-    # H.264 .mp4 (HEVC / odd container, counts against RENDITION_MAX_PER_SYNC) or,
-    # when already web-playable, hosted as-is and persisted as their own rendition so
-    # the month build never re-hosts them and this pass never re-downloads them.
-    # Bounded: at most 2x the transcode budget in candidates per source per run;
-    # converges across nights. Runs on the same synced-asset view as the probe pass.
-    rendered, prehosted, render_skipped = _prerender_pass(
-        gym_id, drive, store, merged, seen_ids, probe_fn, log,
-        budget_n=(config.rendition_max_per_sync() if render_budget is None
-                  else int(render_budget)),
-        host_fn=host_fn)
-
-    # 6b. STORY_CLASSIFIER sort (default ON, spec §0): tag freshly-seen assets raw /
-    # finished / ambiguous. AMBIGUOUS queues for a human (or auto-sorts); a
-    # CONFIDENT FINISHED verdict is quarantined out of the raw pool (see
-    # _sort_ambiguous / _quarantine_finished — the 2026-09-01 fix). Uses the
-    # post-probe view (merged) so a probed video classifies on real aspect/duration
-    # AND the live OCR/cut signals gathered above. Only NEW rows are sorted (a
-    # re-sync never re-queues a file a coach already resolved). Sorts + quarantines
-    # only; posts/stages/composes nothing.
-    to_sort = [merged.get(r["id"], r) for r in new_rows]
-    queued_ambiguous = _sort_ambiguous(to_sort, gym_id, log, store=store,
-                                       ocr_signals=ocr_signals)
-
-    photos = sum(1 for r in rows if r["kind"] == _idx.KIND_PHOTO)
-    videos = sum(1 for r in rows if r["kind"] == _idx.KIND_VIDEO)
-    summary = {
-        "ok": True, "gym_id": gym_id, "source_id": source_id,
-        "photos": photos, "videos": videos, "inserted": inserted,
-        "updated": updated, "probed": probed, "newly_eligible": newly_eligible,
-        "removed": removed, "skipped": len(skipped),
-        "rejected": dict(reject_counts), "new_rows": len(new_rows),
-        "queued_ambiguous": queued_ambiguous,
-        "rendered": rendered, "prehosted": prehosted, "render_skipped": render_skipped}
+    summary = {"ok": True, "gym_id": gym_id, "source_id": source_id, **effects}
+    inserted = effects["inserted"]
+    photos = effects["photos"]
+    videos = effects["videos"]
+    newly_eligible = effects["newly_eligible"]
+    reject_counts = effects["rejected"]
     # 7. per-gym new-asset digest (only when something new arrived)
     if emit_digest and inserted:
         rejected_txt = ", ".join(f"{k} x{v}" for k, v in sorted(reject_counts.items())) \

@@ -118,7 +118,7 @@ class GapOwnerTransport:
 
 
 def run_pending(*, persistence, jobs=None, transport=None, bundle_reader=None, accounts=None,
-                row_runner=None, now=None):
+                row_runner=None, now=None, client_admission=None, issuer_dispatch=None):
     """One finite pass in the existing dedicated owner, default OFF.
 
     All bundle/account reads complete before bind locks.
@@ -176,7 +176,9 @@ def run_pending(*, persistence, jobs=None, transport=None, bundle_reader=None, a
                 if current != authority:
                     raise runtime.RuntimeHold('generated_gap_binding_changed')
                 result = row_runner(base, account, bound['calendar_row_id'],
-                                    persistence=persistence, jobs=jobs)
+                                    persistence=persistence, jobs=jobs,
+                                    **(dict(client_admission=client_admission, issuer_dispatch=issuer_dispatch)
+                                       if client_admission is not None else {}))
                 transport.record(request, bound['calendar_row_id'], result)
                 report.append(dict(request_id=request['request_id'], **result))
                 if result.get('reason') == 'generated_owner_commit_uncertain':

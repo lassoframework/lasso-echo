@@ -266,13 +266,13 @@ def generated_snapshot(persistence, calendar_row_id):
         raise ForwardMediaVerificationHold('dedicated generated owner required')
     persistence._assert_owner_identity()
     with persistence._conn.cursor() as cur:
-        cur.execute('select public.fixer_generated_snapshot_20261007(%s)',
+        cur.execute('select public.fixer_generated_snapshot_guarded_20261008(%s)',
                     (_uuid(calendar_row_id),))
         return cur.fetchone()[0]
 
 
 def reserve_generated(persistence, calendar_row_id, candidate, trusted_snapshot, *,
-                      history_visuals, read_bytes=None):
+                      history_visuals, read_bytes=None, client_admission=None):
     """Existing dedicated owner prepares an Astra original atomically.
 
     The configured owner must reload its verified copy/palette/depletion facts
@@ -303,6 +303,7 @@ def reserve_generated(persistence, calendar_row_id, candidate, trusted_snapshot,
             or candidate.get('provider') != 'astra'
             or candidate.get('model') != 'gpt-6-astra'
             or trusted_snapshot.get('photo_inventory_complete') is not True
+            or trusted_snapshot.get('local_census_current') is not True
             or trusted_snapshot.get('eligible_photo_count') != 0
             or trusted_snapshot.get('history_complete') is not True
             or trusted_snapshot.get('palette_verified') is not True
@@ -353,6 +354,7 @@ def reserve_generated(persistence, calendar_row_id, candidate, trusted_snapshot,
         if key in trusted_snapshot and current.get(key) != trusted_snapshot[key]:
             raise ForwardMediaVerificationHold('generated database snapshot changed: ' + key)
     if (current.get('photo_inventory_complete') is not True
+            or current.get('local_census_current') is not True
             or current.get('eligible_photo_count') != 0 or current.get('history_complete') is not True):
         raise ForwardMediaVerificationHold('generated database depletion/history unverified')
     # End read-only identity/snapshot work BEFORE bounded remote object reads.
@@ -425,6 +427,12 @@ def reserve_generated(persistence, calendar_row_id, candidate, trusted_snapshot,
     manifest = prepare.build_render_manifest(original, original.source_url, data,
         'same_object', 'generated-astra:' + candidate['job_id'])
     persistence._assert_owner_identity()
+    if client_admission is not None:
+        from .generated_client_admission import GeneratedClientAdmission
+        if type(client_admission) is not GeneratedClientAdmission or not delegated:
+            raise ForwardMediaVerificationHold('dedicated generated client admission required')
+        return client_admission.stage(persistence, calendar_row_id, candidate,
+                                      checked_visuals, manifest.row(), approved_source_revision)
     with persistence._conn.cursor() as cur:
         operation = 'fixer_reserve_generated_bundle_20261007' if delegated else 'fixer_reserve_generated_20261007'
         cur.execute('select public.' + operation + '(%s,%s::jsonb,%s::jsonb,%s::jsonb,%s::text)',

@@ -122,56 +122,49 @@ def test_flag_off_is_noop(monkeypatch):
     assert out["ok"] is False and out["reason"] == "flag off"
 
 
-def test_fills_empty_days_with_pending_infographic_rows(monkeypatch):
+def test_fills_empty_days_holds_until_trusted_receipt_authority(monkeypatch):
+    """GENERATED-CLIENT CONTRACT safety repair (2026-10-09): every card this
+    lane builds is a generated card, and NO trusted hosted-byte receipt
+    writer/lookup exists. fill_gaps must render the cards, then HOLD the whole
+    batch pre-insert: filled == 0, zero rows written, insert-only preserved.
+    The row-shape assertions from the pre-hold version of this test resume
+    only when a real trusted receipt authority is deployed."""
     _sources()
     _stub_pipeline(monkeypatch)
-    _arm_astra(monkeypatch, 200, _astra_body())
+    seen = _arm_astra(monkeypatch, 200, _astra_body())
     store = _Store()
     out = cif.fill_gaps("gymx", _acct(), store, voice=_voice(),
                         now="2026-08-25T12:00:00-04:00")
-    assert out["ok"] is True and out["filled"] == cif.FILL_MAX_PER_RUN, out
+    assert out["ok"] is True and out["filled"] == 0, out
+    assert "generated cards held" in (out.get("reason") or ""), out
+    assert store.inserted == [], "no generated row may reach the calendar"
     assert store.deleted == [], "fill must be INSERT-only"
-    feeds_ig = [r for r in store.inserted
-                if r["format"] == "feed" and r["account"] == "instagram"]
-    feeds_fb = [r for r in store.inserted
-                if r["format"] == "feed" and r["account"] == "facebook"]
-    assert len(feeds_ig) == cif.FILL_MAX_PER_RUN and len(feeds_fb) == len(feeds_ig)
-    for r in store.inserted:
-        assert r["status"] == "pending", "every card awaits the owner's approval"
-        assert r["gym_id"] == "gymx"
-        assert (r.get("image_url") or "").startswith("https://r2/igfill_")
-        assert "id" not in r
-        assert len(r.get("caption") or "") >= 40           # a real caption, not a stub
+    assert len(seen) == cif.FILL_MAX_PER_RUN, "cards are still rendered before the hold"
 
 
-def test_every_inserted_row_carries_the_client_safe_review_mark(monkeypatch):
-    """PRODUCTION INCIDENT (2026-09-11): rows this lane inserted before the mark
-    existed reached crossfitnewtown, district_h, toughtemple52040e and
-    crossfitreverb30b5b2 unmarked -- 3 of them were already status='approved' and
-    would have cleared calendar_autopublish's CLIENT-SAFE REVIEW HARD BLOCK
-    (agent/calendar_autopublish.py) silently, since that block trusts the pillar
-    string alone. Every row fill_gaps() ever inserts MUST carry the mark, no
-    exceptions -- this is the regression test for the fix at
-    agent/client_infographic_fill.py's Draft(... category=_with_review_mark(...)).
-    Fails on revert: swap that call back to the pre-fix
-    `getattr(source, "category", "") or "educational"` and every assertion below
-    fails."""
+def test_review_mark_survives_and_insert_is_held(monkeypatch):
+    """PRODUCTION INCIDENT (2026-09-11) regression, two halves after the
+    2026-10-09 generated-contract safety repair:
+    (a) _with_review_mark still stamps the client-safe review SUFFIX on the
+        source's real taxonomy category -- the direct regression for the fix at
+        agent/client_infographic_fill.py's Draft(... category=_with_review_mark(...)).
+    (b) The full fill path now HOLDS every generated card pre-insert (no
+        trusted hosted-byte receipt authority exists), so the per-inserted-row
+        mark assertion is superseded by: NO row is inserted at all. When a real
+        trusted writer exists, reinstate per-row mark assertions on inserts."""
+    suffix = cif._NEEDS_CLIENT_SAFE_REVIEW_SUFFIX
+    for base in ("educational", "service"):
+        marked = cif._with_review_mark(base)
+        assert marked.endswith(suffix)
+        assert marked[: -len(suffix)] == base
     _sources()
     _stub_pipeline(monkeypatch)
     _arm_astra(monkeypatch, 200, _astra_body())
     store = _Store()
     out = cif.fill_gaps("gymx", _acct(), store, voice=_voice(),
                         now="2026-08-25T12:00:00-04:00")
-    assert out["ok"] is True and out["filled"] > 0
-    assert store.inserted, "the fixture must actually exercise an insert"
-    for r in store.inserted:
-        pillar = r.get("pillar") or r.get("category") or ""
-        assert pillar.endswith(cif._NEEDS_CLIENT_SAFE_REVIEW_SUFFIX), (
-            f"unmarked row would silently clear the autopublish hard block: {r!r}")
-        # the mark is a SUFFIX, not a replacement: the source's real taxonomy
-        # category must still be legible to a human reviewer at a glance.
-        base = pillar[: -len(cif._NEEDS_CLIENT_SAFE_REVIEW_SUFFIX)]
-        assert base in ("educational", "service"), base
+    assert out["ok"] is True and out["filled"] == 0
+    assert store.inserted == []
 
 
 def test_days_with_existing_feeds_are_never_touched(monkeypatch):
@@ -192,14 +185,15 @@ def test_days_with_existing_feeds_are_never_touched(monkeypatch):
 def test_denied_days_count_as_empty(monkeypatch):
     _sources()
     _stub_pipeline(monkeypatch)
-    _arm_astra(monkeypatch, 200, _astra_body())
     rows = [{"post_date": "2026-08-26", "format": "feed", "account": "instagram",
              "status": "denied"}]
     store = _Store(rows)
+    seen = _arm_astra(monkeypatch, 200, _astra_body())
     out = cif.fill_gaps("gymx", _acct(), store, voice=_voice(),
                         now="2026-08-25T12:00:00-04:00", days_ahead=1, max_per_run=1)
-    assert out["filled"] == 1
-    assert store.inserted[0]["post_date"] == "2026-08-26"
+    assert len(seen) == 1, "the denied day counts as empty: a card was rendered for it"
+    # generated-contract hold: rendered but never inserted (safety repair)
+    assert out["filled"] == 0 and store.inserted == []
 
 
 def test_no_sources_is_noop(monkeypatch):
@@ -241,8 +235,9 @@ def test_fill_cards_are_drawn_by_astra(monkeypatch):
     store = _Store()
     out = cif.fill_gaps("gymx", _acct(), store, voice=_voice(),
                         now="2026-08-25T12:00:00-04:00", days_ahead=1, max_per_run=1)
-    assert out["filled"] == 1
+    # Astra still draws the card; the generated-contract hold then blocks insert.
     assert len(seen) == 1
+    assert out["filled"] == 0 and store.inserted == []
     assert seen[0]["model"] == "gpt-6-astra"
     assert seen[0]["tools"][0]["model"] == "gpt-image-2.5-sunburst"
 
@@ -343,7 +338,7 @@ def test_astra_brief_carries_the_verified_gym_palette(monkeypatch):
     store = _Store()
     out = cif.fill_gaps("gymx", _acct(), store, voice=_voice(),
                         now="2026-08-25T12:00:00-04:00", days_ahead=1, max_per_run=1)
-    assert out["filled"] == 1
+    assert out["filled"] == 0 and store.inserted == []  # held: no trusted receipt authority
     brief = seen[0]["input"]
     if not isinstance(brief, str):
         brief = " ".join(str(c.get("text", "")) for c in brief
@@ -369,7 +364,7 @@ def test_client_gym_never_initializes_the_gemini_lane(monkeypatch):
     store = _Store()
     out = cif.fill_gaps("gymx", _acct(), store, voice=_voice(),
                         now="2026-08-25T12:00:00-04:00", days_ahead=1, max_per_run=1)
-    assert out["filled"] == 1
+    assert out["filled"] == 0 and store.inserted == []  # held: no trusted receipt authority
 
 
 def test_indexed_drive_photo_holds_infographic_even_with_drive_flags_off(
@@ -377,7 +372,7 @@ def test_indexed_drive_photo_holds_infographic_even_with_drive_flags_off(
     """2026-10-02 regression (8e06dbf): the indexed Drive inventory is authoritative
     even when the staging lane is disabled. A pickable approved client photo must
     hold the Astra fallback with BOTH Drive flags off."""
-    from agent import gym_media_index
+    from agent import astra_prompt, gym_media_index
     from tests.gym_media_fakes import make_asset, bound_review_fields
 
     photo = make_asset("ph1", gym_id="gymx", kind="photo", title="team.jpg")
@@ -397,6 +392,12 @@ def test_indexed_drive_photo_holds_infographic_even_with_drive_flags_off(
 
     monkeypatch.setattr(gym_media_index, "default_store",
                         lambda: DriveIndexWithPhoto())
+    # A missing gym website or palette must not block an eligible gym photo.
+    # Reaching the palette loader here would turn a photo-first decision into
+    # an unrelated website dependency.
+    monkeypatch.setattr(astra_prompt, "load_gym_brand_palette",
+                        lambda *_: (_ for _ in ()).throw(
+                            AssertionError("palette lookup preceded photo choice")))
     monkeypatch.setenv("GYM_DRIVE_STAGE", "false")
     monkeypatch.setenv("GYM_DRIVE_CONNECT", "false")
     _sources()
@@ -771,121 +772,52 @@ def _stub_pipeline_hosting(monkeypatch):
     return served
 
 
-def test_guard_on_routes_through_production_store_with_exact_hosted_astra_bytes(
-        monkeypatch):
-    """AGENT_VISUAL_GLOBAL_WRITER_PREP, production shape: fill_gaps writes the
-    real content_calendar POST through SupabaseCalendarStore.insert_rows; the
-    preparation RPCs run BEFORE that POST; and the bytes the byte-proof reads
-    are the exact Astra-generated bytes fill_gaps wrote and hosted (the hosted
-    card IS the generated object, uploaded untransformed). The prior version of
-    this test used an in-memory _Store and then called prepare() separately
-    with fake bytes that never matched Astra's output -- it proved neither the
-    production insert path nor the hosted-byte identity."""
-    import hashlib
-    import uuid
-
+def test_guard_on_fill_held_until_trusted_receipt_authority(monkeypatch):
+    """AGENT_VISUAL_GLOBAL_WRITER_PREP, production shape -- superseded by the
+    2026-10-09 generated-contract safety repair. fill_gaps renders and hosts
+    the Astra card through the SAME production pipeline, but the pre-insert
+    fail-closed hold (no trusted hosted-byte receipt authority) stops the
+    batch BEFORE the content_calendar POST: zero insert payloads, zero
+    preparation RPCs. The hosted bytes still land in the serving stub, so the
+    same-object identity property (served == written) stays asserted. The
+    guarded-insert byte-proof assertions from the prior version resume only
+    when a real trusted receipt authority is deployed."""
     from agent import visual_owner_receipts as owner
-    from agent import visual_writer_prepare as prep
+    import uuid
 
     monkeypatch.setenv("AGENT_VISUAL_GLOBAL_WRITER_PREP", "true")
     monkeypatch.setattr(config, "S3_PUBLIC_BASE_URL", "https://r2", raising=False)
     _sources()
     served = _stub_pipeline_hosting(monkeypatch)
     _arm_astra(monkeypatch, 200, _astra_body())
-
-    # Served-byte reader bound to the ACTUAL hosted objects: only URLs fill_gaps
-    # itself hosted may be read, and the bytes returned are the bytes uploaded.
-    def _read_hosted(url):
-        assert url in served, f"byte proof read an unknown URL: {url}"
-        return served[url]
-    monkeypatch.setattr(prep, "_bytes_for_url", _read_hosted)
-
     receipt_observations = []
-
-    def _same_object_writer(**kw):
-        receipt_observations.append(kw)
-        return {"read_receipt": str(uuid.uuid4()), "render_receipt": None}
     monkeypatch.setattr(owner, "default_same_object_writer",
-                        lambda: _same_object_writer)
-
+                        lambda: lambda **kw: receipt_observations.append(kw)
+                        or {"read_receipt": str(uuid.uuid4()), "render_receipt": None})
     store, http = _production_store()
     out = cif.fill_gaps("gymx", _acct(), store, voice=_voice(),
                         now="2026-08-25T12:00:00-04:00", days_ahead=1, max_per_run=1)
-    assert out["ok"] is True and out["filled"] == 1, out
-
-    astra_bytes = _astra_bytes()
-    assert served, "fill_gaps must have hosted its card"
-    assert all(data == astra_bytes for data in served.values()), (
-        "the hosted object must be the exact Astra-generated bytes, not a "
-        "stand-in; the byte proof below is only meaningful if served == written")
-
-    # insert_rows really POSTed the batch to content_calendar ...
-    assert len(http.insert_payloads) == 1, http.calls
-    batch = http.insert_payloads[0]
-    assert batch and all(isinstance(r, dict) for r in batch)
-    digest = "md5:" + hashlib.md5(astra_bytes).hexdigest()
-    for r in batch:
-        assert r.get("image_url") in served, r
-        assert r.get("source_media_url") == r["image_url"], (
-            f"guarded row must carry the explicit same-object source: {r!r}")
-        assert r["visual_group_key"] == "vg_same", r
-        assert r["byte_hash"] == "derived:" + digest, (
-            f"row byte_hash must be derived from the exact hosted Astra bytes: {r!r}")
-        assert r["status"] == "pending"
-
-    # ... the raw source was registered through the owner bundle RPC ...
-    assert http.bundle_args, http.calls
-    for args in http.bundle_args:
-        assert args["p_fingerprint"] == digest, (
-            f"raw source registration must attest the exact hosted bytes: {args}")
-    # ... and the owner-receipt writer observed the exact hosted Astra bytes.
-    assert receipt_observations, "owner receipt writer was never invoked"
-    for obs in receipt_observations:
-        assert obs["exact_bytes"] == astra_bytes, (
-            "owner receipt must attest the exact Astra bytes served at the row URL")
-        assert obs["evidence"]["exact_url"] in served
-
-    # Preparation RPCs ran BEFORE the content_calendar insert POST, and the
-    # rendition RPC repeated the attested digest back unchanged.
-    posts = [ep for method, ep in http.calls if method == "post"]
-    insert_at = posts.index("content_calendar")
-    rendition_at = posts.index("visual_global_prepare_source_rendition")
-    bundle_at = posts.index("visual_global_prepare_bundle")
-    assert bundle_at < rendition_at < insert_at, posts
-    for args in http.rendition_args:
-        assert args["p_group_key"] == "vg_same"
-        assert args["p_source_read_receipt"] == args["p_delivered_read_receipt"]
-        assert args["p_render_receipt"] is None
+    assert out["ok"] is True and out["filled"] == 0, out
+    assert "generated cards held" in (out.get("reason") or ""), out
+    assert served, "fill_gaps must have hosted its card before the hold"
+    assert all(data == _astra_bytes() for data in served.values())
+    assert http.insert_payloads == [], http.calls
+    assert not http.rendition_args and not http.bundle_args, http.calls
 
 
-def test_guard_off_through_production_store_no_prep_calls_legacy_row_shape(
-        monkeypatch):
-    """Guard OFF through the SAME production-shaped store: zero preparation RPC
-    calls, and the content_calendar POST carries the pre-migration legacy row
-    shape (no source_media_url / visual_group_key / byte_hash columns)."""
-    from agent import visual_writer_prepare as prep
-
-    monkeypatch.delenv("AGENT_VISUAL_GLOBAL_WRITER_PREP", raising=False)
+def test_guard_off_fill_held_until_trusted_receipt_authority(monkeypatch):
+    """Guard OFF through the SAME production-shaped store: the legacy row
+    shape never reaches content_calendar either, because the generated-contract
+    hold stops the batch pre-insert. The legacy insert-shape assertions resume
+    when a real trusted receipt authority exists."""
     _sources()
     _stub_pipeline_hosting(monkeypatch)
     _arm_astra(monkeypatch, 200, _astra_body())
     store, http = _production_store()
     out = cif.fill_gaps("gymx", _acct(), store, voice=_voice(),
                         now="2026-08-25T12:00:00-04:00", days_ahead=1, max_per_run=1)
-    assert out["ok"] is True and out["filled"] == 1, out
-
-    assert len(http.insert_payloads) == 1, http.calls
-    batch = http.insert_payloads[0]
-    assert batch, "guard OFF must still insert through the production store"
-    for r in batch:
-        for column in ("source_media_url", "visual_group_key", "byte_hash"):
-            assert column not in r, (
-                f"guard OFF must never write the provenance columns: {r!r}")
-    # prepare stays an exact pass-through for legacy rows ...
-    legacy = dict(batch[0])
-    assert prep.prepare(store, "gymx", legacy) is legacy
-    # ... and the whole run made no preparation RPC calls at all.
-    assert not http.rendition_args and not http.bundle_args, http.calls
+    assert out["ok"] is True and out["filled"] == 0, out
+    assert http.insert_payloads == [], http.calls
     assert not any("visual_global" in ep for _m, ep in http.calls), http.calls
 
 

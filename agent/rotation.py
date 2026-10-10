@@ -209,6 +209,9 @@ def reserve_local_media_once(account_key, key, pillar, day_key, path=None):
     competing process must finish its claim before it can inspect the history.
     Return the exact served row id, or None when used or unreadable.
     """
+    from . import local_inventory_mutation as mutation
+    if mutation.enabled():
+        return _mutate_local_reservation(account_key, key, pillar, day_key, path)
     if not account_key or not key or not day_key:
         return None
     from . import db as _db
@@ -241,10 +244,151 @@ def reserve_local_photo_once(account_key, key, pillar, day_key, path=None):
     return reserve_local_media_once(account_key, key, pillar, day_key, path=path)
 
 
-def release_served(reservation_id):
+def _mutate_local_reservation(account_key, key, pillar, day_key, path,
+                              *, reservation_id=None, content_hash=None):
+    """Fence the exact local served row using the authority-owned connection.
+
+    Release requires caller-bound identity; an id alone cannot prove a tenant
+    or asset. Completed use history is never pruned by this seam.
+    """
+    from pathlib import Path
+    from . import local_inventory_mutation as mutation
+    if not path or not account_key or not key:
+        raise mutation.MutationHold('local_mutation_reservation_binding_invalid')
+    asset = Path(path).absolute()
+    gym = mutation.gym_for_asset(asset)
+    if _base_account_key(account_key) != gym:
+        raise mutation.MutationHold('local_mutation_reservation_binding_invalid')
+    cfg = mutation.configured(gym, asset.parent)
+    cfg.asset_path(asset)
+    def bound_key():
+        sidecar = asset.with_suffix('.json')
+        cfg.asset_path(sidecar)
+        try:
+            data = json.loads(sidecar.read_text()) if sidecar.exists() else {}
+            if not isinstance(data, dict):
+                raise ValueError
+            return data.get('dupe_group') or asset.name
+        except Exception:
+            raise mutation.MutationHold('local_mutation_sidecar_invalid') from None
+    expected_hash = local_content_hash(asset)
+    if (not expected_hash or bound_key() != key
+            or (reservation_id is not None and content_hash != expected_hash)):
+        raise mutation.MutationHold('local_mutation_reservation_binding_invalid')
+    releasing = reservation_id is not None
+    if not releasing and not day_key:
+        raise mutation.MutationHold('local_mutation_reservation_binding_invalid')
+    lanes = (gym, f'{gym}_ig', f'{gym}_fb', f'{gym}_gbp')
+
+    def legacy_rows():
+        # db.migrate_legacy commits and renames the shared JSON file. Neither
+        # effect belongs inside this gym's fenced transaction. Import only this
+        # gym's permanent history here, leaving other gyms' source intact.
+        legacy = Path(_legacy_state_path())
+        if not legacy.exists():
+            return []
+        try:
+            data = json.loads(legacy.read_text())
+            if not isinstance(data, dict):
+                raise ValueError
+            result = []
+            for lane in lanes:
+                entries = data.get(lane, [])
+                if not isinstance(entries, list):
+                    raise ValueError
+                for entry in entries:
+                    if not isinstance(entry, dict) or not entry.get('key'):
+                        raise ValueError
+                    values = [lane, entry['key'], entry.get('pillar', ''),
+                              entry.get('date', ''), entry.get('archetype', ''),
+                              entry.get('set', ''), entry.get('content_hash', '')]
+                    if any(not isinstance(value, str) for value in values):
+                        raise ValueError
+                    result.append(values)
+            return result
+        except Exception:
+            raise mutation.MutationHold('local_mutation_legacy_history_unavailable') from None
+
+    legacy_history = legacy_rows()
+    payload = {'account_key': account_key, 'asset': str(asset), 'key': key,
+               'content_hash': expected_hash, 'pillar': pillar, 'date': day_key,
+               'reservation_id': reservation_id, 'legacy_history': legacy_history}
+
+    def apply(conn):
+        # Recheck under the canonical gym flock before touching the ledger.
+        cfg.asset_path(asset)
+        if (local_content_hash(asset) != expected_hash
+                or bound_key() != key):
+            raise mutation.MutationHold('local_mutation_reservation_binding_invalid')
+        if legacy_rows() != legacy_history:
+            raise mutation.MutationHold('local_mutation_legacy_history_changed')
+        columns = 'id, account_key, key, pillar, date, archetype, set_name, content_hash'
+        if releasing:
+            row = conn.execute('SELECT ' + columns + ' FROM served WHERE id=?',
+                               (reservation_id,)).fetchone()
+            if (not row or row[1] != account_key or row[2] != key
+                    or row[7] != expected_hash):
+                raise mutation.MutationHold('local_mutation_reservation_binding_invalid')
+            before = list(row)
+            cur = conn.execute('DELETE FROM served WHERE id=? AND account_key=? '
+                               'AND key=? AND content_hash=?',
+                               (reservation_id, account_key, key, expected_hash))
+            if (cur.rowcount != 1 or conn.execute('SELECT 1 FROM served WHERE id=?',
+                                                (reservation_id,)).fetchone()):
+                raise mutation.MutationHold('local_mutation_reservation_readback_invalid')
+            return {'released': True, 'row': before, 'asset': str(asset)}
+        imported = []
+        for entry in legacy_history:
+            existing = conn.execute('SELECT ' + columns + ' FROM served WHERE '
+                                    'account_key=? AND key=? AND pillar=? AND date=? '
+                                    'AND archetype=? AND set_name=? AND content_hash=? LIMIT 1',
+                                    entry).fetchone()
+            if not existing:
+                cur = conn.execute('INSERT INTO served (account_key, key, pillar, date, '
+                                   'archetype, set_name, content_hash) VALUES (?,?,?,?,?,?,?)',
+                                   entry)
+                existing = conn.execute('SELECT ' + columns + ' FROM served WHERE id=?',
+                                        (cur.lastrowid,)).fetchone()
+                if list(existing or ())[1:] != entry:
+                    raise mutation.MutationHold('local_mutation_reservation_readback_invalid')
+            imported.append(list(existing))
+        prior = conn.execute('SELECT 1 FROM served WHERE account_key IN (?,?,?,?) '
+                             'AND (key=? OR content_hash=?) LIMIT 1',
+                             (*lanes, key, expected_hash)).fetchone()
+        if prior:
+            return {'reservation_id': None, 'asset': str(asset), 'content_hash': expected_hash,
+                    'legacy_rows': imported}
+        cur = conn.execute('INSERT INTO served (account_key, key, pillar, date, '
+                           'archetype, set_name, content_hash) VALUES (?,?,?,?,?,?,?)',
+                           (account_key, key, pillar, day_key, '', '', expected_hash))
+        row = conn.execute('SELECT ' + columns + ' FROM served WHERE id=?',
+                           (cur.lastrowid,)).fetchone()
+        expected = [cur.lastrowid, account_key, key, pillar, day_key, '', '', expected_hash]
+        if list(row or ()) != expected:
+            raise mutation.MutationHold('local_mutation_reservation_readback_invalid')
+        return {'reservation_id': cur.lastrowid, 'row': expected, 'asset': str(asset),
+                'legacy_rows': imported}
+
+    authority = mutation.MutationAuthority.from_environment()
+    try:
+        result = mutation.run(cfg, authority,
+                              'local_media_release' if releasing else 'local_media_reserve',
+                              payload, apply)
+        return result['released'] if releasing else result['reservation_id']
+    finally:
+        authority.close()
+
+
+def release_served(reservation_id, *, account_key=None, key=None, path=None,
+                   content_hash=None):
     """Release exactly one unlanded reservation; never delete by media/date tuple."""
     if not reservation_id:
         return False
+    from . import local_inventory_mutation as mutation
+    if mutation.enabled():
+        return _mutate_local_reservation(account_key, key, '', None, path,
+                                         reservation_id=reservation_id,
+                                         content_hash=content_hash)
     from . import db as _db
     try:
         with _db._lock, _conn() as conn:

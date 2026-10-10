@@ -648,6 +648,11 @@ def _record_feed_served(account, feed, day_key):
             getattr(feed, "category", "") or "", day_key, path=path)
         if reservation_id:
             setattr(feed, "_served_reservation_id", reservation_id)
+            # Keep the exact reservation identity beside the id so a later
+            # release can prove the tenant and asset it is un-claiming.
+            setattr(feed, "_served_reservation_binding", {
+                "account_key": account.key, "key": dam.rotation_key(path),
+                "path": path, "content_hash": rotation.local_content_hash(path)})
         return bool(reservation_id)
     except Exception as e:  # noqa: BLE001
         print(f"[client-month] served-record failed for {day_key}: {type(e).__name__}: {e}")
@@ -698,22 +703,47 @@ def _release_unlanded_reservations(drafts, retained=()):
     """Release exact served rows for drafts that never became calendar rows."""
     from . import rotation
     keep = {int(r) for r in (retained or ()) if r}
+    drafts = list(drafts or ())
     seen = set()
-    for draft in drafts or ():
+    for draft in drafts:
         rid = getattr(draft, "_served_reservation_id", None)
         if not rid or int(rid) in keep or int(rid) in seen:
             continue
-        seen.add(int(rid))
-        rotation.release_served(rid)
+        reservation_id = int(rid)
+        seen.add(reservation_id)
+        binding = getattr(draft, "_served_reservation_binding", None)
+        if not isinstance(binding, dict) or not all(
+                binding.get(k) for k in ("account_key", "key", "path")):
+            # Without the original tenant/asset identity no release can prove
+            # what it un-claims: hold the reservation and report the gap.
+            print(f"[client-month] reservation {rid} held: missing release "
+                  "identity binding")
+            continue
+        released = rotation.release_served(
+            rid, account_key=binding["account_key"], key=binding["key"],
+            path=binding["path"], content_hash=binding.get("content_hash") or "")
+        if released:
+            # Several drafts (for example a feed and its Story) can carry the
+            # same reservation. Clear every copy only after authority confirms
+            # the release, so a later cleanup pass cannot release it again.
+            for related in drafts:
+                try:
+                    same_reservation = int(getattr(
+                        related, "_served_reservation_id", 0) or 0) == reservation_id
+                except (TypeError, ValueError):
+                    same_reservation = False
+                if not same_reservation:
+                    continue
+                for attr in ("_served_reservation_id", "_served_reservation_binding"):
+                    try:
+                        delattr(related, attr)
+                    except (AttributeError, TypeError):
+                        pass
 
 
 def _release_feed_reservation(feed):
     """Release one feed reserved before finishing could add it to ``drafts``."""
     _release_unlanded_reservations([feed])
-    try:
-        delattr(feed, "_served_reservation_id")
-    except (AttributeError, TypeError):
-        pass
 
 
 def _finish_feed_with_story(account, feed, library_path, log, *, day_key="",
@@ -904,6 +934,10 @@ def _rollback_drive_asset(draft, day_key, log):
     are not cleared on publish, so the same photo re-staged after its cooldown still
     carries the record of its earlier PUBLISHED post, and undoing that would re-pool
     an image currently live on the gym's feed."""
+    if getattr(draft, "_drive_use_pending", None) is not None:
+        # No authoritative never-landed protocol exists. Keep its exact claim;
+        # neither an early planning refusal nor unknown stage releases media.
+        return
     asset_id = (getattr(draft, "source_media_asset_id", "") or "").strip()
     account_key = getattr(draft, "account_key", "") or ""
     if not asset_id or not account_key or not day_key:
@@ -1423,7 +1457,8 @@ def append_gym_drive_drafts(account, base_key, start, days, voice, *, log,
                 draft = gym_media_builder.build_gym_media_draft(
                     account, day_key, pillar, voice, source, store=store, drive=drive,
                     slot_index=slot_i, rendition_budget=rendition_budget,
-                    kind_prefs=kind_prefs, exclude_ids=tuple(sorted(failed)))
+                    kind_prefs=kind_prefs, exclude_ids=tuple(sorted(failed)),
+                    remote_writer_bound=True)
             except Exception as e:  # noqa: BLE001 - the lane never sinks the month
                 log(f"[gym-drive] builder failed for {base_key} {day_key}: "
                     f"{type(e).__name__}: {e}")
@@ -1618,6 +1653,10 @@ def build_client_month(account, base_key, start_date, days=30, *, voice,
     reason} when a flag is off, an input is missing, or the gym is awaiting media
     (nothing touched)."""
     log = logger or (lambda m: print(f"[client-month] {m}"))
+    from . import feed_drive_use
+    recovery = feed_drive_use.recover(store=store, logger=log, tenant_id=base_key)
+    if recovery is not None and not recovery.get("ok"):
+        return dict(recovery, upserted=0, days=0, skipped_banned=0)
     if not config.client_month_enabled():
         return {"ok": False, "reason": "AGENT_CLIENT_MONTH off", "upserted": 0,
                 "days": 0, "skipped_banned": 0}
@@ -2310,6 +2349,7 @@ def _build_client_month_body(account, base_key, start, days, *, voice, library_p
             log(f"{base_key}: ask coverage lane skipped, the voice doc carries no "
                 "approved CTA that reads as a single ask (never an invented one)")
 
+    from . import feed_drive_use
     rows = _to_rows(base_key, drafts)
     # Blake 2026-10-06 ruling: no NEW row is ever withheld in 'coach_review' — a first
     # month now lands as 'pending' like every other draft so the client approves it
@@ -2343,7 +2383,8 @@ def _build_client_month_body(account, base_key, start, days, *, voice, library_p
                         poster_render_evidence_by_url=_poster_render_evidence_by_url(
                             drafts),
                         render_evidence_by_url=_gbp_render_evidence or None,
-                        apply_state=apply_state)
+                        apply_state=apply_state,
+                        before_forward_stage=feed_drive_use.stage_callback(base_key, drafts))
     except Exception:
         # _apply catches remote write failures and returns their unknown-outcome
         # flag. An exception escaping its contract is a prewrite planning failure
@@ -2578,7 +2619,7 @@ def _insert_rows_with_poster_evidence(insert_rows, base_key, rows, evidence_by_u
                                       render_evidence_by_url=None,
                                       required_feed_slots=None,
                                       prevalidated_cadence=False,
-                                      expected_old_rows=None):
+                                      expected_old_rows=None, before_forward_stage=None):
     """Forward poster proof through the prepared writer boundary.
 
     A TypeError from a prepared call is ambiguous: the store may have written before
@@ -2586,6 +2627,12 @@ def _insert_rows_with_poster_evidence(insert_rows, base_key, rows, evidence_by_u
     the plain legacy call for older stores and test fakes.
     """
     kwargs = {}
+    if before_forward_stage is not None:
+        import inspect
+        if "before_forward_stage" not in inspect.signature(insert_rows).parameters:
+            from .portal_calendar_store import CalendarInsertNotStartedError
+            raise CalendarInsertNotStartedError(503, "exact feed journal writer unavailable")
+        kwargs["before_forward_stage"] = before_forward_stage
     if expected_old_rows is not None:
         # Never degrade an armed replacement into an older delete/insert store.
         import inspect
@@ -3102,7 +3149,8 @@ def _forward_replacement_rows(store, base_key, months, first, last, locked_days,
 
 def _apply(base_key, rows, start, days, store, log, locked_days=(),
            allow_reshape=False, poster_render_evidence_by_url=None,
-           render_evidence_by_url=None, apply_state=None):
+           render_evidence_by_url=None, apply_state=None,
+           before_forward_stage=None):
     """Gym-scoped replacement: armed reservations stage one immutable inactive batch.
 
     With the reservation gate armed, this lane NEVER deletes and never claims a
@@ -3348,6 +3396,10 @@ def _apply(base_key, rows, start, days, store, log, locked_days=(),
         # is unreadable gate state and refuses identically. Flag OFF: inert.
         from . import portal_calendar_store as _pcs
         reservation_flag = _pcs.forward_reservation_flag()
+        if before_forward_stage is not None and reservation_flag is not True:
+            return {"ok": False, "reason": "feed journal requires atomic stage",
+                    "upserted": 0, "inserted": 0, "deleted": 0, "months": months}
+
         if reservation_flag is not False:
             def _reservation_bound(r):
                 try:
@@ -3500,7 +3552,8 @@ def _apply(base_key, rows, start, days, store, log, locked_days=(),
                 render_evidence_by_url=render_evidence_by_url,
                 required_feed_slots=new_feed_slots,
                 prevalidated_cadence=cadence_prevalidated,
-                expected_old_rows=old_rows) or []
+                expected_old_rows=old_rows,
+                before_forward_stage=before_forward_stage) or []
             if (len(staged_rows) != len(store_rows)
                     or _instagram_feed_slots(staged_rows) != new_feed_slots):
                 raise _pcs.ReservationStoreError(502, "staged batch result incomplete; outcome unknown")

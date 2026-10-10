@@ -23,7 +23,9 @@ def launch_isolated(lane, arguments, *, environment):
         if lane == 'owner':
             from .forward_media_owner import check_environment
             check_environment(environment)
-            module = 'agent.forward_media_owner_packet'
+            module = ('agent.forward_media_owner_worker'
+                      if environment.get('AGENT_FORWARD_MEDIA_OWNER_WORKER', '').lower()
+                      in ('1', 'true', 'yes', 'on') else 'agent.forward_media_owner_packet')
         else:
             from .forward_media_attester_worker import settings_from_environment
             settings_from_environment(environment)

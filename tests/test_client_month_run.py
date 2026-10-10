@@ -1409,6 +1409,117 @@ def test_noop_month_releases_exact_local_reservations(tmp_path, monkeypatch):
     assert rotation.load_served_strict().get("gritx_ig", []) == []
 
 
+def test_noop_month_release_passes_exact_reservation_identity(tmp_path, monkeypatch):
+    """Every unlanded release must carry the original account_key/key/path/hash."""
+    from agent import rotation
+    _stock_clean("gritx_ig")
+    lib = _lib(tmp_path, n=6)
+    store = _FakeStore()
+    releases = []
+    real_release = rotation.release_served
+    monkeypatch.setattr(
+        rotation, "release_served",
+        lambda rid, **kw: releases.append((rid, kw)) or real_release(rid, **kw))
+    monkeypatch.setattr(cmr, "_apply", lambda *a, **k: {
+        "ok": True, "upserted": 0, "inserted": 0, "deleted": 0,
+        "noop_shrink": True, "retained_reservation_ids": []})
+
+    cmr.build_client_month(
+        _account(), "gritx", "2026-08-01", days=3, voice=_voice(),
+        library_path=lib, store=store, banned_words=())
+
+    assert releases
+    for rid, kw in releases:
+        assert rid
+        assert kw["account_key"] == "gritx_ig"
+        assert kw["key"] and kw["path"]
+        assert kw["content_hash"] == rotation.local_content_hash(kw["path"])
+    assert rotation.load_served_strict().get("gritx_ig", []) == []
+
+
+def test_unlanded_release_holds_without_identity_binding(monkeypatch, capsys):
+    """An id alone cannot prove the tenant/asset: hold and report, never delete."""
+    from types import SimpleNamespace
+    from agent import rotation
+    releases = []
+    monkeypatch.setattr(rotation, "release_served",
+                        lambda *a, **k: releases.append((a, k)))
+    draft = SimpleNamespace(_served_reservation_id=42)
+
+    cmr._release_unlanded_reservations([draft])
+
+    assert releases == []
+    assert "held" in capsys.readouterr().out
+
+
+def test_unlanded_release_forwards_staged_identity_binding(monkeypatch):
+    from types import SimpleNamespace
+    from agent import rotation
+    calls = []
+    monkeypatch.setattr(rotation, "release_served",
+                        lambda rid, **kw: calls.append((rid, kw)))
+    binding = {"account_key": "gritx_ig", "key": "photo_00.jpg",
+               "path": "/lib/photo_00.jpg", "content_hash": "abc123"}
+    draft = SimpleNamespace(_served_reservation_id=7,
+                            _served_reservation_binding=binding)
+
+    cmr._release_unlanded_reservations([draft])
+
+    assert calls == [(7, binding)]
+
+
+def test_successful_unlanded_release_clears_all_draft_copies(monkeypatch):
+    """A confirmed release must not be replayed by a later cleanup pass."""
+    from types import SimpleNamespace
+    from agent import rotation
+    calls = []
+    monkeypatch.setattr(rotation, "release_served",
+                        lambda rid, **kw: calls.append((rid, kw)) or True)
+    binding = {"account_key": "gritx_ig", "key": "photo_00.jpg",
+               "path": "/lib/photo_00.jpg", "content_hash": "abc123"}
+    drafts = [SimpleNamespace(_served_reservation_id=7,
+                              _served_reservation_binding=dict(binding))
+              for _ in range(2)]
+
+    cmr._release_unlanded_reservations(drafts)
+    cmr._release_unlanded_reservations(drafts)
+
+    assert len(calls) == 1
+    assert all(not hasattr(d, "_served_reservation_id") for d in drafts)
+    assert all(not hasattr(d, "_served_reservation_binding") for d in drafts)
+
+
+def test_failed_unlanded_release_preserves_draft_identity(monkeypatch):
+    """A failed/uncertain release keeps its identity available for reconciliation."""
+    from types import SimpleNamespace
+    from agent import rotation
+    monkeypatch.setattr(rotation, "release_served", lambda *a, **k: False)
+    binding = {"account_key": "gritx_ig", "key": "photo_00.jpg",
+               "path": "/lib/photo_00.jpg", "content_hash": "abc123"}
+    draft = SimpleNamespace(_served_reservation_id=7,
+                            _served_reservation_binding=binding)
+
+    cmr._release_unlanded_reservations([draft])
+
+    assert draft._served_reservation_id == 7
+    assert draft._served_reservation_binding == binding
+
+
+def test_feed_release_preserves_identity_when_release_fails(monkeypatch):
+    from types import SimpleNamespace
+    from agent import rotation
+    monkeypatch.setattr(rotation, "release_served", lambda *a, **k: False)
+    binding = {"account_key": "gritx_ig", "key": "photo_00.jpg",
+               "path": "/lib/photo_00.jpg", "content_hash": "abc123"}
+    feed = SimpleNamespace(_served_reservation_id=7,
+                           _served_reservation_binding=binding)
+
+    cmr._release_feed_reservation(feed)
+
+    assert feed._served_reservation_id == 7
+    assert feed._served_reservation_binding == binding
+
+
 def test_ambiguous_month_insert_keeps_media_reservations(tmp_path, monkeypatch):
     from agent import rotation
     _stock_clean("gritx_ig")

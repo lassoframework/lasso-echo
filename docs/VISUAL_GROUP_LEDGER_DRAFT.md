@@ -15,15 +15,17 @@ the same bytes and aliases reuses it; registration alone creates no global
 usage. Only the calendar claim trigger may mark those bytes used.
 
 This repair does not authorize activation. The flag remains OFF by default.
-Direct paths still requiring separate writer/response review include the
-feed-aspect rehost in `calendar_autopublish.py` (it ignores an unsuccessful
-`patch_image_url` result and does not yet submit transformation evidence) and
-callers outside `SupabaseCalendarStore` that write
-`content_calendar.image_url` directly. Portal caption-edit reburn now passes
+The feed-aspect rehost in `calendar_autopublish.py` now submits source/output
+render evidence when writer preparation is enabled and refuses an unverified
+persisted `patch_image_url` result. Portal caption-edit reburn also passes
 render evidence through store preparation and checks the persisted PATCH row.
-The store's `patch_image_url` status filter accepts only pending or coach-review
-rows; approved-story reburn now holds instead of publishing a URL that was not
-persisted. The legacy one-hash preparation/claim path still cannot represent a
+The store accepts a publish-time approved row only with a complete
+`expected_row` compare-and-swap; an unverified reburn remains held. Direct
+flag-off PATCH fallbacks in `scripts/refresh_lasso_calendar.py` and
+`scripts/swap_crossfitchateau_blocked_media.py` still need release review.
+Forward-reservation staging skips ordinary visual preparation; its isolated
+finalization must independently prove exact bytes and lineage before global
+guard activation. The legacy one-hash preparation/claim path cannot represent a
 distinct raw `source_media_url` and delivered rendition. The new DRAFT
 source/rendition path registers both only with byte-read/render receipts and
 uses the set-based global claim; its writer, SQL, and PostgreSQL acceptance

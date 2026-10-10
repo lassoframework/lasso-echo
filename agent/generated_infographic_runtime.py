@@ -483,6 +483,11 @@ class OwnerSnapshotLoader:
                 or snap.get('account') != ('instagram' if key.endswith('_ig') else 'facebook')
                 or snap.get('format') != 'feed'):
             raise RuntimeHold('generated_calendar_binding_changed')
+        # Generated fallback is allowed only when the guarded owner RPC has
+        # certified the exact latest complete, fresh zero census for this
+        # inventory generation and epoch. Legacy/raw snapshots cannot prove it.
+        if snap.get('local_census_current') is not True:
+            raise RuntimeHold('generated_local_census_unverified')
         copy = snap.get('copy')
         if (not isinstance(copy, dict) or copy.get('gym_id') != base
                 or any(copy.get(k) != snap.get(k) for k in ('local_date', 'logical_post_id', 'group_key'))
@@ -699,7 +704,7 @@ def _same_post_job(jobs, row_id, frozen, source_revision):
 
 
 def run_calendar_row(base, account, row_id, *, persistence, loader=None, jobs=None,
-                     provider=None, reviewer=None, storage=None):
+                     provider=None, reviewer=None, storage=None, client_admission=None, issuer_dispatch=None):
     """Generate one exact persisted feed row and acknowledge owner reservation.
 
     Missing/changed photos, palette, copy and delivered-byte history hold before
@@ -708,6 +713,7 @@ def run_calendar_row(base, account, row_id, *, persistence, loader=None, jobs=No
     """
     if not enabled():
         return dict(ok=False, held=True, reason='generated_runtime_disabled')
+    from .generated_client_admission import AdmissionHold
     committing = False
     try:
         _account_binding(base, account)
@@ -716,16 +722,37 @@ def run_calendar_row(base, account, row_id, *, persistence, loader=None, jobs=No
         from . import forward_media_guard as guard, forward_media_owner as owner
         if not guard.enabled():
             raise RuntimeHold('generated_forward_authority_disabled')
-        from .forward_media_owner_worker import settings_from_environment
-        tenants, _ = settings_from_environment()
+        if getattr(persistence, '_environment_lane', 'owner') == 'generated_owner':
+            # This finite command has its own exact environment contract. It
+            # never arms the ordinary photo owner's census/clearance worker.
+            owner.check_environment(lane='generated_owner')
+            tenant = os.getenv('ECHO_GENERATED_CLIENT_TENANT', '')
+            if (not re.fullmatch(r'[a-z0-9][a-z0-9_-]{0,127}', tenant)
+                    or os.getenv('AGENT_FORWARD_MEDIA_OWNER_TENANTS') != tenant):
+                raise RuntimeHold('generated_owner_tenant_not_allowed')
+            tenants = (tenant,)
+        else:
+            from .forward_media_owner_worker import settings_from_environment
+            tenants, _ = settings_from_environment()
         if base not in tenants:
             raise RuntimeHold('generated_owner_tenant_not_allowed')
         if type(persistence) is not owner.ForwardMediaOwnerPersistence:
             raise RuntimeHold('generated_owner_required')
         loader = loader or OwnerSnapshotLoader(persistence)
         jobs = jobs or prep.SQLiteGenerationJobs(journal_path())
+        from . import generated_client_admission as client_contract
+        if client_admission is not None:
+            if not client_contract.enabled():
+                raise RuntimeHold('generated_client_admission_disabled')
+            if (type(client_admission) is not client_contract.GeneratedClientAdmission
+                    or os.path.realpath(client_admission.journal.path) != os.path.realpath(jobs.path)):
+                raise RuntimeHold('generated_client_durable_binding_required')
+            if client_admission.authority.tenant_id != base:
+                raise RuntimeHold('generated_client_tenant_mismatch')
+        elif client_contract.enabled():
+            raise RuntimeHold('generated_client_reader_not_provisioned')
         existing = _runtime_record(jobs, row_id)
-        if existing and existing['state'] == 'committing':
+        if existing and existing['state'] == 'committing' and client_admission is None:
             raise RuntimeHold('generated_owner_commit_uncertain')
         if existing and existing['job_state'] == 'generating':
             raise RuntimeHold('generated_execution_pending_reconciliation')
@@ -778,14 +805,45 @@ def run_calendar_row(base, account, row_id, *, persistence, loader=None, jobs=No
             raise RuntimeHold('generated_approved_source_changed')
         if candidate['job_id'] != existing['job_id']:
             raise RuntimeHold('generated_row_job_changed')
-        reservation = guard.reserve_generated(persistence, row_id, candidate, current,
-                                              history_visuals=visuals, read_bytes=loader.reader)
+        def reserve():
+            return guard.reserve_generated(persistence, row_id, candidate, current,
+                history_visuals=visuals, read_bytes=loader.reader,
+                **({'client_admission': client_admission} if client_admission is not None else {}))
+        if client_admission is not None:
+            try:
+                client_admission.journal.load(row_id)
+            except AdmissionHold as exc:
+                if str(exc) != 'generated_client_binding_unavailable':
+                    raise
+                # Freeze the actual owner plan and render manifest first.
+                try:
+                    reserve()
+                except AdmissionHold as pending:
+                    if str(pending) != 'generated_client_receipt_pending':
+                        raise
+                else:
+                    raise RuntimeHold('generated_client_binding_changed')
+            persistence._conn.rollback()
+            client_admission.queue_receipt(row_id, queue=issuer_dispatch, persistence=persistence)
+            reservation = reserve()
+        else:
+            reservation = reserve()
+        if client_admission is not None:
+            client_admission.before_commit(row_id)
         _runtime_record(jobs, row_id, state='committing')
         committing = True
         persistence._conn.commit()
         _runtime_record(jobs, row_id, state='committed')
-        return dict(ok=True, reserved=True, calendar_row_id=row_id,
-                    job_id=candidate['job_id'], receipt_ref=reservation.get('receipt_ref'))
+        if client_admission is not None:
+            client_admission.committed(row_id)
+        result = dict(ok=True, reserved=True, calendar_row_id=row_id,
+                      job_id=candidate['job_id'], receipt_ref=reservation.get('receipt_ref'))
+        if client_admission is not None:
+            result.update(admitted=reservation.get('admitted') is True,
+                          prepared=reservation.get('prepared') is True,
+                          calendar_row_id=reservation.get('calendar_row_id'),
+                          placeholder_row_id=row_id, stage_plan=reservation.get('stage_plan'))
+        return result
     except Exception as exc:
         if committing:
             return dict(ok=False, held=True, reason='generated_owner_commit_uncertain')
@@ -793,7 +851,7 @@ def run_calendar_row(base, account, row_id, *, persistence, loader=None, jobs=No
             persistence._conn.rollback()
         except Exception:
             pass
-        reason = str(exc) if isinstance(exc, (RuntimeHold, prep.PreparationHold)) else 'generated_runtime_unavailable'
+        reason = str(exc) if isinstance(exc, (RuntimeHold, prep.PreparationHold, AdmissionHold)) else 'generated_runtime_unavailable'
         return dict(ok=False, held=True, reason=reason)
 
 

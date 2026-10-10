@@ -31,14 +31,78 @@ Same flag as the upload page: AGENT_INTAKE_ENABLED, default OFF (dormant).
 """
 
 import hashlib
+from contextvars import ContextVar
 import io
 import json
 import os
+from pathlib import Path
 
-from . import config, ops_alerts, visual_fingerprint
+from . import config, local_inventory_mutation as _mutation, ops_alerts, visual_fingerprint
 from .accounts import get_account
 
 MANIFEST = "manifest.json"
+_active_mutation = ContextVar("intake_inventory_mutation", default=None)
+
+
+def _after_disposition(callback):
+    active = _active_mutation.get()
+    if active is None:
+        return callback()
+    active["followups"].append(callback)
+
+
+def _ops_alert(*args, **kwargs):
+    return _after_disposition(lambda: ops_alerts.alert(*args, **kwargs))
+
+
+def _post_notice(poster, text):
+    return _after_disposition(lambda: poster.post_notice(text))
+
+
+# ---- inventory mutation receipt guard ------------------------------------------
+# When armed, one receipt fences the entire client media disposition. It loads
+# the manifest under the canonical gym flock, writes/verifies retained media and
+# provenance, saves/verifies the manifest, and only then consumes incoming copies.
+# Any uncertain effect holds the entire receipt for reconciliation. The default
+# OFF path retains legacy handling, with source retention corrected for same-name
+# conversions. Form landing needs a connection-aware adapter and explicitly holds
+# in armed mode. Notifications and DAM/draft follow-ups run after COMPLETE.
+def _mutation_config(client, lib_dir):
+    if not _mutation.enabled():
+        return None
+    root = Path(lib_dir).absolute()
+    root.mkdir(parents=True, exist_ok=True)
+    return _mutation.configured(client, root)
+
+
+def _guarded(client, kind, request_payload, apply, lib_dir):
+    """Run apply(conn) under the mutation receipt protocol when armed, else directly."""
+    active = _active_mutation.get()
+    if active is not None:
+        if active["cfg"].gym_id != client:
+            raise _mutation.MutationHold("intake_mutation_binding_invalid")
+        # The whole client disposition already owns the canonical lock. Nested
+        # effects belong to that receipt and must never reacquire its flock.
+        try:
+            return apply(active["conn"])
+        except Exception:
+            # A failed effect may already have changed durable state. Never let
+            # the per-file bad-media handler reclassify it as safe to consume.
+            raise _mutation.MutationHold("intake_disposition_pending") from None
+    cfg = _mutation_config(client, lib_dir)
+    if cfg is None:
+        return apply(None)
+    authority = _mutation.MutationAuthority.from_environment()
+    def _apply(conn):
+        token = _active_mutation.set({"cfg": cfg, "conn": conn, "followups": []})
+        try:
+            return apply(conn)
+        finally:
+            _active_mutation.reset(token)
+    try:
+        return _mutation.run(cfg, authority, kind, request_payload, _apply)
+    finally:
+        authority.close()
 
 
 # ---- default media transforms (lazy imports; injectable for tests) -------------
@@ -109,7 +173,7 @@ def _convert_default(data, name):
     """(new_bytes, new_name): HEIC/HEIF -> JPG (orientation normalized);
     MOV -> MP4 (ffmpeg remux when available, else unchanged); MP4 passes
     through. The ORIGINAL bytes are archived by the pipeline whenever the
-    name changes, so no conversion ever loses the source file."""
+    bytes or name change, so no conversion ever loses the source file."""
     lower = name.lower()
     if lower.endswith(".mp4"):
         return data, name
@@ -205,12 +269,48 @@ def _make_thumbnail(data, name, max_px=400):
 
 
 # ---- manifest -------------------------------------------------------------------
+def _object_absent(exc, key):
+    """Only an explicit missing-object response establishes absence."""
+    if isinstance(exc, KeyError):
+        return exc.args == (key,)  # the requested key in an in-memory store
+    if isinstance(exc, FileNotFoundError):
+        return True  # local object store
+    response = getattr(exc, "response", None)
+    return (isinstance(response, dict)
+            and response.get("Error", {}).get("Code") in
+            ("NoSuchKey", "NotFound", "404"))
+
+
 def _load_manifest(r2, client):
+    manifest_key = f"intake/{client}/{MANIFEST}"
     try:
-        raw = r2.get_bytes(f"intake/{client}/{MANIFEST}")
+        raw = r2.get_bytes(manifest_key)
         manifest = json.loads(raw.decode("utf-8"))
-    except Exception:
+    except Exception as exc:
+        if _active_mutation.get() is not None and not _object_absent(exc, manifest_key):
+            raise _mutation.MutationHold("intake_manifest_unavailable") from None
         manifest = {"processed": [], "sha256": [], "phash": []}
+    if _active_mutation.get() is not None:
+        if (not isinstance(manifest, dict)
+                or any(not isinstance(manifest.get(k, []), list)
+                       or any(not isinstance(v, str) for v in manifest.get(k, []))
+                       for k in ("processed", "sha256", "phash", "sha256_raw",
+                                 "source_fingerprints"))
+                or any(not isinstance(manifest.get(k, {}), dict)
+                       for k in ("source_fingerprint_aliases", "asset_provenance"))):
+            raise _mutation.MutationHold("intake_manifest_invalid")
+        for k in ("processed", "sha256", "phash"):
+            manifest.setdefault(k, [])
+        if (any(not isinstance(k, str) or not isinstance(v, list)
+                or any(not isinstance(alias, str) for alias in v)
+                for k, v in manifest.get("source_fingerprint_aliases", {}).items())
+                or any(not isinstance(k, str) or not isinstance(v, dict)
+                       for k, v in manifest.get("asset_provenance", {}).items())):
+            raise _mutation.MutationHold("intake_manifest_invalid")
+        try:
+            _mutation.canonical_json(manifest)
+        except (ValueError, TypeError):
+            raise _mutation.MutationHold("intake_manifest_invalid") from None
     # additive key for raw-bytes dedupe; old manifests gain it on first touch
     manifest.setdefault("sha256_raw", [])
     # Strong source identities are authoritative. Drive-compatible MD5 values
@@ -377,7 +477,7 @@ def _is_section_shaped(payload):
     return any(isinstance(payload.get(k), dict) for k in _SECTION_KEYS)
 
 
-def _land_intake_form(client, payload, r2, key, manifest):
+def _land_intake_form(client, payload, r2, key, manifest, lib_dir=None):
     """Route one submitted intake form through the client-sources path: fact
     sections land as PENDING sources (never auto approved, deduped so a second
     submission adds nothing twice); the approver + gym basics are held as an
@@ -514,10 +614,18 @@ def _land_intake_form(client, payload, r2, key, manifest):
 
     # archive the FULL payload (voice/audience/media notes included) for the
     # bible draft, then consume the incoming object
-    r2.put_bytes(f"intake/{client}/forms/{os.path.basename(key)}",
-                 json.dumps(payload).encode("utf-8"),
-                 content_type="application/json")
-    r2.delete(key)
+    def _archive_form(conn):
+        r2.put_bytes(f"intake/{client}/forms/{os.path.basename(key)}",
+                     json.dumps(payload).encode("utf-8"),
+                     content_type="application/json")
+        r2.delete(key)
+        return {"archived": os.path.basename(key)}
+    if lib_dir is not None:
+        _guarded(client, "intake_admit",
+                 {"asset": key, "lane": "form", "status": "form_archived"},
+                 _archive_form, lib_dir)
+    else:
+        _archive_form(None)
     manifest["processed"].append(key)
     # TELL THE TRUTH. This line said "pending source(s) to review (approve before they
     # can draft)" no matter what actually happened, so with AGENT_INTAKE_AUTO_APPROVE
@@ -538,7 +646,121 @@ def _land_intake_form(client, payload, r2, key, manifest):
     return len(created)
 
 
+class _DispositionR2:
+    """Read back remote effects; consume incoming sources after manifest commit.
+
+    R2 cannot roll back with SQLite. An uncertain remote write or delete raises
+    inside the batch receipt, leaving it pending for explicit reconciliation.
+    """
+    def __init__(self, r2):
+        self.r2 = r2
+        self.deletions = {}
+        self.sources = {}
+        self.retained = {}
+
+    def __getattr__(self, name):
+        return getattr(self.r2, name)
+
+    def get_bytes(self, key):
+        data = self.r2.get_bytes(key)
+        if "/incoming/" in key:
+            source_hash = hashlib.sha256(data).hexdigest()
+            if key in self.sources and self.sources[key] != source_hash:
+                raise _mutation.MutationHold("intake_source_changed")
+            self.sources[key] = source_hash
+        return data
+
+    def put_bytes(self, key, data, content_type="application/octet-stream"):
+        try:
+            if "/originals/" in key:
+                try:
+                    existing = self.r2.get_bytes(key)
+                except Exception as exc:
+                    if not _object_absent(exc, key):
+                        raise _mutation.MutationHold("intake_original_unavailable")
+                else:
+                    if existing != data:
+                        raise _mutation.MutationHold("intake_original_conflict")
+                    self.retained[key] = hashlib.sha256(data).hexdigest()
+                    return  # immutable, already verified at these exact bytes
+            self.r2.put_bytes(key, data, content_type=content_type)
+            if self.r2.get_bytes(key) != data:
+                raise _mutation.MutationHold("intake_remote_write_unverified")
+            self.retained[key] = hashlib.sha256(data).hexdigest()
+        except Exception:
+            raise _mutation.MutationHold("intake_remote_write_unverified") from None
+
+    def delete(self, key):
+        if key not in self.deletions:
+            self.get_bytes(key)  # bind deletion to the bytes originally read
+            self.deletions[key] = self.sources[key]
+
+    def consume_sources(self):
+        # Verify the retained bytes and lineage as one disposition immediately
+        # before releasing any source; an earlier PUT receipt alone is weaker.
+        for key, retained_hash in self.retained.items():
+            try:
+                if hashlib.sha256(self.r2.get_bytes(key)).hexdigest() != retained_hash:
+                    raise _mutation.MutationHold("intake_retained_bytes_changed")
+            except Exception:
+                raise _mutation.MutationHold("intake_retained_bytes_unverified") from None
+        for key, source_hash in self.deletions.items():
+            try:
+                if hashlib.sha256(self.r2.get_bytes(key)).hexdigest() != source_hash:
+                    raise _mutation.MutationHold("intake_source_changed")
+                self.r2.delete(key)
+                try:
+                    self.r2.get_bytes(key)
+                except Exception as exc:
+                    if _object_absent(exc, key):
+                        continue
+                raise _mutation.MutationHold("intake_remote_delete_unverified")
+            except Exception:
+                raise _mutation.MutationHold("intake_remote_delete_unverified") from None
+
+
 def _process_client(client, r2, poster, converter, phash, moderator):
+    if not _mutation.enabled():
+        return _process_client_body(client, r2, poster, converter, phash, moderator)
+    lib_dir = _library_dir_for(client)
+    followups = []
+    held_subpath = []
+    def _disposition(conn):
+        if any(key.endswith("_intake.json") for key in
+               r2.list_keys(f"intake/{client}/incoming/")):
+            # Form landing writes through separate DB helpers rather than conn.
+            # It cannot participate in this SQLite transaction safely yet.
+            held_subpath.append("intake_form_transaction_adapter_required")
+            raise _mutation.MutationHold("intake_form_transaction_adapter_required")
+        _active_mutation.get()["followups"] = followups
+        guarded_r2 = _DispositionR2(r2)
+        stats = _process_client_body(client, guarded_r2, poster, converter, phash,
+                                     moderator)
+        # The body's authoritative manifest read and write are both under this
+        # lock. No incoming copy is consumed before its durable disposition.
+        guarded_r2.consume_sources()
+        return {"stats": stats, "consumed_sources": guarded_r2.deletions,
+                "retained_objects": guarded_r2.retained,
+                "manifest_sha256": guarded_r2.retained[f"intake/{client}/{MANIFEST}"]}
+    try:
+        result = _guarded(client, "intake_batch",
+                          {"client": client, "lane": "incoming"},
+                          _disposition, lib_dir)
+    except _mutation.MutationHold:
+        if held_subpath:
+            raise _mutation.MutationHold(held_subpath[0]) from None
+        raise
+    stats = result["stats"]
+    for callback in followups:
+        try:
+            callback()
+        except Exception as exc:
+            print(f"[intake] post-disposition follow-up failed for {client}: "
+                  f"{type(exc).__name__}")
+    return stats
+
+
+def _process_client_body(client, r2, poster, converter, phash, moderator):
     stats = {"accepted": 0, "duplicates": 0, "held": 0, "flagged": 0, "deadlettered": 0,
              "skipped": 0, "intake_forms": 0, "needs_caption": 0, "low_res": 0}
     manifest = _load_manifest(r2, client)
@@ -550,25 +772,36 @@ def _process_client(client, r2, poster, converter, phash, moderator):
 
     # Intake FORM submissions first: they are tiny and carry the sources the
     # media may pair with. A malformed payload dead-letters; never crashes.
+    lib_dir = _library_dir_for(client)
     for key in form_keys:
         if key in manifest["processed"]:
             stats["skipped"] += 1
             continue
         try:
             payload = json.loads(r2.get_bytes(key).decode("utf-8"))
-            _land_intake_form(client, payload, r2, key, manifest)
+            _land_intake_form(client, payload, r2, key, manifest, lib_dir)
             stats["intake_forms"] += 1
+        except _mutation.MutationHold:
+            raise   # a pending receipt mutation is never dead-lettered or marked processed
         except Exception as e:
             stats["deadlettered"] += 1
             try:
-                r2.put_bytes(f"intake/{client}/deadletter/{os.path.basename(key)}",
-                             r2.get_bytes(key))
-                r2.delete(key)
+                _guarded(client, "intake_quarantine",
+                         {"asset": os.path.basename(key), "lane": "form",
+                          "reason": "malformed_form"},
+                         lambda conn: (r2.put_bytes(
+                             f"intake/{client}/deadletter/{os.path.basename(key)}",
+                             r2.get_bytes(key)),
+                             r2.delete(key),
+                             {"quarantined": os.path.basename(key)})[-1],
+                         lib_dir)
+            except _mutation.MutationHold:
+                raise
             except Exception as dl_err:
                 print(f"[intake] form dead-letter failed for {client}/"
                       f"{os.path.basename(key)}: {type(dl_err).__name__}")
             manifest["processed"].append(key)
-            ops_alerts.alert(f"intake form dead-lettered {client}/"
+            _ops_alert(f"intake form dead-lettered {client}/"
                              f"{os.path.basename(key)}: {type(e).__name__}: {e}")
 
     # note/sidecar lookup: a media file's sidecar shares its timestamp prefix.
@@ -579,16 +812,19 @@ def _process_client(client, r2, poster, converter, phash, moderator):
         for sk in sidecars:
             if os.path.basename(sk).startswith(stamp):
                 try:
-                    return True, json.loads(r2.get_bytes(sk).decode("utf-8")) or {}
+                    payload = json.loads(r2.get_bytes(sk).decode("utf-8"))
+                    if not isinstance(payload, dict):
+                        raise ValueError("invalid upload sidecar")
+                    if (_active_mutation.get() is not None and
+                            not isinstance(payload.get("note", ""), str)):
+                        raise ValueError("invalid upload caption")
+                    return True, payload
                 except Exception:
+                    if _active_mutation.get() is not None:
+                        raise _mutation.MutationHold("intake_sidecar_unavailable") from None
                     return True, {}
         return False, {}
 
-    def _note_for(media_key):
-        _, payload = _sidecar_for(media_key)
-        return payload.get("note", "")
-
-    lib_dir = _library_dir_for(client)
     # Draft-on-upload (AGENT_DRAFT_ON_UPLOAD): assets filed THIS pass, so we can
     # draft one approval card per new upload the instant ingest finishes.
     newly_filed = []
@@ -606,10 +842,15 @@ def _process_client(client, r2, poster, converter, phash, moderator):
             # hand empty bytes to a converter.
             if not raw:
                 stats["deadlettered"] += 1
-                r2.put_bytes(f"intake/{client}/deadletter/{name}", b"")
-                r2.delete(key)
+                _guarded(client, "intake_quarantine",
+                         {"asset": name, "reason": "zero_byte"},
+                         lambda conn: (r2.put_bytes(
+                             f"intake/{client}/deadletter/{name}", b""),
+                             r2.delete(key),
+                             {"quarantined": name})[-1],
+                         lib_dir)
                 manifest["processed"].append(key)
-                ops_alerts.alert(f"intake ingest quarantined {client}/{name}: "
+                _ops_alert(f"intake ingest quarantined {client}/{name}: "
                                  "zero-byte upload (empty file, nothing filed)")
                 continue
 
@@ -625,11 +866,45 @@ def _process_client(client, r2, poster, converter, phash, moderator):
             raw_sha = hashlib.sha256(raw).hexdigest()
             if raw_sha in manifest["sha256_raw"]:
                 stats["duplicates"] += 1
-                r2.delete(key)
+                if _active_mutation.get() is not None:
+                    # An older manifest can name a source whose first JPEG was
+                    # re-encoded without retaining its raw bytes. Keep this raw
+                    # re-upload rather than relying on that historical claim.
+                    archive_key = f"intake/{client}/originals/{os.path.basename(key)}"
+                    provenance = _record_asset_provenance(
+                        manifest, original_key=key, current_key=archive_key,
+                        filename=os.path.basename(key), status="duplicate_raw",
+                        source_fingerprint=src_fp, source_aliases=src_aliases[1:],
+                        converted_bytes=raw)
+                    r2.put_bytes(archive_key, raw)
+                    r2.put_bytes(f"{archive_key}.provenance.json",
+                                 json.dumps(provenance).encode("utf-8"),
+                                 content_type="application/json")
+                _guarded(client, "intake_delete",
+                         {"asset": key, "reason": "raw_duplicate",
+                          "sha256": raw_sha},
+                         lambda conn: (r2.delete(key), {"deleted": key})[-1],
+                         lib_dir)
                 manifest["processed"].append(key)
                 continue
 
             data, name = converter(raw, name)
+
+            # A guarded receipt owns provenance by library basename. Two
+            # different source objects that convert to that same basename
+            # cannot safely share the media/sidecar pair: updating either one
+            # would replace the other's accepted bytes or source binding. Hold
+            # the receipt before any archive, dedupe disposition, or library
+            # write; the incoming source remains available for reconciliation.
+            if _active_mutation.get() is not None:
+                conflicting = any(
+                    record.get("status") == "accepted"
+                    and record.get("filename") == name
+                    and record.get("source_fingerprint") != src_fp
+                    for record in manifest["asset_provenance"].values()
+                )
+                if conflicting:
+                    raise _mutation.MutationHold("intake_basename_collision")
 
             sha = hashlib.sha256(data).hexdigest()
             ph = phash(data, name)
@@ -646,12 +921,19 @@ def _process_client(client, r2, poster, converter, phash, moderator):
                     filename=os.path.basename(key), status="duplicate_converted",
                     source_fingerprint=src_fp, source_aliases=src_aliases[1:],
                     converted_bytes=data)
-                r2.put_bytes(archive_key, raw)
-                r2.put_bytes(
-                    f"{archive_key}.provenance.json",
-                    json.dumps(provenance).encode("utf-8"),
-                    content_type="application/json")
-                r2.delete(key)
+                def _archive_dup(conn, archive_key=archive_key,
+                                 provenance=provenance):
+                    r2.put_bytes(archive_key, raw)
+                    r2.put_bytes(
+                        f"{archive_key}.provenance.json",
+                        json.dumps(provenance).encode("utf-8"),
+                        content_type="application/json")
+                    r2.delete(key)
+                    return {"archived": archive_key}
+                _guarded(client, "intake_admit",
+                         {"asset": key, "archive_key": archive_key,
+                          "status": "duplicate_converted", "sha256": sha},
+                         _archive_dup, lib_dir)
                 manifest["processed"].append(key)
                 continue
             if ph is not None and ph in manifest["phash"]:
@@ -669,20 +951,32 @@ def _process_client(client, r2, poster, converter, phash, moderator):
                     filename=os.path.basename(key), status="held_near_duplicate",
                     source_fingerprint=src_fp, source_aliases=src_aliases[1:],
                     converted_bytes=data, similarity_alias=f"perceptual:{ph}")
-                r2.put_bytes(hold_key, raw)
-                r2.put_bytes(
-                    f"intake/{client}/hold/{os.path.splitext(os.path.basename(key))[0]}.json",
-                    json.dumps({
-                        **provenance,
-                        "phash": ph,
-                        "note": "perceptual-hash collision with an accepted "
-                                "asset; source preserved, awaiting human "
-                                "keep/drop decision",
-                    }).encode("utf-8"),
-                    content_type="application/json")
-                r2.delete(key)   # only AFTER the hold copy + sidecar landed
+                hold_sidecar_key = (
+                    f"intake/{client}/hold/"
+                    f"{os.path.splitext(os.path.basename(key))[0]}.json")
+
+                def _hold(conn, hold_key=hold_key, provenance=provenance,
+                          hold_sidecar_key=hold_sidecar_key):
+                    r2.put_bytes(hold_key, raw)
+                    r2.put_bytes(
+                        hold_sidecar_key,
+                        json.dumps({
+                            **provenance,
+                            "phash": ph,
+                            "note": "perceptual-hash collision with an accepted "
+                                    "asset; source preserved, awaiting human "
+                                    "keep/drop decision",
+                        }).encode("utf-8"),
+                        content_type="application/json")
+                    r2.delete(key)   # only AFTER the hold copy + sidecar landed
+                    return {"held": hold_key}
+                _guarded(client, "intake_quarantine",
+                         {"asset": key, "hold_key": hold_key,
+                          "status": "held_near_duplicate",
+                          "similarity_alias": f"perceptual:{ph}"},
+                         _hold, lib_dir)
                 manifest["processed"].append(key)
-                ops_alerts.alert(
+                _ops_alert(
                     f"intake ingest HELD {client}/{os.path.basename(key)}: "
                     "near-duplicate of an already-accepted asset (pHash "
                     "collision). Source preserved under hold/ — confirm "
@@ -698,43 +992,69 @@ def _process_client(client, r2, poster, converter, phash, moderator):
                     source_fingerprint=src_fp, source_aliases=src_aliases[1:],
                     converted_bytes=data)
                 provenance["review_reason"] = reason
-                r2.put_bytes(review_key, data)
-                r2.put_bytes(
-                    f"intake/{client}/review/{os.path.splitext(name)[0]}.json",
-                    json.dumps(provenance).encode("utf-8"),
-                    content_type="application/json")
-                if name != os.path.basename(key):
-                    r2.put_bytes(f"intake/{client}/originals/{os.path.basename(key)}",
-                                 raw)
-                r2.delete(key)
+                review_sidecar_key = (
+                    f"intake/{client}/review/{os.path.splitext(name)[0]}.json")
+
+                def _review(conn, review_key=review_key, provenance=provenance,
+                            review_sidecar_key=review_sidecar_key):
+                    r2.put_bytes(review_key, data)
+                    r2.put_bytes(
+                        review_sidecar_key,
+                        json.dumps(provenance).encode("utf-8"),
+                        content_type="application/json")
+                    if raw != data or name != os.path.basename(key):
+                        r2.put_bytes(
+                            f"intake/{client}/originals/{os.path.basename(key)}",
+                            raw)
+                    r2.delete(key)
+                    return {"quarantined": review_key}
+                _guarded(client, "intake_quarantine",
+                         {"asset": key, "review_key": review_key,
+                          "status": "review", "reason": reason},
+                         _review, lib_dir)
                 manifest["processed"].append(key)
                 stats["flagged"] += 1
                 if poster is not None:
-                    poster.post_notice(f"Intake: {client} file {name} sent to review "
+                    _post_notice(poster, f"Intake: {client} file {name} sent to review "
                                        f"({reason}); nothing filed to the library.")
                 # A moderation reject can be a FALSE POSITIVE that silently buries a
                 # legit gym photo in review/. Raise an ops alert so a human can eyeball
                 # it and release it, rather than the photo just vanishing (audit #4).
-                ops_alerts.alert(
+                _ops_alert(
                     f"intake moderation sent {client}/{name} to review ({reason}); "
                     "verify — a false positive strands a legit photo in review/")
                 continue
 
-            # ORIGINALS KEPT: a conversion (name changed: HEIC->JPG, MOV->MP4)
+            # ORIGINALS KEPT: a conversion can change bytes without a rename.
             # archives the untouched source bytes to intake/<client>/originals/
             # BEFORE the incoming object is deleted. No conversion loses a file.
-            if name != os.path.basename(key):
-                r2.put_bytes(f"intake/{client}/originals/{os.path.basename(key)}",
-                             raw)
+            # The original is only ever copied, never mutated in place.
+            if raw != data or name != os.path.basename(key):
+                originals_key = f"intake/{client}/originals/{os.path.basename(key)}"
+                _guarded(client, "intake_admit",
+                         {"asset": key, "archive_key": originals_key,
+                          "status": "original_archived",
+                          "source_fingerprint": src_fp},
+                         lambda conn: (r2.put_bytes(originals_key, raw),
+                                       {"archived": originals_key})[-1],
+                         lib_dir)
 
             # THUMBNAIL: generated after conversion, before library filing.
-            # A failed thumbnail logs a warning and never blocks ingest.
+            # A failed thumbnail logs a warning and never blocks ingest; a
+            # receipt-protocol hold, however, is never swallowed.
             thumb_result = _make_thumbnail(data, name)
             if thumb_result is not None:
                 thumb_bytes, thumb_name = thumb_result
                 try:
-                    r2.put_bytes(f"intake/{client}/thumbs/{thumb_name}",
-                                 thumb_bytes, content_type="image/jpeg")
+                    _guarded(client, "intake_thumbnail",
+                             {"asset": name, "thumb": thumb_name},
+                             lambda conn: (r2.put_bytes(
+                                 f"intake/{client}/thumbs/{thumb_name}",
+                                 thumb_bytes, content_type="image/jpeg"),
+                                 {"thumb": thumb_name})[-1],
+                             lib_dir)
+                except _mutation.MutationHold:
+                    raise
                 except Exception as thumb_err:
                     print(f"[intake] thumbnail store failed for {client}/{name}: "
                           f"{type(thumb_err).__name__}")
@@ -757,7 +1077,7 @@ def _process_client(client, r2, poster, converter, phash, moderator):
                                         "resolution": f"{w_check}x{h_check}"}
                         stats["low_res"] += 1
                         if poster is not None:
-                            poster.post_notice(
+                            _post_notice(poster,
                                 f"Heads up: the photo {name} for {client} is "
                                 f"low resolution ({w_check}x{h_check}). It has "
                                 "been filed but a higher resolution version will "
@@ -783,46 +1103,35 @@ def _process_client(client, r2, poster, converter, phash, moderator):
                 pending_sidecar.update({
                     **low_res_flag,
                 })
-                r2.put_bytes(pending_key, data)
-                r2.put_bytes(
-                    f"intake/{client}/pending_caption/{os.path.splitext(name)[0]}.json",
-                    json.dumps(pending_sidecar).encode("utf-8"),
-                    content_type="application/json",
-                )
+                pending_sidecar_key = (
+                    f"intake/{client}/pending_caption/"
+                    f"{os.path.splitext(name)[0]}.json")
+
+                def _stage_pending(conn, pending_key=pending_key,
+                                   pending_sidecar=pending_sidecar,
+                                   pending_sidecar_key=pending_sidecar_key):
+                    r2.put_bytes(pending_key, data)
+                    r2.put_bytes(
+                        pending_sidecar_key,
+                        json.dumps(pending_sidecar).encode("utf-8"),
+                        content_type="application/json",
+                    )
+                    r2.delete(key)
+                    return {"staged": pending_key}
+                _guarded(client, "intake_quarantine",
+                         {"asset": key, "pending_key": pending_key,
+                          "status": "needs_caption"},
+                         _stage_pending, lib_dir)
                 manifest["processed"].append(key)
                 manifest["sha256"].append(sha)
                 manifest["sha256_raw"].append(raw_sha)
                 if ph is not None:
                     manifest["phash"].append(ph)
-                r2.delete(key)
                 if poster is not None:
-                    poster.post_notice(
+                    _post_notice(poster,
                         f"Got your photo! Send a quick caption and we will get "
                         f"it into your content lineup.")
                 continue
-
-            os.makedirs(lib_dir, exist_ok=True)
-            with open(os.path.join(lib_dir, name), "wb") as fh:
-                fh.write(data)
-            note = caption_text
-            if note:
-                stem = os.path.splitext(name)[0]
-                with open(os.path.join(lib_dir, f"{stem}.txt"), "w", encoding="utf-8") as fh:
-                    fh.write(note.strip())
-            if low_res_flag:
-                stem = os.path.splitext(name)[0]
-                try:
-                    existing_sidecar_path = os.path.join(lib_dir, f"{stem}.json")
-                    if os.path.exists(existing_sidecar_path):
-                        with open(existing_sidecar_path, encoding="utf-8") as _fh:
-                            filed_sidecar = json.load(_fh)
-                    else:
-                        filed_sidecar = {}
-                    filed_sidecar.update(low_res_flag)
-                    with open(existing_sidecar_path, "w", encoding="utf-8") as _fh:
-                        json.dump(filed_sidecar, _fh)
-                except Exception:
-                    pass
 
             library_path = os.path.join(lib_dir, name)
             provenance = _record_asset_provenance(
@@ -831,43 +1140,110 @@ def _process_client(client, r2, poster, converter, phash, moderator):
                 source_fingerprint=src_fp, source_aliases=src_aliases[1:],
                 converted_bytes=data)
             provenance.update(low_res_flag)
-            provenance_path = os.path.join(
-                lib_dir, f"{os.path.splitext(name)[0]}.json")
-            try:
-                existing_provenance = {}
-                if os.path.exists(provenance_path):
-                    with open(provenance_path, encoding="utf-8") as _fh:
-                        existing_provenance = json.load(_fh) or {}
-                existing_provenance.update(provenance)
-                with open(provenance_path, "w", encoding="utf-8") as _fh:
-                    json.dump(existing_provenance, _fh)
-            except (OSError, ValueError):
-                pass
+            note = caption_text
+
+            def _file_into_library(conn, note=note, provenance=provenance,
+                                   library_path=library_path):
+                os.makedirs(lib_dir, exist_ok=True)
+                active = _active_mutation.get()
+                if active is not None:
+                    cfg = active["cfg"]
+                    media_path = cfg.asset_path(Path(library_path))
+                    stem = os.path.splitext(name)[0]
+                    sidecar_path = cfg.asset_path(Path(lib_dir) / f"{stem}.json")
+                    caption_path = (cfg.asset_path(Path(lib_dir) / f"{stem}.txt")
+                                    if note else None)
+                    try:
+                        existing = (json.loads(sidecar_path.read_text(encoding="utf-8"))
+                                    if sidecar_path.exists() else {})
+                        if not isinstance(existing, dict):
+                            raise ValueError("invalid provenance sidecar")
+                    except (OSError, ValueError):
+                        raise _mutation.MutationHold("intake_provenance_unavailable") from None
+                    existing.update(provenance)
+                    _mutation.atomic_write_bytes(media_path, data)
+                    if caption_path is not None:
+                        _mutation.atomic_write_bytes(caption_path, note.strip().encode("utf-8"))
+                    _mutation.atomic_write_json(sidecar_path, existing)
+                    r2.delete(key)
+                    return {"filed": str(media_path)}
+                with open(library_path, "wb") as fh:
+                    fh.write(data)
+                if note:
+                    stem = os.path.splitext(name)[0]
+                    with open(os.path.join(lib_dir, f"{stem}.txt"),
+                              "w", encoding="utf-8") as fh:
+                        fh.write(note.strip())
+                if low_res_flag:
+                    stem = os.path.splitext(name)[0]
+                    try:
+                        existing_sidecar_path = os.path.join(lib_dir, f"{stem}.json")
+                        if os.path.exists(existing_sidecar_path):
+                            with open(existing_sidecar_path, encoding="utf-8") as _fh:
+                                filed_sidecar = json.load(_fh)
+                        else:
+                            filed_sidecar = {}
+                        filed_sidecar.update(low_res_flag)
+                        with open(existing_sidecar_path, "w", encoding="utf-8") as _fh:
+                            json.dump(filed_sidecar, _fh)
+                    except Exception:
+                        pass
+                provenance_path = os.path.join(
+                    lib_dir, f"{os.path.splitext(name)[0]}.json")
+                try:
+                    existing_provenance = {}
+                    if os.path.exists(provenance_path):
+                        with open(provenance_path, encoding="utf-8") as _fh:
+                            existing_provenance = json.load(_fh) or {}
+                    existing_provenance.update(provenance)
+                    with open(provenance_path, "w", encoding="utf-8") as _fh:
+                        json.dump(existing_provenance, _fh)
+                except (OSError, ValueError):
+                    pass
+                r2.delete(key)
+                return {"filed": library_path}
+            _guarded(client, "intake_admit",
+                     {"asset": key, "library_path": library_path,
+                      "status": "accepted", "sha256": sha,
+                      "source_fingerprint": src_fp},
+                     _file_into_library, lib_dir)
 
             manifest["processed"].append(key)
             manifest["sha256"].append(sha)
             manifest["sha256_raw"].append(raw_sha)
             if ph is not None:
                 manifest["phash"].append(ph)
-            r2.delete(key)
             stats["accepted"] += 1
-            newly_filed.append((os.path.join(lib_dir, name), note))
+            newly_filed.append((library_path, note))
             # DAM auto-tag on the freshly filed asset (AGENT_AUTOTAG_ENABLED,
             # OFF by default; errors are contained inside autotag)
             try:
                 from . import dam
-                dam.autotag(os.path.join(lib_dir, name))
+                _after_disposition(lambda path=os.path.join(lib_dir, name): dam.autotag(path))
             except Exception:
                 pass
+        except _mutation.MutationHold:
+            # A fenced mutation is PENDING, never failed-safe: do not dead-letter
+            # the source, do not mark the key processed, do not save the manifest
+            # over it. The pass aborts so the durable journal can be reconciled.
+            raise
         except Exception as e:
             stats["deadlettered"] += 1
             try:
                 # quarantine from the bytes already in memory when we have them
                 # (a corrupt object can be unreadable a second time); re-fetch
                 # only if the original get itself was what failed.
-                r2.put_bytes(f"intake/{client}/deadletter/{os.path.basename(key)}",
-                             raw if raw is not None else r2.get_bytes(key))
-                r2.delete(key)
+                _guarded(client, "intake_quarantine",
+                         {"asset": os.path.basename(key), "lane": "media",
+                          "reason": f"{type(e).__name__}"},
+                         lambda conn: (r2.put_bytes(
+                             f"intake/{client}/deadletter/{os.path.basename(key)}",
+                             raw if raw is not None else r2.get_bytes(key)),
+                             r2.delete(key),
+                             {"quarantined": os.path.basename(key)})[-1],
+                         lib_dir)
+            except _mutation.MutationHold:
+                raise
             except Exception as dl_err:
                 # even dead-lettering must never crash the loop, but a failed
                 # dead-letter is LOUD, and the key is still marked processed
@@ -875,7 +1251,7 @@ def _process_client(client, r2, poster, converter, phash, moderator):
                 print(f"[intake] dead-letter itself failed for {client}/"
                       f"{os.path.basename(key)}: {type(dl_err).__name__}")
             manifest["processed"].append(key)
-            ops_alerts.alert(f"intake ingest dead-lettered {client}/{os.path.basename(key)}: "
+            _ops_alert(f"intake ingest dead-lettered {client}/{os.path.basename(key)}: "
                              f"{type(e).__name__}: {e}")
 
     # WHOLE-BATCH DEAD-LETTER ESCALATION (audit #3): when a pass tried several media
@@ -886,14 +1262,21 @@ def _process_client(client, r2, poster, converter, phash, moderator):
     # alert so the batch failure is visible and actionable, not buried.
     if stats["deadlettered"] >= 3 and stats["accepted"] == 0 \
             and stats["duplicates"] == 0:
-        ops_alerts.alert(
+        _ops_alert(
             f"intake BATCH FAILURE for {client}: {stats['deadlettered']} media file(s) "
             "dead-lettered this pass and NONE were filed. This is usually a missing "
             "decoder/converter in the deployed image (pillow-heif for HEIC, ffmpeg for "
             "HEVC/MOV). Check the worker image before more uploads are lost.",
             force=True)
 
-    _save_manifest(r2, client, manifest)
+    manifest_bytes = json.dumps(manifest).encode("utf-8")
+    _guarded(client, "intake_manifest",
+             {"client": client,
+              "manifest_sha256": hashlib.sha256(manifest_bytes).hexdigest(),
+              "processed": len(manifest["processed"])},
+             lambda conn: (_save_manifest(r2, client, manifest),
+                           {"processed": len(manifest["processed"])})[-1],
+             lib_dir)
 
     # DRAFT-ON-UPLOAD (AGENT_DRAFT_ON_UPLOAD, OFF by default): draft one approval
     # card per newly filed asset the instant ingest finishes, so a gym's upload
@@ -902,16 +1285,18 @@ def _process_client(client, r2, poster, converter, phash, moderator):
     # self-guarding: flag OFF or no new assets -> no-op; a draft failure never
     # breaks ingest (this whole block is contained).
     if config.draft_on_upload_enabled() and newly_filed:
-        try:
-            from . import runner
-            drafts = runner.draft_for_new_upload(client, newly_filed, poster=poster)
-            stats["drafted_on_upload"] = len(drafts)
-        except Exception as e:
-            print(f"[intake] draft-on-upload failed for {client}: "
-                  f"{type(e).__name__}: {e}")
-            ops_alerts.alert(f"draft-on-upload trigger errored for {client}: "
-                             f"{type(e).__name__}: {e}. Media is filed; the daily "
-                             "draw will still pick it up.")
+        def _draft_uploaded():
+            try:
+                from . import runner
+                drafts = runner.draft_for_new_upload(client, newly_filed, poster=poster)
+                stats["drafted_on_upload"] = len(drafts)
+            except Exception as e:
+                print(f"[intake] draft-on-upload failed for {client}: "
+                      f"{type(e).__name__}: {e}")
+                _ops_alert(f"draft-on-upload trigger errored for {client}: "
+                           f"{type(e).__name__}: {e}. Media is filed; the daily "
+                           "draw will still pick it up.")
+        _after_disposition(_draft_uploaded)
 
     return stats
 

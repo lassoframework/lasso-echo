@@ -2,8 +2,8 @@
 -- Apply after schema, claim trigger and backfill drafts, BEFORE the activation
 -- draft (which must be last). This does not arm any guard.
 -- All writes below are additive. Rollback before activation: DROP these RPCs
--- and tables in reverse dependency order. After a confirmed publish, preserve
--- visual_global_usage and visual_global_usage_member as permanent history.
+-- and tables in reverse dependency order. Preserve imported incidents and
+-- confirmed usage as permanent history after activation.
 begin;
 lock table public.gym_visual_guard_settings in share row exclusive mode;
 do $$ begin
@@ -31,7 +31,8 @@ create table if not exists public.visual_global_identity (
   foreign key (tenant_id, group_key) references public.visual_group(gym_id, group_key)
 );
 
--- One fingerprint has exactly one tenant/date owner globally. A published
+-- Runtime claims have one tenant/date owner per fingerprint. Historical
+-- repeated uses are separate immutable incidents below. A published runtime
 -- owner is permanent, including when all calendar rows later disappear.
 create table if not exists public.visual_global_usage (
   fingerprint text primary key,
@@ -93,6 +94,38 @@ create table if not exists public.visual_global_published_attribution (
 create index if not exists visual_global_published_attribution_fingerprint_idx
   on public.visual_global_published_attribution(fingerprint);
 
+-- Historical incidents have no single-owner FK: real repeated consumption
+-- cannot be compressed into one fictional tenant/date winner. One source
+-- anchor and fingerprint records one immutable incident. Runtime owner/member
+-- rows remain separate and are never re-dated or rewritten by this importer.
+create table if not exists public.visual_global_historical_incident (
+  id bigint generated always as identity primary key,
+  source_kind text not null check (source_kind in ('calendar','local_ledger')),
+  source_key text not null check (btrim(source_key)<>''),
+  source_state text not null check (source_state in ('reserved','published','released')),
+  tenant_id text not null,
+  group_key text not null,
+  fingerprint text not null check (fingerprint ~ '^md5:[0-9a-f]{32}$'),
+  calendar_row_id uuid,
+  channel text,
+  used_date date not null,
+  source_evidence jsonb not null check (jsonb_typeof(source_evidence)='object'
+    and source_evidence<>'{}'::jsonb),
+  byte_evidence jsonb not null check (jsonb_typeof(byte_evidence)='array'
+    and jsonb_array_length(byte_evidence)>0),
+  recorded_at timestamptz not null default now(),
+  unique (source_kind,source_key,source_state,tenant_id,group_key,fingerprint),
+  foreign key (tenant_id,group_key) references public.visual_group(gym_id,group_key),
+  check (source_kind<>'calendar' or (source_state='published' and calendar_row_id is not null))
+);
+create index if not exists visual_global_historical_incident_fingerprint_idx
+  on public.visual_global_historical_incident(fingerprint);
+create index if not exists visual_global_historical_incident_scene_idx
+  on public.visual_global_historical_incident(tenant_id,group_key,used_date);
+alter table public.visual_global_historical_incident enable row level security;
+revoke all on public.visual_global_historical_incident from public,anon,authenticated,service_role;
+grant select on public.visual_global_historical_incident to service_role;
+
 -- These are owner-only writes. The service role can inspect receipts but must
 -- use the validated SECURITY DEFINER functions to bind and import history.
 alter table public.visual_global_identity enable row level security;
@@ -126,6 +159,11 @@ drop trigger if exists visual_global_published_attribution_immutable
   on public.visual_global_published_attribution;
 create trigger visual_global_published_attribution_immutable before update or delete
   on public.visual_global_published_attribution for each row execute function public.visual_global_immutable();
+drop trigger if exists visual_global_historical_incident_immutable
+  on public.visual_global_historical_incident;
+create trigger visual_global_historical_incident_immutable before update or delete
+  on public.visual_global_historical_incident for each row
+  execute function public.visual_global_immutable();
 create or replace function public.visual_global_member_guard()
 returns trigger language plpgsql set search_path = public as $$
 begin
@@ -1023,16 +1061,86 @@ begin
 end;
 $$;
 
+-- Persist only authority-bearing immutable source fields: tenant, row, group,
+-- date, channel, format and the immutable media/byte evidence. Mutable provider
+-- receipt fields (published_at, late_post_id) are deliberately excluded: a
+-- legitimate receipt backfill after fleet import must match the recorded
+-- incident, not raise source-evidence drift. Copy edits do not alter a
+-- historical byte anchor; changes to the row's tenant, date, channel, scene
+-- key or any immutable media/byte proof are still detected as source drift
+-- instead of silently laundering a changed image or scene.
+create or replace function public.visual_global_historical_row_evidence(
+  p_row public.content_calendar
+) returns jsonb language sql stable set search_path=public as $$
+  select jsonb_build_object('id',p_row.id,'raw_gym_key',p_row.gym_id,
+    'post_date',p_row.post_date,'channel',p_row.account,'format',p_row.format,
+    'image_url',p_row.image_url,'source_media_url',to_jsonb(p_row)->'source_media_url',
+    'thumbnail_url',to_jsonb(p_row)->'thumbnail_url',
+    'source_media_asset_id',to_jsonb(p_row)->'source_media_asset_id',
+    'drive_file_id',to_jsonb(p_row)->'drive_file_id','byte_hash',to_jsonb(p_row)->'byte_hash',
+    'r2_key',to_jsonb(p_row)->'r2_key','visual_group_key',p_row.visual_group_key,
+    'logical_post_id',to_jsonb(p_row)->'logical_post_id');
+$$;
+
+create or replace function public.visual_global_historical_row_covered(
+  p_row public.content_calendar,p_group text
+) returns boolean language sql stable security definer set search_path=public as $$
+  select p_row.post_date is not null
+    and (p_row.status='published' or p_row.published_at is not null)
+    and public.visual_global_row_verified_fingerprints(p_row,p_group) is not null
+    and not exists(select 1 from unnest(
+      public.visual_global_row_verified_fingerprints(p_row,p_group)) f
+      where not exists(select 1 from public.visual_global_historical_incident h
+        where h.source_kind='calendar' and h.source_state='published'
+          and h.source_key=p_row.id::text and h.calendar_row_id=p_row.id
+          and h.tenant_id=public.visual_group_tenant_id(p_row.gym_id)::text
+          and h.group_key=p_group and h.fingerprint=f
+          and h.used_date=p_row.post_date and h.channel is not distinct from p_row.account
+          and h.source_evidence=public.visual_global_historical_row_evidence(p_row)));
+$$;
+
+-- Permanent per-row consumption slots are independent of mutable calendar rows
+-- and local sibling lifecycle. Deletes/releases never make the slot available.
+create table if not exists public.visual_global_row_slot_receipt (
+  tenant_id text not null, group_key text not null, calendar_row_id uuid not null,
+  used_date date, logical_post_id text, channel text, format text,
+  primary key(tenant_id,group_key,calendar_row_id)
+);
+alter table public.visual_global_row_slot_receipt enable row level security;
+revoke all on public.visual_global_row_slot_receipt from public,anon,authenticated,service_role;
+grant select on public.visual_global_row_slot_receipt to service_role;
+drop trigger if exists visual_global_row_slot_receipt_immutable on public.visual_global_row_slot_receipt;
+create trigger visual_global_row_slot_receipt_immutable before update or delete
+  on public.visual_global_row_slot_receipt for each row execute function public.visual_global_immutable();
+
+-- Authorized expressions of one logical post share at most one platform slot.
+create or replace function public.visual_global_platform_slot(p_channel text,p_format text)
+returns text language sql immutable set search_path=public as $$
+  select case
+    when lower(p_channel) in ('ig','instagram') and lower(p_format)='feed' then 'ig/feed'
+    when lower(p_channel) in ('fb','facebook') and lower(p_format)='feed' then 'fb/feed'
+    when lower(p_channel) in ('ig','instagram') and lower(p_format)='story' then 'ig/story'
+  end;
+$$;
+revoke all on function public.visual_global_platform_slot(text,text)
+  from public,anon,authenticated,service_role;
+
 -- All fingerprints are locked in sorted order and preflighted before any
 -- usage/member write. A collision on any source, rendition, or linked
 -- component aborts the statement and rolls back the whole calendar mutation.
+-- Replace the old eight-argument overload on draft reapplication. The safe
+-- compatibility wrapper below delegates to the strict evidence implementation.
+drop function if exists public.visual_global_claim_fingerprint_set(text,text,date,uuid,text,boolean,boolean,text[]);
+drop function if exists public.visual_global_claim_fingerprint_set(text,text,date,uuid,text,boolean,boolean,text[],jsonb);
 create or replace function public.visual_global_claim_fingerprint_set(
   p_tenant text,p_group_key text,p_date date,p_row_id uuid,p_channel text,
-  p_published boolean,p_ambiguous boolean,p_fingerprints text[]
+  p_published boolean,p_ambiguous boolean,p_fingerprints text[],
+  p_row_evidence jsonb,p_restore_imported_reservation boolean
 ) returns text[] language plpgsql security definer set search_path = public as $$
 declare v_fingerprints text[]; v_hash text;
   v_usage public.visual_global_usage%rowtype;
   v_member public.visual_global_usage_member%rowtype;
+  v_row_evidence jsonb; v_slot text; v_restore_existing boolean;
 begin
   p_tenant:=public.visual_group_tenant_strict(p_tenant)::text;
   if p_published is null or p_ambiguous is null or (p_date is null and not p_published)
@@ -1054,6 +1162,122 @@ begin
     perform public.visual_group_auxiliary_lock(hashtextextended(
       jsonb_build_array('visual_global_fingerprint',v_hash)::text,0));
   end loop;
+  -- BEFORE INSERT cannot query NEW. The owner-only claim_scene wrapper passes
+  -- NEW evidence; other internal callers use the persisted calendar row.
+  -- Original-row retries retain idempotency even with legacy NULL identities.
+  -- New rows need a matching non-null logical identity and an unused slot.
+  v_row_evidence:=p_row_evidence;
+  if v_row_evidence is null then
+    select public.visual_global_historical_row_evidence(c) into v_row_evidence
+      from public.content_calendar c where c.id=p_row_id;
+  end if;
+  v_slot:=public.visual_global_platform_slot(p_channel,v_row_evidence->>'format');
+  -- Only the owner-only importer requests this narrowly scoped restoration.
+  -- It preserves a reservation that already existed before fleet import,
+  -- witnessed by the frozen local-ledger incident, without creating a new
+  -- sibling exception for runtime rows or changing the original claim owner.
+  v_restore_existing:=coalesce(p_restore_imported_reservation,false)
+    and exists(select 1 from public.visual_global_historical_incident anchor
+      join public.visual_group_usage_ledger ledger
+        on ledger.gym_id=anchor.tenant_id and ledger.group_key=anchor.group_key
+      where anchor.source_kind='local_ledger' and anchor.source_state='reserved'
+        and anchor.tenant_id=p_tenant and anchor.group_key=p_group_key
+        and anchor.used_date=p_date and anchor.calendar_row_id=p_row_id
+        and anchor.channel is not distinct from p_channel
+        and ledger.state='reserved' and ledger.calendar_row_id=p_row_id
+        and ledger.reserved_date=p_date and ledger.channel is not distinct from p_channel
+        and anchor.source_evidence->'ledger'=to_jsonb(ledger));
+  if exists(select 1 from public.visual_global_historical_incident h
+      where h.source_kind='calendar' and h.calendar_row_id=p_row_id
+        and (h.channel is distinct from p_channel
+          or h.source_evidence->>'format' is distinct from v_row_evidence->>'format'
+          or h.source_evidence->>'logical_post_id' is distinct from v_row_evidence->>'logical_post_id')) then
+    raise exception 'consumed calendar platform slot identity is immutable' using errcode='23514';
+  end if;
+  if exists(select 1 from public.visual_global_historical_incident h
+      where (h.fingerprint=any(v_fingerprints) or
+        (h.tenant_id=p_tenant and h.group_key in (
+          select public.visual_group_scene_members(p_tenant,p_group_key))))
+      and (h.tenant_id<>p_tenant or h.used_date is distinct from p_date
+        or h.group_key not in (select public.visual_group_scene_members(p_tenant,p_group_key))
+        or not coalesce((
+          h.calendar_row_id=p_row_id or v_restore_existing or
+          (h.source_kind='local_ledger' and coalesce(
+            h.source_evidence->'sibling_ids' @> jsonb_build_array(p_row_id::text),false)) or
+          (h.source_kind='local_ledger'
+            and v_row_evidence->>'logical_post_id' is not null and v_slot is not null
+            and not exists (
+              select 1 from (
+                select h.calendar_row_id::text id
+                union select jsonb_array_elements_text(coalesce(h.source_evidence->'sibling_ids','[]'::jsonb))
+              ) recorded
+              where not exists(select 1 from public.visual_global_historical_incident anchor
+                where anchor.source_kind='calendar' and anchor.calendar_row_id::text=recorded.id
+                  and anchor.tenant_id=p_tenant and anchor.used_date=p_date
+                  and anchor.group_key in (select public.visual_group_scene_members(p_tenant,p_group_key))
+                  and anchor.source_evidence->>'logical_post_id'=v_row_evidence->>'logical_post_id'
+                  and public.visual_global_platform_slot(anchor.channel,anchor.source_evidence->>'format') is not null
+                  and public.visual_global_platform_slot(anchor.channel,anchor.source_evidence->>'format')<>v_slot))) or
+          (h.source_kind='calendar'
+            and v_row_evidence->>'logical_post_id' is not null
+            and h.source_evidence->>'logical_post_id'=v_row_evidence->>'logical_post_id'
+            and v_slot is not null
+            and public.visual_global_platform_slot(h.channel,h.source_evidence->>'format') is not null
+            and public.visual_global_platform_slot(h.channel,h.source_evidence->>'format')<>v_slot)
+        ),false))) then
+    raise exception 'visual fingerprint or scene permanently consumed by historical incident'
+      using errcode='23514';
+  end if;
+  -- Immutable slot receipts remain authoritative after calendar mutation or
+  -- deletion. Check every consumed runtime row across linked scene groups.
+  if exists(select 1 from public.visual_global_row_slot_receipt r
+      where r.tenant_id=p_tenant and r.group_key in (
+        select public.visual_group_scene_members(p_tenant,p_group_key))
+        and r.calendar_row_id<>p_row_id
+        and (r.used_date is distinct from p_date
+          or v_row_evidence->>'logical_post_id' is null
+          or r.logical_post_id is distinct from v_row_evidence->>'logical_post_id'
+          or v_slot is null
+          or public.visual_global_platform_slot(r.channel,r.format) is null
+          or public.visual_global_platform_slot(r.channel,r.format)=v_slot)) then
+    raise exception 'historical scene platform sibling slot occupied or identity unverified'
+      using errcode='23514';
+  end if;
+  -- An old runtime sibling without a retained receipt is uncertain; never
+  -- infer a free slot from its mutable calendar row or released state. Only
+  -- immutable historical calendar evidence can account for that old row.
+  if exists(select 1 from public.visual_group_usage_sibling sibling
+      where sibling.gym_id=p_tenant and sibling.group_key in (
+        select public.visual_group_scene_members(p_tenant,p_group_key))
+        and sibling.calendar_row_id<>p_row_id
+        and not exists(select 1 from public.visual_global_row_slot_receipt r
+          where r.tenant_id=sibling.gym_id and r.group_key=sibling.group_key
+            and r.calendar_row_id=sibling.calendar_row_id)
+        and not exists(select 1 from public.visual_global_historical_incident h
+          where h.source_kind='calendar' and h.tenant_id=sibling.gym_id
+            and h.group_key in (select public.visual_group_scene_members(p_tenant,p_group_key))
+            and h.calendar_row_id=sibling.calendar_row_id and h.used_date=p_date
+            and h.source_evidence->>'logical_post_id'=v_row_evidence->>'logical_post_id'
+            and v_slot is not null
+            and public.visual_global_platform_slot(h.channel,h.source_evidence->>'format') is not null
+            and public.visual_global_platform_slot(h.channel,h.source_evidence->>'format')<>v_slot)) then
+    raise exception 'historical scene platform sibling slot occupied or identity unverified'
+      using errcode='23514';
+  end if;
+  if v_row_evidence is not null then
+    insert into public.visual_global_row_slot_receipt
+      (tenant_id,group_key,calendar_row_id,used_date,logical_post_id,channel,format)
+      values(p_tenant,p_group_key,p_row_id,p_date,v_row_evidence->>'logical_post_id',
+        p_channel,v_row_evidence->>'format') on conflict do nothing;
+    if exists(select 1 from public.visual_global_row_slot_receipt r
+        where r.tenant_id=p_tenant and r.group_key=p_group_key and r.calendar_row_id=p_row_id
+          and (r.used_date is distinct from p_date
+            or r.logical_post_id is distinct from v_row_evidence->>'logical_post_id'
+            or r.channel is distinct from p_channel
+            or r.format is distinct from v_row_evidence->>'format')) then
+      raise exception 'consumed calendar platform slot identity is immutable' using errcode='23514';
+    end if;
+  end if;
   -- Preflight existing owners and members before inserting any absent key.
   for v_usage in select u.* from public.visual_global_usage u
       where u.fingerprint=any(v_fingerprints) order by u.fingerprint for update loop
@@ -1122,120 +1346,86 @@ begin
 end;
 $$;
 
--- Historical attribution claims exactly the byte subset one published
--- null-key calendar row verifiably consumed, under that row's own original
--- publication date. Unlike visual_global_claim_fingerprint_set this is NOT a
--- full-scene claim: other members of the same group (keyed staged
--- reservations or bytes attested after the row published) may exist outside
--- the subset and are never touched. The keyed full-set invariant stays with
--- visual_global_claim_fingerprint_set; this helper exists so two historical
--- rows that shared a scene source but delivered distinct renditions can both
--- attribute without each rejecting the other's already-claimed bytes.
--- Existing reserved owners/members inside the subset keep their reserved
--- state: historical attribution never promotes a pending keyed reservation
--- to published. Any cross-tenant or cross-date owner collision, released
--- owner, or conflicting member date aborts the whole statement, rolling back
--- the identity mutation that triggered the refresh. Owner-only; never
--- granted to service_role.
+-- Preserve the activation migration's original checked signature while routing
+-- every legacy/internal call through the same strict authority above.
+create or replace function public.visual_global_claim_fingerprint_set(
+  p_tenant text,p_group_key text,p_date date,p_row_id uuid,p_channel text,
+  p_published boolean,p_ambiguous boolean,p_fingerprints text[]
+) returns text[] language sql security definer set search_path=public as $$
+  select public.visual_global_claim_fingerprint_set(p_tenant,p_group_key,p_date,
+    p_row_id,p_channel,p_published,p_ambiguous,p_fingerprints,null::jsonb,false);
+$$;
+revoke all on function public.visual_global_claim_fingerprint_set(text,text,date,uuid,text,boolean,boolean,text[])
+  from public,anon,authenticated,service_role;
+
+-- Owner-only importer for one ACTUAL published row. Every supplied field and
+-- the complete selected byte subset must match the source row. Repeated real
+-- dates/tenants are incidents, not competing runtime claims. This function
+-- never chooses a winner or creates/updates runtime owners and members.
 create or replace function public.visual_global_claim_historical_row(
   p_tenant text,p_group_key text,p_date date,p_row_id uuid,p_channel text,
   p_fingerprints text[]
-) returns text[] language plpgsql security definer set search_path = public as $$
-declare v_fingerprints text[]; v_hash text;
-  v_usage public.visual_global_usage%rowtype;
-  v_member public.visual_global_usage_member%rowtype;
+) returns text[] language plpgsql security definer set search_path=public as $$
+declare r public.content_calendar; v_fingerprints text[]; v_hash text;
+  v_source jsonb; v_bytes jsonb; v_existing public.visual_global_historical_incident%rowtype;
 begin
   p_tenant:=public.visual_group_tenant_strict(p_tenant)::text;
-  if p_date is null
-      or not exists(select 1 from public.visual_group
-        where gym_id=p_tenant and group_key=p_group_key) then
-    raise exception 'historical attribution needs a canonical scene and verified date'
-      using errcode='22023';
+  perform public.visual_group_auxiliary_lock(hashtextextended(
+    jsonb_build_array('visual_tenant',p_tenant)::text,0));
+  select * into r from public.content_calendar where id=p_row_id for share;
+  if not found or not (r.status='published' or r.published_at is not null)
+      or p_date is null or r.post_date is distinct from p_date
+      or public.visual_group_tenant_id(r.gym_id)::text is distinct from p_tenant
+      or public.visual_group_resolve_row(r) is distinct from p_group_key
+      or r.account is distinct from p_channel then
+    raise exception 'historical attribution must match actual published row tenant/group/date/channel'
+      using errcode='23514';
   end if;
-  select array_agg(f order by f) into v_fingerprints from (
-    select distinct lower(btrim(x)) f from unnest(p_fingerprints) x
-  ) q where f ~ '^md5:[0-9a-f]{32}$';
-  if v_fingerprints is null
-      or cardinality(v_fingerprints)<>cardinality(p_fingerprints)
-      or exists(select 1 from unnest(p_fingerprints) x
-        where x is null or lower(btrim(x)) !~ '^md5:[0-9a-f]{32}$') then
-    raise exception 'complete unique MD5 fingerprint set required' using errcode='22023';
+  v_fingerprints:=public.visual_global_row_verified_fingerprints(r,p_group_key);
+  if v_fingerprints is null or p_fingerprints is null
+      or v_fingerprints is distinct from array(
+        select distinct lower(btrim(x)) from unnest(p_fingerprints) x order by 1)
+      or cardinality(v_fingerprints)<>cardinality(p_fingerprints) then
+    raise exception 'historical row complete verified byte evidence required' using errcode='23514';
+  end if;
+  if public.visual_group_row_review_pending(r) then
+    raise exception 'historical row has unresolved scene review' using errcode='23514';
+  end if;
+  v_source:=public.visual_global_historical_row_evidence(r);
+  if exists(select 1 from public.visual_global_historical_incident h
+      where h.source_kind='calendar' and h.source_key=p_row_id::text
+        and (h.tenant_id<>p_tenant or h.group_key<>p_group_key
+          or h.used_date is distinct from p_date or h.source_evidence is distinct from v_source
+          or not (h.fingerprint=any(v_fingerprints)))) then
+    raise exception 'historical incident source evidence drift' using errcode='23514';
   end if;
   foreach v_hash in array v_fingerprints loop
     perform public.visual_group_auxiliary_lock(hashtextextended(
       jsonb_build_array('visual_global_fingerprint',v_hash)::text,0));
-  end loop;
-  -- Preflight existing owners and this row's own member claims before any
-  -- write. Only the subset is inspected; other group members are out of
-  -- scope for historical attribution.
-  for v_usage in select u.* from public.visual_global_usage u
-      where u.fingerprint=any(v_fingerprints) order by u.fingerprint for update loop
-    if v_usage.state='released' then
-      raise exception 'legacy released global fingerprint requires historical repair'
-        using errcode='23514';
-    elsif v_usage.tenant_id<>p_tenant or v_usage.used_date is distinct from p_date then
-      raise exception 'visual byte fingerprint already used by another client or date'
-        using errcode='23514';
+    select jsonb_agg(to_jsonb(o) order by o.exact_url) into v_bytes
+      from public.visual_global_object_attestation o
+      where o.tenant_id=p_tenant and o.fingerprint=v_hash
+        and o.exact_url in (btrim(r.image_url),btrim(to_jsonb(r)->>'source_media_url'),
+          btrim(to_jsonb(r)->>'thumbnail_url'));
+    if v_bytes is null then
+      raise exception 'historical row lacks retained exact-object receipts' using errcode='23514';
     end if;
-  end loop;
-  for v_member in select m.* from public.visual_global_usage_member m
-      where m.tenant_id=p_tenant and m.group_key=p_group_key
-        and m.fingerprint=any(v_fingerprints)
-      order by m.fingerprint for update loop
-    if v_member.state='released' then
-      raise exception 'legacy released global member requires historical repair'
-        using errcode='23514';
-    elsif v_member.used_date is distinct from p_date then
-      raise exception 'visual group has conflicting historical membership'
-        using errcode='23514';
+    select * into v_existing from public.visual_global_historical_incident h
+      where h.source_kind='calendar' and h.source_key=p_row_id::text
+        and h.source_state='published' and h.tenant_id=p_tenant
+        and h.group_key=p_group_key and h.fingerprint=v_hash;
+    if found and (v_existing.used_date is distinct from p_date
+        or v_existing.channel is distinct from p_channel
+        or v_existing.source_evidence is distinct from v_source
+        or v_existing.byte_evidence is distinct from v_bytes) then
+      raise exception 'historical incident source evidence drift' using errcode='23514';
     end if;
-  end loop;
-  -- A manually linked scene is one visual subject: every staged or published
-  -- member anywhere in the connected component pins the whole component to
-  -- one date. Two attested published null-key rows with DISTINCT fingerprints
-  -- in the same linked scene therefore cannot carry different dates even
-  -- though neither byte has its own owner conflict; same-date siblings pass.
-  if exists(select 1 from public.visual_global_usage_member cm
-      where cm.tenant_id=p_tenant
-        and cm.group_key in (select public.visual_group_scene_members(
-          p_tenant,p_group_key))
-        and cm.state in ('reserved','published')
-        and cm.used_date is distinct from p_date) then
-    raise exception 'linked visual scene has a conflicting component-wide usage date'
-      using errcode='23514';
-  end if;
-  foreach v_hash in array v_fingerprints loop
-    -- The historical row verifiably published this byte, so an absent owner
-    -- is created published. An existing owner already passed the tenant/date
-    -- preflight and is deliberately left at its current state: a pending
-    -- keyed reservation of the same byte on the same date stays reserved.
-    insert into public.visual_global_usage
-      (fingerprint,tenant_id,used_date,state,ambiguous,published_at)
-      values(v_hash,p_tenant,p_date,'published',false,now())
-      on conflict (fingerprint) do nothing;
-    select * into v_usage from public.visual_global_usage
-      where fingerprint=v_hash for update;
-    if v_usage.state='released' or v_usage.tenant_id<>p_tenant
-        or v_usage.used_date is distinct from p_date then
-      raise exception 'visual byte fingerprint owner changed during atomic claim'
-        using errcode='23514';
-    end if;
-    -- Same rule for members: a new member records this row's publication;
-    -- an existing member (keyed reservation or an earlier historical row
-    -- sharing the byte) is an idempotent no-op, never a state rewrite.
-    insert into public.visual_global_usage_member
-      (tenant_id,group_key,fingerprint,calendar_row_id,channel,used_date,state,ambiguous)
-      values(p_tenant,p_group_key,v_hash,p_row_id,p_channel,p_date,'published',false)
-      on conflict (tenant_id,group_key,fingerprint) do nothing;
-    -- Durable append-only proof that THIS published row consumed this byte on
-    -- this date. When a keyed same-date reservation already owns the member
-    -- row, the member stays keyed and reserved above; this receipt still
-    -- records the publication, and survives keyed-member release, calendar
-    -- row deletion and import re-runs without ever being rewritten.
-    insert into public.visual_global_published_attribution
-      (tenant_id,group_key,fingerprint,calendar_row_id,channel,used_date)
-      values(p_tenant,p_group_key,v_hash,p_row_id,p_channel,p_date)
-      on conflict (tenant_id,group_key,fingerprint,calendar_row_id) do nothing;
+    insert into public.visual_global_historical_incident
+      (source_kind,source_key,source_state,tenant_id,group_key,fingerprint,
+       calendar_row_id,channel,used_date,source_evidence,byte_evidence)
+      values('calendar',p_row_id::text,'published',p_tenant,p_group_key,v_hash,
+        p_row_id,p_channel,p_date,v_source,v_bytes)
+      on conflict (source_kind,source_key,source_state,tenant_id,group_key,fingerprint) do nothing;
   end loop;
   return v_fingerprints;
 end;
@@ -1353,7 +1543,8 @@ begin
   select array_agg(fingerprint order by fingerprint) into v_fingerprints
     from public.visual_global_scene_fingerprints(v_tenant,p_row.visual_group_key);
   return public.visual_global_claim_fingerprint_set(v_tenant,p_row.visual_group_key,
-    p_row.post_date,p_row.id,p_row.account,p_published,p_ambiguous,v_fingerprints);
+    p_row.post_date,p_row.id,p_row.account,p_published,p_ambiguous,v_fingerprints,
+    public.visual_global_historical_row_evidence(p_row),false);
 end;
 $$;
 
@@ -1424,11 +1615,12 @@ end;
 $$;
 
 -- Fleet-wide import includes published, reserved, and released local history.
--- Released local rows are imported as reserved because staging consumes bytes.
+-- Released local staging is retained as an incident because staging consumes bytes.
 create or replace function public.visual_global_import_history()
 returns jsonb language plpgsql security definer set search_path = public as $$
-declare r public.content_calendar; lrow record; v_count integer:=0; v_historical integer:=0;
-  v_fingerprints text[]; v_tenant text; v_resolved text;
+declare r public.content_calendar; lrow record; v_count integer:=0; v_historical integer:=0; v_null_key integer:=0;
+  v_fingerprints text[]; v_tenant text; v_resolved text; v_hash text; v_bytes jsonb;
+  v_source jsonb; v_existing public.visual_global_historical_incident%rowtype;
 begin
   if current_setting('transaction_isolation')<>'read committed' then
     raise exception 'global history import requires READ COMMITTED' using errcode='25006';
@@ -1455,7 +1647,7 @@ begin
     public.visual_global_object_attestation,
     public.visual_global_scene_object_member, public.visual_global_object_lineage,
     public.visual_global_usage, public.visual_global_usage_member,
-    public.visual_global_published_attribution
+    public.visual_global_published_attribution, public.visual_global_historical_incident
     in share row exclusive mode nowait;
   if exists(select 1 from public.visual_group_reconciliation e
       where e.outcome='confirmed_published'
@@ -1466,8 +1658,8 @@ begin
       using errcode='23514';
   end if;
   if exists(select 1 from public.visual_group_usage_ledger l
-      where l.reserved_date is null and l.state<>'published') then
-    raise exception 'global history import refused: staged history has no original date'
+      where l.reserved_date is null) then
+    raise exception 'global history import refused: consumed history has no verified original date'
       using errcode='23514';
   end if;
   if exists(select 1 from public.visual_group_usage_ledger l
@@ -1485,27 +1677,53 @@ begin
     raise exception 'global history import refused: calendar coverage incomplete'
       using errcode='23514';
   end if;
-  -- Keyed complete-scene ledgers always import first so the keyed full-set
-  -- invariant and any same-date reserved members exist before historical
-  -- subset attribution runs.
+  -- Snapshot every local consumption (including released staging). The
+  -- complete scene was consumed by this local claim; keep its actual anchor,
+  -- state and sibling IDs, without minting a global tenant/date owner.
   for lrow in select l.* from public.visual_group_usage_ledger l
-      order by (l.state='published') desc,l.gym_id,l.group_key loop
-    select array_agg(fingerprint order by fingerprint) into v_fingerprints
-      from public.visual_global_scene_fingerprints(lrow.gym_id,lrow.group_key);
-    perform public.visual_global_claim_fingerprint_set(lrow.gym_id,lrow.group_key,
-      lrow.reserved_date,lrow.calendar_row_id,lrow.channel,lrow.state='published',
-      lrow.ambiguous,v_fingerprints);
+      order by l.gym_id,l.group_key loop
+    if lrow.ambiguous and not public.visual_group_group_reconciled(lrow.gym_id,lrow.group_key) then
+      raise exception 'global history import refused: unresolved ambiguous local consumption'
+        using errcode='23514';
+    end if;
+    v_source:=jsonb_build_object('ledger',to_jsonb(lrow),'sibling_ids',coalesce((
+      select jsonb_agg(s.calendar_row_id::text order by s.calendar_row_id)
+      from public.visual_group_usage_sibling s
+      where s.gym_id=lrow.gym_id and s.group_key=lrow.group_key), '[]'::jsonb));
+    for v_hash in select fingerprint from public.visual_global_scene_fingerprints(
+        lrow.gym_id,lrow.group_key) order by fingerprint loop
+      perform public.visual_group_auxiliary_lock(hashtextextended(
+        jsonb_build_array('visual_global_fingerprint',v_hash)::text,0));
+      select jsonb_agg(to_jsonb(o) order by o.exact_url) into v_bytes
+        from public.visual_global_object_attestation o
+        where o.tenant_id=lrow.gym_id and o.fingerprint=v_hash
+          and o.group_key in (select public.visual_group_scene_members(lrow.gym_id,lrow.group_key));
+      select * into v_existing from public.visual_global_historical_incident h
+        where h.source_kind='local_ledger' and h.source_key=lrow.group_key
+          and h.source_state=lrow.state and h.tenant_id=lrow.gym_id
+          and h.group_key=lrow.group_key and h.fingerprint=v_hash;
+      if found and (v_existing.used_date is distinct from lrow.reserved_date
+          or v_existing.calendar_row_id is distinct from lrow.calendar_row_id
+          or v_existing.channel is distinct from lrow.channel) then
+        raise exception 'historical ledger anchor evidence drift' using errcode='23514';
+      end if;
+      insert into public.visual_global_historical_incident
+        (source_kind,source_key,source_state,tenant_id,group_key,fingerprint,
+         calendar_row_id,channel,used_date,source_evidence,byte_evidence)
+        values('local_ledger',lrow.group_key,lrow.state,lrow.gym_id,lrow.group_key,v_hash,
+          lrow.calendar_row_id,lrow.channel,lrow.reserved_date,v_source,v_bytes)
+        on conflict (source_kind,source_key,source_state,tenant_id,group_key,fingerprint) do nothing;
+    end loop;
     v_count:=v_count+1;
   end loop;
-  -- Published rows whose group key was never recorded attribute only their
-  -- own verified byte subset under their original publication date, without
+  -- EVERY published row attributes only its own verified byte subset under
+  -- its original publication date, without
   -- mutating the row. The coverage preflight above already refused any
   -- unresolved, unmapped, undated or unattested row, so a failure here means
   -- the data changed mid-import and aborts the whole import, keyed claims
   -- included; a partial historical import never persists.
   for r in select c.* from public.content_calendar c
-      where c.visual_group_key is null
-        and (c.status='published' or c.published_at is not null)
+      where (c.status='published' or c.published_at is not null)
       order by c.post_date,c.id loop
     v_tenant:=public.visual_group_tenant_id(r.gym_id)::text;
     if v_tenant is null then
@@ -1525,6 +1743,18 @@ begin
     perform public.visual_global_claim_historical_row(
       v_tenant,v_resolved,r.post_date,r.id,r.account,v_fingerprints);
     v_historical:=v_historical+1;
+    if r.visual_group_key is null then v_null_key:=v_null_key+1; end if;
+  end loop;
+  -- Live keyed reservations still require real atomic runtime claims. Any
+  -- incident on a different date/tenant refuses activation; historical
+  -- published/released records need no fabricated runtime owner.
+  for lrow in select l.* from public.visual_group_usage_ledger l
+      where l.state='reserved' order by l.gym_id,l.group_key loop
+    select array_agg(fingerprint order by fingerprint) into v_fingerprints
+      from public.visual_global_scene_fingerprints(lrow.gym_id,lrow.group_key);
+    perform public.visual_global_claim_fingerprint_set(lrow.gym_id,lrow.group_key,
+      lrow.reserved_date,lrow.calendar_row_id,lrow.channel,false,lrow.ambiguous,v_fingerprints,
+      null::jsonb,true);
   end loop;
   if exists(select 1 from public.visual_global_coverage() where issue<>'ready')
       or exists(select 1 from public.visual_global_history_coverage() where issue<>'ready') then
@@ -1532,8 +1762,12 @@ begin
       using errcode='23514';
   end if;
   return jsonb_build_object('imported_local_groups',v_count,
-    'imported_null_key_rows',v_historical,
-    'global_fingerprints',(select count(*) from public.visual_global_usage));
+    'imported_null_key_rows',v_null_key,
+    'imported_published_rows',v_historical,
+    'global_fingerprints',(select count(distinct fingerprint) from (
+      select fingerprint from public.visual_global_usage union all
+      select fingerprint from public.visual_global_historical_incident) f),
+    'historical_incidents',(select count(*) from public.visual_global_historical_incident));
 end;
 $$;
 
@@ -1555,33 +1789,15 @@ language sql stable security definer set search_path = public as $$
         then 'selected_media_bytes_unverified'
       when (c.status='published' or c.published_at is not null) and c.post_date is null
         then 'published_date_unverified'
+      when (c.status='published' or c.published_at is not null)
+        then case when public.visual_global_historical_row_covered(c,rg.resolved_group)
+          then 'ready' else 'not_imported' end
       when c.visual_group_key is not null
           and not exists(select 1 from public.visual_group_usage_ledger l
           where l.gym_id=public.visual_group_tenant_id(c.gym_id)::text
             and l.group_key=c.visual_group_key and l.state<>'released'
             and l.reserved_date is not distinct from c.post_date)
         then 'missing_matching_local_ledger'
-      when c.visual_group_key is not null
-          and (c.status='published' or c.published_at is not null) and
-          not exists(select 1 from public.visual_group_usage_ledger l
-          where l.gym_id=public.visual_group_tenant_id(c.gym_id)::text
-            and l.group_key=c.visual_group_key and l.state='published')
-        then 'published_row_without_permanent_local_ledger'
-      -- Component-wide date parity for null-key published rows: a manually
-      -- linked scene is one visual subject, so any staged or published member
-      -- anywhere in the connected component pins the whole component to one
-      -- date. Distinct fingerprints in sibling groups do not evade the check;
-      -- the row's own same-date members never flag it.
-      when c.visual_group_key is null
-          and (c.status='published' or c.published_at is not null)
-          and c.post_date is not null
-          and exists(select 1 from public.visual_global_usage_member cm
-            where cm.tenant_id=public.visual_group_tenant_id(c.gym_id)::text
-              and cm.group_key in (select public.visual_group_scene_members(
-                public.visual_group_tenant_id(c.gym_id)::text, rg.resolved_group))
-              and cm.state in ('reserved','published')
-              and cm.used_date is distinct from c.post_date)
-        then 'component_usage_date_conflict'
       when g.fingerprint is null then 'not_imported'
       when g.tenant_id<>public.visual_group_tenant_id(c.gym_id)::text
           or g.used_date is distinct from c.post_date
@@ -1603,13 +1819,13 @@ language sql stable security definer set search_path = public as $$
       when c.status='published' or c.published_at is not null
         then public.visual_group_resolve_row(c) end as resolved_group) rg on true
   left join lateral (
-    -- Keyed rows are covered against every byte of their complete scene.
-    -- Null-key published rows are covered only against the exact byte subset
+    -- Live keyed rows cover every byte of their complete scene.
+    -- Every published row covers only its own exact byte subset
     -- the row itself verifiably consumed, so an untouched scene rendition is
     -- never reported as consumed by a row that never selected it.
     select unnest(case
       when rg.resolved_group is null then null::text[]
-      when c.visual_group_key is not null then
+      when c.visual_group_key is not null and not (c.status='published' or c.published_at is not null) then
         (select array_agg(f.fingerprint order by f.fingerprint)
           from public.visual_global_scene_fingerprints(
             public.visual_group_tenant_id(c.gym_id)::text,c.visual_group_key) f)
@@ -1634,6 +1850,13 @@ language sql stable security definer set search_path = public as $$
       when not public.visual_global_scene_complete(l.gym_id,l.group_key)
         then 'incomplete_scene_byte_evidence'
       when fp.fingerprint is null then 'missing_verified_fingerprint'
+      when exists(select 1 from public.visual_global_historical_incident h
+        where h.source_kind='local_ledger' and h.source_key=l.group_key
+          and h.source_state=l.state and h.tenant_id=l.gym_id and h.group_key=l.group_key
+          and h.fingerprint=fp.fingerprint and h.used_date=l.reserved_date
+          and h.calendar_row_id is not distinct from l.calendar_row_id
+          and h.channel is not distinct from l.channel)
+        and l.state in ('published','released') then 'ready'
       when g.fingerprint is null then 'not_imported'
       when g.state='released' then 'legacy_released_global_usage'
       when g.tenant_id<>l.gym_id or g.used_date is distinct from l.reserved_date
@@ -1718,7 +1941,41 @@ language sql stable security definer set search_path = public as $$
     'global_usage_without_member'
   from public.visual_global_usage g
   where not exists(select 1 from public.visual_global_usage_member m
-    where m.fingerprint=g.fingerprint);
+    where m.fingerprint=g.fingerprint)
+  union all
+  -- Incident coverage cannot hide a malformed older runtime claim. Keep
+  -- every owner/member's original tenant/date anchored to retained source
+  -- evidence independently of whether a local ledger has incident coverage.
+  select g.tenant_id,m.group_key,g.fingerprint,g.used_date,g.state,
+    case
+      when g.state='released' then 'legacy_released_global_usage'
+      when m.state='released' then 'legacy_released_global_member'
+      when m.tenant_id<>g.tenant_id or m.used_date is distinct from g.used_date
+        then 'global_owner_or_date_conflict'
+      when not exists(select 1 from public.visual_group_usage_ledger l
+          where l.gym_id=m.tenant_id and l.group_key=m.group_key
+            and l.reserved_date is not distinct from m.used_date
+            and exists(select 1 from public.visual_global_scene_fingerprints(
+              l.gym_id,l.group_key) f where f.fingerprint=m.fingerprint))
+        and not exists(select 1 from public.visual_global_historical_incident h
+          where h.tenant_id=m.tenant_id and h.group_key=m.group_key
+            and h.fingerprint=m.fingerprint and h.used_date=m.used_date
+            and h.calendar_row_id=m.calendar_row_id)
+        and not exists(select 1 from public.visual_global_published_attribution a
+          where a.tenant_id=m.tenant_id and a.group_key=m.group_key
+            and a.fingerprint=m.fingerprint and a.used_date=m.used_date
+            and a.calendar_row_id=m.calendar_row_id)
+        then 'global_runtime_claim_without_source_evidence'
+      else 'ready' end
+  from public.visual_global_usage g
+  join public.visual_global_usage_member m on m.fingerprint=g.fingerprint
+  union all
+  -- Incidents remain visible as permanent history after calendar deletion.
+  -- Their immutable constraints and owner-only source-bound writer establish
+  -- evidence; no single runtime owner is required for conflicting past uses.
+  select h.tenant_id,h.group_key,h.fingerprint,h.used_date,h.source_state,'ready'
+  from public.visual_global_historical_incident h;
+
 $$;
 
 -- The separate DRAFT activation migration adds the all-tenant calendar-write
@@ -1770,7 +2027,7 @@ revoke all on function public.visual_global_row_verified_fingerprints(public.con
   from public,anon,authenticated,service_role;
 revoke all on function public.visual_global_lineage_verified(text,text,text,text,text,text)
   from public,anon,authenticated,service_role;
-revoke all on function public.visual_global_claim_fingerprint_set(text,text,date,uuid,text,boolean,boolean,text[])
+revoke all on function public.visual_global_claim_fingerprint_set(text,text,date,uuid,text,boolean,boolean,text[],jsonb,boolean)
   from public,anon,authenticated,service_role;
 revoke all on function public.visual_global_claim_historical_row(text,text,date,uuid,text,text[])
   from public,anon,authenticated,service_role;
@@ -1783,6 +2040,10 @@ revoke all on function public.visual_global_claim_scene(public.content_calendar,
 revoke all on function public.visual_global_claim(text,text,date,uuid,text,boolean,boolean,text)
   from public,anon,authenticated,service_role;
 revoke all on function public.visual_global_release(text,text)
+  from public,anon,authenticated,service_role;
+revoke all on function public.visual_global_historical_row_evidence(public.content_calendar)
+  from public,anon,authenticated,service_role;
+revoke all on function public.visual_global_historical_row_covered(public.content_calendar,text)
   from public,anon,authenticated,service_role;
 revoke all on function public.visual_global_import_history()
   from public,anon,authenticated,service_role;

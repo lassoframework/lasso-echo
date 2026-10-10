@@ -9,6 +9,13 @@ do $$
 begin
  if current_user in ('service_role','anon','authenticated') then
   raise exception 'trusted existing migration owner required' using errcode='42501'; end if;
+ -- Supabase installs pgcrypto in extensions. Require that exact dependency
+ -- before changing bridge objects; never install or relocate it implicitly.
+ if to_regprocedure('extensions.digest(bytea,text)') is null then
+  raise exception 'extensions pgcrypto digest dependency unavailable' using errcode='55000'; end if;
+ if not has_schema_privilege(current_user,'extensions','USAGE')
+  or not has_function_privilege(current_user,'extensions.digest(bytea,text)','EXECUTE') then
+  raise exception 'trusted migration owner lacks extensions digest privileges' using errcode='42501'; end if;
  if to_regprocedure('public.echo_source_brand_active(uuid)') is null
   or to_regclass('public.echo_intake_tokens') is null
   or to_regprocedure('public.fixer_owner_photo_canonical_20261007(jsonb)') is null then
@@ -64,7 +71,7 @@ begin
  select jsonb_object_agg(key,value) into binding from jsonb_each(c)
  where key=any(array['gym_id','local_date','logical_post_id','copy_revision','inventory_revision',
   'history_revision','palette_revision','copy_digest','palette_digest','review_policy_id','authority_pins','copy_derivation_receipt']);
- bytes:=substring(public.digest(uuid_send('6ba7b811-9dad-11d1-80b4-00c04fd430c8'::uuid)||
+ bytes:=substring(extensions.digest(uuid_send('6ba7b811-9dad-11d1-80b4-00c04fd430c8'::uuid)||
   convert_to('echo-astra:'||public.fixer_owner_photo_canonical_20261007(binding),'UTF8'),'sha1') from 1 for 16);
  bytes:=set_byte(bytes,6,(get_byte(bytes,6)&15)|80);
  bytes:=set_byte(bytes,8,(get_byte(bytes,8)&63)|128);

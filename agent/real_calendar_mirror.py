@@ -252,6 +252,26 @@ def _real_row(account_key, draft, caption=None):
     logical = _logical_post_id(draft)
     if logical:
         row["logical_post_id"] = logical
+    # GENERATED-CLIENT CONTRACT (2026-10-09, safety repair): generated cards
+    # UNCONDITIONALLY hold before calendar insert. No trusted hosted-byte
+    # receipt writer/lookup exists, so a producer-supplied receipt -- even one
+    # shaped to bind gym + version + hosted URL + delivered SHA exactly -- is
+    # not proof, and a partial generated identity (marker cleared, fields left)
+    # fails closed too. The hold rides the shared media hold column, which
+    # blocks BOTH portal approval and the publisher's claim predicate, and no
+    # generated contract column is ever emitted. Contract-column transport is
+    # deferred until a REAL trusted authority exists; the destination-tenant
+    # binding check below documents the guard that path must enforce and is
+    # inert while the unconditional hold stands.
+    from .drafter import generated_hold_reason
+    _gen_hold = generated_hold_reason(draft)
+    if (not _gen_hold
+            and (getattr(draft, "creative_origin", "") or "").strip()
+            and str(getattr(draft, "account_key", "") or "") != str(account_key or "")):
+        _gen_hold = ("generated card destination calendar does not match its "
+                     "source gym (tenant binding)")
+    if _gen_hold:
+        row["media_not_ready_reason"] = _gen_hold
     # Private writer side channel, never a calendar column or owner authority.
     # insert_rows strips it and binds it only to the exact returned inserted UUID.
     from . import forward_media_observation_bridge

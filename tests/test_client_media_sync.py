@@ -1549,3 +1549,407 @@ def test_infographic_fill_lane_actually_runs(monkeypatch):
     (res,) = out["results"]
     assert res["status"] == "awaiting_media"         # no media: the exact fill case
     assert calls == [("gritx", "gritx_ig", True)]    # the lane RAN, with a real voice
+
+
+# ---- inventory mutation receipt protocol (guarded mode, DRAFT default OFF) ----
+# With AGENT_LOCAL_INVENTORY_MUTATIONS_ENABLED armed, every R2-to-local mutation
+# in client_media_sync (downloaded media bytes + sidecar, in sync_uploads AND
+# the sync_hosted_media recovery lane) runs through the begin/complete receipt
+# fence in agent.local_inventory_mutation — the same protocol intake_web and
+# intake_ingest already use. These tests arm the fence against a throwaway
+# SQLite + journal dir and a fake authority, and assert fail-closed behavior:
+# collisions, partial effects, symlink safety, malformed provenance, missing R2
+# bytes and idempotent replay. Flag OFF behavior is covered by every test above.
+import sqlite3  # noqa: E402
+import uuid  # noqa: E402
+
+from agent import config as _config  # noqa: E402
+from agent import local_inventory_mutation as mutation  # noqa: E402
+
+
+class FakeAuthority:
+    """Stands in for MutationAuthority: receipts shaped exactly as _receipt()
+    requires; fail='begin'/'complete' simulates a lost acknowledgement."""
+
+    def __init__(self, fail=None):
+        self.fail = fail
+        self.events = []
+        self.pending = None
+
+    def begin(self, request):
+        self.events.append(("begin", request["kind"]))
+        self.pending = dict(request, state="pending", generation=1,
+                            result_digest=None,
+                            begun_at="2026-10-08T00:00:00+00:00",
+                            completed_at=None)
+        if self.fail == "begin":
+            raise mutation.MutationHold("ack_lost")
+        return dict(self.pending)
+
+    def complete(self, request, result_digest):
+        self.events.append(("complete", request["kind"]))
+        self.pending.update(state="complete", result_digest=result_digest,
+                            completed_at="2026-10-08T00:00:01+00:00")
+        if self.fail == "complete":
+            raise mutation.MutationHold("ack_lost")
+        return dict(self.pending)
+
+    def close(self):
+        pass
+
+
+def _arm_fence(monkeypatch, tmp_path, authority):
+    """Arm the mutation fence fully offline; returns the journal directory."""
+    monkeypatch.setenv("AGENT_LOCAL_INVENTORY_MUTATIONS_ENABLED", "true")
+    monkeypatch.setenv("LOCAL_INVENTORY_MUTATION_EPOCH", str(uuid.uuid4()))
+    db_file = tmp_path / "echo.db"
+    sqlite3.connect(db_file).close()
+    monkeypatch.setenv("AGENT_DB_PATH", str(db_file))
+    monkeypatch.setattr(_config, "LIBRARY_PATH", str(tmp_path / "content_library"))
+    monkeypatch.setattr(mutation.MutationAuthority, "from_environment",
+                        lambda: authority)
+    return tmp_path / "inventory-mutation-receipts"
+
+
+def _journals(receipts_dir):
+    return [json.loads(p.read_text())
+            for p in sorted(receipts_dir.glob("*.json"))]
+
+
+def _one_upload(base="gritx", name="20260810T120000Z_photo.jpg",
+                data=b"\xff\xd8\xffFAKEJPEG-GUARDED", prefix="incoming"):
+    objs = {f"intake/{base}/{prefix}/{name}": data,
+            f"intake/{base}/incoming/20260810T120000Z_upload.json": json.dumps(
+                {"note": "", "captions": {name: "the gym's own line"}}).encode()}
+    return FakeR2(objs), name, data
+
+
+def test_unguarded_sync_writes_no_receipts(monkeypatch, tmp_path):
+    """Fence OFF (default): legacy behavior byte-for-byte, zero journal files."""
+    monkeypatch.setattr(_config, "LIBRARY_PATH", str(tmp_path / "content_library"))
+    r2, name, data = _one_upload()
+    out = cms.sync_uploads("gritx", r2=r2)
+    assert out == {"synced": 1, "skipped": 0}
+    lib = tmp_path / "content_library" / "gritx"
+    assert (lib / name).read_bytes() == data
+    assert not (tmp_path / "inventory-mutation-receipts").exists()
+
+
+def test_guarded_sync_settles_one_complete_receipt(monkeypatch, tmp_path):
+    """Guarded write: exact source bytes + sidecar (public_url, the gym's note,
+    source fingerprint + aliases) land and one COMPLETE receipt fences them."""
+    auth = FakeAuthority()
+    receipts_dir = _arm_fence(monkeypatch, tmp_path, auth)
+    r2, name, data = _one_upload()
+    out = cms.sync_uploads("gritx", r2=r2)
+    assert out == {"synced": 1, "skipped": 0}
+    lib = tmp_path / "content_library" / "gritx"
+    assert (lib / name).read_bytes() == data           # original bytes preserved
+    side = json.loads((lib / "20260810T120000Z_photo.json").read_text())
+    assert side["note"] == "the gym's own line"
+    assert side["public_url"].startswith("https://cdn.example.com/")
+    assert side["source_fingerprint"].startswith("source:sha256:")
+    assert any(a.startswith("source:md5:")
+               for a in side["source_fingerprint_aliases"])
+    records = _journals(receipts_dir)
+    assert [r["kind"] for r in records] == ["client_media_sync"]
+    assert records[0]["local_state"] == "complete"
+    assert records[0]["gym_id"] == "gritx"
+    begun = [k for ev, k in auth.events if ev == "begin"]
+    completed = [k for ev, k in auth.events if ev == "complete"]
+    assert begun == completed == ["client_media_sync"]
+
+
+def test_guarded_sync_is_idempotent_and_preserves_reviewed_note(
+        monkeypatch, tmp_path):
+    """Replay: a second armed sync downloads nothing new, writes nothing, and a
+    human-reviewed note on the sidecar is never clobbered."""
+    auth = FakeAuthority()
+    receipts_dir = _arm_fence(monkeypatch, tmp_path, auth)
+    r2, name, data = _one_upload()
+    assert cms.sync_uploads("gritx", r2=r2) == {"synced": 1, "skipped": 0}
+    lib = tmp_path / "content_library" / "gritx"
+    side_path = lib / "20260810T120000Z_photo.json"
+    side = json.loads(side_path.read_text())
+    side["note"] = "reviewed by a human"
+    side_path.write_text(json.dumps(side))
+    out = cms.sync_uploads("gritx", r2=r2)
+    assert out == {"synced": 0, "skipped": 1}
+    assert (lib / name).read_bytes() == data
+    assert json.loads(side_path.read_text())["note"] == "reviewed by a human"
+    # exactly one receipt ever: the replay wrote nothing new
+    assert len(_journals(receipts_dir)) == 1
+
+
+def test_guarded_same_basename_collision_never_overwrites(monkeypatch, tmp_path):
+    """A DIFFERENT source already sitting at the same local basename is never
+    overwritten: the sync fails closed with local_destination_conflict."""
+    auth = FakeAuthority()
+    _arm_fence(monkeypatch, tmp_path, auth)
+    r2, name, _data = _one_upload()
+    lib = tmp_path / "content_library" / "gritx"
+    lib.mkdir(parents=True)
+    (lib / name).write_bytes(b"\xff\xd8\xffDIFFERENT-SOURCE")
+    out = cms.sync_uploads("gritx", r2=r2)
+    assert out["held"] == "local_destination_conflict"
+    assert out["synced"] == 0
+    assert (lib / name).read_bytes() == b"\xff\xd8\xffDIFFERENT-SOURCE"
+
+
+def test_guarded_same_basename_two_prefixes_downloads_once(monkeypatch, tmp_path):
+    """The SAME basename in pending_caption/ and incoming/ syncs once (the
+    processed pending_caption form wins) — one receipt, one local file."""
+    auth = FakeAuthority()
+    receipts_dir = _arm_fence(monkeypatch, tmp_path, auth)
+    name = "20260810T120000Z_photo.jpg"
+    objs = {
+        f"intake/gritx/pending_caption/{name}": b"\xff\xd8\xffPROCESSED",
+        f"intake/gritx/incoming/{name}": b"\xff\xd8\xffRAW-COPY",
+    }
+    out = cms.sync_uploads("gritx", r2=FakeR2(objs))
+    assert out == {"synced": 1, "skipped": 0}
+    lib = tmp_path / "content_library" / "gritx"
+    assert (lib / name).read_bytes() == b"\xff\xd8\xffPROCESSED"
+    assert len(_journals(receipts_dir)) == 1
+
+
+def test_guarded_missing_r2_bytes_fails_closed(monkeypatch, tmp_path):
+    """A listed object whose bytes cannot be read holds the sync; nothing is
+    written and no success is certified."""
+
+    class _EmptyR2(FakeR2):
+        def get_bytes(self, key):
+            self.got.append(key)
+            return None
+
+    auth = FakeAuthority()
+    _arm_fence(monkeypatch, tmp_path, auth)
+    r2, name, _data = _one_upload()
+    r2_empty = _EmptyR2(r2.objects)
+    out = cms.sync_uploads("gritx", r2=r2_empty)
+    assert out["held"] == "r2_source_bytes_missing"
+    assert out["synced"] == 0
+    assert not (tmp_path / "content_library" / "gritx" / name).exists()
+
+
+def test_guarded_symlink_destination_fails_closed(monkeypatch, tmp_path):
+    """A symlinked local destination is never written through: the sync holds
+    and the symlink's target keeps its original bytes."""
+    auth = FakeAuthority()
+    _arm_fence(monkeypatch, tmp_path, auth)
+    r2, name, _data = _one_upload()
+    lib = tmp_path / "content_library" / "gritx"
+    lib.mkdir(parents=True)
+    elsewhere = tmp_path / "elsewhere.jpg"
+    elsewhere.write_bytes(b"ORIGINAL-ELSEWHERE")
+    os.symlink(elsewhere, lib / name)
+    out = cms.sync_uploads("gritx", r2=r2)
+    assert "held" in out
+    assert out["synced"] == 0
+    assert elsewhere.read_bytes() == b"ORIGINAL-ELSEWHERE"
+    assert (lib / name).is_symlink()
+
+
+def test_guarded_malformed_existing_sidecar_fails_closed(monkeypatch, tmp_path):
+    """An existing sidecar that cannot be parsed is malformed provenance: armed
+    mode fails closed instead of merging over it (legacy mode tolerates it)."""
+    auth = FakeAuthority()
+    _arm_fence(monkeypatch, tmp_path, auth)
+    r2, name, _data = _one_upload()
+    lib = tmp_path / "content_library" / "gritx"
+    lib.mkdir(parents=True)
+    (lib / "20260810T120000Z_photo.json").write_text("{not json")
+    out = cms.sync_uploads("gritx", r2=r2)
+    assert out["held"] == "local_sidecar_unreadable"
+    assert out["synced"] == 0
+
+
+def test_guarded_conflicting_sidecar_provenance_fails_closed(
+        monkeypatch, tmp_path):
+    """A sidecar already bound to a DIFFERENT source fingerprint is never
+    rebound to this upload's bytes."""
+    auth = FakeAuthority()
+    _arm_fence(monkeypatch, tmp_path, auth)
+    r2, name, data = _one_upload()
+    lib = tmp_path / "content_library" / "gritx"
+    lib.mkdir(parents=True)
+    other_fp = "source:sha256:" + ("0" * 64)
+    (lib / "20260810T120000Z_photo.json").write_text(json.dumps(
+        {"note": "kept", "source_fingerprint": other_fp}))
+    out = cms.sync_uploads("gritx", r2=r2)
+    assert out["held"] == "local_sidecar_provenance_conflict"
+    side = json.loads((lib / "20260810T120000Z_photo.json").read_text())
+    assert side["source_fingerprint"] == other_fp      # never rebound
+
+
+def test_guarded_partial_effect_stays_pending_and_blocks_retry(
+        monkeypatch, tmp_path):
+    """A lost COMPLETE acknowledgement keeps the exact mutation pending: the
+    sync reports the hold (never certifying success), the journal is retained
+    for reconciliation, and a retry fails closed until it is settled."""
+    receipts_dir = _arm_fence(monkeypatch, tmp_path, FakeAuthority(fail="complete"))
+    r2, name, _data = _one_upload()
+    out = cms.sync_uploads("gritx", r2=r2)
+    assert out["held"] == "local_mutation_pending_reconciliation"
+    assert out["synced"] == 0
+    records = _journals(receipts_dir)
+    assert len(records) == 1
+    assert records[0]["local_state"] != "complete"
+    # retry with a healthy authority: the unsettled journal blocks BEFORE any write
+    monkeypatch.setattr(mutation.MutationAuthority, "from_environment",
+                        lambda: FakeAuthority())
+    out2 = cms.sync_uploads("gritx", r2=r2)
+    assert out2["held"] in ("local_mutation_reconciliation_required",
+                            "local_mutation_pending_reconciliation")
+    assert out2["synced"] == 0
+
+
+def test_guarded_hosted_recovery_settles_receipt(monkeypatch, tmp_path):
+    """The hosted-media recovery lane is fenced too: one COMPLETE
+    client_media_recovery receipt, original bytes and hosted public_url kept."""
+    auth = FakeAuthority()
+    receipts_dir = _arm_fence(monkeypatch, tmp_path, auth)
+    data = b"\xff\xd8\xffHOSTED-ORIGINAL"
+    r2 = FakeR2({"echo/gritx/ab12cd34ef567890/IMG_0001.jpg": data})
+    out = cms.sync_hosted_media("gritx", r2=r2)
+    assert out == {"recovered": 1, "skipped": 0}
+    lib = tmp_path / "content_library" / "gritx"
+    local = lib / "ab12cd34ef567890_IMG_0001.jpg"
+    assert local.read_bytes() == data
+    side = json.loads((lib / "ab12cd34ef567890_IMG_0001.json").read_text())
+    assert side["public_url"].endswith("echo/gritx/ab12cd34ef567890/IMG_0001.jpg")
+    assert side["source_fingerprint"].startswith("source:sha256:")
+    records = _journals(receipts_dir)
+    assert [r["kind"] for r in records] == ["client_media_recovery"]
+    assert records[0]["local_state"] == "complete"
+    # replay is idempotent: skipped, no new receipt
+    out2 = cms.sync_hosted_media("gritx", r2=r2)
+    assert out2 == {"recovered": 0, "skipped": 1}
+    assert len(_journals(receipts_dir)) == 1
+
+
+def test_guarded_hosted_recovery_collision_never_overwrites(
+        monkeypatch, tmp_path):
+    """Recovery lane: a different local file already at the collision-safe name
+    is never overwritten by the hosted object's bytes."""
+    auth = FakeAuthority()
+    _arm_fence(monkeypatch, tmp_path, auth)
+    r2 = FakeR2({"echo/gritx/ab12cd34ef567890/IMG_0001.jpg": b"\xff\xd8\xffHOSTED"})
+    lib = tmp_path / "content_library" / "gritx"
+    lib.mkdir(parents=True)
+    local = lib / "ab12cd34ef567890_IMG_0001.jpg"
+    local.write_bytes(b"\xff\xd8\xffDIFFERENT")
+    out = cms.sync_hosted_media("gritx", r2=r2)
+    assert out["held"] == "local_destination_conflict"
+    assert local.read_bytes() == b"\xff\xd8\xffDIFFERENT"
+
+
+def test_guarded_gym_isolation(monkeypatch, tmp_path):
+    """Receipts are per-gym: gym A's sync never touches gym B's library or
+    journal, and each receipt binds exactly its own gym_id."""
+    auth = FakeAuthority()
+    receipts_dir = _arm_fence(monkeypatch, tmp_path, auth)
+    r2a, name_a, _ = _one_upload(base="gyma",
+                                 name="20260810T120000Z_a.jpg")
+    r2b, name_b, _ = _one_upload(base="gymb",
+                                 name="20260810T120000Z_b.jpg")
+    assert cms.sync_uploads("gyma", r2=r2a) == {"synced": 1, "skipped": 0}
+    assert (tmp_path / "content_library" / "gyma" / name_a).exists()
+    assert not (tmp_path / "content_library" / "gymb").exists() or not (
+        tmp_path / "content_library" / "gymb" / name_a).exists()
+    assert cms.sync_uploads("gymb", r2=r2b) == {"synced": 1, "skipped": 0}
+    records = _journals(receipts_dir)
+    assert {r["gym_id"] for r in records} == {"gyma", "gymb"}
+    assert all(r["local_state"] == "complete" for r in records)
+
+
+@pytest.mark.parametrize("hosted", [False, True])
+@pytest.mark.parametrize("side_kind", ["normal", "symlink", "dangling", "malformed"])
+def test_guarded_existing_metadata_is_fenced(monkeypatch, tmp_path, hosted, side_kind):
+    auth = FakeAuthority()
+    receipts = _arm_fence(monkeypatch, tmp_path, auth)
+    name = "20261001T120000Z_IMG_0001.jpg"
+    local_name = "ab12cd34ef567890_" + name if hosted else name
+    key = ("echo/gritx/ab12cd34ef567890/" + name if hosted else
+           "intake/gritx/incoming/" + name)
+    data = b"same-source"
+    r2 = FakeR2({key: data,
+        "intake/gritx/incoming/20261001T120000Z_upload.json": json.dumps({
+            "timestamp": "20261001T120000Z", "filenames": [name]}).encode()})
+    lib = tmp_path / "content_library" / "gritx"
+    lib.mkdir(parents=True)
+    (lib / local_name).write_bytes(data)
+    side = lib / (os.path.splitext(local_name)[0] + ".json")
+    elsewhere = tmp_path / "outside.json"
+    if side_kind in ("symlink", "dangling"):
+        if side_kind == "symlink":
+            elsewhere.write_text('{"note":"kept", "approved":false}')
+        side.symlink_to(elsewhere)
+    else:
+        side.write_text('[]' if side_kind == "malformed" else
+                        '{"note":"kept", "approved":false}')
+    sync = cms.sync_hosted_media if hosted else cms.sync_uploads
+    out = sync("gritx", r2=r2)
+    if side_kind != "normal":
+        assert "held" in out
+        assert out["skipped"] == 0
+        assert auth.events == []
+        if side_kind == "symlink":
+            assert elsewhere.read_text() == '{"note":"kept", "approved":false}'
+        if side_kind == "dangling":
+            assert not elsewhere.exists()
+        return
+    assert out["skipped"] == 1
+    payload = json.loads(side.read_text())
+    assert payload["note"] == "kept" and payload["approved"] is False
+    assert payload["intake_batch_timestamp"] == "20261001T120000Z"
+    assert auth.events == [("begin", "client_media_intake_metadata"),
+                           ("complete", "client_media_intake_metadata")]
+    assert _journals(receipts)[0]["local_state"] == "complete"
+    assert sync("gritx", r2=r2)["skipped"] == 1
+    assert len(auth.events) == 2
+
+
+def test_guarded_consent_holds_before_bytes_or_marker(monkeypatch, tmp_path):
+    from agent import dam
+    auth = FakeAuthority()
+    _arm_fence(monkeypatch, tmp_path, auth)
+    r2, name, data = _one_upload()
+    batch = "intake/gritx/incoming/20260810T120000Z_upload.json"
+    r2.objects[batch] = json.dumps({"consent": {name: True}}).encode()
+    calls = []
+    monkeypatch.setattr(dam, "set_consent", lambda *a, **kw: calls.append(a))
+    out = cms.sync_uploads("gritx", r2=r2)
+    assert out == {"synced": 0, "skipped": 0,
+                   "held": "local_consent_transaction_binding_unavailable"}
+    lib = tmp_path / "content_library" / "gritx"
+    assert not (lib / name).exists()
+    side = lib / "20260810T120000Z_photo.json"
+    assert not side.exists()
+    assert calls == [] and auth.events == []
+    with pytest.raises(mutation.MutationHold, match="local_consent_transaction_binding"):
+        cms._write_sidecar(str(lib), name, batch, "", lambda *_: None,
+                           strict=True, consent=True)
+    assert not side.exists()
+
+
+def test_guarded_metadata_readback_failure_keeps_pending(monkeypatch, tmp_path):
+    auth = FakeAuthority()
+    receipts = _arm_fence(monkeypatch, tmp_path, auth)
+    lib = tmp_path / "content_library" / "gritx"
+    lib.mkdir(parents=True)
+    name = "20261001T120000Z_IMG_0001.jpg"
+    (lib / name).write_bytes(b"same-source")
+    side = lib / "20261001T120000Z_IMG_0001.json"
+    side.write_text('{"note":"kept"}')
+    real_write = mutation.atomic_write_json
+    def corrupt_side(path, payload):
+        real_write(path, {} if str(path) == str(side) else payload)
+    monkeypatch.setattr(mutation, "atomic_write_json", corrupt_side)
+    r2 = FakeR2({"intake/gritx/incoming/" + name: b"same-source",
+        "intake/gritx/incoming/20261001T120000Z_upload.json": json.dumps({
+            "timestamp": "20261001T120000Z", "filenames": [name]}).encode()})
+    out = cms.sync_uploads("gritx", r2=r2)
+    assert "held" in out and out["skipped"] == 0
+    assert auth.events == [("begin", "client_media_intake_metadata")]
+    assert _journals(receipts)[0]["local_state"] != "complete"

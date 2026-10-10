@@ -10,6 +10,8 @@ import json
 import os
 import sys
 
+import pytest
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 from agent import config, intake_ingest, ops_alerts  # noqa: E402
@@ -407,3 +409,618 @@ def test_exact_converted_dup_archives_raw_source_before_drop(monkeypatch, tmp_pa
     originals = [k for k in r2.objects
                  if k.startswith("intake/gyma/originals/") and not k.endswith(".json")]
     assert {r2.objects[orig] for orig in originals} == {b"HEIC-ONE", b"HEIC-TWO"}
+
+
+# ---- inventory mutation receipt protocol (guarded mode) -------------------------
+# With AGENT_LOCAL_INVENTORY_MUTATIONS_ENABLED armed, every durable intake effect
+# (admission, quarantine, thumbnails, sidecars, deletions, the manifest commit)
+# runs through the begin/complete receipt fence in agent.local_inventory_mutation.
+# These tests arm the fence against a throwaway SQLite + journal dir and a fake
+# authority, and assert both that behavior is preserved (quarantine, lineage,
+# originals never mutated in place) and that a hold is never swallowed.
+import sqlite3  # noqa: E402
+import uuid  # noqa: E402
+
+from agent import local_inventory_mutation as mutation  # noqa: E402
+
+
+class FakeAuthority:
+    """Stands in for MutationAuthority: receipts shaped exactly as _receipt()
+    requires; fail='begin'/'complete' simulates a lost acknowledgement."""
+
+    def __init__(self, fail=None):
+        self.fail = fail
+        self.events = []
+        self.pending = None
+
+    def begin(self, request):
+        self.events.append(("begin", request["kind"]))
+        self.pending = dict(request, state="pending", generation=1,
+                            result_digest=None,
+                            begun_at="2026-10-08T00:00:00+00:00",
+                            completed_at=None)
+        if self.fail == "begin":
+            raise mutation.MutationHold("ack_lost")
+        return dict(self.pending)
+
+    def complete(self, request, result_digest):
+        self.events.append(("complete", request["kind"]))
+        self.pending.update(state="complete", result_digest=result_digest,
+                            completed_at="2026-10-08T00:00:01+00:00")
+        if self.fail == "complete":
+            raise mutation.MutationHold("ack_lost")
+        return dict(self.pending)
+
+    def close(self):
+        pass
+
+
+def _arm_fence(monkeypatch, tmp_path, authority):
+    """Arm BOTH the intake flag and the mutation fence, fully offline."""
+    _arm(monkeypatch, tmp_path)
+    monkeypatch.setenv("AGENT_LOCAL_INVENTORY_MUTATIONS_ENABLED", "true")
+    monkeypatch.setenv("LOCAL_INVENTORY_MUTATION_EPOCH", str(uuid.uuid4()))
+    db_file = tmp_path / "echo.db"
+    sqlite3.connect(db_file).close()
+    monkeypatch.setenv("AGENT_DB_PATH", str(db_file))
+    monkeypatch.setattr(mutation.MutationAuthority, "from_environment",
+                        lambda: authority)
+    return tmp_path / "inventory-mutation-receipts"
+
+
+def _journals(receipts_dir):
+    return [json.loads(p.read_text())
+            for p in sorted(receipts_dir.glob("*.json"))]
+
+
+def test_unguarded_mode_writes_no_receipts(monkeypatch, tmp_path):
+    """Fence OFF (default): identical legacy behavior, zero journal files."""
+    _arm(monkeypatch, tmp_path)
+    monkeypatch.setenv("AGENT_DB_PATH", str(tmp_path / "echo.db"))
+    r2 = FakeR2()
+    _seed(r2)
+    out = _run(r2)
+    assert out["gyma"]["accepted"] == 1
+    assert not (tmp_path / "inventory-mutation-receipts").exists()
+
+
+def test_guarded_acceptance_thumbnail_sidecar_and_manifest_receipts(
+        monkeypatch, tmp_path):
+    """Guarded admission: library file + note + provenance sidecar land, the
+    incoming object is consumed, the manifest commits — and every durable step
+    (admission, thumbnail, manifest) belongs to one COMPLETE batch receipt."""
+    auth = FakeAuthority()
+    receipts_dir = _arm_fence(monkeypatch, tmp_path, auth)
+    r2 = FakeR2()
+    _seed(r2, data=_real_jpeg_bytes())   # real JPEG so the thumbnail path fires
+    out = intake_ingest.process_all(r2=r2, converter=None, phash=_fake_phash,
+                                    moderator=_pass_all)
+    assert out["gyma"]["accepted"] == 1
+    lib = tmp_path / "library" / "gyma"
+    assert (lib / "20260702T100000Z_photo.jpg").exists()
+    assert (lib / "20260702T100000Z_photo.txt").read_text() == "Saturday open house"
+    # the thumbnail was generated and stored under the receipt fence
+    assert any(k.startswith("intake/gyma/thumbs/") for k in r2.objects)
+    # lineage survives guarding: the filed sidecar keeps the source identity
+    filed = json.loads((lib / "20260702T100000Z_photo.json").read_text())
+    assert filed["original_key"].endswith(
+        "intake/gyma/incoming/20260702T100000Z_photo.jpg")
+    assert filed["source_fingerprint"].startswith("source:sha256:")
+    assert filed["status"] == "accepted"
+    assert not any(k.startswith("intake/gyma/incoming/")
+                   and not k.endswith(".json") for k in r2.objects)
+    manifest = json.loads(r2.objects["intake/gyma/manifest.json"])
+    binding = manifest["asset_provenance"][
+        "intake/gyma/incoming/20260702T100000Z_photo.jpg"]
+    assert binding["status"] == "accepted"
+    assert binding["converted_fingerprint"].startswith("derived:sha256:")
+    # every mutation journaled begin -> local effects -> complete
+    records = _journals(receipts_dir)
+    kinds = {r["kind"] for r in records}
+    assert kinds == {"intake_batch"}
+    assert all(r["local_state"] == "complete" for r in records)
+    assert all(r["gym_id"] == "gyma" for r in records)
+    begun = [k for ev, k in auth.events if ev == "begin"]
+    completed = [k for ev, k in auth.events if ev == "complete"]
+    assert begun == completed and len(begun) == len(records)
+
+
+def test_guarded_zero_byte_quarantine_receipt(monkeypatch, tmp_path):
+    """Guarded quarantine: a zero-byte upload still dead-letters with the
+    specific alert, and the move belongs to a complete intake_batch receipt."""
+    auth = FakeAuthority()
+    receipts_dir = _arm_fence(monkeypatch, tmp_path, auth)
+    fired = _alerts(monkeypatch)
+    r2 = FakeR2()
+    r2.put_bytes("intake/gyma/incoming/20260702T100000Z_empty.jpg", b"")
+    out = _run(r2)
+    assert out["gyma"]["deadlettered"] == 1
+    assert "intake/gyma/deadletter/20260702T100000Z_empty.jpg" in r2.objects
+    assert "intake/gyma/incoming/20260702T100000Z_empty.jpg" not in r2.objects
+    assert any("zero-byte" in m for m in fired)
+    records = _journals(receipts_dir)
+    kinds = [r["kind"] for r in records]
+    assert kinds == ["intake_batch"]
+    assert all(r["local_state"] == "complete" for r in records)
+
+
+def test_guarded_phash_hold_preserves_source_and_lineage(monkeypatch, tmp_path):
+    """Guarded hold: a pHash collision is still a QUARANTINE, never a delete —
+    raw source + honest sidecar under hold/, lineage intact, receipts complete."""
+    auth = FakeAuthority()
+    receipts_dir = _arm_fence(monkeypatch, tmp_path, auth)
+    r2 = FakeR2()
+    _seed(r2, name="20260702T100000Z_a.jpg", data=b"PHOTO-A")
+    _seed(r2, name="20260702T100001Z_b.jpg", data=b"PHOTO-B-DIFFERENT")
+    out = intake_ingest.process_all(
+        r2=r2, converter=_fake_converter,
+        phash=lambda d, n: "collision", moderator=_pass_all)
+    assert out["gyma"]["accepted"] == 1 and out["gyma"]["held"] == 1
+    assert r2.objects["intake/gyma/hold/20260702T100001Z_b.jpg"] == \
+        b"PHOTO-B-DIFFERENT"
+    side = json.loads(r2.objects["intake/gyma/hold/20260702T100001Z_b.json"])
+    assert side["status"] == "held_near_duplicate"
+    from agent import visual_fingerprint as vf
+    assert side["source_fingerprint"] == vf.fingerprint(b"PHOTO-B-DIFFERENT")
+    assert side["similarity_alias"] == "perceptual:collision"
+    records = _journals(receipts_dir)
+    assert all(r["local_state"] == "complete" for r in records)
+    assert {r["kind"] for r in records} == {"intake_batch"}
+
+
+def test_guarded_raw_dedupe_delete_receipt(monkeypatch, tmp_path):
+    """Guarded deletion: the second raw-identical upload is still dropped once
+    (the survivor holds the bytes), and the delete is receipted."""
+    auth = FakeAuthority()
+    receipts_dir = _arm_fence(monkeypatch, tmp_path, auth)
+    r2 = FakeR2()
+    _seed(r2, name="20260702T100000Z_a.jpg", data=b"SAMEBYTES")
+    _seed(r2, name="20260702T100001Z_b.jpg", data=b"SAMEBYTES")
+    out = _run(r2)
+    assert out["gyma"]["accepted"] == 1 and out["gyma"]["duplicates"] == 1
+    lib = tmp_path / "library" / "gyma"
+    assert len([p for p in os.listdir(lib) if p.endswith(".jpg")]) == 1
+    records = _journals(receipts_dir)
+    assert {r["kind"] for r in records} == {"intake_batch"}
+    assert all(r["local_state"] == "complete" for r in records)
+
+
+def test_guarded_converted_dup_archives_originals_never_mutates_source(
+        monkeypatch, tmp_path):
+    """Guarded original admission: distinct HEIC originals converting to the
+    same JPG both survive in originals/ (copied, never mutated in place)."""
+    auth = FakeAuthority()
+    receipts_dir = _arm_fence(monkeypatch, tmp_path, auth)
+    r2 = FakeR2()
+    _seed(r2, name="20260702T100000Z_a.heic", data=b"HEIC-ONE")
+    _seed(r2, name="20260702T100001Z_b.heic", data=b"HEIC-TWO")
+    out = intake_ingest.process_all(
+        r2=r2, converter=lambda _data, name: (b"SAME-JPG", name[:-5] + ".jpg"),
+        phash=_fake_phash, moderator=_pass_all)
+    assert out["gyma"]["accepted"] == 1 and out["gyma"]["duplicates"] == 1
+    originals = [k for k in r2.objects
+                 if k.startswith("intake/gyma/originals/")
+                 and not k.endswith(".json")]
+    assert {r2.objects[o] for o in originals} == {b"HEIC-ONE", b"HEIC-TWO"}
+    assert all(r["local_state"] == "complete" for r in _journals(receipts_dir))
+
+
+def test_guarded_begin_hold_is_never_swallowed_or_marked_processed(
+        monkeypatch, tmp_path):
+    """A lost begin ack leaves the exact mutation 'prepared' in the journal,
+    aborts the pass loudly (per-client error), touches NO local supply, and the
+    incoming object is NOT consumed. A retry is fenced by reconciliation."""
+    auth = FakeAuthority(fail="begin")
+    receipts_dir = _arm_fence(monkeypatch, tmp_path, auth)
+    r2 = FakeR2()
+    _seed(r2)
+    out = _run(r2)
+    assert "error" in out["gyma"]
+    # the source object is untouched; nothing filed; manifest never committed
+    assert "intake/gyma/incoming/20260702T100000Z_photo.jpg" in r2.objects
+    assert not (tmp_path / "library" / "gyma" /
+                "20260702T100000Z_photo.jpg").exists()
+    assert "intake/gyma/manifest.json" not in r2.objects
+    (record,) = _journals(receipts_dir)
+    assert record["local_state"] == "prepared"
+    # the unresolved attempt blocks any further mutation for this gym
+    again = _run(r2)
+    assert "error" in again["gyma"]
+
+
+def test_guarded_complete_hold_keeps_mutation_pending_and_blocks_retry(
+        monkeypatch, tmp_path):
+    """A lost complete ack after local commit: the journal keeps the exact
+    identity at local_committed, the pass reports an error (never a silent
+    success), the manifest records the committed disposition, and every
+    later pass holds on reconciliation."""
+    auth = FakeAuthority(fail="complete")
+    receipts_dir = _arm_fence(monkeypatch, tmp_path, auth)
+    r2 = FakeR2()
+    _seed(r2)
+    out = _run(r2)
+    assert "error" in out["gyma"]
+    (record,) = _journals(receipts_dir)
+    assert record["local_state"] == "local_committed"
+    assert record["result_digest"]
+    # Manifest and source disposition committed together before uncertain COMPLETE.
+    assert "intake/gyma/manifest.json" in r2.objects
+    assert "intake/gyma/incoming/20260702T100000Z_photo.jpg" not in r2.objects
+    again = _run(r2)
+    assert "error" in again["gyma"]
+    assert len(_journals(receipts_dir)) == 1   # no new mutation could begin
+
+
+@pytest.mark.parametrize("guarded", [False, True])
+@pytest.mark.parametrize("rejected", [False, True])
+def test_same_name_jpeg_reencode_preserves_exact_original(
+        monkeypatch, tmp_path, guarded, rejected):
+    if guarded:
+        _arm_fence(monkeypatch, tmp_path, FakeAuthority())
+    else:
+        _arm(monkeypatch, tmp_path)
+    raw = _real_jpeg_bytes()
+    converted, name = intake_ingest._convert_default(raw, "20260702T100000Z_photo.jpg")
+    assert converted != raw and name == "20260702T100000Z_photo.jpg"
+    r2 = FakeR2()
+    _seed(r2, data=raw)
+    result = intake_ingest.process_all(
+        r2=r2, phash=_fake_phash,
+        moderator=lambda *_: (not rejected, "test review"))
+    assert result["gyma"]["flagged" if rejected else "accepted"] == 1
+    assert r2.objects["intake/gyma/originals/20260702T100000Z_photo.jpg"] == raw
+    assert "intake/gyma/incoming/20260702T100000Z_photo.jpg" not in r2.objects
+
+
+def _assert_pending_source(r2, auth, receipts_dir):
+    assert "intake/gyma/incoming/20260702T100000Z_photo.jpg" in r2.objects
+    assert "intake/gyma/manifest.json" not in r2.objects
+    assert not any(event == "complete" for event, _ in auth.events)
+    (record,) = _journals(receipts_dir)
+    assert record["local_state"] == "pending"
+
+
+@pytest.mark.parametrize("payload", [b"{broken", b"[]", b"null", b'{"note": 1}'])
+def test_guarded_corrupt_upload_sidecar_stays_pending(
+        monkeypatch, tmp_path, payload):
+    auth = FakeAuthority()
+    receipts = _arm_fence(monkeypatch, tmp_path, auth)
+    r2 = FakeR2()
+    _seed(r2)
+    r2.objects["intake/gyma/incoming/20260702T100000Z_upload.json"] = payload
+    assert "error" in _run(r2)["gyma"]
+    _assert_pending_source(r2, auth, receipts)
+    assert not (tmp_path / "library/gyma/20260702T100000Z_photo.jpg").exists()
+
+
+def test_guarded_corrupt_local_provenance_never_truncates_or_consumes(
+        monkeypatch, tmp_path):
+    auth = FakeAuthority()
+    receipts = _arm_fence(monkeypatch, tmp_path, auth)
+    lib = tmp_path / "library/gyma"
+    lib.mkdir(parents=True)
+    media = lib / "20260702T100000Z_photo.jpg"
+    media.write_bytes(b"existing media")
+    sidecar = media.with_suffix(".json")
+    sidecar.write_bytes(b"{broken")
+    r2 = FakeR2()
+    _seed(r2)
+    assert "error" in _run(r2)["gyma"]
+    _assert_pending_source(r2, auth, receipts)
+    assert media.read_bytes() == b"existing media"
+    assert sidecar.read_bytes() == b"{broken"
+
+
+@pytest.mark.parametrize("suffix", [".jpg", ".txt", ".json"])
+def test_guarded_atomic_local_write_failure_retains_source(
+        monkeypatch, tmp_path, suffix):
+    auth = FakeAuthority()
+    receipts = _arm_fence(monkeypatch, tmp_path, auth)
+    original_write = mutation.atomic_write_bytes
+    def fail_selected(path, data):
+        if path.parent == tmp_path / "library/gyma" and path.suffix == suffix:
+            raise OSError("disk full")
+        return original_write(path, data)
+    monkeypatch.setattr(mutation, "atomic_write_bytes", fail_selected)
+    r2 = FakeR2()
+    _seed(r2)
+    assert "error" in _run(r2)["gyma"]
+    _assert_pending_source(r2, auth, receipts)
+
+
+@pytest.mark.parametrize("suffix", [".jpg", ".txt", ".json"])
+def test_guarded_symlink_cannot_modify_other_gym(
+        monkeypatch, tmp_path, suffix):
+    auth = FakeAuthority()
+    receipts = _arm_fence(monkeypatch, tmp_path, auth)
+    lib = tmp_path / "library/gyma"
+    lib.mkdir(parents=True)
+    foreign = tmp_path / "library/gymb"
+    foreign.mkdir()
+    target = foreign / ("other" + suffix)
+    target.write_bytes(b"other gym data")
+    (lib / ("20260702T100000Z_photo" + suffix)).symlink_to(target)
+    r2 = FakeR2()
+    _seed(r2)
+    assert "error" in _run(r2)["gyma"]
+    _assert_pending_source(r2, auth, receipts)
+    assert target.read_bytes() == b"other gym data"
+
+
+@pytest.mark.parametrize("failure", ["unreadable", "invalid_json", "wrong_shape",
+                                     "untyped_aliases", "internal_keyerror"])
+def test_guarded_uncertain_manifest_is_never_empty(
+        monkeypatch, tmp_path, failure):
+    auth = FakeAuthority()
+    receipts = _arm_fence(monkeypatch, tmp_path, auth)
+    r2 = FakeR2()
+    _seed(r2)
+    key = "intake/gyma/manifest.json"
+    if failure in ("unreadable", "internal_keyerror"):
+        original_get = r2.get_bytes
+        def failed_get(request_key):
+            if request_key == key:
+                if failure == "internal_keyerror":
+                    raise KeyError("Body")
+                raise PermissionError("remote denied")
+            return original_get(request_key)
+        monkeypatch.setattr(r2, "get_bytes", failed_get)
+    else:
+        r2.objects[key] = {"invalid_json": b"{broken", "wrong_shape": b"[]",
+                           "untyped_aliases": b'{"source_fingerprint_aliases":{"fp":"alias"}}'}[failure]
+    before = dict(r2.objects)
+    result = _run(r2)
+    assert "error" in result["gyma"]
+    assert r2.objects == before
+    assert not any(event == "complete" for event, _ in auth.events)
+    assert _journals(receipts)[0]["local_state"] == "pending"
+
+
+def test_guarded_confirmed_missing_manifest_initializes_inside_receipt(
+        monkeypatch, tmp_path):
+    auth = FakeAuthority()
+    receipts = _arm_fence(monkeypatch, tmp_path, auth)
+    r2 = FakeR2()
+    _seed(r2)
+    assert _run(r2)["gyma"]["accepted"] == 1
+    assert _journals(receipts)[0]["local_state"] == "complete"
+    assert json.loads(r2.objects["intake/gyma/manifest.json"])["processed"] == [
+        "intake/gyma/incoming/20260702T100000Z_photo.jpg"]
+
+
+def test_guarded_different_sources_cannot_overwrite_same_converted_basename(
+        monkeypatch, tmp_path):
+    auth = FakeAuthority()
+    receipts = _arm_fence(monkeypatch, tmp_path, auth)
+    r2 = FakeR2()
+    _seed(r2, name="20260702T100000Z_photo.heic", data=b"HEIC-SOURCE")
+    assert _run(r2)["gyma"]["accepted"] == 1
+    media = tmp_path / "library/gyma/20260702T100000Z_photo.jpg"
+    original_media = media.read_bytes()
+    original_provenance = json.loads(
+        r2.objects["intake/gyma/manifest.json"])["asset_provenance"]
+
+    _seed(r2, name="20260702T100000Z_photo.jpg", data=b"DIFFERENT-JPEG")
+    incoming = "intake/gyma/incoming/20260702T100000Z_photo.jpg"
+    result = _run(r2)
+
+    assert "error" in result["gyma"]
+    assert r2.objects[incoming] == b"DIFFERENT-JPEG"
+    assert media.read_bytes() == original_media
+    manifest = json.loads(r2.objects["intake/gyma/manifest.json"])
+    assert manifest["asset_provenance"] == original_provenance
+    assert any(record["local_state"] == "pending"
+               for record in _journals(receipts))
+
+
+@pytest.mark.parametrize("failure", ["write", "readback"])
+def test_guarded_manifest_persistence_precedes_source_delete(
+        monkeypatch, tmp_path, failure):
+    auth = FakeAuthority()
+    receipts = _arm_fence(monkeypatch, tmp_path, auth)
+    r2 = FakeR2()
+    _seed(r2)
+    original_put = r2.put_bytes
+    def failed_put(key, data, content_type="application/octet-stream"):
+        if key.endswith("/manifest.json"):
+            if failure == "write":
+                raise OSError("remote unavailable")
+            data = b"wrong stored bytes"
+        original_put(key, data, content_type)
+    monkeypatch.setattr(r2, "put_bytes", failed_put)
+    assert "error" in _run(r2)["gyma"]
+    assert "intake/gyma/incoming/20260702T100000Z_photo.jpg" in r2.objects
+    assert not any(event == "complete" for event, _ in auth.events)
+    assert _journals(receipts)[0]["local_state"] == "pending"
+
+
+def test_guarded_deletion_requires_manifest_and_remote_absence(
+        monkeypatch, tmp_path):
+    auth = FakeAuthority()
+    receipts = _arm_fence(monkeypatch, tmp_path, auth)
+    r2 = FakeR2()
+    _seed(r2)
+    def unacknowledged_delete(key):
+        assert key in json.loads(r2.objects["intake/gyma/manifest.json"])["processed"]
+        # A silent provider no-op is not evidence of source deletion.
+    monkeypatch.setattr(r2, "delete", unacknowledged_delete)
+    assert "error" in _run(r2)["gyma"]
+    assert "intake/gyma/incoming/20260702T100000Z_photo.jpg" in r2.objects
+    assert _journals(receipts)[0]["local_state"] == "pending"
+    assert not any(event == "complete" for event, _ in auth.events)
+
+
+def test_overlapping_guarded_passes_load_manifest_under_same_lock(
+        monkeypatch, tmp_path):
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+    _arm_fence(monkeypatch, tmp_path, FakeAuthority())
+    monkeypatch.setattr(mutation.MutationAuthority, "from_environment", FakeAuthority)
+    # Both passes clear the settled preflight before either creates its journal.
+    # Their actual disposition callbacks must then serialize on the real flock.
+    barrier = threading.Barrier(2)
+    original_settled = mutation.assert_settled
+    def concurrent_preflight(cfg):
+        original_settled(cfg)
+        barrier.wait(timeout=5)
+    monkeypatch.setattr(mutation, "assert_settled", concurrent_preflight)
+    converting = threading.Event()
+    resume = threading.Event()
+    r2 = FakeR2()
+    _seed(r2, data=b"PHOTO-A")
+    def converter(data, name):
+        if data == b"PHOTO-A":
+            converting.set()
+            assert resume.wait(timeout=5)
+        return data, name
+    def process():
+        return intake_ingest._process_client(
+            "gyma", r2, None, converter, _fake_phash, _pass_all)
+    with ThreadPoolExecutor(max_workers=2) as workers:
+        first, second = workers.submit(process), workers.submit(process)
+        assert converting.wait(timeout=5)
+        _seed(r2, name="20260702T100001Z_second.jpg", data=b"PHOTO-B")
+        resume.set()
+        results = first.result(timeout=10), second.result(timeout=10)
+    assert sum(result["accepted"] for result in results) == 2
+    manifest = json.loads(r2.objects["intake/gyma/manifest.json"])
+    assert set(manifest["processed"]) == {
+        "intake/gyma/incoming/20260702T100000Z_photo.jpg",
+        "intake/gyma/incoming/20260702T100001Z_second.jpg"}
+    assert len(manifest["asset_provenance"]) == 2
+    assert len(manifest["sha256_raw"]) == 2
+    assert all(record["local_state"] == "complete" for record in
+               _journals(tmp_path / "inventory-mutation-receipts"))
+
+
+def test_guarded_forms_explicitly_hold_without_running_separate_db_writers(
+        monkeypatch, tmp_path):
+    auth = FakeAuthority()
+    receipts = _arm_fence(monkeypatch, tmp_path, auth)
+    r2 = FakeR2()
+    _seed(r2)
+    r2.put_bytes("intake/gyma/incoming/20260702T100000Z_intake.json",
+                 b'{"answers":{"offers":"reported offer"}}')
+    before = dict(r2.objects)
+    monkeypatch.setattr(intake_ingest, "_land_intake_form",
+                        lambda *_: pytest.fail("unsafe nested DB writer"))
+    result = _run(r2)
+    assert "error" in result["gyma"]
+    assert "intake_form_transaction_adapter_required" in result["gyma"]["error"]
+    assert r2.objects == before
+    assert _journals(receipts)[0]["local_state"] == "pending"
+    assert not any(event == "complete" for event, _ in auth.events)
+
+
+def test_guarded_raw_dedupe_does_not_trust_missing_historical_original(
+        monkeypatch, tmp_path):
+    import hashlib
+    auth = FakeAuthority()
+    receipts = _arm_fence(monkeypatch, tmp_path, auth)
+    r2 = FakeR2()
+    raw = _real_jpeg_bytes()
+    _seed(r2, data=raw)
+    r2.put_bytes("intake/gyma/manifest.json", json.dumps({
+        "processed": [], "sha256": [], "phash": [],
+        "sha256_raw": [hashlib.sha256(raw).hexdigest()]}).encode())
+    assert _run(r2)["gyma"]["duplicates"] == 1
+    archive = "intake/gyma/originals/20260702T100000Z_photo.jpg"
+    assert r2.objects[archive] == raw
+    manifest = json.loads(r2.objects["intake/gyma/manifest.json"])
+    assert manifest["asset_provenance"][
+        "intake/gyma/incoming/20260702T100000Z_photo.jpg"]["status"] == "duplicate_raw"
+    assert _journals(receipts)[0]["local_state"] == "complete"
+
+
+def test_guarded_callbacks_run_after_complete_with_database_available(
+        monkeypatch, tmp_path):
+    auth = FakeAuthority()
+    receipts = _arm_fence(monkeypatch, tmp_path, auth)
+    r2 = FakeR2()
+    _seed(r2, name="20260702T100000Z_first.jpg", data=b"PHOTO-A")
+    _seed(r2, name="20260702T100001Z_second.jpg", data=b"PHOTO-B")
+    notifications = []
+    def alert(*args, **kwargs):
+        assert _journals(receipts)[0]["local_state"] == "complete"
+        with sqlite3.connect(tmp_path / "echo.db", timeout=0) as conn:
+            conn.execute("CREATE TABLE IF NOT EXISTS callback_check (id integer)")
+            conn.execute("INSERT INTO callback_check VALUES (1)")
+        notifications.append(args)
+    monkeypatch.setattr(ops_alerts, "alert", alert)
+    result = intake_ingest.process_all(
+        r2=r2, converter=_fake_converter,
+        phash=lambda *_: "collision", moderator=_pass_all)
+    assert result["gyma"]["accepted"] == 1 and result["gyma"]["held"] == 1
+    assert len(notifications) == 1
+
+
+def test_guarded_originals_are_immutable_on_conflict(monkeypatch, tmp_path):
+    auth = FakeAuthority()
+    receipts = _arm_fence(monkeypatch, tmp_path, auth)
+    r2 = FakeR2()
+    raw = _real_jpeg_bytes()
+    _seed(r2, data=raw)
+    archive = "intake/gyma/originals/20260702T100000Z_photo.jpg"
+    r2.put_bytes(archive, b"older preserved source")
+    assert "error" in intake_ingest.process_all(
+        r2=r2, phash=_fake_phash, moderator=_pass_all)["gyma"]
+    _assert_pending_source(r2, auth, receipts)
+    assert r2.objects[archive] == b"older preserved source"
+
+
+def test_guarded_original_readback_drift_holds_before_source_delete(
+        monkeypatch, tmp_path):
+    auth = FakeAuthority()
+    receipts = _arm_fence(monkeypatch, tmp_path, auth)
+    r2 = FakeR2()
+    raw = _real_jpeg_bytes()
+    _seed(r2, data=raw)
+    archive = "intake/gyma/originals/20260702T100000Z_photo.jpg"
+    original_get = r2.get_bytes
+    reads = []
+    def drifting_get(key):
+        data = original_get(key)
+        if key == archive:
+            reads.append(key)
+            if len(reads) >= 2:
+                return b"changed remote original"
+        return data
+    monkeypatch.setattr(r2, "get_bytes", drifting_get)
+    assert "error" in intake_ingest.process_all(
+        r2=r2, phash=_fake_phash, moderator=_pass_all)["gyma"]
+    assert "intake/gyma/incoming/20260702T100000Z_photo.jpg" in r2.objects
+    assert not any(event == "complete" for event, _ in auth.events)
+    assert _journals(receipts)[0]["local_state"] == "pending"
+
+
+def test_guarded_changed_incoming_source_is_not_consumed(
+        monkeypatch, tmp_path):
+    auth = FakeAuthority()
+    receipts = _arm_fence(monkeypatch, tmp_path, auth)
+    r2 = FakeR2()
+    _seed(r2, data=b"first source")
+    def source_changes(data, name):
+        r2.objects["intake/gyma/incoming/20260702T100000Z_photo.jpg"] = b"replacement source"
+        return data, name
+    assert "error" in intake_ingest.process_all(
+        r2=r2, converter=source_changes, phash=_fake_phash,
+        moderator=_pass_all)["gyma"]
+    _assert_pending_source(r2, auth, receipts)
+    assert r2.objects["intake/gyma/incoming/20260702T100000Z_photo.jpg"] == b"replacement source"
+
+
+def test_guarded_unreadable_upload_sidecar_is_not_a_captionless_upload(
+        monkeypatch, tmp_path):
+    auth = FakeAuthority()
+    receipts = _arm_fence(monkeypatch, tmp_path, auth)
+    r2 = FakeR2()
+    _seed(r2)
+    original_get = r2.get_bytes
+    def denied_get(key):
+        if key.endswith("_upload.json"):
+            raise PermissionError("remote denied")
+        return original_get(key)
+    monkeypatch.setattr(r2, "get_bytes", denied_get)
+    assert "error" in _run(r2)["gyma"]
+    _assert_pending_source(r2, auth, receipts)
+    assert not any("pending_caption/" in key for key in r2.objects)
