@@ -169,6 +169,45 @@ def scan_support_bus(bus=None, *, page_size=500, max_pages=1000):
         1 for bucket in summary.values() for r in bucket
         if r.get("client_visible_working"))
 
+    # Actionable list: every verified real-client ticket whose classifier says
+    # the portal still displays working, plus new requests that may be stuck
+    # before intake. The reminder applies an age threshold to those new rows.
+    # Bounded
+    # metadata only -- never ticket text, bodies, attachments, or gym slugs.
+    tickets_by_id = {t.get("id"): t for t in tickets if isinstance(t, dict)}
+
+    def _actionable_entry(r):
+        ticket = tickets_by_id.get(r.get("ticket_id"))
+        if not isinstance(ticket, dict):
+            return None
+        entry = {
+            "ticket_id": r.get("ticket_id"),
+            "reason": r.get("reason"),
+            "product": ticket.get("product"),
+            "source": ticket.get("source"),
+            "bot_identity": ticket.get("bot_identity"),
+            "client_id": ticket.get("client_id"),
+            "request_version": ticket.get("request_version"),
+            "status": ticket.get("status"),
+        }
+        if ticket.get("status") == "new":
+            entry["created_at"] = ticket.get("created_at")
+        return entry
+
+    actionable = []
+    for bucket in summary.values():
+        for r in bucket:
+            ticket = tickets_by_id.get(r.get("ticket_id"))
+            stale_intake_candidate = (r.get("category") == EXCEPTION
+                                      and r.get("reason") == "client_request_open"
+                                      and isinstance(ticket, dict)
+                                      and ticket.get("status") == "new")
+            if not r.get("client_visible_working") and not stale_intake_candidate:
+                continue
+            entry = _actionable_entry(r)
+            if entry is not None:
+                actionable.append(entry)
+
     return {
         "ok": True,
         "scanned": len(tickets),
@@ -177,4 +216,5 @@ def scan_support_bus(bus=None, *, page_size=500, max_pages=1000):
         "exceptions": _brief(summary.get(EXCEPTION, [])),
         "anomalies": _brief(summary.get(ANOMALY, [])),
         "out_of_scope": counts.get(OUT_OF_SCOPE, 0),
+        "actionable": actionable,
     }

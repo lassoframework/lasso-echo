@@ -515,6 +515,8 @@ def _print_scheduled_lanes():
         ("nightly backup", config.backup_enabled(), "AGENT_BACKUP_ENABLED"),
         ("portal echo ticket bridge", config.portal_echo_tickets_enabled(),
          "AGENT_PORTAL_ECHO_TICKETS_ENABLED"),
+        ("client support scan reminder", config.client_support_scan_reminder_enabled(),
+         "AGENT_CLIENT_SUPPORT_SCAN_REMINDER_ENABLED"),
         ("cross gym brain (weekly)", config.cross_gym_brain_enabled(),
          "AGENT_CROSS_GYM_BRAIN"),
         ("brains feed captions", config.brain_feeds_captions_enabled(),
@@ -959,6 +961,12 @@ def _daily_scheduler(store):
     except ValueError:
         held_ticket_reconcile_minutes = 15
     held_ticket_reconcile_every = held_ticket_reconcile_minutes * 60
+    try:
+        support_scan_reminder_minutes = max(15, min(240, int(
+            os.environ.get("AGENT_CLIENT_SUPPORT_SCAN_REMINDER_POLL_MINUTES", "60"))))
+    except ValueError:
+        support_scan_reminder_minutes = 60
+    support_scan_reminder_every = support_scan_reminder_minutes * 60
     last_run_date = _read_last_run_date()  # survives a redeploy inside the window
     last_pcast_auto = _read_podcast_auto_date()  # weekly Monday auto-ingest guard
     last_ingest = 0.0
@@ -969,6 +977,7 @@ def _daily_scheduler(store):
     last_cms = 0.0
     last_portal_echo = 0.0
     last_held_ticket_reconcile = 0.0
+    last_support_scan_reminder = 0.0
     auto_reels_worker = None
     while True:
         now = datetime.now(timezone.utc)
@@ -1237,6 +1246,22 @@ def _daily_scheduler(store):
                     print(f"[held-ticket-reconcile] skipped: {_held_result.get('reason', '')}")
             except Exception as e:
                 print(f"[held-ticket-reconcile] pass failed: {type(e).__name__}")
+        # The shared Help Center scan is a separate default-off internal notice
+        # lane. Its claim is per ticket/request/day, so frequent ticks do not
+        # repeat a notice. It never closes a ticket or sends to a client.
+        if time.monotonic() - last_support_scan_reminder >= support_scan_reminder_every:
+            last_support_scan_reminder = time.monotonic()
+            try:
+                from .jobs.client_support_scan_reminder import run as _support_scan_run
+                _support_scan_result = _support_scan_run()
+                if not _support_scan_result.get("ok"):
+                    print("[client-support-scan-reminder] skipped: "
+                          f"{_support_scan_result.get('reason', '')}")
+                elif _support_scan_result.get("degraded"):
+                    print("[client-support-scan-reminder] CRITICAL unqueued "
+                          f"client tickets: {_support_scan_result.get('skipped', [])}")
+            except Exception as e:
+                print(f"[client-support-scan-reminder] pass failed: {type(e).__name__}")
         # CLIENT MEDIA SYNC frequent lane: dormant unless AGENT_CLIENT_MEDIA_SYNC.
         # Picks up a client gym's fresh R2 upload PROMPTLY (throttled to
         # AGENT_CLIENT_MEDIA_SYNC_MINUTES, default 5) and auto-builds its DRAFT

@@ -267,6 +267,60 @@ def test_current_census_shape_has_19_real_client_working_rows():
     assert report["client_visible_working"] == 19
     assert report["out_of_scope"] == 1
     assert report["anomalies"][-1] == {"ticket_id": "t-0021", "reason": "null_client_id"}
+    # Actionable list: every one of the 19 client-visible-working rows,
+    # including anomaly rows (resolved/merged missing resolved_at), each with
+    # bounded metadata and no client text.
+    actionable = report["actionable"]
+    assert len(actionable) == 19
+    ids = {e["ticket_id"] for e in actionable}
+    assert ids == {f"t-{n:04d}" for n in range(1, 20)}
+    by_id = {t["id"]: t for t in tickets}
+    for entry in actionable:
+        assert set(entry) == {"ticket_id", "reason", "product", "source",
+                              "bot_identity", "client_id", "request_version",
+                              "status"}
+        t = by_id[entry["ticket_id"]]
+        assert entry["product"] == t["product"]
+        assert entry["source"] == t["source"]
+        assert entry["bot_identity"] == t["bot_identity"]
+        assert entry["client_id"] == t["client_id"]
+        assert entry["request_version"] == t["request_version"]
+        assert entry["status"] == t["status"]
+    # The Dale-style resolved anomaly is actionable with its reason carried.
+    resolved_anomalies = [e for e in actionable
+                          if e["reason"] == "resolved_missing_resolved_at"]
+    assert len(resolved_anomalies) == 6
+    # The null-client anomaly is NOT client-visible-working and never appears.
+    assert "t-0021" not in ids and "t-0020" not in ids
+    assert "SECRET" not in str(actionable)
+    assert "zz-test-gym" not in str(actionable)
+
+
+def test_actionable_includes_dale_merged_anomaly_metadata():
+    tickets = [
+        _ticket(1, id="554ac760-b0b3-413a-919f-4e13cff6d3fc",
+                client_id=DALE_GYM["id"], status="merged", resolved_at=None,
+                classification="code_fix", request_version=3),
+    ]
+    report = s.scan_support_bus(FakeBus(tickets, GYMS))
+    assert report["ok"]
+    assert report["actionable"] == [{
+        "ticket_id": tickets[0]["id"],
+        "reason": "merged_missing_resolved_at",
+        "product": "echo",
+        "source": "website_tab",
+        "bot_identity": "echo",
+        "client_id": DALE_GYM["id"],
+        "request_version": 3,
+        "status": "merged",
+    }]
+
+
+def test_satisfied_ticket_not_actionable():
+    t = _ticket(1)
+    report = s.scan_support_bus(FakeBus([t], GYMS, [_guarded_receipt(t, 1)]))
+    assert report["ok"]
+    assert report["actionable"] == []
 
 
 def test_valid_current_cycle_receipt_suppresses_visible_working():
@@ -323,9 +377,14 @@ def test_report_has_no_text_slugs_attachments_or_error_strings():
                       "attachments", "delivery_expected", "Traceback"):
         assert forbidden not in blob, forbidden
     assert set(report) == {"ok", "scanned", "counts", "client_visible_working",
-                           "exceptions", "anomalies", "out_of_scope"}
+                           "exceptions", "anomalies", "out_of_scope",
+                           "actionable"}
     for entry in report["exceptions"] + report["anomalies"]:
         assert set(entry) == {"ticket_id", "reason"}
+    for entry in report["actionable"]:
+        assert set(entry) == {"ticket_id", "reason", "product", "source",
+                              "bot_identity", "client_id", "request_version",
+                              "status"}
 
 
 def test_no_write_method_ever_called():
