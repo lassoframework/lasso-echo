@@ -1,8 +1,9 @@
 """Bounded, read-only historical delivered-image byte audit.
 
 Reads a private local JSON array of calendar rows (id, gym_id, image_url,
-status, post_date), optionally fetches each unique image URL for rows whose
-status is exactly "published" over HTTPS from an explicitly allowed origin,
+status, post_date), optionally fetches each unique image URL for published
+rows, or for approved and pending rows with explicit --include-future, over
+HTTPS from an explicitly allowed origin,
 and writes a mode-0600 JSON receipt mapping row ids to the exact URL and its
 MD5/SHA256 digests, byte length and per-row status.
 
@@ -11,7 +12,8 @@ address must be a public globally-routable IP, and the TLS connection is
 opened directly to that pinned IP via raw socket + ssl + http.client (no
 urllib opener, no proxy handling) while certificate verification and the Host
 header still use the original hostname (DNS-rebinding resistant). Redirects
-(any non-200 status) are refused. Non-published rows are never fetched.
+(any non-200 status) are refused. Statuses outside the selected scope are
+never fetched.
 
 No database access, no DB writes, no provider calls, no redirects, no
 cross-host fetches, 128 MiB streamed cap. Network is OFF unless --fetch is
@@ -35,6 +37,19 @@ from urllib.parse import urlsplit
 MAX_BYTES = 128 * 1024 * 1024  # 128 MiB
 REQUIRED_FIELDS = ("id", "gym_id", "image_url", "status", "post_date")
 PUBLISHED_STATUS = "published"
+FUTURE_STATUSES = ("approved", "pending")
+
+
+def _selected_statuses(include_future):
+    """Statuses (after trim + casefold) eligible for auditing.
+
+    Default is published-only; --include-future also audits approved and
+    pending rows. Rows in other statuses are never fetched.
+    """
+    selected = {PUBLISHED_STATUS}
+    if include_future:
+        selected.update(FUTURE_STATUSES)
+    return selected
 
 
 def _validate_url(url, allowed_origin):
@@ -201,9 +216,14 @@ def load_rows(path):
     return data
 
 
-def audit(rows, allowed_origin, fetch=False, resolver=None, connection_factory=None):
+def audit(rows, allowed_origin, fetch=False, include_future=False,
+          resolver=None, connection_factory=None):
     receipt = {}
     seen = {}
+    selected = _selected_statuses(include_future)
+    not_selected_reason = (
+        "status_not_selected" if include_future else "status_not_published"
+    )
     counts = {
         "rows_total": 0,
         "rows_ok": 0,
@@ -211,6 +231,9 @@ def audit(rows, allowed_origin, fetch=False, resolver=None, connection_factory=N
         "rows_skipped_nonpublished": 0,
         "unique_urls": 0,
         "urls_fetched": 0,
+        "include_future": bool(include_future),
+        "selected_statuses": sorted(selected),
+        "rows_skipped_status": 0,
     }
     for idx, row in enumerate(rows):
         counts["rows_total"] += 1
@@ -221,9 +244,10 @@ def audit(rows, allowed_origin, fetch=False, resolver=None, connection_factory=N
             counts["rows_failed"] += 1
             continue
         status = row.get("status")
-        if not (isinstance(status, str) and status.strip().lower() == PUBLISHED_STATUS):
-            receipt[str(key)] = {"status": "skipped", "reason": "status_not_published"}
+        if not (isinstance(status, str) and status.strip().lower() in selected):
+            receipt[str(key)] = {"status": "skipped", "reason": not_selected_reason}
             counts["rows_skipped_nonpublished"] += 1
+            counts["rows_skipped_status"] += 1
             continue
         url = row.get("image_url")
         ok, reason = _validate_url(url, allowed_origin) if isinstance(url, str) else (False, "missing_image_url")
@@ -251,8 +275,15 @@ def audit(rows, allowed_origin, fetch=False, resolver=None, connection_factory=N
     return receipt, counts
 
 
-def write_receipt(receipt, path):
-    payload = {"audit": "published_visual_bytes", "version": 1, "rows": receipt}
+def write_receipt(receipt, path, selected_statuses=None):
+    payload = {
+        "audit": "published_visual_bytes",
+        "version": 1,
+        "rows": receipt,
+    }
+    if selected_statuses is not None:
+        # Make the audited scope explicit without implying every row was published.
+        payload["selected_statuses"] = list(selected_statuses)
     # A new receipt path prevents a check/open race and protects prior evidence.
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
     with os.fdopen(fd, "w", encoding="utf-8") as fh:
@@ -266,15 +297,23 @@ def main(argv=None):
     parser.add_argument("--allowed-origin", required=True, help="exact HTTPS origin host allowed, e.g. https://cdn.example.com")
     parser.add_argument("--receipt", required=True, help="output receipt path (written mode 0600)")
     parser.add_argument("--fetch", action="store_true", help="actually fetch bytes over HTTPS (default: no network)")
+    parser.add_argument(
+        "--include-future",
+        action="store_true",
+        help="also audit rows with status approved or pending (default: published only)",
+    )
     args = parser.parse_args(argv)
 
     rows = load_rows(args.input)
-    receipt, counts = audit(rows, args.allowed_origin, fetch=args.fetch)
-    write_receipt(receipt, args.receipt)
+    receipt, counts = audit(
+        rows, args.allowed_origin, fetch=args.fetch, include_future=args.include_future
+    )
+    write_receipt(receipt, args.receipt, selected_statuses=counts["selected_statuses"])
     print(
         "coverage: rows_total={rows_total} rows_ok={rows_ok} rows_failed={rows_failed} "
         "rows_skipped_nonpublished={rows_skipped_nonpublished} unique_urls={unique_urls} "
-        "urls_fetched={urls_fetched} fetch={fetch}".format(
+        "urls_fetched={urls_fetched} fetch={fetch} "
+        "include_future={include_future} selected_statuses={selected_statuses}".format(
             fetch="on" if args.fetch else "off", **counts
         )
     )

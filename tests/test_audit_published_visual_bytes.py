@@ -332,3 +332,72 @@ def test_load_rows_requires_array(tmp_path):
 
 def test_cap_constant_is_128_mib():
     assert MAX_BYTES == 128 * 1024 * 1024
+
+
+# --- include-future opt-in -----------------------------------------------------
+
+
+def test_default_skips_future_statuses_without_network():
+    calls = []
+    rows = [
+        row(id="pub", status="published"),
+        row(id="appr", status="approved"),
+        row(id="pend", status="pending"),
+        row(id="den", status="denied"),
+    ]
+    receipt, counts = audit(
+        rows, ORIGIN, fetch=True, resolver=public_resolver,
+        connection_factory=make_factory({URL_KEY: BODY}, calls),
+    )
+    # only the published row touches the network; future rows are skipped
+    assert len(calls) == 1
+    assert receipt["pub"]["status"] == "fetched"
+    assert receipt["appr"] == {"status": "skipped", "reason": "status_not_published"}
+    assert receipt["pend"] == {"status": "skipped", "reason": "status_not_published"}
+    assert receipt["den"] == {"status": "skipped", "reason": "status_not_published"}
+    assert counts["rows_skipped_nonpublished"] == 3
+    assert counts["unique_urls"] == 1
+
+
+def test_include_future_fetches_approved_and_pending_but_skips_denied():
+    calls = []
+    rows = [
+        row(id="pub"),
+        row(id="appr", status="approved"),
+        row(id="pend", status=" PENDING "),  # trim + casefold
+        row(id="den", status="denied"),
+    ]
+    receipt, counts = audit(
+        rows, ORIGIN, fetch=True, include_future=True,
+        resolver=public_resolver, connection_factory=make_factory({URL_KEY: BODY}, calls),
+    )
+    assert len(calls) == 1  # same URL deduped across pub/appr/pend
+    assert receipt["pub"]["sha256"] == receipt["appr"]["sha256"] == receipt["pend"]["sha256"]
+    assert receipt["den"] == {"status": "skipped", "reason": "status_not_selected"}
+    assert counts["selected_statuses"] == ["approved", "pending", "published"]
+    assert counts["include_future"] is True
+    assert counts["urls_fetched"] == 1
+    assert counts["rows_skipped_status"] == 1
+
+
+def test_main_include_future_receipt_metadata(tmp_path, capsys):
+    src = tmp_path / "rows.json"
+    src.write_text(json.dumps([
+        row(id="pub"),
+        row(id="appr", status="approved"),
+        row(id="den", status="denied"),
+    ]))
+    out = tmp_path / "receipt.json"
+    rc = main([
+        "--input", str(src), "--allowed-origin", ORIGIN,
+        "--receipt", str(out), "--include-future",
+    ])
+    stdout = capsys.readouterr().out
+    assert rc == 0
+    assert "include_future=True" in stdout
+    assert "selected_statuses=['approved', 'pending', 'published']" in stdout
+    assert "rows_skipped_nonpublished=1" in stdout  # denied row skipped, not failed
+    payload = json.loads(out.read_text())
+    assert payload["selected_statuses"] == ["approved", "pending", "published"]
+    assert payload["rows"]["appr"]["status"] == "not_fetched"
+    assert payload["rows"]["den"]["reason"] == "status_not_selected"
