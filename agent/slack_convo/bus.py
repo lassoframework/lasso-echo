@@ -21,6 +21,8 @@ parameter does not emit -- so ON CONFLICT would fail with "no unique or exclusio
 matching" at runtime. Catching the violation is the reliable form.
 """
 import json
+import os
+from urllib.parse import urlparse
 import re
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -137,6 +139,58 @@ class Bus:
         self._url = (url if url is not None else config.supabase_url())
         self._key = (service_key if service_key is not None else config.supabase_service_key())
         self._http = http
+
+    def read_authenticated_client_closed_projection(self, ticket, completion_message_id):
+        """Legacy contract name: machine parity, not authenticated client access.
+
+        Acceptance still requires a separate live client UI canary. No retries.
+        """
+        secret = os.environ.get("SUPPORT_CLOSED_PROJECTION_SECRET", "")
+        url = os.environ.get("SUPPORT_CLOSED_PROJECTION_URL", "")
+        parsed = urlparse(url)
+        if (os.environ.get("SUPPORT_CLOSED_PROJECTION_ENABLED") != "true" or not secret or
+                parsed.scheme != "https" or parsed.netloc != "ops.lassoframework.com" or
+                parsed.username or parsed.password or parsed.query or parsed.fragment or
+                parsed.path != "/api/internal/support/closed-projection"):
+            return None
+        if not isinstance(ticket, dict) or any(not _UUID.fullmatch(str(v or "")) for v in
+                (ticket.get("id"), ticket.get("client_id"), completion_message_id)):
+            return None
+        try:
+            response = self._client().post(url, headers={"Authorization": f"Bearer {secret}",
+                "Content-Type": "application/json", "Accept": "application/json"},
+                json={"ticket_id": ticket["id"], "gym_id": ticket["client_id"],
+                      "completion_message_id": completion_message_id},
+                timeout=10, allow_redirects=False)
+            if response.status_code != 200:
+                return None
+            result = response.json()
+            from ..support_historical_closeout import _identity_matches
+            fixer = (ticket.get("verification_after") or {}).get("fixer") or {}
+            recovery = fixer.get("historical_receipt_recovery") or {}
+            if (not isinstance(result, dict) or not _identity_matches(result, ticket) or
+                    result.get("ticket_id") != ticket["id"] or
+                    result.get("authenticated_client_id") != ticket["client_id"] or
+                    result.get("completion_message_id") != completion_message_id or
+                    recovery.get("notice_message_id") != completion_message_id or
+                    recovery.get("request_version") != ticket.get("request_version") or
+                    fixer.get("request_key_version") != ticket.get("request_version") or
+                    recovery.get("request_key") != fixer.get("request_key") or
+                    result.get("request_key") != fixer.get("request_key") or
+                    not _HASH.fullmatch(str(result.get("request_key") or "")) or
+                    result.get("display_status") != "done" or
+                    result.get("client_delivery_confirmed") is not True or
+                    result.get("authentication_kind") != "machine_projection_parity" or
+                    result.get("live_client_ui_canary_required") is not True or
+                    not str(result.get("observation_ref") or "").startswith("portal-machine-projection:") or
+                    not result.get("completion_slack_ts")):
+                return None
+            stamp = datetime.fromisoformat(result["observed_at"].replace("Z", "+00:00"))
+            if not 0 <= (datetime.now(timezone.utc) - stamp).total_seconds() <= 60:
+                return None
+            return result
+        except Exception:
+            return None
 
     # ---- transport ----------------------------------------------------------------------
     def available(self):
