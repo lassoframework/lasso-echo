@@ -168,6 +168,61 @@ def test_the_different_photo_chip_routes_to_the_free_swap(monkeypatch):
     assert store._rows["p1"]["image_url"] == "https://cdn/new.jpg"
 
 
+def test_cross_date_hold_clears_only_after_verified_replacement(monkeypatch):
+    monkeypatch.setenv("ECHO_MEDIA_SWAP_FREE", "true")
+    row = _row("p1")
+    row["media_not_ready_reason"] = "cross_date_media_repeat_needs_new_visual"
+
+    class HeldStore(_Store):
+        def release_swapped_repeat_media_hold(self, gym, original, staged):
+            assert self.get_row(gym, original["id"]) == staged
+            assert staged["media_not_ready_reason"] == row["media_not_ready_reason"]
+            self._rows[original["id"]]["media_not_ready_reason"] = None
+            return self.get_row(gym, original["id"])
+
+    store = HeldStore([row])
+    _wire(monkeypatch, store)
+    status, body = ps.handle_swap_media("zanshin", "p1", "u1", sb_store=store,
+                                        picker=_picker)
+    assert status == 200 and body["ok"] is True
+    assert store._rows["p1"]["media_not_ready_reason"] is None
+    assert store._rows["p1"]["status"] == "pending"
+
+
+def test_cross_date_hold_release_failure_does_not_claim_ready(monkeypatch):
+    monkeypatch.setenv("ECHO_MEDIA_SWAP_FREE", "true")
+    row = _row("p1")
+    row["media_not_ready_reason"] = "cross_date_media_repeat_needs_new_visual"
+
+    class HeldStore(_Store):
+        def release_swapped_repeat_media_hold(self, gym, original, staged):
+            return None
+
+    store = HeldStore([row])
+    _wire(monkeypatch, store)
+    status, body = ps.handle_swap_media("zanshin", "p1", "u1", sb_store=store,
+                                        picker=_picker)
+    assert status == 503 and body["reason"] == "hold_release_unknown"
+    assert store._rows["p1"]["image_url"] == "https://cdn/new.jpg"
+    assert store._rows["p1"]["media_not_ready_reason"] == row["media_not_ready_reason"]
+
+
+def test_cross_date_hold_requires_independent_release_readback(monkeypatch):
+    monkeypatch.setenv("ECHO_MEDIA_SWAP_FREE", "true")
+    row = _row("p1")
+    row["media_not_ready_reason"] = "cross_date_media_repeat_needs_new_visual"
+
+    class HeldStore(_Store):
+        def release_swapped_repeat_media_hold(self, gym, original, staged):
+            return dict(staged, media_not_ready_reason=None)
+
+    store = HeldStore([row])
+    _wire(monkeypatch, store)
+    status, body = ps.handle_swap_media("zanshin", "p1", "u1", sb_store=store,
+                                        picker=_picker)
+    assert status == 503 and body["reason"] == "hold_release_unknown"
+
+
 def test_caption_intent_still_charges_exactly_as_before(monkeypatch):
     monkeypatch.setenv("ECHO_MEDIA_SWAP_FREE", "true")
     store = _Store([_row("p1")])

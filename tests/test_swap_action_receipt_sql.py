@@ -9,6 +9,7 @@ production host; if local PG17 binaries are missing they skip.
 """
 import hashlib
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -23,6 +24,20 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 SQL = (ROOT / "migrations" / "portal_action_receipt_draft_20261004.sql").read_text()
 LOW = SQL.lower()
+HELD_SQL = (ROOT / "migrations" / "portal_action_receipt_held_repeat_20261010.sql").read_text()
+HELD_LOW = HELD_SQL.lower()
+
+
+def test_held_repeat_upgrade_freezes_hold_and_keeps_atomic_readback():
+    claim = HELD_LOW.split("function public.portal_action_receipt_claim_selection(", 1)[1]
+    apply = HELD_LOW.split("function public.portal_action_receipt_apply(", 1)[1]
+    assert "'media_not_ready_reason', c.media_not_ready_reason" in claim
+    assert "v_row.media_not_ready_reason is distinct from (v_member->>'media_not_ready_reason')" in apply
+    assert "cross_date_media_repeat_needs_new_visual" in apply
+    assert "media_not_ready_reason is not distinct from (v_member->>'media_not_ready_reason')" in apply
+    assert apply.index("held repeat replacement is not distinct") < apply.index("write phase")
+    assert apply.index("select * into v_persisted") > apply.index("set image_url")
+    assert "v_persisted.media_not_ready_reason is not null" in apply
 
 PGBIN_CANDIDATES = [Path("/opt/homebrew/opt/postgresql@17/bin"),
                     Path("/usr/local/opt/postgresql@17/bin")]
@@ -264,6 +279,7 @@ PGBIN = _pgbin()
 pytestmark_live = pytest.mark.skipif(PGBIN is None, reason="no local PostgreSQL 17 binaries")
 
 SOCK = None
+PGUSER = "postgres"
 DB = "echo_swap_receipt_test"
 
 
@@ -274,7 +290,7 @@ def _run(cmd, **kw):
 
 def sql(statement, expect_error=False):
     assert SOCK
-    done = _run([str(PGBIN / "psql"), "-U", "postgres", "-X", "-q", "-A", "-t", "-v", "ON_ERROR_STOP=1",
+    done = _run([str(PGBIN / "psql"), "-U", PGUSER, "-X", "-q", "-A", "-t", "-v", "ON_ERROR_STOP=1",
                  "-h", SOCK, "-d", DB, "-c", statement])
     if expect_error:
         assert done.returncode != 0, f"expected failure, got: {done.stdout}"
@@ -286,27 +302,44 @@ def sql(statement, expect_error=False):
 
 @pytest.fixture(scope="module")
 def pg():
-    global SOCK
+    global SOCK, PGUSER, DB
     if PGBIN is None:
         pytest.skip("no local PostgreSQL 17 binaries")
-    tmp = Path(tempfile.mkdtemp(prefix="echo-receipt-pg-"))
-    SOCK = str(tmp)
-    init = _run([str(PGBIN / "initdb"), "-D", str(tmp / "data"), "-U", "postgres",
-                 "--auth=trust", "-E", "UTF8", "--no-instructions"])
-    if init.returncode != 0:
-        shutil.rmtree(tmp, ignore_errors=True)
-        pytest.skip(f"disposable PostgreSQL unavailable in this sandbox: "
-                    f"{init.stderr.strip().splitlines()[-1] if init.stderr else 'initdb failed'}")
-    start = _run([str(PGBIN / "pg_ctl"), "-D", str(tmp / "data"), "-l", str(tmp / "log"),
-                  "-o", f"-k {tmp} -c listen_addresses='' -c fsync=off", "-w", "start"])
-    assert start.returncode == 0, start.stderr
+    reuse = os.environ.get("ECHO_RECEIPT_REUSE_LOCAL_PG") == "1"
+    tmp = None
+    if reuse:
+        SOCK = "/tmp"
+        PGUSER = os.environ.get("USER", "blakeruff")
+        DB = "echo_receipt_test_" + uuid.uuid4().hex[:12]
+        probe = _run([str(PGBIN / "psql"), "-U", PGUSER, "-X", "-A", "-t",
+                      "-h", SOCK, "-d", "postgres", "-c", "show server_version_num"])
+        assert probe.returncode == 0 and probe.stdout.strip().startswith("17"), probe.stderr
+        roles = _run([str(PGBIN / "psql"), "-U", PGUSER, "-X", "-A", "-t",
+                      "-h", SOCK, "-d", "postgres", "-c",
+                      "select rolname from pg_roles where rolname in "
+                      "('anon','authenticated','service_role') order by rolname"])
+        assert roles.returncode == 0 and roles.stdout.strip().splitlines() == [
+            "anon", "authenticated", "service_role"]
+    else:
+        tmp = Path(tempfile.mkdtemp(prefix="echo-receipt-pg-"))
+        SOCK = str(tmp)
+        init = _run([str(PGBIN / "initdb"), "-D", str(tmp / "data"), "-U", PGUSER,
+                     "--auth=trust", "-E", "UTF8", "--no-instructions"])
+        if init.returncode != 0:
+            shutil.rmtree(tmp, ignore_errors=True)
+            pytest.skip(f"disposable PostgreSQL unavailable in this sandbox: "
+                        f"{init.stderr.strip().splitlines()[-1] if init.stderr else 'initdb failed'}")
+        start = _run([str(PGBIN / "pg_ctl"), "-D", str(tmp / "data"), "-l", str(tmp / "log"),
+                      "-o", f"-k {tmp} -c listen_addresses='' -c fsync=off", "-w", "start"])
+        assert start.returncode == 0, start.stderr
     try:
-        sql_admin = lambda s: _run([str(PGBIN / "psql"), "-U", "postgres", "-X", "-q", "-v", "ON_ERROR_STOP=1",
+        sql_admin = lambda s: _run([str(PGBIN / "psql"), "-U", PGUSER, "-X", "-q", "-v", "ON_ERROR_STOP=1",
                                     "-h", SOCK, "-d", "postgres", "-c", s])
         assert sql_admin(f"create database {DB}").returncode == 0
-        sql("do $$ begin if not exists(select from pg_roles where rolname='anon') then create role anon; end if;"
-            "if not exists(select from pg_roles where rolname='authenticated') then create role authenticated; end if;"
-            "if not exists(select from pg_roles where rolname='service_role') then create role service_role; end if; end $$;")
+        if not reuse:
+            sql("do $$ begin if not exists(select from pg_roles where rolname='anon') then create role anon; end if;"
+                "if not exists(select from pg_roles where rolname='authenticated') then create role authenticated; end if;"
+                "if not exists(select from pg_roles where rolname='service_role') then create role service_role; end if; end $$;")
         sql("""create table public.content_calendar(
             id uuid primary key default gen_random_uuid(), gym_id text, post_date date,
             logical_post_id uuid,
@@ -319,8 +352,12 @@ def pg():
         sql("""create table public.media_asset(id text primary key, gym_id text, content_hash text,
             eligible boolean, excluded_by_coach boolean not null default false);""")
         mig = ROOT / "migrations" / "portal_action_receipt_draft_20261004.sql"
-        done = _run([str(PGBIN / "psql"), "-U", "postgres", "-X", "-q", "-v", "ON_ERROR_STOP=1",
+        done = _run([str(PGBIN / "psql"), "-U", PGUSER, "-X", "-q", "-v", "ON_ERROR_STOP=1",
                      "-h", SOCK, "-d", DB, "-f", str(mig)])
+        assert done.returncode == 0, done.stderr
+        held_mig = ROOT / "migrations" / "portal_action_receipt_held_repeat_20261010.sql"
+        done = _run([str(PGBIN / "psql"), "-U", PGUSER, "-X", "-q", "-v", "ON_ERROR_STOP=1",
+                     "-h", SOCK, "-d", DB, "-f", str(held_mig)])
         assert done.returncode == 0, done.stderr
         # operator rollout seed: the trusted public media origin the tests
         # mint URLs under (the migration itself ships no host)
@@ -328,8 +365,11 @@ def pg():
             " values('public_origin','https://cdn.example.com')")
         yield
     finally:
-        _run([str(PGBIN / "pg_ctl"), "-D", str(tmp / "data"), "-m", "immediate", "stop"])
-        shutil.rmtree(tmp, ignore_errors=True)
+        if reuse:
+            assert sql_admin(f"drop database {DB} with (force)").returncode == 0
+        else:
+            _run([str(PGBIN / "pg_ctl"), "-D", str(tmp / "data"), "-m", "immediate", "stop"])
+            shutil.rmtree(tmp, ignore_errors=True)
 
 
 OLD = "https://cdn.example.com/old.jpg"
@@ -398,6 +438,58 @@ def _apply(gym, action_id, fp, row_ids, asset, url=None):
                                          "thumbnail_url": None, "source_media_asset_id": asset}}
         for r in row_ids]})
     return sql(f"select status from public.portal_action_receipt_apply('{gym}','{action_id}','{fp}','{rows}'::jsonb)")
+
+
+def test_live_frozen_cross_date_hold_clears_atomically_after_distinct_media(pg):
+    gym = "gym-repeat"
+    asset, primary, sibling, _ = _seed_gym(gym)
+    sql(f"update public.content_calendar set media_not_ready_reason="
+        f"'cross_date_media_repeat_needs_new_visual' where id='{primary}'")
+    fp, _ = _begin(gym, "act-repeat", primary)
+    _claim(gym, "act-repeat", fp, asset, NEW_FOR(gym), primary, sibling)
+    assert _apply(gym, "act-repeat", fp, [primary, sibling], asset) == "succeeded"
+    assert sql(f"select media_not_ready_reason is null, image_url, status, caption "
+               f"from public.content_calendar where id='{primary}'") == \
+        f"t|{NEW_FOR(gym)}|pending|cap"
+    assert sql(f"select status from public.portal_action_receipt where "
+               f"gym_id='{gym}' and action_id='act-repeat'") == "succeeded"
+    # Same action_id is terminal replay; no second media write is needed.
+    assert _apply(gym, "act-repeat", fp, [primary, sibling], asset) == "succeeded"
+
+
+def test_live_other_hold_remains_blocked_and_receipt_selected(pg):
+    gym = "gym-otherhold"
+    asset, primary, sibling, _ = _seed_gym(gym)
+    sql(f"update public.content_calendar set media_not_ready_reason='rights_review' "
+        f"where id='{primary}'")
+    fp, _ = _begin(gym, "act-otherhold", primary)
+    _claim(gym, "act-otherhold", fp, asset, NEW_FOR(gym), primary, sibling)
+    err = sql(f"select public.portal_action_receipt_apply('{gym}', 'act-otherhold', "
+              f"'{fp}', '{_rows_json([primary, sibling], asset, NEW_FOR(gym))}'::jsonb)",
+              expect_error=True)
+    assert "stale eligible sibling or media hold" in err
+    assert sql(f"select media_not_ready_reason, image_url from public.content_calendar "
+               f"where id='{primary}'") == f"rights_review|{OLD}"
+    assert sql(f"select status from public.portal_action_receipt where "
+               f"gym_id='{gym}' and action_id='act-otherhold'") == "selected"
+
+
+def test_live_held_repeat_refuses_same_image_even_with_new_asset(pg):
+    gym = "gym-sameimage"
+    asset, primary, sibling, _ = _seed_gym(gym)
+    same = NEW_FOR(gym)
+    sql(f"update public.content_calendar set image_url='{same}', "
+        f"source_media_url='{same}', "
+        f"media_not_ready_reason='cross_date_media_repeat_needs_new_visual' "
+        f"where id='{primary}'")
+    fp, _ = _begin(gym, "act-sameimage", primary)
+    _claim(gym, "act-sameimage", fp, asset, same, primary, sibling)
+    err = sql(f"select public.portal_action_receipt_apply('{gym}', 'act-sameimage', "
+              f"'{fp}', '{_rows_json([primary, sibling], asset, same)}'::jsonb)",
+              expect_error=True)
+    assert "held repeat replacement is not distinct" in err
+    assert sql(f"select media_not_ready_reason from public.content_calendar "
+               f"where id='{primary}'") == "cross_date_media_repeat_needs_new_visual"
 
 
 @pytestmark_live
@@ -876,7 +968,7 @@ def test_live_phantom_insert_blocked_by_apply_lock_strategy(pg):
     # a concurrent INSERT, so a newly inserted same-post sibling cannot slip in.
     _seed_gym("gym-lock")
     holder = subprocess.Popen(
-        [str(PGBIN / "psql"), "-U", "postgres", "-X", "-q", "-h", SOCK, "-d", DB],
+        [str(PGBIN / "psql"), "-U", PGUSER, "-X", "-q", "-h", SOCK, "-d", DB],
         stdin=subprocess.PIPE, text=True)
     holder.stdin.write("begin; lock table public.content_calendar in share row exclusive mode;\n")
     holder.stdin.flush()
@@ -1182,7 +1274,7 @@ def test_live_apply_media_asset_for_share_serializes_concurrent_flip(pg):
     # concurrent coach exclusion holds the asset row lock (uncommitted):
     # apply's FOR SHARE recheck must WAIT, then time out -- never write
     holder = subprocess.Popen(
-        [str(PGBIN / "psql"), "-U", "postgres", "-X", "-q", "-h", SOCK, "-d", DB],
+        [str(PGBIN / "psql"), "-U", PGUSER, "-X", "-q", "-h", SOCK, "-d", DB],
         stdin=subprocess.PIPE, text=True)
     holder.stdin.write("begin;\n")
     holder.stdin.write(f"update public.media_asset set excluded_by_coach=true where id='{asset}';\n")
@@ -1214,7 +1306,7 @@ def test_live_media_asset_for_share_blocks_concurrent_update(pg):
     concurrent coach UPDATE row lock (and is released at commit)."""
     asset, _, _, _ = _seed_gym("gym-fshare")
     holder = subprocess.Popen(
-        [str(PGBIN / "psql"), "-U", "postgres", "-X", "-q", "-h", SOCK, "-d", DB],
+        [str(PGBIN / "psql"), "-U", PGUSER, "-X", "-q", "-h", SOCK, "-d", DB],
         stdin=subprocess.PIPE, text=True)
     holder.stdin.write("begin;\n")
     holder.stdin.write(f"select 1 from public.media_asset where id='{asset}' for share;\n")

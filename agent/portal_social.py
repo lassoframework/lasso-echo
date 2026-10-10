@@ -1774,9 +1774,10 @@ def _handle_swap_media_receipt(sb_store, account_key, draft_id, actor_id,
             # Only the OTHER members are shaped as variants here; the claim
             # still freezes the full member manifest for apply.
             others = [m for m in members if str(m.get("id")) != str(draft_id)]
-            pick = (picker or _ms.pick_replacement)(account_key, row,
-                                                    store=sb_store,
-                                                    siblings=others)
+            pick_args = {"store": sb_store, "siblings": others}
+            if picker is None:
+                pick_args["require_original_proof"] = True
+            pick = (picker or _ms.pick_replacement)(account_key, row, **pick_args)
             if not pick.get("ok"):
                 return 409, {"ok": False, "action": _RECEIPT_ACTION,
                              "draft_id": draft_id, "action_id": action_id,
@@ -1818,6 +1819,32 @@ def _handle_swap_media_receipt(sb_store, account_key, draft_id, actor_id,
                             RECEIPT_LOCAL_ASSET_PREFIX)):
                     identity["source_media_asset_id"] = selected["asset_id"]
                 planned[mid] = identity
+
+            # The receipt RPC may atomically release a cross-date media hold.
+            # Before freezing its selection, prove different original bytes
+            # with the same evidence gate used by the ordinary swap path.
+            held_members = [m for m in members if m.get("media_not_ready_reason")
+                            == "cross_date_media_repeat_needs_new_visual"]
+            if held_members:
+                try:
+                    from . import media_guard
+                    byte_cache = {}
+                    new_original = media_guard.swap_original_identity(
+                        account_key, row, sb_store, pick=pick, byte_cache=byte_cache)
+                    for member in held_members:
+                        old_original = media_guard.swap_original_identity(
+                            account_key, member, sb_store, byte_cache=byte_cache)
+                        variant = pick if member["id"] == draft_id else variants[member["id"]]
+                        replacement = media_guard.swap_original_identity(
+                            account_key, member, sb_store, pick=variant,
+                            byte_cache=byte_cache)
+                        if (old_original["sha256"] == replacement["sha256"]
+                                or replacement != new_original):
+                            raise ValueError("held repeat is not a distinct original")
+                except Exception:
+                    return _receipt_short(account_key, draft_id, action_id, 409,
+                                          "A different original photo could not be verified.",
+                                          "media_evidence_unavailable")
 
             # Reserve the once-used media BEFORE the selection is frozen, so a
             # frozen selection always implies a prior successful reservation.
@@ -2198,6 +2225,7 @@ def _handle_swap_media(account_key, draft_id, actor_id, reader=None, sb_store=No
         # still requires its independent exact-ID readback; a persistent GET
         # outage completes bounded sibling work but remains outcome unknown.
         local_landed = True
+        held_swaps = [(row, updated)] if row.get("media_not_ready_reason") == "cross_date_media_repeat_needs_new_visual" else []
         # Same-post siblings, one operation, the SAME per-row server-side status guard
         # (a sibling approved between the read and this write matches nothing and is
         # reported as left).
@@ -2238,6 +2266,8 @@ def _handle_swap_media(account_key, draft_id, actor_id, reader=None, sb_store=No
                         unknown_siblings.append(sid)
             if done is not None:
                 swapped.append(sid)
+                if sib.get("media_not_ready_reason") == "cross_date_media_repeat_needs_new_visual":
+                    held_swaps.append((sib, done))
                 sibling_kind = _media_kind(done.get("image_url", ""))
                 sibling_results.append({
                     "id": sid,
@@ -2265,6 +2295,33 @@ def _handle_swap_media(account_key, draft_id, actor_id, reader=None, sb_store=No
         _ms.after_swap(account_key, row, pick,
                        book_rows=_month_rows_for(sb_store, account_key, row),
                        swapped_ids=swapped)
+        # A media-held row must stay held during the first write. Release only
+        # after the independent exact-ID swap readback above, with a second CAS
+        # that changes no media, approval or schedule field. A failed release
+        # must never be described to the client as a ready post.
+        for before, staged in held_swaps:
+            released = sb_store.release_swapped_repeat_media_hold(
+                account_key, before, staged)
+            if released is None:
+                return 503, {"ok": False, "action": "swap-media", "draft_id": draft_id,
+                             "reason": "hold_release_unknown",
+                             "error": "The new photo was saved, but its hold could not be cleared safely.",
+                             "recreate_budget": _budget_state(account_key)}
+            try:
+                verified = _swap_readback_row(sb_store, account_key, before["id"])
+            except Exception:
+                verified = None
+            expected = {key: value for key, value in staged.items()
+                        if key not in ("media_not_ready_reason", "updated_at")}
+            if (not isinstance(verified, dict)
+                    or any(verified.get(key) != value for key, value in expected.items())
+                    or verified.get("media_not_ready_reason") is not None):
+                return 503, {"ok": False, "action": "swap-media", "draft_id": draft_id,
+                             "reason": "hold_release_unknown",
+                             "error": "The new photo was saved, but its hold could not be verified as cleared.",
+                             "recreate_budget": _budget_state(account_key)}
+            if before["id"] == row["id"]:
+                updated = verified
     except Exception as exc:
         # A typed CAS encoding refusal occurs before the calendar PATCH, so the
         # exact reservation is safe to release. Other exceptions after the

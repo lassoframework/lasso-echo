@@ -1367,6 +1367,51 @@ class SupabaseCalendarStore:
                 return row
         return None
 
+    def release_swapped_repeat_media_hold(self, account_key, original, staged):
+        """Clear a cross-date repeat hold after an independently verified swap.
+
+        The ordinary swap keeps the hold while new pixels are staged. This
+        second, exact-row CAS changes only the hold and never changes approval,
+        caption, schedule or media identity. A changed row loses the race.
+        """
+        reason = "cross_date_media_repeat_needs_new_visual"
+        if (not isinstance(original, dict) or not isinstance(staged, dict)
+                or original.get("id") != staged.get("id")
+                or str(original.get("gym_id")) != str(account_key)
+                or str(staged.get("gym_id")) != str(account_key)
+                or original.get("media_not_ready_reason") != reason
+                or staged.get("media_not_ready_reason") != reason
+                or staged.get("status") not in ("pending", "coach_review")
+                or staged.get("image_url") == original.get("image_url")
+                or any(staged.get(key) is not None for key in
+                       ("published_at", "late_post_id", "publish_claim_token"))
+                or any(key not in row for row in (original, staged)
+                       for key in _CORE_VISUAL_MEDIA_CAS_COLUMNS)):
+            return None
+        media = {"image_url", "source_media_url", "source_media_asset_id",
+                 "thumbnail_url", "media_not_ready_reason", *_DRAFT_SCENE_CAS_COLUMNS}
+        if any(staged.get(key) != original.get(key)
+               for key in _VISUAL_MEDIA_CAS_COLUMNS if key not in media):
+            return None
+        params = {"id": f'eq.{staged["id"]}', "gym_id": f"eq.{account_key}",
+                  "status": "in.(pending,coach_review)"}
+        for key in _VISUAL_MEDIA_CAS_COLUMNS:
+            if key not in staged:
+                continue
+            encoded = _eq_filter(staged[key])
+            if encoded is None:
+                raise PreWriteCASError(422, "repeat media release snapshot cannot be encoded")
+            params[key] = encoded
+        response = self._client().patch(
+            self._rest(_TABLE), params=params,
+            headers=self._headers({"Content-Type": "application/json",
+                                   "Prefer": "return=representation"}),
+            json={"media_not_ready_reason": None}, timeout=30)
+        if response.status_code >= 400:
+            raise PortalStoreError(response.status_code, "repeat media hold release failed")
+        return self._visual_media_result(response.json(), account_key, staged,
+                                         {"media_not_ready_reason": None})
+
     # ---- durable portal action receipts (DRAFT, flag-gated, v3 2026-10-04) ----
     #
     # Backing table + RPCs: public.portal_action_receipt and the three SECURITY
