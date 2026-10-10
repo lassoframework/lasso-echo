@@ -1467,15 +1467,23 @@ class Bus:
             eligible=lambda _row, _att: True,
             updates=lambda _row, _att: {"fixer_staff_alerted": True})
 
-    def pending_fixer_finalization(self, identity, limit=100):
+    def pending_fixer_finalization(self, identity, limit=100, after=None):
         """Verified Slack posts whose ticket close may have been interrupted."""
-        return self._get(_MESSAGES, {
+        params = {
             "direction": "eq.outbound", "delivery_status": "eq.posted",
             "attachments->>identity": f"eq.{identity}",
             "attachments->>fixer_slack_delivery_intent": "not.is.null",
             "attachments->>fixer_delivery_finalized_at": "is.null",
-            "select": "*", "order": "created_at.desc", "limit": str(int(limit)),
-        })
+            "select": "*", "order": "created_at.asc,id.asc",
+            "limit": str(int(limit)),
+        }
+        if after:
+            ts = str(after.get("created_at") or "").replace('"', "")
+            mid = str(after.get("id") or "").replace('"', "")
+            if ts and mid:
+                params["or"] = (f'(created_at.gt."{ts}",'
+                                f'and(created_at.eq."{ts}",id.gt."{mid}"))')
+        return self._get(_MESSAGES, params)
 
     def fixer_receipt_exists(self, message_id, ticket_id, kind):
         """Require the complete immutable identity of a FIXER delivery receipt."""
