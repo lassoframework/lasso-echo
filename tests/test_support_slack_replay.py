@@ -823,6 +823,9 @@ def test_uncertain_replay_blocks_local_fence_drain(pg_bus,paused,monkeypatch):
     row=next(m for m in pg_bus.msgs if (m.get('attachments') or {}).get('kind')=='ack')
     pg_bus.mark_message(row['id'],'held',meta_update={'slack_replay_delivery_uncertain':True})
     paused.write_text(json.dumps({'paused':True,'generation':'replay-acceptance'}))
+    # fence.receipt reads the frozen 0624 admission status RPC; install it so the
+    # held row itself is the blocker (lane stays paused=true, unresolved=0).
+    install_support_admission_fixture(pg_bus)
     result=fence.receipt(pg_bus)
     assert result['local_drained'] is False
     assert f'held:{row["id"]}' in result['blockers']
@@ -1037,6 +1040,8 @@ def test_uncertainty_scan_blocks_drain_independent_of_status(pg_bus,paused,monke
     pg_bus.mark_message(row['id'],status,meta_update={'slack_replay_delivery_uncertain':True})
     monkeypatch.setenv('RAILWAY_GIT_COMMIT_SHA','p1-status-scan')
     paused.write_text(json.dumps({'paused':True,'generation':'replay-acceptance'}))
+    # Same frozen 0624 admission status RPC must exist before the drain receipt.
+    install_support_admission_fixture(pg_bus)
     receipt=fence.receipt(pg_bus)
     assert not receipt['local_drained']
     assert f'uncertain:{row["id"]}' in receipt['blockers']
@@ -1088,12 +1093,17 @@ def test_atomic_capture_waits_for_replay_flag_then_reconciles(monkeypatch, pg_bu
     assert all('slack_replay_delivery_token' not in m['attachments'] for m in outbound)
 
 
-def enable_support_admission(pg_bus):
-    """Install the unchanged 0624 fixture once and open only its test build."""
+def install_support_admission_fixture(pg_bus):
+    """Install the unchanged 0624 frozen admission schema and RPCs once."""
     present=pg_bus.engine.sql("select to_regclass('public.support_admission_control') is not null")
     if present != 't':
         fixture=Path(__file__).parent/'fixtures/support_admission_0624_frozen.sql'
         pg_bus.engine.sql(fixture.read_text())
+
+
+def enable_support_admission(pg_bus):
+    """Install the unchanged 0624 fixture once and open only its test build."""
+    install_support_admission_fixture(pg_bus)
     pg_bus.engine.sql("update public.support_admission_control set paused=false, "
         "allowed_builds='[{\"deployment\":\"test-deployment\","
         "\"build\":\"test-build\"}]' where lane='support-resolution-send'")
