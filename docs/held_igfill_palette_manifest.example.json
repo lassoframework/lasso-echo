@@ -1,0 +1,14 @@
+{
+  "crossfitnewtown": {
+    "colors": ["#1B2D5B", "#38A240", "#FFFFFF"],
+    "source_url": "https://crossfitnewtown.com/wp-content/uploads/2025/09/logo.png",
+    "source_file": "/absolute/private/path/to/captured-newtown-logo-and-css-evidence",
+    "source_sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+  },
+  "district_h": {
+    "colors": ["#FF8900", "#FFA733", "#C33F45", "#171717"],
+    "source_url": "https://districthsf.com",
+    "source_file": "/Users/blakeruff/lasso-gym-sites/src/config/gyms/district-h-strength-fitness.ts",
+    "source_sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+  }
+}
