@@ -208,7 +208,12 @@ def test_local_global_ledger_batches_101_fingerprints_over_http(monkeypatch, tmp
             if url.endswith("tenant_alias"):
                 return Response([{"alias_key": "gymx",
                                   "tenant_id": "11111111-2222-3333-4444-555555555555"}])
-            assert url.endswith("visual_global_usage")
+            # PR385 fail-closed: the selector also reads
+            # visual_global_historical_incident, one bounded page per 100
+            # fingerprints. Model a complete-but-empty read (no incident rows
+            # prove these bytes were ever globally consumed).
+            assert url.endswith(("visual_global_usage",
+                                 "visual_global_historical_incident"))
             return Response([])
 
     http = Http()
@@ -216,6 +221,10 @@ def test_local_global_ledger_batches_101_fingerprints_over_http(monkeypatch, tmp
                                                          ledger_http=http)
 
     usage_calls = [call for call in http.calls if call[0].endswith("visual_global_usage")]
+    incident_calls = [call for call in http.calls
+                      if call[0].endswith("visual_global_historical_incident")]
     assert available == set(paths)
-    assert len(http.calls) == 3             # one tenant mapping + two bounded pages
+    # one tenant mapping + two usage pages + two incident pages
+    assert len(http.calls) == 5
     assert [len(call[1]["fingerprint"][4:-1].split(",")) for call in usage_calls] == [100, 1]
+    assert [len(call[1]["fingerprint"][4:-1].split(",")) for call in incident_calls] == [100, 1]
