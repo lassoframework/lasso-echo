@@ -256,6 +256,35 @@ class Bus:
                       for field in identity_fields})
         return self._patch(_TICKETS, match, fields)
 
+    def adopt_independent_release(self, expected_ticket, *, fix_pr_url,
+                                  verification_before, verification_after):
+        """One operator adoption CAS, preserving concurrent proof and request identity.
+
+        Call support_release_adoption.adopt_release to validate real release and
+        business evidence first. This transport cannot be used to resolve a ticket.
+        Both JSON columns are compared in full; a concurrent receipt writer wins
+        instead of losing evidence to a replacement assembled from an older read.
+        """
+        if (expected_ticket.get('product') != 'echo'
+                or expected_ticket.get('source') != 'slack_conversation'
+                or expected_ticket.get('classification') != 'code_fix'
+                or expected_ticket.get('status') != 'verification'
+                or expected_ticket.get('escalated') is not False
+                or expected_ticket.get('hold_tier') is not None
+                or type(expected_ticket.get('request_version')) is not int):
+            raise BusError(400, 'ineligible independent release adoption')
+        fields = ('id', 'request_version', 'status', 'classification', 'source', 'product',
+                  'client_id', 'bot_identity', 'identity_kind', 'slack_user_id',
+                  'slack_channel_id', 'slack_thread_ts', 'fix_pr_url', 'escalated', 'hold_tier')
+        match = {key: 'is.null' if expected_ticket.get(key) is None else
+                 f'eq.{str(expected_ticket[key]).lower() if type(expected_ticket[key]) is bool else expected_ticket[key]}'
+                 for key in fields}
+        for key in ('verification_before', 'verification_after'):
+            value = expected_ticket.get(key)
+            match[key] = 'is.null' if value is None else 'eq.' + json.dumps(value, separators=(',', ':'))
+        return self._patch(_TICKETS, match, {'status':'merged', 'fix_pr_url':fix_pr_url,
+            'verification_before':verification_before, 'verification_after':verification_after})
+
     def stamp_outreach_ticket_if_current(self, ticket_id, *, expected_ticket,
                                          channel_id, thread_ts, slack_user_id,
                                          bot_identity, identity_kind):

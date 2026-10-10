@@ -6,6 +6,18 @@ mapping authority; authenticate_capture independently verifies original transpor
 bytes (e.g. a collector-owned receipt), never a persisted identity_verified label.
 The authenticated portal read alone does not prove external response authenticity.
 No caller-supplied validation report or assessor result is accepted by observe().
+
+Palette revalidation: an approved repeated palette token survives an
+identical recapture at its approved byte offset, but only while the token
+there remains a standalone six-digit color (an eight-digit #rrggbbaa head
+at the approved offset holds). On changed bytes, revalidation relocates
+only through the frozen bounded context: 64 bytes either side for CSS assets,
+12 bytes either side for HTML pages so nearby factual copy can change. The
+context from the original frozen capture must occur exactly once
+in the new bytes and the token must be standalone at the corresponding
+offset. Any other changed-byte shape holds fail-closed with
+selected_palette_missing_or_changed; a bare token match elsewhere in
+changed CSS is never accepted, because it can validate an unrelated rule.
 """
 from __future__ import annotations
 
@@ -158,6 +170,8 @@ def _snapshot(raw, digest, gym, key):
             _hold('website_only_capture_set_required')
         if policy['mode'] == 'website_and_social_v2' and 'social' not in kinds:
             raise ValueError()
+        # With no social source, a stylesheet alone cannot establish gym facts.
+        # Keep a fact-bearing website page in the approved source set.
         if policy['mode'] == 'website_only_no_connected_instagram_v2' and 'website' not in kinds:
             raise ValueError()
         # A connected v2 identity binds the numeric Instagram owner; every
@@ -256,6 +270,8 @@ complete text, not characters. Cite exact relevant spans including negation cont
 Supported requires at least one citation and no contradiction anywhere in the relevant
 evidence. Missing can have empty citations. Any uncertainty must say uncertain/false.
 No prose, inferred facts or advisory recommendations. All captures must be inspected.
+palette_only_captures, when present, binds authenticated palette-only CSS assets by id
+and hash whose raw text is intentionally not supplied; they are never fact support.
 """
 
 
@@ -391,6 +407,55 @@ def _exact_offset(raw, token):
     return start
 
 
+_HEX_TAIL = frozenset(b'0123456789abcdefABCDEF')
+_CSS_CONTEXT_WINDOW = 64
+_PAGE_CONTEXT_WINDOW = 12
+
+
+def _standalone_at(raw, offset, needle):
+    """True when needle at offset is not the head of a longer hex token.
+
+    A six-digit CSS token immediately followed by a hex digit is the head
+    of an eight-digit (#rrggbbaa) color, not a standalone palette token.
+    """
+    end = offset + len(needle)
+    return end == len(raw) or raw[end] not in _HEX_TAIL
+
+
+def _revalidated_palette_offset(raw, token, approved_offset, frozen_raw, context_window):
+    """Byte offset for an approved palette token on recapture.
+
+    The APPROVED OFFSET is authoritative on identical recapture bytes: when
+    the token is still standalone (not the head of an eight-digit
+    #rrggbbaa token), it survives even when it repeats elsewhere in
+    the capture (real gym CSS repeats brand tokens, e.g. #015ad2 x64,
+    #ff4700 x83). On changed bytes the only safe relocation is the frozen
+    bounded context: the configured bytes either side of the approved token
+    from the original frozen capture must occur exactly once in the new
+    bytes, with the exact token standalone at the corresponding offset. A
+    bare token match anywhere else in changed CSS is never accepted: it can
+    belong to an unrelated rule. Missing, repeated or shifted context
+    returns None so the caller holds explicitly; guessing is never allowed.
+    """
+    needle = token.encode('utf-8')
+    if (raw == frozen_raw and type(approved_offset) is int and 0 <= approved_offset
+            and raw[approved_offset:approved_offset + len(needle)] == needle
+            and _standalone_at(raw, approved_offset, needle)):
+        return approved_offset
+    if (type(approved_offset) is not int or approved_offset < 0
+            or frozen_raw[approved_offset:approved_offset + len(needle)] != needle):
+        return None
+    start = max(0, approved_offset - context_window)
+    context = frozen_raw[start:approved_offset + len(needle) + context_window]
+    pos = raw.find(context)
+    if pos < 0 or raw.find(context, pos + 1) >= 0:
+        return None
+    offset = pos + approved_offset - start
+    if not _standalone_at(raw, offset, needle):
+        return None
+    return offset
+
+
 class TrustedSourceObservationProducer:
     """No public report input; all reads and authentication are server owned.
 
@@ -501,7 +566,17 @@ class TrustedSourceObservationProducer:
                 by_location[_location(c)] = c, raw
             if len({c['id'] for c in current}) != len(current):
                 raise ValueError()
-            if sum(len(raw) for _, raw in by_location.values()) > MAX_EVIDENCE_BYTES:
+            # Palette-only CSS assets (approved exact .css URL, kind website_asset,
+            # referenced by NO selected fact) stay fully authenticated, hashed and
+            # persisted in the observation, but their raw text is not sent to the
+            # fact assessor: CSS is not fact evidence. Every other capture keeps
+            # the complete-evidence byte bound; nothing is ever truncated.
+            fact_capture_ids = {f['capture_id'] for f in old['selected_facts']}
+            palette_only = {c['id']: c for c, _ in by_location.values()
+                if c['source_kind'] == 'website_asset' and c['id'] not in fact_capture_ids
+                and urlsplit(c['source_url']).path.lower().endswith('.css')}
+            if sum(len(raw) for c, raw in by_location.values()
+                   if c['id'] not in palette_only) > MAX_EVIDENCE_BYTES:
                 _hold('complete_evidence_exceeds_assessor_bound')
             facts, spans = [], []
             for fact in old['selected_facts']:
@@ -516,14 +591,27 @@ class TrustedSourceObservationProducer:
                               'source_locator': fact['source_locator'], 'witness': witness})
             prior_palette = next(c for c in old['captures'] if c['id'] == old['palette']['capture_id'])
             pal, raw = by_location[_location(prior_palette)]
-            offsets = [_exact_offset(raw, old['palette'][name]) for name in ('primary', 'secondary')]
+            # Palette revalidation uses the approved offset first so a
+            # repeated approved token survives an identical recapture; the
+            # fact lane above keeps its strict ambiguity hold. Changed-byte
+            # relocation goes through the frozen bounded context only.
+            frozen_raw = base64.b64decode(prior_palette['bytes_base64'], validate=True)
+            context_window = (_CSS_CONTEXT_WINDOW if pal['source_kind'] == 'website_asset'
+                              else _PAGE_CONTEXT_WINDOW)
+            offsets = [_revalidated_palette_offset(raw, old['palette'][name],
+                        old['palette'][name + '_byte_offset'], frozen_raw, context_window)
+                       for name in ('primary', 'secondary')]
             if any(offset is None for offset in offsets):
                 _hold('selected_palette_missing_or_changed')
+            capture_keys = ('id', 'source_kind', 'source_url', 'source_locator',
+                'provider_account_id', 'bytes_sha256', 'source_revision', 'fetched_at')
             evidence = {'gym_id': gym_id, 'echo_account_key': mapping.echo_account_key,
                 'configuration_sha256': b['content_sha256'], 'selected_facts': facts,
-                'captures': [{**{k: c[k] for k in ('id', 'source_kind', 'source_url', 'source_locator',
-                    'provider_account_id', 'bytes_sha256', 'source_revision', 'fetched_at')},
-                    'text': raw.decode('utf-8')} for c, raw in by_location.values()]}
+                'captures': [{**{k: c[k] for k in capture_keys},
+                    'text': raw.decode('utf-8')} for c, raw in by_location.values()
+                    if c['id'] not in palette_only],
+                'palette_only_captures': [{**{k: c[k] for k in capture_keys},
+                    'palette_only': True} for c in palette_only.values()]}
             report = self.assessor.assess(evidence)
             # Assessor is an internal dependency, and must return the validated
             # contract. Production defaults to the concrete authenticated class.
