@@ -22,6 +22,8 @@ TICKET_ID = "30205455-1555-4150-a69a-247a0b4c91ab"
 @pytest.fixture(autouse=True)
 def arm_current_notice_for_contract_tests(monkeypatch):
     monkeypatch.setenv("SLACK_CONVO_ECHO_CURRENT_NOTICE_ENABLED", "true")
+    monkeypatch.setenv("RAILWAY_DEPLOYMENT_ID", "dep-test")
+    monkeypatch.setenv("RAILWAY_GIT_COMMIT_SHA", "build-test")
 
 
 class NoticeBus:
@@ -37,6 +39,92 @@ class NoticeBus:
         }
         self.row = None
         self.events = []
+        self.admission = {"generation": 7, "unresolved": 0, "paused": False,
+                          "acquire_denied": False, "finish_fails": False,
+                          "finishes": [], "calls": []}
+
+    # -- portal 0624 support-resolution-send admission transport ----------------
+    def _client(self):
+        bus = self
+
+        class AdmissionClient:
+            def post(self, url, data=None, headers=None, timeout=None):
+                body = json.loads(data or "{}")
+                name = url.rsplit("rpc/", 1)[-1]
+                bus.admission["calls"].append(name)
+
+                class Resp:
+                    status_code = 200
+
+                    def json(self):
+                        if name == "support_admission_status_lane":
+                            return {"lane": "support-resolution-send",
+                                    "generation": bus.admission["generation"],
+                                    "unresolved": bus.admission["unresolved"],
+                                    "paused": bus.admission["paused"],
+                                    "drained": bus.admission["paused"]
+                                    and bus.admission["unresolved"] == 0,
+                                    "operation_id": "op-test"}
+                        if name == "support_admission_acquire_lane":
+                            if bus.admission["acquire_denied"]:
+                                return {"admitted": False,
+                                        "lane": "support-resolution-send",
+                                        "invocation_id": body["p_invocation_id"],
+                                        "generation": body["p_expected_generation"]}
+                            return {"admitted": True,
+                                    "lane": "support-resolution-send",
+                                    "invocation_id": body["p_invocation_id"],
+                                    "generation": body["p_expected_generation"]}
+                        if name == "support_admission_finish_lane":
+                            bus.admission["finishes"].append(body["p_outcome"])
+                            if bus.admission["finish_fails"]:
+                                return {"recorded": False,
+                                        "lane": "support-resolution-send",
+                                        "invocation_id": body["p_invocation_id"]}
+                            return {"recorded": True,
+                                    "lane": "support-resolution-send",
+                                    "invocation_id": body["p_invocation_id"]}
+                        raise AssertionError("unexpected rpc " + name)
+
+                return Resp()
+
+        return AdmissionClient()
+
+    def _rest(self, table):
+        return "http://test.local/rest/v1/" + table
+
+    def _headers(self, extra=None):
+        return dict(extra or {})
+
+    def _patch(self, table, match, fields):
+        # Exact support_messages CAS: refuse unless every match term holds.
+        assert table == "support_messages"
+        row = self.row
+        for key, spec in match.items():
+            current = row.get(key)
+            if spec == "is.null":
+                if current is not None:
+                    return None
+                continue
+            assert spec.startswith("eq.")
+            want = spec[3:]
+            if key == "attachments":
+                encoded = (None if current is None else json.dumps(
+                    current, sort_keys=True, separators=(",", ":")))
+                if encoded != want:
+                    return None
+            elif key == "delivery_request_version":
+                if str(current) != want:
+                    return None
+            elif current != want:
+                return None
+        if isinstance(fields.get("attachments"), dict):
+            row["attachments"] = fields["attachments"]
+        if "slack_ts" in fields:
+            row["slack_ts"] = fields["slack_ts"]
+        if "delivery_status" in fields:
+            row["delivery_status"] = fields["delivery_status"]
+        return deepcopy(row)
 
     def ticket(self, _tid):
         return deepcopy(self.current)
@@ -142,7 +230,7 @@ class NoticeBus:
         self.events.append("finalize")
 
 
-def _send(bus, *, post=None):
+def _send(bus, *, post=None, member_check=None):
     snapshot = bus.ticket(TICKET_ID)
     identity = SimpleNamespace(name="echo", bot_user_id=lambda: "U_ECHO")
     who = SimpleNamespace(slack_user_id="U_CLIENT", kind="client")
@@ -152,6 +240,8 @@ def _send(bus, *, post=None):
         posts.append((channel, body))
         bus.events.append("slack_post")
         return post(channel, body) if post else {"ok": True, "ts": bus.ts}
+
+    do_post.verify_sender = lambda: {"ok": True, "user_id": "U_ECHO"}
 
     def readback(channel, **_kwargs):
         bus.events.append("readback")
@@ -165,7 +255,7 @@ def _send(bus, *, post=None):
         message_text="Your account is connected.", completion=True,
         claim_message=bus.claim_message, ticket_lookup=bus.ticket,
         current_notice_bus=bus, readback=readback,
-        member_check=lambda _channel, _user: True)
+        member_check=member_check or (lambda _channel, _user: True))
     return snapshot, result, posts
 
 
@@ -180,6 +270,317 @@ def test_single_post_binds_after_exact_readback_then_resolves():
     assert bus.events.index("bind") < bus.events.index("posted")
     assert worker._resolve_delivered(bus, snapshot, result, log=lambda _msg: None)
     assert bus.current["status"] == "resolved"
+
+
+
+def test_admitted_send_records_lease_before_post_and_completion_after():
+    """The successful path: durable 0624 admission wraps the exact one POST."""
+    bus = NoticeBus()
+    _snapshot, result, posts = _send(bus)
+    assert result.delivered and len(posts) == 1
+    calls = bus.admission["calls"]
+    assert calls[0] == "support_admission_status_lane"
+    assert calls.index("support_admission_acquire_lane") < bus.events.index("slack_post")
+    assert calls.index("support_admission_acquire_lane") < calls.index(
+        "support_admission_finish_lane")
+    assert bus.admission["finishes"] == ["completed"]
+    att = bus.row["attachments"]
+    lease = att["support_resolution_send_admission"]
+    assert lease["lane"] == "support-resolution-send"
+    assert lease["deployment"] == "dep-test" and lease["build"] == "build-test"
+    assert lease["binding"]["sender"] == "U_ECHO"
+    assert lease["binding"]["ticket"]["id"] == TICKET_ID
+    assert lease["binding"]["ticket"]["slack_channel_id"] is None
+    assert lease["binding"]["channel"] == "G_CLIENT"
+    assert att["support_resolution_send_completion"]["recorded"] is True
+    assert att["support_resolution_send_completion"]["generation"] == 7
+
+
+def test_paused_admission_lane_zero_posts_and_no_reservation():
+    """A paused 0624 lane refuses before reservation: no row, no notice, no POST."""
+    bus = NoticeBus()
+    bus.admission["paused"] = True
+    _snapshot, result, posts = _send(bus)
+    assert posts == [] and bus.row is None
+    assert not result.opened or result.reason == "current_notice_admission_unavailable"
+    assert result.reason == "current_notice_admission_unavailable"
+    assert result.notice_id == "" and result.attempt_token == ""
+    assert bus.events == [] and bus.admission["calls"] == ["support_admission_status_lane"]
+
+
+def test_wrong_sender_zero_posts_and_no_reservation():
+    """auth.test proof that is not this identity's bot user refuses pre-reservation."""
+    bus = NoticeBus()
+    identity = SimpleNamespace(name="echo", bot_user_id=lambda: "U_ECHO")
+    who = SimpleNamespace(slack_user_id="U_CLIENT", kind="client")
+    posts = []
+
+    def do_post(channel, body):
+        posts.append((channel, body))
+        return {"ok": True, "ts": bus.ts}
+
+    do_post.verify_sender = lambda: {"ok": True, "user_id": "U_INTRUDER"}
+    result = outreach._send(
+        bus.ticket(TICKET_ID), who, identity,
+        open_group_dm=lambda _users: {"ok": True, "channel_id": "G_CLIENT"},
+        post_first_message=do_post, record_outbound=bus.record_outbound,
+        message_text="Your account is connected.", completion=True,
+        claim_message=bus.claim_message, ticket_lookup=bus.ticket,
+        current_notice_bus=bus,
+        readback=lambda channel, **kw: {"ok": True, "messages": []},
+        member_check=lambda _channel, _user: True)
+    assert posts == [] and bus.row is None
+    assert result.reason == "current_notice_sender_mismatch"
+    assert bus.events == [] and bus.admission["calls"] == []
+
+
+def test_missing_sender_verifier_refuses_before_reservation():
+    bus = NoticeBus()
+    identity = SimpleNamespace(name="echo", bot_user_id=lambda: "U_ECHO")
+    who = SimpleNamespace(slack_user_id="U_CLIENT", kind="client")
+    posts = []
+    result = outreach._send(
+        bus.ticket(TICKET_ID), who, identity,
+        open_group_dm=lambda _users: {"ok": True, "channel_id": "G_CLIENT"},
+        post_first_message=lambda channel, body: posts.append((channel, body))
+        or {"ok": True, "ts": bus.ts},
+        record_outbound=bus.record_outbound,
+        message_text="Your account is connected.", completion=True,
+        claim_message=bus.claim_message, ticket_lookup=bus.ticket,
+        current_notice_bus=bus,
+        readback=lambda channel, **kw: {"ok": True, "messages": []},
+        member_check=lambda _channel, _user: True)
+    assert posts == [] and bus.row is None
+    assert result.reason == "current_notice_preflight_unavailable"
+    assert bus.events == [] and bus.admission["calls"] == []
+
+
+def test_missing_deployment_env_refuses_before_reservation(monkeypatch):
+    monkeypatch.delenv("RAILWAY_DEPLOYMENT_ID")
+    bus = NoticeBus()
+    _snapshot, result, posts = _send(bus)
+    assert posts == [] and bus.row is None
+    assert result.reason == "current_notice_admission_unavailable"
+    assert bus.events == [] and bus.admission["calls"] == []
+
+
+def test_denied_acquisition_holds_uncertain_finishes_unknown_and_never_posts():
+    """A denied 0624 acquisition: zero POSTs, lease finished unknown, row held."""
+    bus = NoticeBus()
+    bus.admission["acquire_denied"] = True
+    _snapshot, result, posts = _send(bus)
+    assert posts == []
+    assert not result.delivered and result.reason == "current_notice_uncertain"
+    assert bus.row["delivery_status"] == "held"
+    assert bus.row["attachments"]["fixer_route_uncertain"] is True
+    assert bus.admission["finishes"] == ["unknown"]
+    assert "bind" not in bus.events and "resolve" not in bus.events
+
+
+def test_failed_post_finishes_lease_unknown_and_never_replays():
+    bus = NoticeBus()
+    _snapshot, result, posts = _send(bus, post=lambda _c, _b: {"ok": False})
+    assert len(posts) == 1 and not result.delivered
+    assert bus.row["delivery_status"] == "held"
+    assert bus.admission["finishes"] == ["unknown"]
+    att = bus.row["attachments"]
+    assert "support_resolution_send_completion" not in att
+    assert "bind" not in bus.events
+
+
+def test_unconfirmed_completion_ack_holds_without_replay():
+    """The send + readback succeeded but the completion ACK is unconfirmed: the
+    row is held for reconciliation, the lease is finished unknown, never reposted."""
+    bus = NoticeBus()
+    bus.admission["finish_fails"] = True
+    _snapshot, result, posts = _send(bus)
+    assert len(posts) == 1 and not result.delivered
+    assert result.reason == "current_notice_uncertain"
+    assert bus.row["delivery_status"] == "held"
+    # The completed ACK was attempted and refused; the lease then closes unknown.
+    assert bus.admission["finishes"] == ["completed", "unknown"]
+    assert "bind" not in bus.events and "posted" not in bus.events
+
+
+def test_sender_change_after_acquisition_never_posts():
+    """The exact captured poster is re-authenticated after admission; a changed
+    sender finishes the lease unknown with zero POSTs and the row held."""
+    bus = NoticeBus()
+    proofs = iter([{"ok": True, "user_id": "U_ECHO"},
+                   {"ok": True, "user_id": "U_SWAPPED"}])
+    identity = SimpleNamespace(name="echo", bot_user_id=lambda: "U_ECHO")
+    who = SimpleNamespace(slack_user_id="U_CLIENT", kind="client")
+    posts = []
+
+    def do_post(channel, body):
+        posts.append((channel, body))
+        return {"ok": True, "ts": bus.ts}
+
+    do_post.verify_sender = lambda: next(proofs)
+    result = outreach._send(
+        bus.ticket(TICKET_ID), who, identity,
+        open_group_dm=lambda _users: {"ok": True, "channel_id": "G_CLIENT"},
+        post_first_message=do_post, record_outbound=bus.record_outbound,
+        message_text="Your account is connected.", completion=True,
+        claim_message=bus.claim_message, ticket_lookup=bus.ticket,
+        current_notice_bus=bus,
+        readback=lambda channel, **kw: {"ok": True, "messages": []},
+        member_check=lambda _channel, _user: True)
+    assert posts == [] and not result.delivered
+    assert result.reason == "current_notice_uncertain"
+    assert bus.row["delivery_status"] == "held"
+    assert bus.admission["finishes"] == ["unknown"]
+
+
+@pytest.mark.parametrize("mode", ["revoked", "unreadable"])
+def test_membership_change_after_acquisition_never_posts(mode):
+    """P1 reproduction: after the 0624 acquire and the second auth.test, Blake's
+    exact channel membership is rechecked immediately before the one POST. A
+    revoked or unreadable membership finishes the lease 'unknown', holds the row
+    and never posts, binds or replays."""
+    bus = NoticeBus()
+
+    def member_check(_channel, _user):
+        if "support_admission_acquire_lane" in bus.admission["calls"]:
+            if mode == "unreadable":
+                raise RuntimeError("conversations.members unavailable")
+            return False
+        return True
+
+    _snapshot, result, posts = _send(bus, member_check=member_check)
+    assert posts == []
+    assert result.reason == "current_notice_uncertain"
+    assert bus.admission["finishes"] == ["unknown"]
+    assert "slack_post" not in bus.events
+    assert "bind" not in bus.events and "posted" not in bus.events
+    assert bus.row["delivery_status"] == "held"
+
+
+def test_request_change_during_membership_recheck_never_posts():
+    """The post-acquire membership network call cannot stale the final request."""
+    bus = NoticeBus()
+
+    def member_check(_channel, _user):
+        if "support_admission_acquire_lane" in bus.admission["calls"]:
+            bus.current["request_version"] = 4
+        return True
+
+    _snapshot, result, posts = _send(bus, member_check=member_check)
+    assert posts == []
+    assert result.reason == "current_notice_uncertain"
+    assert bus.current["request_version"] == 4
+    assert bus.admission["finishes"] == ["unknown"]
+    assert bus.row["delivery_status"] == "held"
+    assert "bind" not in bus.events and "posted" not in bus.events
+
+
+def _pending_route_recovery(receipt):
+    now = datetime.now(timezone.utc)
+    ts = str(now.timestamp() + 5)
+    intent = {"channel": "G_CLIENT", "thread_ts": None, "body": "Exact body",
+              "sender": "U_ECHO", "claimed_at": now.isoformat(),
+              "not_before": now.isoformat(), "request_key": None,
+              "request_version": 3}
+    row = {"id": "70164909-16b5-43df-b6a3-8d7499d51485", "ticket_id": TICKET_ID,
+           "delivery_status": "held", "slack_ts": ts,
+           "delivery_request_version": 3, "body": "Exact body",
+           "attachments": {"kind": "status",
+                           "fixer_current_attempt_token": NOTICE_TOKEN,
+                           "fixer_route_pending": True, "fixer_route_uncertain": True,
+                           "fixer_slack_delivery_intent": intent,
+                           "delivery_expected_status": "verification"}}
+    if receipt is not None:  # admitted rows carry the durable 0624 lease
+        row["attachments"][outbox.SUPPORT_SEND_ADMISSION_KEY] = {
+            "lane": outbox.SUPPORT_SEND_LANE, "invocation_id": "inv-1",
+            "generation": 7, "deployment": "dep-test", "build": "build-test",
+            "binding": {"ticket": {"id": TICKET_ID, "request_version": 3},
+                        "message_id": row["id"], "sender": "U_ECHO",
+                        "channel": "G_CLIENT", "thread_ts": None}}
+    if receipt in ("completed", "bad"):
+        row["attachments"]["support_resolution_send_completion"] = {
+            "recorded": receipt == "completed", "lane": outbox.SUPPORT_SEND_LANE,
+            "invocation_id": "inv-1", "generation": 7}
+
+    class RecoveryBus:
+        def __init__(self):
+            self.events = []
+            self.current = {"id": TICKET_ID, "request_version": 3,
+                            "status": "verification"}
+
+        def record_held_current_notice_readback(self, mid, proof, *,
+                                                expected_intent, expected_ts):
+            assert row["delivery_status"] == "held" and row["slack_ts"] == expected_ts
+            row["attachments"].update(proof)
+            self.events.append("readback")
+            return deepcopy(row)
+
+        def transition_fixer_delivery(self, mid, status, *, slack_ts=None,
+                                      meta_update=None, expected_intent=None,
+                                      expected_ts=None):
+            assert row["delivery_status"] == "posting"
+            assert row["slack_ts"] == expected_ts == slack_ts
+            row["attachments"].update(meta_update or {})
+            row["delivery_status"] = status
+            self.events.append(status)
+            return deepcopy(row)
+
+        def ticket(self, _tid):
+            return deepcopy(self.current)
+
+        def bind_current_notice_route(self, _tid, _version, _mid, _token,
+                                      _channel, _ts):
+            assert row["attachments"]["delivery_readback_verified"] is True
+            row["attachments"].pop("fixer_route_pending")
+            row["attachments"].pop("fixer_route_uncertain", None)
+            row["delivery_status"] = "posting"
+            self.events.append("bind")
+            return True
+
+        def resolve_current_notice(self, _ticket, _mid, _token, _expected):
+            assert row["delivery_status"] == "posted"
+            self.current["status"] = "resolved"
+            self.events.append("resolve")
+            return deepcopy(self.current)
+
+        def finalize_fixer_delivery(self, _mid, reason):
+            assert reason == "resolved_after_verified_slack"
+            self.events.append("finalize")
+
+    bus = RecoveryBus()
+    proof = {"delivery_readback_verified": True, "delivery_readback_ts": ts}
+    summary = {"resolved": 0}
+    finished = outbox._finish_pending_route_notice(
+        bus, deepcopy(row), proof, SimpleNamespace(name="echo"),
+        lambda _msg: None, summary)
+    return finished, bus, row, summary
+
+
+def test_pending_route_recovery_requires_confirmed_completion_receipt():
+    """An admitted held notice closes only with the confirmed durable receipt
+    persisted before binding; exact readback alone never binds on uncertainty."""
+    finished, bus, row, summary = _pending_route_recovery("completed")
+    assert finished and summary["resolved"] == 1
+    assert bus.events == ["readback", "bind", "posted", "resolve", "finalize"]
+    assert row["delivery_status"] == "posted"
+
+
+@pytest.mark.parametrize("receipt", ["missing", "bad"])
+def test_pending_route_recovery_no_bind_on_unknown_or_bad_receipt(receipt):
+    """P1 reproduction: absent or unrecorded 0624 completion receipts stay held;
+    recovery never binds, promotes, resolves or resends on uncertainty."""
+    finished, bus, row, summary = _pending_route_recovery(receipt)
+    assert not finished and summary["resolved"] == 0
+    assert bus.events == ["readback"]
+    assert row["delivery_status"] == "held"
+    assert row["attachments"]["fixer_route_pending"] is True
+
+
+def test_pending_route_recovery_legacy_proof_only_row_unchanged():
+    """Rows predating the durable admission contract keep proof-only recovery."""
+    finished, bus, row, summary = _pending_route_recovery(None)
+    assert finished and summary["resolved"] == 1
+    assert bus.events == ["readback", "bind", "posted", "resolve", "finalize"]
+    assert row["delivery_status"] == "posted"
 
 
 def test_uncertain_first_post_is_held_and_never_bound():
@@ -945,6 +1346,10 @@ def test_real_bus_fixer_answer_selects_armed_close_contract(monkeypatch, enabled
         meta["fixer_current_attempt_token"] = token
     row = {"id": "70164909-16b5-43df-b6a3-8d7499d51485", "ticket_id": TICKET_ID,
            "delivery_status": "posted", "attachments": meta}
+    # Closeout now re-reads the persisted outbound row before using the
+    # atomic FIXER resolver. Model that durable read alongside the RPC.
+    monkeypatch.setattr(bus, "message", lambda mid: deepcopy(row)
+                        if mid == row["id"] else None)
     summary = {"resolved": 0}
     outbox._resolve_on_answer(bus, deepcopy(ticket), row, "answer", summary,
                               att=meta, body="Your account is connected.")
@@ -975,8 +1380,16 @@ def test_real_bus_generic_resolve_tap_uses_actual_notice_flag(
     monkeypatch.setattr(bus, "ticket", lambda _tid: deepcopy(ticket))
     written = []
     monkeypatch.setattr(bus, "recent_messages", lambda *_a, **_kw: deepcopy(written))
-    monkeypatch.setattr(bus, "_insert", lambda _table, row:
-                        (written.append(deepcopy(row)) or deepcopy(row), False))
+
+    def insert(_table, row):
+        # PostgREST supplies the durable row ID on INSERT; downstream closeout
+        # now reads that exact persisted row before resolving.
+        persisted = {"id": "70164909-16b5-43df-b6a3-8d7499d51485",
+                     **deepcopy(row)}
+        written.append(persisted)
+        return deepcopy(persisted), False
+
+    monkeypatch.setattr(bus, "_insert", insert)
     monkeypatch.setattr(bus, "set_ticket", lambda _tid, **fields: ticket.update(fields))
     monkeypatch.setattr(bus, "_client", lambda: pytest.fail("generic tap used notice RPC"))
     monkeypatch.setattr(outbox, "_recipient_armed", lambda *_a: True)
@@ -999,6 +1412,8 @@ def test_real_bus_generic_resolve_tap_uses_actual_notice_flag(
         assert not outbox.resolve_and_notify(bus, TICKET_ID, approved_by="U_BLAKE",
                                              identity=identity, log=lambda _msg: None)
         row = {**written[0], "delivery_status": "posted"}
+        monkeypatch.setattr(bus, "message", lambda mid: deepcopy(row)
+                            if mid == row["id"] else None)
         summary = {"resolved": 0}
         outbox._resolve_on_answer(bus, ticket, row, "status", summary,
                                   att=row["attachments"], body=row["body"])
@@ -1136,6 +1551,10 @@ def test_failed_suppression_alert_insert_reconciles_from_terminal_source(monkeyp
             return True
 
         monkeypatch.setattr(bus, "claim_message", claim)
+        # These two refusal paths never reach the in-flight 0624 admission; the
+        # durable lane status preflight is stubbed so the real Bus needs no HTTP.
+        monkeypatch.setattr(outreach, "_current_notice_admission_status",
+                            lambda _bus: {"generation": 7})
         _snapshot, result, posts = _send(bus)
         assert result.reason == ("lost_claim" if path == "lost_claim" else "delivery_identity_changed")
     notice = next(r for r in rows.values() if r["attachments"].get("fixer") is True)

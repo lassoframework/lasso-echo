@@ -58,7 +58,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from agent import config, db
+from agent import config, db, support_sender_fence as _fence
 from agent.slack_convo import adapter as _a
 from agent.slack_convo.bus import Bus
 
@@ -118,6 +118,8 @@ def _dedup_key(ticket_id, day):
     return f"{_DEDUP_PREFIX}{ticket_id}_{day}"
 
 
+@_fence.guarded("stale_reminder_producer", lambda: {"ok": True, "reminded": [],
+    "reason": "support_sender_paused", "paused": 1})
 def run(*, bus=None, now=None, stale_hours=None, enabled=None, log=_log):
     """Find every stale held-escalated ticket and post ONE re-fire reminder per
     ticket per calendar day, deduped in kv so a job re-run the same day is a
