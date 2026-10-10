@@ -140,6 +140,9 @@ def test_tenant_token_mismatch_holds_before_identity_call(tmp_path):
 
     class Tokens:
         def __call__(self, table, params):
+            assert table == 'echo_intake_tokens'
+            assert params == {'gym_id': 'eq.' + GYM,
+                              'select': 'gym_id,echo_account_key'}
             return [{'gym_id': GYM, 'echo_account_key': 'someone-else'}]
 
     from agent.source_brand_collector import AuthenticatedZernioIdentityReader
