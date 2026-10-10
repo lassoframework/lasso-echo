@@ -50,6 +50,31 @@ def test_stage_retains_hold_and_clears_stale_source():
     assert http.calls[1][1] == {'media_not_ready_reason': None}
 
 
+def test_swapped_repeat_hold_release_is_exact_cas_and_hold_only():
+    from agent.portal_calendar_store import _CORE_VISUAL_MEDIA_CAS_COLUMNS
+    original = {key: None for key in _CORE_VISUAL_MEDIA_CAS_COLUMNS}
+    original.update(id='r1', gym_id='eng', status='pending', format='feed',
+                    account='googlebusiness', post_date='2026-10-06',
+                    image_url='https://cdn/old.jpg',
+                    source_media_url='https://cdn/old.jpg',
+                    media_not_ready_reason='cross_date_media_repeat_needs_new_visual')
+    staged = dict(original, image_url='https://cdn/new.jpg',
+                  source_media_url='https://cdn/new.jpg',
+                  source_media_asset_id='new-asset')
+    http = HTTP(staged)
+    store = SupabaseCalendarStore(url='https://example.test', service_key='key', http=http)
+    result = store.release_swapped_repeat_media_hold('eng', original, staged)
+    assert result['media_not_ready_reason'] is None
+    params, payload = http.calls[0]
+    assert payload == {'media_not_ready_reason': None}
+    assert params['gym_id'] == 'eq.eng'
+    assert params['image_url'] == 'eq.https://cdn/new.jpg'
+    assert params['media_not_ready_reason'] == 'eq.cross_date_media_repeat_needs_new_visual'
+    assert store.release_swapped_repeat_media_hold(
+        'eng', original, dict(staged, status='approved')) is None
+    assert len(http.calls) == 1
+
+
 def test_server_race_returns_no_match():
     row = _row()
     http = HTTP(row, race=True)
