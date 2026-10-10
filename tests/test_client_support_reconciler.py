@@ -495,3 +495,301 @@ def test_fetch_pages_ceiling_fails_closed():
     rows = _rows(10_000)
     with pytest.raises(r.PaginationError):
         r.fetch_pages(_keyset_fetch(rows), page_size=10, max_pages=3)
+
+
+# --- consumed posted-notice adoption proof (Portal 0645) ---------------------
+
+ADOPTION_TICKET_ID = "cd08b049-1bf6-4b71-bb80-35d42d9d9de2"
+ADOPTION_NOTICE_ID = "20adfae9-986b-4391-a74c-671e9d807d3e"
+_ADOPTION_RESOLVED_AT = "2026-10-09T21:30:00+00:00"
+
+
+def _adoption_ticket(**over):
+    base = _ticket(
+        id=ADOPTION_TICKET_ID,
+        status="resolved",
+        resolved_at=_ADOPTION_RESOLVED_AT,
+        request_version=1,
+        client_id=DALE_GYM["id"],
+        slack_user_id="U06P23E3Y2Y",
+    )
+    base.update(over)
+    return base
+
+
+def _adoption_message(**over):
+    msg = {
+        "id": ADOPTION_NOTICE_ID,
+        "ticket_id": ADOPTION_TICKET_ID,
+        "created_at": "2026-10-09T21:00:00+00:00",
+        "direction": "outbound",
+        "author_type": "echo",
+        "slack_ts": "1791573331.865259",
+        "delivery_status": "posted",
+        "delivery_request_version": 1,
+        "attachments": {
+            "kind": "status",
+            "operator_disposition": "provider limitation, no technical fix",
+            "delivery_readback_verified": True,
+            "delivery_readback_ts": "1791573331.865259",
+            "delivery_readback_channel": "C0BUJKCCX6C",
+            "delivery_readback_sender": "U0BE39F02KV",
+        },
+    }
+    msg.update(over)
+    return msg
+
+
+def _adoption_row(**over):
+    snapshot = {
+        "id": ADOPTION_TICKET_ID,
+        "product": "echo",
+        "source": "website_tab",
+        "status": "verification",
+        "resolved_at": None,
+        "request_version": 1,
+        "client_id": DALE_GYM["id"],
+        "bot_identity": "echo",
+        "slack_user_id": "U06P23E3Y2Y",
+        "classification": "answerable_question",
+    }
+    body_sha = "b98d25c16a4ea90b045cab49aa1b3560c569ca661cc8c078f71c5ccabdada23d"
+    receipt = {
+        "identity_binding": "exact_historical_notice",
+        "notice_message_id": ADOPTION_NOTICE_ID,
+        "history_match_count": 1,
+        "client_msg_id": None,
+        "channel": "C0BUJKCCX6C",
+        "sender": "U0BE39F02KV",
+        "ts": "1791573331.865259",
+        "thread_ts": None,
+        "recipient_user_id": "U06P23E3Y2Y",
+        "recipient_membership_verified": True,
+        "body_sha256": body_sha,
+        "verified": True,
+        "method": "slack_api_readback",
+        "observed_at": "2026-10-09T21:05:00+00:00",
+        "evidence_ref": "evidence/adoption.json",
+        "evidence_sha256": "c" * 64,
+    }
+    review = {
+        "passed": True,
+        "scope": "provider limitation disposition; no Grow connection",
+        "reviewer": "independent-reviewer",
+        "author_identity": "echo-fixer",
+        "evidence_ref": "evidence/review.json",
+        "evidence_sha256": "d" * 64,
+        "ticket_id": ADOPTION_TICKET_ID,
+        "notice_message_id": ADOPTION_NOTICE_ID,
+        "transcript_sha256": "a" * 64,
+        "ticket_snapshot": snapshot,
+        "receipt": receipt,
+        "body_sha256": body_sha,
+    }
+    row = {
+        "ticket_id": ADOPTION_TICKET_ID,
+        "notice_message_id": ADOPTION_NOTICE_ID,
+        "ticket_snapshot": snapshot,
+        "transcript_sha256": "a" * 64,
+        "receipt": receipt,
+        "independent_review": review,
+        "created_at": "2026-10-09T21:10:00+00:00",
+        "consumed_at": _ADOPTION_RESOLVED_AT,
+    }
+    row.update(over)
+    return row
+
+
+def _adoption_result(ticket=None, messages=None, adoptions="default"):
+    t = ticket or _adoption_ticket()
+    msgs = [_adoption_message()] if messages is None else messages
+    rows = [_adoption_row()] if adoptions == "default" else adoptions
+    return r.classify_ticket(t, msgs, gym=DALE_GYM, adoptions=rows)
+
+
+def test_consumed_adoption_proof_satisfies_terminal_ticket():
+    res = _adoption_result()
+    assert res["category"] == r.SATISFIED
+    assert res["reason"] == "consumed_posted_notice_adoption"
+    assert res["client_visible_working"] is False
+
+
+def test_no_adoption_rows_still_exception():
+    res = _adoption_result(adoptions=None)
+    assert res["reason"] == "terminal_missing_completion_receipt"
+    res = _adoption_result(adoptions=[])
+    assert res["reason"] == "terminal_missing_completion_receipt"
+
+
+def test_multiple_adoption_rows_rejected():
+    res = _adoption_result(adoptions=[_adoption_row(), _adoption_row()])
+    assert res["reason"] == "terminal_missing_completion_receipt"
+
+
+def test_unconsumed_adoption_rejected():
+    res = _adoption_result(adoptions=[_adoption_row(consumed_at=None)])
+    assert res["reason"] == "terminal_missing_completion_receipt"
+
+
+def test_consumed_at_must_equal_resolved_at():
+    res = _adoption_result(
+        adoptions=[_adoption_row(consumed_at="2026-10-09T21:31:00+00:00")])
+    assert res["reason"] == "terminal_missing_completion_receipt"
+
+
+def test_adoption_pinned_to_exact_ticket_and_message():
+    # A different ticket can never use the proof, even with a row that lies.
+    other = _adoption_ticket(id="t-9")
+    res = _adoption_result(ticket=other,
+                           adoptions=[_adoption_row(ticket_id="t-9")])
+    assert res["reason"] == "terminal_missing_completion_receipt"
+    # Wrong notice message id in the proof.
+    res = _adoption_result(adoptions=[_adoption_row(notice_message_id="m-x")])
+    assert res["reason"] == "terminal_missing_completion_receipt"
+    # Wrong ticket id in the proof row.
+    res = _adoption_result(adoptions=[_adoption_row(ticket_id="t-9")])
+    assert res["reason"] == "terminal_missing_completion_receipt"
+
+
+def test_adoption_version_drift_rejected():
+    # Snapshot from a newer request version.
+    row = _adoption_row()
+    row["ticket_snapshot"] = dict(row["ticket_snapshot"], request_version=2)
+    assert _adoption_result(adoptions=[row])["reason"] == (
+        "terminal_missing_completion_receipt")
+    # Message posted under a newer delivery request version.
+    assert _adoption_result(
+        messages=[_adoption_message(delivery_request_version=2)]
+    )["reason"] == "terminal_missing_completion_receipt"
+    # Ticket itself no longer v1.
+    assert _adoption_result(ticket=_adoption_ticket(request_version=2))[
+        "reason"] == "terminal_missing_completion_receipt"
+
+
+def test_adoption_snapshot_must_be_predecessor_verification_unresolved():
+    row = _adoption_row()
+    row["ticket_snapshot"] = dict(row["ticket_snapshot"], status="resolved")
+    assert _adoption_result(adoptions=[row])["reason"] == (
+        "terminal_missing_completion_receipt")
+    row = _adoption_row()
+    row["ticket_snapshot"] = dict(row["ticket_snapshot"],
+                                  resolved_at=_ADOPTION_RESOLVED_AT)
+    assert _adoption_result(adoptions=[row])["reason"] == (
+        "terminal_missing_completion_receipt")
+    row = _adoption_row()
+    row["ticket_snapshot"] = dict(row["ticket_snapshot"],
+                                  slack_user_id="U999")
+    assert _adoption_result(adoptions=[row])["reason"] == (
+        "terminal_missing_completion_receipt")
+
+
+def test_adoption_current_identity_must_match_snapshot():
+    # Current ticket identity drift from the pinned v1 snapshot fails.
+    assert _adoption_result(ticket=_adoption_ticket(slack_user_id="U999"))[
+        "reason"] == "terminal_missing_completion_receipt"
+    assert _adoption_result(
+        ticket=_adoption_ticket(classification="code_fix"))[
+        "reason"] == "terminal_missing_completion_receipt"
+
+
+def test_adoption_malformed_proof_fields_rejected():
+    assert _adoption_result(adoptions=["nope"])["reason"] == (
+        "terminal_missing_completion_receipt")
+    assert _adoption_result(adoptions=[_adoption_row(
+        transcript_sha256="zzzz")])["reason"] == (
+        "terminal_missing_completion_receipt")
+    assert _adoption_result(adoptions=[_adoption_row(
+        ticket_snapshot=None)])["reason"] == (
+        "terminal_missing_completion_receipt")
+    assert _adoption_result(adoptions=[_adoption_row(
+        receipt="nope")])["reason"] == "terminal_missing_completion_receipt"
+    assert _adoption_result(adoptions=[_adoption_row(
+        independent_review=None)])["reason"] == (
+        "terminal_missing_completion_receipt")
+
+
+def test_adoption_receipt_and_review_binding_required():
+    # Receipt not verified / wrong method / wrong notice binding.
+    row = _adoption_row()
+    row["receipt"] = dict(row["receipt"], verified=False)
+    assert _adoption_result(adoptions=[row])["reason"] == (
+        "terminal_missing_completion_receipt")
+    row = _adoption_row()
+    row["receipt"] = dict(row["receipt"], notice_message_id="m-other")
+    assert _adoption_result(adoptions=[row])["reason"] == (
+        "terminal_missing_completion_receipt")
+    # Review not passed.
+    row = _adoption_row()
+    row["independent_review"] = dict(row["independent_review"], passed=False)
+    assert _adoption_result(adoptions=[row])["reason"] == (
+        "terminal_missing_completion_receipt")
+    # Reviewer must be independent of the author.
+    row = _adoption_row()
+    row["independent_review"] = dict(row["independent_review"],
+                                     reviewer="echo-fixer")
+    assert _adoption_result(adoptions=[row])["reason"] == (
+        "terminal_missing_completion_receipt")
+    # Review must bind this exact ticket / notice / receipt.
+    row = _adoption_row()
+    row["independent_review"] = dict(row["independent_review"],
+                                     ticket_id="t-other")
+    assert _adoption_result(adoptions=[row])["reason"] == (
+        "terminal_missing_completion_receipt")
+    row = _adoption_row()
+    row["independent_review"] = dict(row["independent_review"], receipt={})
+    assert _adoption_result(adoptions=[row])["reason"] == (
+        "terminal_missing_completion_receipt")
+    row = _adoption_row()
+    row["receipt"] = dict(row["receipt"], body_sha256="a" * 64)
+    row["independent_review"] = dict(row["independent_review"],
+                                      receipt=row["receipt"], body_sha256="a" * 64)
+    assert _adoption_result(adoptions=[row])["reason"] == (
+        "terminal_missing_completion_receipt")
+
+
+def test_adoption_notice_message_must_be_posted_with_readback():
+    # Message missing entirely.
+    assert _adoption_result(messages=[])["reason"] == (
+        "terminal_missing_completion_receipt")
+    # Not actually posted.
+    assert _adoption_result(messages=[_adoption_message(
+        delivery_status="ready")])["reason"] == (
+        "terminal_missing_completion_receipt")
+    # Inbound or wrong ticket.
+    assert _adoption_result(messages=[_adoption_message(
+        direction="inbound")])["reason"] == (
+        "terminal_missing_completion_receipt")
+    assert _adoption_result(messages=[_adoption_message(
+        ticket_id="t-other")])["reason"] == (
+        "terminal_missing_completion_receipt")
+    # Readback metadata absent: attachments alone are never trusted.
+    msg = _adoption_message()
+    msg["attachments"] = {"kind": "status"}
+    assert _adoption_result(messages=[msg])["reason"] == (
+        "terminal_missing_completion_receipt")
+    for changed in ({"author_type": "system"},
+                    {"slack_ts": "1791573331.865260"}):
+        assert _adoption_result(messages=[_adoption_message(**changed)])["reason"] == (
+            "terminal_missing_completion_receipt")
+    msg = _adoption_message()
+    msg["attachments"] = dict(msg["attachments"],
+                               delivery_readback_channel="wrong-channel")
+    assert _adoption_result(messages=[msg])["reason"] == (
+        "terminal_missing_completion_receipt")
+
+
+def test_post_close_acknowledgement_is_not_adoption():
+    # A separate posted post-close acknowledgement (different message id)
+    # never substitutes for the adopted client disposition message.
+    ack = _adoption_message(id="ack-1")
+    assert _adoption_result(messages=[ack])["reason"] == (
+        "terminal_missing_completion_receipt")
+
+
+def test_adoption_reconcile_plumbing():
+    t = _adoption_ticket()
+    rows = {t["id"]: [_adoption_row()]}
+    summary = r.reconcile([(t, [_adoption_message()])],
+                          gym_for=_gym_for(DALE_GYM),
+                          adoption_for=rows.get)
+    assert [x["ticket_id"] for x in summary[r.SATISFIED]] == [t["id"]]

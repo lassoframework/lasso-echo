@@ -71,6 +71,31 @@ _ALLOWED_PREDECESSORS = frozenset({
     ("resolved", "action_request"),
 })
 
+# Consumed posted-notice adoption proof (Portal migration 0645). Exactly one
+# immutable, service_role-read-only row in public.fixer_posted_notice_adoptions
+# may stand in for an ordinary identity-fenced resolve_notice receipt for the
+# single pinned ENG Grow ticket. The row is consumed only inside the atomic
+# guarded close transaction, which sets status=resolved and
+# resolved_at=consumed_at. This is the adopted CLIENT disposition message --
+# never the separately posted post-close acknowledgement.
+ADOPTION_TICKET_ID = "cd08b049-1bf6-4b71-bb80-35d42d9d9de2"
+ADOPTION_NOTICE_MESSAGE_ID = "20adfae9-986b-4391-a74c-671e9d807d3e"
+_ADOPTION_CLIENT_ID = "6ee04ee4-13a5-47db-8416-7b8ee3e61ab8"
+_ADOPTION_SLACK_USER_ID = "U06P23E3Y2Y"
+_ADOPTION_TICKET_IDENTITY = {
+    "product": "echo",
+    "source": "website_tab",
+    "client_id": _ADOPTION_CLIENT_ID,
+    "bot_identity": "echo",
+    "slack_user_id": _ADOPTION_SLACK_USER_ID,
+    "classification": "answerable_question",
+}
+_ADOPTION_REQUEST_VERSION = 1
+_ADOPTION_RECEIPT_METHOD = "slack_api_readback"
+_ADOPTION_RECEIPT_BINDING = "exact_historical_notice"
+_ADOPTION_REVIEW_SCOPE = "provider limitation disposition; no Grow connection"
+_ADOPTION_BODY_SHA256 = "b98d25c16a4ea90b045cab49aa1b3560c569ca661cc8c078f71c5ccabdada23d"
+
 # Result categories
 SATISFIED = "satisfied"
 EXCEPTION = "exception"
@@ -196,6 +221,150 @@ def qualifying_completion_receipt(ticket, messages):
     return None
 
 
+def _is_hex64(value):
+    """True iff value is a 64-char lowercase hex string (a raw SHA-256)."""
+    return (isinstance(value, str) and len(value) == 64
+            and all(c in "0123456789abcdef" for c in value))
+
+
+def _nonempty_str(value):
+    return isinstance(value, str) and bool(value.strip())
+
+
+def _adoption_receipt_coherent(proof):
+    """Receipt/review bindings derived from the 0645 SQL validation.
+
+    Both must be JSON objects; the receipt must be a verified Slack API
+    readback of exactly this notice message and the independent review must
+    have passed with a reviewer distinct from the author, with every binding
+    (ticket, notice, transcript, snapshot, receipt, body hash) pointing back
+    at this exact proof.
+    """
+    receipt = proof.get("receipt")
+    review = proof.get("independent_review")
+    if not isinstance(receipt, dict) or not isinstance(review, dict):
+        return False
+    notice_id = proof.get("notice_message_id")
+    transcript = proof.get("transcript_sha256")
+    snapshot = proof.get("ticket_snapshot")
+    body_sha = receipt.get("body_sha256")
+    if (body_sha != _ADOPTION_BODY_SHA256
+            or body_sha != review.get("body_sha256")):
+        return False
+    if (receipt.get("identity_binding") != _ADOPTION_RECEIPT_BINDING
+            or receipt.get("notice_message_id") != notice_id
+            or receipt.get("history_match_count") != 1
+            or "client_msg_id" not in receipt
+            or receipt.get("verified") is not True
+            or receipt.get("method") != _ADOPTION_RECEIPT_METHOD
+            or receipt.get("thread_ts") is not None
+            or receipt.get("recipient_membership_verified") is not True
+            or receipt.get("recipient_user_id") != _ADOPTION_SLACK_USER_ID
+            or not _nonempty_str(receipt.get("observed_at"))
+            or not _nonempty_str(receipt.get("evidence_ref"))
+            or not _is_hex64(receipt.get("evidence_sha256"))):
+        return False
+    if (review.get("passed") is not True
+            or review.get("scope") != _ADOPTION_REVIEW_SCOPE
+            or not _nonempty_str(review.get("reviewer"))
+            or not _nonempty_str(review.get("author_identity"))
+            or review.get("reviewer") == review.get("author_identity")
+            or not _nonempty_str(review.get("evidence_ref"))
+            or not _is_hex64(review.get("evidence_sha256"))
+            or review.get("ticket_id") != ADOPTION_TICKET_ID
+            or review.get("notice_message_id") != notice_id
+            or review.get("transcript_sha256") != transcript
+            or review.get("ticket_snapshot") != snapshot
+            or review.get("receipt") != receipt):
+        return False
+    return True
+
+
+def _adoption_notice_message_qualifies(ticket, messages, receipt):
+    """The adopted notice must be the actual posted outbound v1 client message
+    with Slack readback metadata. Body text is never read by this scanner;
+    the consumed DB proof is the authority for content bindings.
+    """
+    for message in messages or []:
+        if not isinstance(message, dict):
+            continue
+        if message.get("id") != ADOPTION_NOTICE_MESSAGE_ID:
+            continue
+        attachments = message.get("attachments")
+        if not isinstance(attachments, dict):
+            return False
+        return (message.get("ticket_id") == ticket.get("id")
+                and message.get("author_type") == "echo"
+                and message.get("direction") == "outbound"
+                and message.get("delivery_status") == "posted"
+                and message.get("delivery_request_version")
+                == _ADOPTION_REQUEST_VERSION
+                and message.get("slack_ts") == "1791573331.865259"
+                and message.get("slack_ts") == receipt.get("ts")
+                and receipt.get("channel") == "C0BUJKCCX6C"
+                and receipt.get("sender") == "U0BE39F02KV"
+                and receipt.get("channel") == attachments.get("delivery_readback_channel")
+                and receipt.get("sender") == attachments.get("delivery_readback_sender")
+                and receipt.get("ts") == attachments.get("delivery_readback_ts")
+                and attachments.get("kind") == "status"
+                and attachments.get("operator_disposition")
+                == "provider limitation, no technical fix"
+                and attachments.get("delivery_readback_verified") is True
+                and _nonempty_str(attachments.get("delivery_readback_ts"))
+                and _nonempty_str(attachments.get("delivery_readback_channel"))
+                and _nonempty_str(attachments.get("delivery_readback_sender")))
+    return False
+
+
+def consumed_adoption_proof_qualifies(ticket, messages, adoptions):
+    """True iff exactly one structurally valid, CONSUMED posted-notice adoption
+    proof closes this terminal ticket. Pure; no I/O. Any mismatch, malformed
+    field, unconsumed row, or version drift returns False (caller keeps the
+    ticket actionable). Read failures never reach here -- the scan shell fails
+    closed before classification.
+    """
+    if not isinstance(ticket, dict):
+        return False
+    # The proof is pinned to exactly one ticket by CHECK constraint.
+    if ticket.get("id") != ADOPTION_TICKET_ID:
+        return False
+    if ticket.get("status") != "resolved":
+        return False
+    if ticket.get("request_version") != _ADOPTION_REQUEST_VERSION:
+        return False
+    if not isinstance(adoptions, list) or len(adoptions) != 1:
+        return False
+    proof = adoptions[0]
+    if not isinstance(proof, dict):
+        return False
+    if (proof.get("ticket_id") != ADOPTION_TICKET_ID
+            or proof.get("notice_message_id") != ADOPTION_NOTICE_MESSAGE_ID
+            or not _is_hex64(proof.get("transcript_sha256"))):
+        return False
+    # Consumed only by the atomic close: consumed_at == ticket.resolved_at.
+    consumed_at = _parse_ts(proof.get("consumed_at"))
+    resolved_at = _parse_ts(ticket.get("resolved_at"))
+    if consumed_at is None or resolved_at is None or consumed_at != resolved_at:
+        return False
+    # Snapshot is the PREDECESSOR row: verification, unresolved, same v1
+    # identity as the current ticket.
+    snapshot = proof.get("ticket_snapshot")
+    if not isinstance(snapshot, dict):
+        return False
+    if (snapshot.get("id") != ADOPTION_TICKET_ID
+            or snapshot.get("status") != "verification"
+            or snapshot.get("resolved_at") is not None
+            or snapshot.get("request_version") != _ADOPTION_REQUEST_VERSION):
+        return False
+    for field, expected in _ADOPTION_TICKET_IDENTITY.items():
+        if snapshot.get(field) != expected or ticket.get(field) != expected:
+            return False
+    if not _adoption_receipt_coherent(proof):
+        return False
+    return _adoption_notice_message_qualifies(ticket, messages,
+                                               proof["receipt"])
+
+
 def _gym_slug_is_test(slug):
     """A gym slug marking a test/demo tenant. Slug is never an ID."""
     if not isinstance(slug, str):
@@ -205,7 +374,7 @@ def _gym_slug_is_test(slug):
             or lowered == "demo" or lowered.startswith("demo-"))
 
 
-def classify_ticket(ticket, messages, gym=None):
+def classify_ticket(ticket, messages, gym=None, adoptions=None):
     """Classify one ticket against its messages. Pure; no I/O, no mutation.
 
     ``gym`` is the verified gym record (mapping with ``id`` and ``slug``) for
@@ -277,6 +446,12 @@ def classify_ticket(ticket, messages, gym=None):
             return result
         if receipt is not None:
             result.update(category=SATISFIED, reason="completion_receipt_posted")
+        elif consumed_adoption_proof_qualifies(ticket, messages, adoptions):
+            # Immutable consumed DB proof of the posted client disposition
+            # message (Portal 0645). Distinct from the separately posted
+            # post-close acknowledgement, which never satisfies closure.
+            result.update(category=SATISFIED,
+                          reason="consumed_posted_notice_adoption")
         else:
             result.update(category=EXCEPTION,
                           reason="terminal_missing_completion_receipt",
@@ -306,18 +481,24 @@ def classify_ticket(ticket, messages, gym=None):
     return result
 
 
-def reconcile(tickets_with_messages, gym_for=None):
+def reconcile(tickets_with_messages, gym_for=None, adoption_for=None):
     """Classify many tickets. `tickets_with_messages` yields (ticket, messages).
 
     `gym_for`, when given, maps client_id -> verified gym record (or None).
-    Returns {"satisfied": [...], "exception": [...], "anomaly": [...],
+    `adoption_for`, when given, maps ticket_id -> adoption proof rows read
+    from public.fixer_posted_notice_adoptions (None/[] when none). Returns
+    {"satisfied": [...], "exception": [...], "anomaly": [...],
     "out_of_scope": [...]} of per-ticket result dicts."""
     summary = {SATISFIED: [], EXCEPTION: [], ANOMALY: [], OUT_OF_SCOPE: []}
     for ticket, messages in tickets_with_messages or []:
         gym = None
-        if callable(gym_for) and isinstance(ticket, dict):
-            gym = gym_for(ticket.get("client_id"))
-        result = classify_ticket(ticket, messages, gym=gym)
+        adoptions = None
+        if isinstance(ticket, dict):
+            if callable(gym_for):
+                gym = gym_for(ticket.get("client_id"))
+            if callable(adoption_for):
+                adoptions = adoption_for(ticket.get("id"))
+        result = classify_ticket(ticket, messages, gym=gym, adoptions=adoptions)
         summary.setdefault(result["category"], []).append(result)
     return summary
 
