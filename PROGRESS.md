@@ -113,6 +113,16 @@
 
 # Echo Build Tracker
 
+## ENG September 5 exact denied-post recreation (2026-10-10, draft)
+
+- [~] Default-OFF one-ticket SQL reservation, exact three-row staging binder,
+  and finalizer wrapper built with explicit maintenance caller. Focused local
+  tests: 20 passed, including disposable PG17 admission and replay checks.
+- [ ] Upstream staged owner/photo/attester discovery still requires active
+  rows. Review and deploy that missing bridge and the forward reservation stack
+  before any gate activation. No production recreation, client notice, or
+  support closeout has occurred.
+
 Living tracker for the Echo social agent build. This markdown is the source of
 truth; the HTML dashboard (`echo_build_tracker.html`) is the visual view. The
 full organic-system scope lives in `BUILD_SPEC.md`.
