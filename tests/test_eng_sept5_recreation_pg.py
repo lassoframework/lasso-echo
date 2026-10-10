@@ -260,6 +260,42 @@ def test_original_edit_wins_race_before_finalization_and_is_refused(pg):
     assert _psql(pg, "select state from public.eng_sept5_recreation_receipt").stdout.strip() == "staged"
 
 
+def test_begin_replay_and_finalize_share_receipt_ticket_lock_order(pg):
+    _gate(pg)
+    _begin(pg)
+    batch, rows = _stage(pg)
+    _psql(pg, f"select public.eng_sept5_recreation_bind('{batch}')")
+    command, env = _connection(pg)
+    ticket_owner = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                    stderr=subprocess.PIPE, text=True, env=env)
+    try:
+        ticket_owner.stdin.write("begin;\n")
+        ticket_owner.stdin.write("update public.support_tickets set status=status where id='"
+                                 + TICKET + "';\n")
+        ticket_owner.stdin.write("select 'ticket_locked';\n")
+        ticket_owner.stdin.flush()
+        assert ticket_owner.stdout.readline().strip() == "ticket_locked"
+        with ThreadPoolExecutor(max_workers=2) as workers:
+            replay = workers.submit(_begin, pg, 2, check=False)
+            time.sleep(0.2)
+            assert not replay.done()
+            finalize = workers.submit(_psql, pg,
+                f"select state from public.eng_sept5_recreation_finalize('{batch}',"
+                f"{_candidate_json(rows)})", check=False)
+            time.sleep(0.2)
+            assert not finalize.done()
+            ticket_owner.stdin.write("commit;\n")
+            ticket_owner.stdin.flush()
+            assert replay.result(timeout=10).returncode == 0
+            assert finalize.result(timeout=10).returncode == 0
+    finally:
+        if ticket_owner.poll() is None:
+            ticket_owner.stdin.write("rollback;\n\\q\n")
+            ticket_owner.stdin.flush()
+        ticket_owner.communicate(timeout=10)
+    assert _psql(pg, "select state from public.eng_sept5_recreation_receipt").stdout.strip() == "finalized"
+
+
 def test_bind_refuses_extra_or_wrong_candidate(pg):
     _gate(pg)
     _begin(pg)

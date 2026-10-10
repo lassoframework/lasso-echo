@@ -88,6 +88,11 @@ begin
    raise exception 'ENG recreation admission is OFF' using errcode='55000'; end if;
  if p_target_date<=current_date or p_target_date>current_date+31 then
    raise exception 'future target required' using errcode='22023'; end if;
+ -- Replay must take the same receipt -> ticket -> originals order as finalize.
+ -- On the initial call no receipt exists yet; the ticket lock serializes the
+ -- insert and a concurrent finalizer cannot see that receipt until commit.
+ select * into r from public.eng_sept5_recreation_receipt
+  where ticket_id='35e066d0-d9bc-40e6-aef8-86719a010590' for update;
  select * into t from public.support_tickets
   where id='35e066d0-d9bc-40e6-aef8-86719a010590' for update;
  if not found or t.client_id is distinct from '6ee04ee4-13a5-47db-8416-7b8ee3e61ab8'::uuid
@@ -109,9 +114,7 @@ begin
   'ff792b3e-be08-4c4e-b0f5-0347e075a9ba'::uuid]);
  if not public.eng_sept5_originals_current(v_originals) then
    raise exception 'ENG denied originals changed' using errcode='23514'; end if;
- select * into r from public.eng_sept5_recreation_receipt
-  where ticket_id=t.id for update;
- if found then
+ if r.ticket_id is not null then
    if r.ticket_snapshot is distinct from to_jsonb(t)
       or r.inbound_sha256 is distinct from v_inbound
       or r.original_snapshots is distinct from v_originals
