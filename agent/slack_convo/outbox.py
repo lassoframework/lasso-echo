@@ -846,8 +846,9 @@ def escalation_blocks(row, ticket):
     body = row.get("body") or ""
     att = row.get("attachments") or {}
     informational_only = (
-        att.get("surface") == "held_client_ticket_reconcile"
-        and att.get("contract") == "held-client-ticket-reconcile-v1"
+        (att.get("surface") == "held_client_ticket_reconcile"
+         and att.get("contract") == "held-client-ticket-reconcile-v1")
+        or _scan_reminder_candidate(row)
     )
     tid = str((ticket or {}).get("id") or "")
     chunks = [body[i:i + _BLOCK_TEXT_CHARS] for i in range(0, len(body), _BLOCK_TEXT_CHARS)] or [""]
@@ -1187,6 +1188,9 @@ def _recover_stale_claims(bus, identity, log, now=None, readback=None, summary=N
         if _age_seconds(row, now) < CLAIM_TIMEOUT_SECONDS:
             continue  # plausibly still in flight; do not steal it
         try:
+            if _scan_reminder_candidate(row):
+                _recover_scan_reminder(bus, row, identity, readback, log, summary)
+                continue
             if _fixer_client_row(row):
                 att = row.get("attachments") or {}
                 intent = att.get("fixer_slack_delivery_intent")
@@ -1893,6 +1897,7 @@ def run_once(bus, post, *, identity, log=print, limit=50, now=None,
     summary["requeued_ready"] += config_requeued
     _report_uncertain_fixer(bus, identity, log, now=now)
     _reconcile_posted_fixer(bus, identity, log, summary)
+    _reconcile_held_scan_reminders(bus, identity, readback, log, summary)
     try:
         rows = bus.outbox("ready", limit=limit, identity=identity.name)
     except TypeError:  # a bus without the identity filter (older fakes)
@@ -1991,9 +1996,410 @@ def _defer_held_reconcile_row(bus, row, reason, retry_after, *, log, summary, no
     summary["skipped"] += 1
 
 
+
+def _scan_reminder_candidate(row):
+    att = row.get("attachments") or {}
+    return (att.get("surface") == "client_support_scan_reminder"
+            or att.get("contract") == "client-support-scan-reminder-v1"
+            or str(row.get("body") or "").startswith("CLIENT SUPPORT SCAN REMINDER:"))
+
+
+def _scan_reminder_anomalous(att):
+    """Forward-compatible guard: replay/admission markers are never this lane's.
+
+    Current main writes no replay or admission markers. If a future or anomalous
+    writer stamps one onto a row that also matches this lane's surface, the
+    reminder branch must neither send, suppress, hold nor accept that row as its
+    own claim; a human reconciles it. Keys only decide, so arbitrary marker
+    values never influence the outcome.
+    """
+    if not isinstance(att, dict):
+        return False
+    for key in att:
+        lowered = str(key).lower()
+        if (lowered in {"slack_replay_id", "support_resolution_send_admission"}
+                or lowered.startswith(("replay", "admission"))
+                or lowered in {"replayed", "admitted", "replay_of",
+                               "admitted_by", "admission_id"}):
+            return True
+    return False
+
+
+def _cas_scan_reminder_transition(bus, row, status, *, meta_update=None,
+                                  slack_ts=None):
+    """Exact delivery-state + attachment-snapshot compare-and-set for one row.
+
+    An ID-only status update can overwrite a concurrent claim winner. PostgREST
+    replaces the whole jsonb column, so the WHERE clause compares the complete
+    attachment snapshot this process observed; a concurrent writer wins and
+    this transition is refused (returns None) instead of clobbering it.
+    """
+    if not isinstance(row, dict) or not row.get("id"):
+        return None
+    current_status = row.get("delivery_status")
+    if not isinstance(current_status, str) or not current_status:
+        return None
+    att = row.get("attachments")
+    snapshot = dict(att or {})
+    fields = {"delivery_status": status,
+              "attachments": {**snapshot, **(meta_update or {})}}
+    if slack_ts:
+        fields["slack_ts"] = slack_ts
+    return bus._patch("support_messages", {  # noqa: SLF001
+        "id": f"eq.{row['id']}",
+        "ticket_id": f"eq.{row['ticket_id']}",
+        "body": f"eq.{row['body']}",
+        "delivery_status": f"eq.{current_status}",
+        "slack_ts": ("is.null" if not row.get("slack_ts") else
+                     f"eq.{row['slack_ts']}"),
+        "attachments": ("is.null" if att is None else
+                        "eq." + json.dumps(snapshot, separators=(",", ":"),
+                                           sort_keys=True)),
+    }, fields)
+
+
+def _scan_reminder_sender(identity):
+    """Resolve a bot sender before POST when its optional user-ID env is absent.
+
+    Scout and Wrangler have live bot tokens but no configured bot user ID in
+    the current production environment. Slack's authenticated identity is the
+    readback sender; a failed lookup refuses delivery before any Slack POST.
+    """
+    configured = identity.bot_user_id()
+    if configured:
+        return configured
+    token = identity.env(identity.bot_token_env)
+    if not token:
+        return None
+    from ..slack_surface import SlackPoster
+    auth = SlackPoster(token=token)._send("https://slack.com/api/auth.test", {})
+    sender = auth.get("user_id") if isinstance(auth, dict) else None
+    if (not isinstance(auth, dict) or auth.get("ok") is not True
+            or not auth.get("bot_id") or not isinstance(sender, str)
+            or not sender.startswith(("U", "W"))):
+        return None
+    return sender
+
+
+def _scan_reminder_eligible(bus, row, identity, *, now=None):
+    """Exact persisted contract plus fresh, metadata-only current classification.
+
+    False is stale/malformed. Read failures raise so callers preserve retryability.
+    """
+    from ..jobs import client_support_scan as scan
+    from ..jobs import client_support_scan_reminder as reminder
+    from ..jobs.client_support_reconciler import classify_ticket, fetch_pages
+
+    att = row.get("attachments") or {}
+    if not isinstance(att, dict) or att.get("identity") != identity.name:
+        return False
+    day = att.get("notice_day")
+    try:
+        day_clock = datetime.strptime(day, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+    except (TypeError, ValueError):
+        return False
+    clock = now or datetime.now(timezone.utc)
+    if clock.tzinfo is None or day != clock.astimezone(timezone.utc).date().isoformat():
+        return False
+    entry = {**att, "bot_identity": att.get("identity")}
+    if (not reminder._valid_entry(entry, armed_identities={identity.name})
+            or not reminder._aged_new_ticket(entry, clock)):
+        return False
+    expected = reminder._notice_identity(entry, day_clock)
+    if not reminder._same_claim(row, expected):
+        return False
+    tickets = bus._get("support_tickets", {
+        "id": f"eq.{row['ticket_id']}", "select": scan._TICKET_FIELDS, "limit": "2"})
+    if not isinstance(tickets, list) or any(not isinstance(t, dict) for t in tickets):
+        raise ValueError("malformed ticket read")
+    if len(tickets) != 1:
+        return False
+    ticket = tickets[0]
+    if (ticket.get("id") != row["ticket_id"]
+            or type(ticket.get("request_version")) is not int
+            or ticket.get("bot_identity") != identity.name
+            or any(ticket.get(k) != att.get(k) for k in
+                   ("request_version", "client_id", "source", "product", "status"))):
+        return False
+    if ticket.get("status") == "new" and ticket.get("created_at") != att.get("created_at"):
+        return False
+    gyms = bus._get("gyms", {"id": f"eq.{ticket['client_id']}",
+                              "select": scan._GYM_FIELDS, "limit": "2"})
+    if not isinstance(gyms, list) or any(not isinstance(g, dict) for g in gyms):
+        raise ValueError("malformed gym read")
+    if len(gyms) != 1:
+        return False
+
+    def page(cursor, size):
+        params = {"ticket_id": f"eq.{ticket['id']}",
+                  "select": scan._MESSAGE_FIELDS, "order": scan._order_clause(),
+                  "limit": str(size)}
+        if cursor is not None:
+            params["or"] = scan._keyset_or(cursor)
+        return bus._get("support_messages", params)
+    messages = fetch_pages(page)
+    if any(m.get("ticket_id") != ticket["id"] for m in messages):
+        raise ValueError("message tenant mismatch")
+    result = classify_ticket(ticket, messages, gym=gyms[0])
+    return (result.get("ticket_id") == ticket["id"]
+            and (result.get("client_visible_working") is True
+                 or result.get("category") == "exception")
+            and result.get("reason") == att.get("reason"))
+
+
+def _dispatch_scan_reminder(bus, post, row, identity, log, summary, *, now=None, readback=None):
+    from ..jobs.client_support_scan_reminder import _enabled
+    if not _enabled():
+        summary["skipped"] += 1
+        return
+    if _scan_reminder_anomalous(row.get("attachments")):
+        # Replay/admission markers belong to another protocol. This lane must
+        # never send, suppress or mutate such a row; a human reconciles it.
+        log(f"[slack-convo/outbox] anomalous reminder row={row.get('id')} "
+            "skipped; no send, no suppression")
+        summary["skipped"] += 1
+        return
+    # A separate identity consumer must never alter another owner's row.
+    if (row.get("attachments") or {}).get("identity") not in (None, "", identity.name):
+        summary["skipped"] += 1
+        return
+    if (row.get("attachments") or {}).get("scan_reminder_slack_intent"):
+        _recover_scan_reminder(bus, row, identity, readback, log, summary)
+        return
+    try:
+        sender = _scan_reminder_sender(identity)
+    except Exception:
+        sender = None
+    if not sender or not callable(readback):
+        summary["skipped"] += 1
+        return
+    claimed = False
+    try:
+        eligible = _scan_reminder_eligible(bus, row, identity, now=now)
+        if eligible:
+            channel = identity.fixer_channel()
+            if not channel or not callable(getattr(bus, "claim_message", None)):
+                summary["skipped"] += 1
+                return
+            if not _claim(bus, row, log):
+                summary["skipped"] += 1
+                return
+            claimed = True
+            current = bus.message(row["id"])
+            eligible = (isinstance(current, dict)
+                        and current.get("delivery_status") == "posting"
+                        and _scan_reminder_eligible(bus, current, identity, now=now))
+    except Exception as exc:
+        # No POST has happened: a transient read leaves the notice retryable.
+        if claimed:
+            try:
+                from ..jobs import client_support_scan_reminder as reminder
+                current = bus.message(row["id"])
+                if (not isinstance(current, dict)
+                        or current.get("delivery_status") != "posting"
+                        or current.get("slack_ts")
+                        or _scan_reminder_anomalous(current.get("attachments"))
+                        or (current.get("attachments") or {}).get("scan_reminder_slack_intent")
+                        or not reminder._same_claim(current, row)):
+                    raise ValueError("unconfirmed pre-POST claim")
+                _cas_scan_reminder_transition(bus, current, "ready")
+            except Exception:
+                pass  # stale claim recovery retains it
+        log(f"[slack-convo/outbox] scan reminder deferred row={row.get('id')}: "
+            f"{type(exc).__name__}")
+        summary["skipped"] += 1
+        return
+    if not eligible:
+        changed = _cas_scan_reminder_transition(bus, current if claimed else row,
+                                                "suppressed", meta_update={
+            "suppressed_why": "scan reminder no longer current"})
+        summary["suppressed" if changed else "skipped"] += 1
+        return
+    # Persist the attempt boundary before Slack. Recovery never auto-replays it.
+    intent = {"channel": channel, "thread_ts": None, "body": current["body"],
+              "sender": sender, "request_version": att_version(current),
+              "not_before": datetime.now(timezone.utc).isoformat()}
+    try:
+        stamped = _cas_scan_reminder_transition(bus, current, "posting", meta_update={
+            "scan_reminder_slack_intent": intent, "scan_reminder_no_post": False})
+        if not stamped:
+            raise ValueError("reminder intent CAS refused: concurrent owner")
+        prepared = bus.message(row["id"])
+        if (not isinstance(prepared, dict) or prepared.get("delivery_status") != "posting"
+                or (prepared.get("attachments") or {}).get("scan_reminder_slack_intent") != intent):
+            raise ValueError("reminder intent readback mismatch")
+        if not _scan_reminder_eligible(bus, prepared, identity, now=now):
+            if _scan_reminder_anomalous(prepared.get("attachments")):
+                summary["skipped"] += 1
+                return
+            changed = _cas_scan_reminder_transition(bus, prepared, "suppressed",
+                                                    meta_update={
+                "suppressed_why": "scan reminder changed before POST"})
+            summary["suppressed" if changed else "skipped"] += 1
+            return
+    except Exception:
+        # This process has not invoked Slack: confirmed absence is safe to retry.
+        # Requeue compares a FRESH snapshot, never the pre-intent one.
+        latest = None
+        try:
+            latest = bus.message(row["id"])
+            latest_att = (latest or {}).get("attachments") or {}
+            if (not isinstance(latest, dict)
+                    or latest.get("delivery_status") != "posting"
+                    or latest.get("slack_ts")
+                    or _scan_reminder_anomalous(latest_att)
+                    or latest_att.get("scan_reminder_slack_intent") != intent):
+                raise ValueError("pre-POST state unconfirmed")
+            cleared = _cas_scan_reminder_transition(bus, latest, "ready", meta_update={
+                "scan_reminder_slack_intent": None, "scan_reminder_no_post": True})
+            if not cleared:
+                raise ValueError("pre-POST requeue CAS refused: concurrent owner")
+        except Exception:
+            _hold_scan_reminder(bus, latest if isinstance(latest, dict) else current,
+                                "pre-POST preparation failed", log, summary)
+            return
+        summary["skipped"] += 1
+        return
+    try:
+        ts = post(channel, prepared["body"], thread_ts=None,
+                  blocks=escalation_blocks(prepared, None))
+        if not isinstance(ts, str) or not ts:
+            raise ValueError("Slack returned no timestamp")
+        # Persist correlation evidence before any delivery certification.
+        if not _cas_scan_reminder_transition(bus, prepared, "posting", slack_ts=ts):
+            raise ValueError("Slack timestamp CAS refused: concurrent owner")
+        observed = bus.message(row["id"])
+        if (not isinstance(observed, dict) or observed.get("slack_ts") != ts
+                or (observed.get("attachments") or {}).get("scan_reminder_slack_intent") != intent):
+            raise ValueError("Slack timestamp not durably recorded")
+        proof, reason = _readback_fixer_message(readback, intent, ts=ts)
+        if not proof:
+            raise ValueError(reason)
+        certified = _cas_scan_reminder_transition(
+            bus, observed, "posted", slack_ts=ts,
+            meta_update={"scan_reminder_readback": proof})
+        if not certified:
+            raise ValueError("posted certification CAS refused: concurrent owner")
+        summary["posted"] += 1
+    except Exception as exc:
+        # Quarantine compares the freshest observed snapshot, never a stale one.
+        try:
+            latest = bus.message(row["id"]) or prepared
+        except Exception:
+            latest = prepared
+        _hold_scan_reminder(bus, latest, "Slack outcome requires exact readback",
+                            log, summary)
+        log(f"[slack-convo/outbox] reminder delivery uncertain row={row['id']}: "
+            f"{type(exc).__name__}")
+
+
+def _reconcile_held_scan_reminders(bus, identity, readback, log, summary):
+    from ..jobs.client_support_reconciler import fetch_pages
+    from ..jobs import client_support_scan as scan
+    from ..jobs.client_support_scan_reminder import _enabled
+    # The lane is default-off. Do not add a full held-row bus scan to every
+    # production outbox tick until it is armed; held rows remain quarantined
+    # during a rollback and can be reconciled after re-enabling the lane.
+    if not _enabled():
+        return
+    def page(cursor, size):
+        params = {"select": "*", "delivery_status": "eq.held",
+                  "attachments->>identity": f"eq.{identity.name}",
+                  "attachments->>surface": "eq.client_support_scan_reminder",
+                  "order": scan._order_clause(), "limit": str(size)}
+        if cursor is not None:
+            params["or"] = scan._keyset_or(cursor)
+        return bus._get("support_messages", params)
+    try:
+        rows = fetch_pages(page, page_size=100, max_pages=1000)
+    except Exception:
+        return
+    for row in rows:
+        if _scan_reminder_candidate(row):
+            _recover_scan_reminder(bus, row, identity, readback, log, summary)
+
+
+def att_version(row):
+    return (row.get("attachments") or {}).get("request_version")
+
+
+def _hold_scan_reminder(bus, row, reason, log, summary):
+    if (not isinstance(row, dict)
+            or row.get("delivery_status") not in {"ready", "posting", "held"}
+            or (row.get("attachments") or {}).get("scan_reminder_readback")):
+        # A posted receipt may have committed before its ACK was lost. Never
+        # demote that terminal proof to held while handling an exception.
+        summary["skipped"] = int(summary.get("skipped") or 0) + 1
+        return
+    try:
+        changed = _cas_scan_reminder_transition(bus, row, "held", meta_update={
+            "scan_reminder_slack_uncertain": True,
+            "scan_reminder_hold_reason": reason})
+        if changed:
+            summary["held"] = int(summary.get("held") or 0) + 1
+        else:
+            # A concurrent claim or recovery winner owns this row; never
+            # overwrite its state with an ID-only write.
+            log(f"[slack-convo/outbox] reminder quarantine refused "
+                f"row={row.get('id')}: concurrent owner")
+            summary["skipped"] += 1
+    except Exception as exc:
+        # If the DB is down, leave posting with its durable intent. Recovery
+        # intercepts this surface before generic stale-claim requeue.
+        log(f"[slack-convo/outbox] reminder quarantine unavailable row={row['id']}: "
+            f"{type(exc).__name__}")
+        summary["skipped"] += 1
+
+
+def _recover_scan_reminder(bus, row, identity, readback, log, summary):
+    """Only a persisted Slack timestamp can certify this exact attempt."""
+    att = row.get("attachments") or {}
+    if att.get("identity") != identity.name:
+        return
+    if _scan_reminder_anomalous(att):
+        # Never certify, hold or requeue a row carrying foreign markers.
+        log(f"[slack-convo/outbox] anomalous reminder row={row.get('id')} "
+            "left untouched for human review")
+        if isinstance(summary, dict):
+            summary["skipped"] = int(summary.get("skipped") or 0) + 1
+        return
+    intent = att.get("scan_reminder_slack_intent")
+    if not isinstance(intent, dict):
+        # No intent means this protocol never reached POST. Quarantine legacy
+        # claims as well: provenance alone cannot prove the old code did not send.
+        _hold_scan_reminder(bus, row, "claim has no durable attempt proof", log, summary)
+        return
+    try:
+        sender = _scan_reminder_sender(identity)
+    except Exception:
+        sender = None
+    owner_channel = identity.fixer_channel()
+    if (intent.get("body") != row.get("body") or intent.get("thread_ts") is not None
+            or not owner_channel or intent.get("channel") != owner_channel
+            or not sender or intent.get("sender") != sender
+            or intent.get("request_version") != att.get("request_version")):
+        _hold_scan_reminder(bus, row, "attempt identity mismatch", log, summary)
+        return
+    proof, reason = _readback_fixer_message(readback, intent, ts=row.get("slack_ts"))
+    if not proof:
+        _hold_scan_reminder(bus, row, reason, log, summary)
+        return
+    try:
+        changed = _cas_scan_reminder_transition(
+            bus, row, "posted", slack_ts=proof["delivery_readback_ts"],
+            meta_update={"scan_reminder_readback": proof})
+        if not changed:
+            raise ValueError("verified receipt CAS refused: concurrent owner")
+        summary["reconciled_posted"] = int(summary.get("reconciled_posted") or 0) + 1
+    except Exception:
+        _hold_scan_reminder(bus, row, "verified Slack receipt database write failed", log, summary)
+
 def _dispatch_one(bus, post, row, *, identity, log, summary, now=None,
                   member_check=None, readback=None):
     att = row.get("attachments") or {}
+    if _scan_reminder_candidate(row):
+        _dispatch_scan_reminder(bus, post, row, identity, log, summary, now=now, readback=readback)
+        return
     if att.get("fixer_route_pending") is True:
         # Direct first-contact completion owns this reserved row. An outbox
         # sweep must never turn it into a portal delivery or a second Slack POST.
