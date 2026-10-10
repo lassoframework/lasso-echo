@@ -2089,8 +2089,7 @@ def _scan_reminder_eligible(bus, row, identity, *, now=None):
     result = classify_ticket(ticket, messages, gym=gyms[0])
     return (result.get("ticket_id") == ticket["id"]
             and (result.get("client_visible_working") is True
-                 or (ticket.get("status") == "new"
-                     and result.get("reason") == "client_request_open"))
+                 or result.get("category") == "exception")
             and result.get("reason") == att.get("reason"))
 
 

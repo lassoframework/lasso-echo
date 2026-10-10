@@ -115,6 +115,23 @@ def test_missing_sender_auth_failure_refuses_post(monkeypatch):
     assert outbox._scan_reminder_sender(identity) is None
 
 
+@pytest.mark.parametrize("status,reason", [
+    ("approved", "client_approved_pending_action"),
+    ("failed", "client_sees_refused"),
+])
+def test_nonworking_client_exception_revalidated_before_internal_post(monkeypatch,
+                                                                       status, reason):
+    bus = Bus()
+    bus.ticket_row["status"] = status
+    bus.row = reminder._notice_identity({**bus.ticket_row,
+                                         "ticket_id": "ticket-1",
+                                         "reason": reason}, NOW)
+    calls, summary = dispatch(monkeypatch, bus)
+    assert summary["posted"] == 1
+    assert len(calls) == 1 and calls[0][0][0] == "CINTERNAL"
+    assert bus.row["delivery_status"] == "posted"
+
+
 @pytest.mark.parametrize("field,value", [
     ("request_version", 3), ("request_version", True), ("client_id", "other"),
     ("bot_identity", "scout"), ("source", "ops_fix"), ("product", "portal"),

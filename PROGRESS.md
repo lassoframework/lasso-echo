@@ -1,10 +1,10 @@
 ## Support ticket reconciliation and owner reminders (2026-10-09, PR #398)
 
-- [~] The read-only shared Help Center scan classifies client-facing tickets against current gym and message evidence. Its actionable list includes every ticket still shown as working and new requests stuck in received status; the latter alert only after 30 minutes.
+- [~] The read-only shared Help Center scan classifies client-facing tickets against current gym and message evidence. Its actionable list includes every verified-client exception (including approved and failed states), every ticket still shown as working, and new requests stuck in received status; the latter alert only after 30 minutes. Unknown statuses are sanitized and sent to degraded health rather than persisted as arbitrary text.
 - [~] A default-off internal reminder lane claims one notice per ticket/request version/UTC day and routes Echo, portal and website tickets to their armed owner identity. Dispatch rechecks the exact ticket, gym, messages and age before posting. Durable Slack intent and timestamp readback prevent automatic resend after an uncertain outcome; those notices remain held for exact recovery.
 - [~] Degraded or unrouted passes now produce a bounded health notice to the reviewed private #echosupport channel, with bot identity and exact Slack readback required before confirmed status. Uncertain alert sends remain unconfirmed and retry at the next hourly opportunity. This is still unproven in the deployed runtime.
-- [~] Focused local tests passed and a separate reviewer accepted the default-off implementation. The 19-ticket fixture is synthetic. No client resolution message, ticket closeout or production delivery is claimed.
-- [ ] Verify the live census, deployed support-channel route and actual health/reminder receipts, then merge/deploy and enable the lane. Each ticket still requires independent fix verification, truthful client resolution receipt, guarded close and closed-status readback.
+- [~] The scanner was replayed offline against sanitized production metadata: 68 ticket rows scanned, 19 actionable, including all four Dale tickets. Focused local tests passed and a separate reviewer accepted the default-off implementation. No client resolution message, ticket closeout or production delivery is claimed.
+- [ ] Reconcile the overlapping outbox edits with FIXER PR #372, pass exact-head CI, verify an actual internal reminder receipt, then merge/deploy and enable the lane. Each ticket still requires independent fix verification, truthful client resolution receipt, guarded close and closed-status readback.
 
 ## FIXER current notice release repairs (2026-10-07, PR #317)
 

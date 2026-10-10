@@ -289,6 +289,36 @@ def test_fresh_new_request_is_not_alerted_yet():
     assert bus.inserted == []
 
 
+@pytest.mark.parametrize("status,reason,phrase", [
+    ("approved", "client_approved_pending_action", "client-approved action still pending"),
+    ("failed", "client_sees_refused", "failed request to the client"),
+])
+def test_client_visible_nonworking_exception_routes_to_owner(status, reason, phrase):
+    ticket = _ticket(32, status=status, resolved_at=None)
+    bus = FakeBus([ticket], GYMS)
+    report = R.scan.scan_support_bus(bus)
+    assert report["client_visible_working"] == 0
+    assert report["actionable"][0]["reason"] == reason
+    result = R.run(bus=bus, now=NOW, enabled=True)
+    assert result["queued"] == [ticket["id"]]
+    notice = _reminder_for(bus, ticket["id"], 1)
+    assert phrase in notice["body"]
+    assert "SECRET" not in notice["body"]
+
+
+def test_unknown_status_degrades_to_internal_health_without_persisting_raw_status():
+    ticket = _ticket(33, status="unexpected SECRET STATUS", resolved_at=None)
+    bus = FakeBus([ticket], GYMS)
+    report = R.scan.scan_support_bus(bus)
+    assert report["actionable"][0]["reason"] == "unknown_status"
+    assert report["actionable"][0]["status"] == "unknown"
+    assert "SECRET" not in str(report)
+    result = R.run(bus=bus, now=NOW, enabled=True)
+    assert result["queued"] == [] and result["skipped"] == [ticket["id"]]
+    assert result["degraded"] is True
+    assert bus.inserted == []
+
+
 def test_new_utc_day_or_version_queues_a_new_reminder():
     bus = FakeBus(_census(), GYMS)
     R.run(bus=bus, now=NOW, enabled=True)

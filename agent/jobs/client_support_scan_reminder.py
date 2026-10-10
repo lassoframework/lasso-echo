@@ -33,9 +33,15 @@ _SUPPORT_OWNER_BY_PRODUCT = {"echo": "echo", "portal": "scout",
 
 _REASON_TOKENS = frozenset({
     "client_request_open",
+    "client_approved_pending_action",
+    "client_sees_refused",
     "terminal_missing_completion_receipt",
     "resolved_missing_resolved_at",
     "merged_missing_resolved_at",
+})
+_WORKING_REASON_TOKENS = frozenset({
+    "client_request_open", "terminal_missing_completion_receipt",
+    "resolved_missing_resolved_at", "merged_missing_resolved_at",
 })
 NEW_INTAKE_GRACE = timedelta(minutes=30)
 
@@ -113,6 +119,10 @@ def _valid_entry(entry, *, armed_identities=None):
         and isinstance(version, int) and not isinstance(version, bool)
         and 0 <= version <= 2**53 - 1
         and isinstance(entry.get("status"), str) and bool(entry["status"].strip())
+        and (entry.get("reason") != "client_approved_pending_action"
+             or entry.get("status") == "approved")
+        and (entry.get("reason") != "client_sees_refused"
+             or entry.get("status") == "failed")
         and (entry.get("status") != "new"
              or _parse_ts(entry.get("created_at")) is not None)
     )
@@ -133,6 +143,14 @@ def _notice_identity(entry, now):
         body = (f"CLIENT SUPPORT SCAN REMINDER: ticket {entry['ticket_id']} "
                 "remains received and untriaged after 30 minutes. This is an "
                 "internal reminder; the ticket is unchanged.")
+    elif entry["reason"] == "client_approved_pending_action":
+        body = (f"CLIENT SUPPORT SCAN REMINDER: ticket {entry['ticket_id']} "
+                "has a client-approved action still pending. This is an "
+                "internal reminder; the ticket is unchanged.")
+    elif entry["reason"] == "client_sees_refused":
+        body = (f"CLIENT SUPPORT SCAN REMINDER: ticket {entry['ticket_id']} "
+                "shows a failed request to the client. This is an internal "
+                "reminder; the ticket is unchanged.")
     else:
         body = (f"CLIENT SUPPORT SCAN REMINDER: ticket {entry['ticket_id']} still "
                 f"displays working to the client (reason: {entry['reason']}). This "
@@ -264,7 +282,9 @@ def run(*, bus=None, now=None, enabled=None, log=print):
             or any(not isinstance(entry, dict) for entry in actionable)):
         return {"ok": False, "queued": [], "reason": "scan_report_malformed"}
     if report.get("client_visible_working") != sum(
-            entry.get("status") != "new" for entry in actionable):
+            entry.get("status") != "new"
+            and entry.get("reason") in _WORKING_REASON_TOKENS
+            for entry in actionable):
         return {"ok": False, "queued": [], "reason": "scan_report_malformed"}
 
     queued, duplicates, skipped = [], [], []

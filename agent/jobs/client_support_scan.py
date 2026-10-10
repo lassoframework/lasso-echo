@@ -169,10 +169,9 @@ def scan_support_bus(bus=None, *, page_size=500, max_pages=1000):
         1 for bucket in summary.values() for r in bucket
         if r.get("client_visible_working"))
 
-    # Actionable list: every verified real-client ticket whose classifier says
-    # the portal still displays working, plus new requests that may be stuck
-    # before intake. The reminder applies an age threshold to those new rows.
-    # Bounded
+    # Actionable list: every verified real-client exception, including states
+    # the portal calls received, approved or refused, plus working anomalies.
+    # The reminder applies an age threshold to new/received rows. Bounded
     # metadata only -- never ticket text, bodies, attachments, or gym slugs.
     tickets_by_id = {t.get("id"): t for t in tickets if isinstance(t, dict)}
 
@@ -188,7 +187,8 @@ def scan_support_bus(bus=None, *, page_size=500, max_pages=1000):
             "bot_identity": ticket.get("bot_identity"),
             "client_id": ticket.get("client_id"),
             "request_version": ticket.get("request_version"),
-            "status": ticket.get("status"),
+            "status": ("unknown" if r.get("reason") == "unknown_status"
+                       else ticket.get("status")),
         }
         if ticket.get("status") == "new":
             entry["created_at"] = ticket.get("created_at")
@@ -197,12 +197,8 @@ def scan_support_bus(bus=None, *, page_size=500, max_pages=1000):
     actionable = []
     for bucket in summary.values():
         for r in bucket:
-            ticket = tickets_by_id.get(r.get("ticket_id"))
-            stale_intake_candidate = (r.get("category") == EXCEPTION
-                                      and r.get("reason") == "client_request_open"
-                                      and isinstance(ticket, dict)
-                                      and ticket.get("status") == "new")
-            if not r.get("client_visible_working") and not stale_intake_candidate:
+            client_exception = r.get("category") == EXCEPTION
+            if not r.get("client_visible_working") and not client_exception:
                 continue
             entry = _actionable_entry(r)
             if entry is not None:
