@@ -69,6 +69,7 @@ TOKEN_READ_ALLOWLIST = {
     "social_intake_reader.py",      # resolve ONE intake's raw key to its token key
     "source_brand_ingest.py",       # exact mapped gym_id eq. before and after ONE capture write
     "source_brand_collector.py",    # approved ONE-gym resolver; transport enforces gym_id eq. UUID
+    "astra_prompt.py",              # exact account key -> ONE reciprocal gym UUID for approved palette readback
     "source_brand_provider_refresh_job.py",  # each approved, allowlisted gym gets one gym_id=eq. token check;
                                               # token rows never enumerate the refresh fleet
     os.path.join("slack_convo", "listener_wiring.py"),   # ONE Slack user's gym -> its key

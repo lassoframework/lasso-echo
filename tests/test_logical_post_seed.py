@@ -79,7 +79,7 @@ def writer_environment(monkeypatch, tmp_path):
     monkeypatch.setattr(infographic, "real_media_status",
                          lambda *_a, **_k: (infographic.MEDIA_DEPLETED, "proven empty"))
     monkeypatch.setattr(astra_prompt, "build_infographic_brief", lambda *a, **k: "grounded test brief")
-    monkeypatch.setattr(astra_prompt, "load_gym_brand_palette", lambda *_: {
+    monkeypatch.setattr(astra_prompt, "load_gym_brand_palette", lambda *_, **__: {
         "canvas": "#112233", "ink": "#FFFFFF", "accent": "#C8102E"})
     monkeypatch.setattr(infographic, "_generate_astra_only", lambda *a, **k: _GeneratedImage())
     monkeypatch.setattr(media_host, "host_media",

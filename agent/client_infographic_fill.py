@@ -526,10 +526,19 @@ def fill_gaps(base, account, store, *, voice, logger=None, now=None,
         return {"ok": False, "reason": reason}
     gym_palette = None
     if not _ap.is_lasso_account(account.key):
-        gym_palette = _ap.load_gym_brand_palette(account.key)
+        # Approved source only: the active approved same-gym source-brand
+        # bundle, read back through the narrow scheduler read-only adapter on
+        # this caller's existing store credentials (never dedicated owner
+        # credentials). A missing/error/ambiguous/stale/cross-tenant readback
+        # fails CLOSED -- no brand_colors.json rescue at this ordinary call
+        # site.
+        gym_palette = _ap.load_gym_brand_palette(
+            account.key,
+            bundle_reader=lambda b: _ap.scheduler_source_brand_bundle(store, b),
+            now=now)
         if not gym_palette:
-            reason = (f"no verified brand colors for {base} "
-                      f"(expected {_ap._gym_brand_colors_path(base)}); "
+            reason = (f"no verified brand colors for {base} (no valid active "
+                      "approved source-brand bundle palette); "
                       "infographic fallback held")
             log(reason)
             return {"ok": False, "reason": reason}

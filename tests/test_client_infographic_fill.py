@@ -102,6 +102,15 @@ class _Store:
         return 0
 
 
+def _stub_palette(monkeypatch, palette=None):
+    """The verified-palette lookup is exercised separately (offline adapter +
+    evidence tests); here the fill pipeline gets a deterministic verified
+    palette, or None to exercise the fail-closed hold."""
+    from agent import astra_prompt
+    monkeypatch.setattr(astra_prompt, "load_gym_brand_palette",
+                        lambda key, **kw: palette)
+
+
 def _stub_pipeline(monkeypatch):
     """Stub nano + hosting so the test is offline; captions go through the REAL
     make_caption (template path, no LLM key) and the REAL A+ gate."""
@@ -114,6 +123,9 @@ def _stub_pipeline(monkeypatch):
     monkeypatch.setattr(creative_studio, "_render_with_timeout", lambda fn: fn())
     monkeypatch.setattr(media_host, "host_media",
                         lambda path, key: f"https://r2/{os.path.basename(path)}")
+    _stub_palette(monkeypatch, {"colors": list(GYMX_BRAND_COLORS),
+                                "path": "source-brand-bundle:test",
+                                "source": "source_brand_bundle"})
 
 
 def test_flag_off_is_noop(monkeypatch):
@@ -290,6 +302,7 @@ def test_missing_brand_colors_fails_closed(monkeypatch, tmp_path):
     why. Colors are never invented from the voice doc's tone."""
     _sources()
     _stub_pipeline(monkeypatch)
+    _stub_palette(monkeypatch, None)
     monkeypatch.setenv("AGENT_CLIENT_VOICE_DIR", str(tmp_path / "empty_voice"))
     logs = []
     store = _Store()
@@ -312,6 +325,7 @@ def test_unproven_brand_colors_fail_closed(monkeypatch, tmp_path):
     (gym_dir / "brand_colors.json").write_text(
         '{"colors": ["#1B2A3C", "#F2EDDE"]}')
     monkeypatch.setenv("AGENT_CLIENT_VOICE_DIR", str(voice_dir))
+    _stub_palette(monkeypatch, None)  # unproven input never becomes a palette
     store = _Store()
     out = cif.fill_gaps("gymx", _acct(), store, voice=_voice(),
                         now="2026-08-25T12:00:00-04:00")
@@ -358,6 +372,9 @@ def test_client_gym_never_initializes_the_gemini_lane(monkeypatch):
     from agent import creative_studio
 
     _sources()
+    _stub_palette(monkeypatch, {"colors": list(GYMX_BRAND_COLORS),
+                                "path": "source-brand-bundle:test",
+                                "source": "source_brand_bundle"})
     monkeypatch.setattr(config, "lasso_infographic_quality_enabled", lambda _key: True)
     monkeypatch.setattr(
         creative_studio, "_default_client",
@@ -790,6 +807,9 @@ def test_guard_on_routes_through_production_store_with_exact_hosted_astra_bytes(
     monkeypatch.setenv("AGENT_VISUAL_GLOBAL_WRITER_PREP", "true")
     monkeypatch.setattr(config, "S3_PUBLIC_BASE_URL", "https://r2", raising=False)
     _sources()
+    _stub_palette(monkeypatch, {"colors": list(GYMX_BRAND_COLORS),
+                                    "path": "source-brand-bundle:test",
+                                    "source": "source_brand_bundle"})
     served = _stub_pipeline_hosting(monkeypatch)
     _arm_astra(monkeypatch, 200, _astra_body())
 
@@ -867,6 +887,9 @@ def test_guard_off_through_production_store_no_prep_calls_legacy_row_shape(
 
     monkeypatch.delenv("AGENT_VISUAL_GLOBAL_WRITER_PREP", raising=False)
     _sources()
+    _stub_palette(monkeypatch, {"colors": list(GYMX_BRAND_COLORS),
+                                "path": "source-brand-bundle:test",
+                                "source": "source_brand_bundle"})
     _stub_pipeline_hosting(monkeypatch)
     _arm_astra(monkeypatch, 200, _astra_body())
     store, http = _production_store()
@@ -1017,6 +1040,9 @@ def test_media_status_uncertain_for_malformed_hidden_same_byte_alias(monkeypatch
 def test_fill_gaps_holds_when_generation_inventory_becomes_uncertain(monkeypatch):
     """A depleted first read cannot mask a later uncertain inventory read."""
     _sources()
+    _stub_palette(monkeypatch, {"colors": list(GYMX_BRAND_COLORS),
+                                "path": "source-brand-bundle:test",
+                                "source": "source_brand_bundle"})
     statuses = iter(((cif.MEDIA_DEPLETED, "proven empty"),
                      (cif.MEDIA_UNCERTAIN, "Drive read failed")))
     monkeypatch.setattr(cif, "real_media_status", lambda *_a, **_k: next(statuses))

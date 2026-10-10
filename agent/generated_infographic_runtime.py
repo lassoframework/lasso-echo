@@ -337,14 +337,16 @@ def validate_authority_pins(pins, base):
     return dict(pins)
 
 
-def delegated_copy(active, base, *, caption=None, local_date=None, now=None):
-    """Exact byte witnesses plus deterministic verbatim derivation, no approval.
+def delegated_palette(active, base, *, now=None):
+    """Verified website palette for the ACTIVE APPROVED same-gym bundle.
 
-    Only consume an authenticated CURRENT active readback. Hashes alone cannot
-    establish actor authority, semantic validation or current locator identity.
-    The trusted SQL bridge must recheck those under its existing tenant locks.
+    Runs the exact same tenant/approval/observation/byte/freshness/provider
+    evidence validation as delegated_copy, WITHOUT deriving copy, selecting a
+    fact by date, or enforcing copy style. Returns the verified palette plus
+    the validated internals delegated_copy reuses. Any missing, stale,
+    cross-tenant, unapproved or tampered evidence fails closed (RuntimeHold).
     """
-    from datetime import datetime, timezone, date
+    from datetime import datetime, timezone
     now = _stamp(now) if isinstance(now, str) else now or datetime.now(timezone.utc)
     try:
         if (not isinstance(active, dict) or active.get('fact_approval_mode') != 'delegated_policy'
@@ -369,6 +371,9 @@ def delegated_copy(active, base, *, caption=None, local_date=None, now=None):
             raise ValueError()
         if (observation['gym_id'] != gym or observation['bundle_id'] != bundle_id
                 or observation['configuration_sha256'] != bundle['content_sha256']
+                or type(observation.get('id')) is not int or observation['id'] < 1
+                or not isinstance(observation.get('validator_revision'), str)
+                or not observation['validator_revision'].strip()
                 or observation['validation_report'].get('selected_facts_status') != 'supported_uncontradicted'
                 or observation['validation_report'].get('identity_status') != 'verified'
                 or not _stamp(receipt['created_at']) <= _stamp(observation['created_at']) <= now):
@@ -408,6 +413,32 @@ def delegated_copy(active, base, *, caption=None, local_date=None, now=None):
                 c['provider_account_id'], c['mapping_revision'], prep.canonical(c['mapping_evidence'])) for c in snap['captures'])
         if identities(configuration) != identities(current):
             raise ValueError()
+        palette = dict(gym_id=base, verified=True, colors=[current['palette'][k] for k in ('primary','secondary')],
+                       evidence_ref='source-brand-observation:sha256:' + observation['content_sha256'])
+        return dict(palette=palette, now=now, gym=gym, bundle=bundle, bundle_id=bundle_id,
+                    receipt=receipt, observation=observation, current=current)
+    except RuntimeHold:
+        raise
+    except (ValueError, KeyError, TypeError, AttributeError, UnicodeError):
+        raise RuntimeHold('generated_bundle_evidence_invalid') from None
+
+
+def delegated_copy(active, base, *, caption=None, local_date=None, now=None):
+    """Exact byte witnesses plus deterministic verbatim derivation, no approval.
+
+    Only consume an authenticated CURRENT active readback. Hashes alone cannot
+    establish actor authority, semantic validation or current locator identity.
+    The trusted SQL bridge must recheck those under its existing tenant locks.
+    Bundle evidence validation is shared with delegated_palette; the copy
+    selection, witness, style and derivation-pin checks below are unchanged.
+    """
+    from datetime import date
+    verified = delegated_palette(active, base, now=now)
+    try:
+        palette = verified['palette']
+        gym, bundle = verified['gym'], verified['bundle']
+        bundle_id, receipt = verified['bundle_id'], verified['receipt']
+        observation, current = verified['observation'], verified['current']
         facts = sorted(current['selected_facts'], key=lambda f: f['key'])
         if caption is None:
             selected = facts[date.fromisoformat(local_date).toordinal() % len(facts)]
@@ -429,8 +460,6 @@ def delegated_copy(active, base, *, caption=None, local_date=None, now=None):
             observation_id=observation['id'], observation_sha256=observation['content_sha256'],
             validator_revision=observation['validator_revision'], derivation_sha256=prep.digest(derivation))
         validate_authority_pins(pins, base)
-        palette = dict(gym_id=base, verified=True, colors=[current['palette'][k] for k in ('primary','secondary')],
-                       evidence_ref='source-brand-observation:sha256:' + observation['content_sha256'])
         return dict(copy=copy, caption=caption, palette=palette, authority_pins=pins,
                     copy_derivation_receipt=derivation, copy_approved=False, copy_verified=True,
                     source_revision='source-brand:sha256:' + prep.digest(pins),
