@@ -2195,6 +2195,12 @@ def _dispatch_scan_reminder(bus, post, row, identity, log, summary, *, now=None,
 def _reconcile_held_scan_reminders(bus, identity, readback, log, summary):
     from ..jobs.client_support_reconciler import fetch_pages
     from ..jobs import client_support_scan as scan
+    from ..jobs.client_support_scan_reminder import _enabled
+    # The lane is default-off. Do not add a full held-row bus scan to every
+    # production outbox tick until it is armed; held rows remain quarantined
+    # during a rollback and can be reconciled after re-enabling the lane.
+    if not _enabled():
+        return
     def page(cursor, size):
         params = {"select": "*", "delivery_status": "eq.held",
                   "attachments->>identity": f"eq.{identity.name}",

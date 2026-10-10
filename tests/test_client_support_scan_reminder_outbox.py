@@ -329,6 +329,7 @@ def test_new_ticket_creation_drift_suppresses(monkeypatch):
 
 
 def test_held_recovery_queries_only_reminders_with_keyset(monkeypatch):
+    monkeypatch.setenv("AGENT_CLIENT_SUPPORT_SCAN_REMINDER_ENABLED", "true")
     bus = Bus()
     calls = []
     def get(table, params):
@@ -340,3 +341,10 @@ def test_held_recovery_queries_only_reminders_with_keyset(monkeypatch):
     assert calls[0][1]['attachments->>identity'] == 'eq.echo'
     assert calls[0][1]['delivery_status'] == 'eq.held'
     assert calls[0][1]['order'] == 'created_at.asc,id.asc'
+
+
+def test_held_recovery_does_not_query_bus_while_lane_disabled(monkeypatch):
+    monkeypatch.delenv("AGENT_CLIENT_SUPPORT_SCAN_REMINDER_ENABLED", raising=False)
+    bus = Bus()
+    bus._get = lambda *_: pytest.fail("default-off lane must not scan held rows")
+    outbox._reconcile_held_scan_reminders(bus, IDENTITY, None, lambda *a: None, {})
