@@ -30,6 +30,23 @@ ENV_ADMIN_PUBLIC_KEY = "AGENT_EXACT_BYTE_ADMIN_PUBLIC_KEY_B64"
 ENV_ATTESTATION_PATH = "AGENT_EXACT_BYTE_ATTESTATION_PATH"
 ENV_RETENTION_SECONDS = "AGENT_EXACT_BYTE_RETENTION_SECONDS"
 
+#: Attestation transport selection. Explicit and mutually exclusive:
+#: "local" (or unset, the pre-transport default) requires ATTESTATION_PATH
+#: and forbids every control env; "r2-control" requires ALL control envs and
+#: forbids ATTESTATION_PATH. Anything else is a fail-closed hold.
+ENV_ATTESTATION_SOURCE = "AGENT_EXACT_BYTE_ATTESTATION_SOURCE"
+#: Publisher-side pinned PRIVATE MUTABLE R2 CONTROL bucket identity, fully
+#: separate from the locked media bucket. The publisher holds ONLY a
+#: read-only control token here; no signer or write secret ever appears in
+#: the publisher environment.
+ENV_CONTROL_ACCOUNT_ID = "AGENT_EXACT_BYTE_CONTROL_R2_ACCOUNT_ID"
+ENV_CONTROL_BUCKET = "AGENT_EXACT_BYTE_CONTROL_R2_BUCKET"
+ENV_CONTROL_KEY = "AGENT_EXACT_BYTE_CONTROL_OBJECT_KEY"
+ENV_CONTROL_RO_KEY_ID = "AGENT_EXACT_BYTE_CONTROL_R2_RO_ACCESS_KEY_ID"
+ENV_CONTROL_RO_SECRET = "AGENT_EXACT_BYTE_CONTROL_R2_RO_SECRET_ACCESS_KEY"
+_CONTROL_ENVS = (ENV_CONTROL_ACCOUNT_ID, ENV_CONTROL_BUCKET, ENV_CONTROL_KEY,
+                 ENV_CONTROL_RO_KEY_ID, ENV_CONTROL_RO_SECRET)
+
 _ACCOUNT_ID_RE = re.compile(r"[0-9a-f]{32}")
 _BUCKET_RE = re.compile(r"[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]")
 _MAX_RETENTION_SECONDS = 86400
@@ -102,6 +119,88 @@ def _attestation_loader(path):
     return load
 
 
+def _control_object_key(value):
+    if (not value or value.startswith("/") or "\\" in value
+            or any(part in ("", ".", "..") for part in value.split("/"))
+            or len(value) > 1024):
+        raise _ConfigHold(f"{ENV_CONTROL_KEY} missing or malformed")
+    return value
+
+
+def _remote_attestation_loader(*, account_id, bucket, key, key_id, secret,
+                               s3_client=None):
+    """Bounded authenticated read-only control-object loader.
+
+    Builds (or accepts an injected) S3 client pinned to the control account's
+    R2 endpoint and returns a loader that performs a FRESH bounded get_object
+    on EVERY call: per-send re-fetch, never a cached success. Any transport,
+    length or read failure raises ImmutableMediaError, which the signed lock
+    source converts to a held verification.
+    """
+    client = s3_client if s3_client is not None else _r2_read_only_client(
+        account_id, key_id, secret)
+
+    def load():
+        body = None
+        try:
+            obj = client.get_object(Bucket=bucket, Key=key)
+            length = obj.get("ContentLength")
+            if (not isinstance(length, int) or isinstance(length, bool)
+                    or not 0 < length <= media.MAX_ATTESTATION_BYTES):
+                raise ValueError()
+            body = obj["Body"]
+            data = body.read(media.MAX_ATTESTATION_BYTES + 1)
+            if not isinstance(data, bytes) or len(data) != length:
+                raise ValueError()
+            return data
+        except Exception:
+            raise media.ImmutableMediaError(
+                "control attestation transport unavailable") from None
+        finally:
+            if body is not None:
+                try:
+                    body.close()
+                except Exception:
+                    pass
+
+    return load
+
+
+def _attestation_source(environ, *, control_s3_client=None):
+    """Resolve the explicit, mutually exclusive attestation transport.
+
+    Returns (loader, verify_initial). verify_initial is True only for the
+    local-file source: a bad local file is a configuration defect held at
+    activation. The remote source is verified lazily per send so a
+    long-lived store recovers after a temporary transport outage while
+    never authorizing a send during the outage.
+    """
+    source = (environ.get(ENV_ATTESTATION_SOURCE, "") or "").strip().lower()
+    path = (environ.get(ENV_ATTESTATION_PATH, "") or "").strip()
+    control = {name: (environ.get(name, "") or "").strip()
+               for name in _CONTROL_ENVS}
+    any_control = any(control.values())
+    if source in ("", "local"):
+        if any_control:
+            raise _ConfigHold("attestation source ambiguous")
+        return _attestation_loader(path), True
+    if source == "r2-control":
+        if path:
+            raise _ConfigHold("attestation source ambiguous")
+        if not all(control.values()):
+            raise _ConfigHold("control attestation identity missing or malformed")
+        account_id = _required(environ, ENV_CONTROL_ACCOUNT_ID, _ACCOUNT_ID_RE)
+        bucket = _required(environ, ENV_CONTROL_BUCKET, _BUCKET_RE)
+        key = _control_object_key(control[ENV_CONTROL_KEY])
+        loader = _remote_attestation_loader(
+            account_id=account_id, bucket=bucket, key=key,
+            key_id=control[ENV_CONTROL_RO_KEY_ID],
+            secret=control[ENV_CONTROL_RO_SECRET],
+            s3_client=control_s3_client)
+        return loader, False
+    raise _ConfigHold(f"{ENV_ATTESTATION_SOURCE} missing or malformed")
+
+
 def _require_signed_serving_evidence(doc, *, account_id, bucket, base):
     """Validate the signed serving contract against the operator-pinned identity.
 
@@ -162,15 +261,17 @@ def _r2_read_only_client(account_id, key_id, secret):
     )
 
 
-def _build(environ, *, store, s3_client, proof_sink):
+def _build(environ, *, store, s3_client, proof_sink, control_s3_client=None,
+           verify_initial=True):
     """Assemble the pinned config; raises _ConfigHold on any gap."""
     account_id = _required(environ, ENV_ACCOUNT_ID, _ACCOUNT_ID_RE)
     bucket = _required(environ, ENV_BUCKET, _BUCKET_RE)
     base = _public_base_url(environ)
     retention = _retention_seconds(environ)
     key = _admin_public_key(environ)
-    loader = _attestation_loader(
-        (environ.get(ENV_ATTESTATION_PATH, "") or "").strip())
+    loader, initial_required = _attestation_source(
+        environ, control_s3_client=control_s3_client)
+    verify_initial = verify_initial and initial_required
     if s3_client is None:
         key_id = _required(environ, ENV_RO_KEY_ID)
         secret = _required(environ, ENV_RO_SECRET)
@@ -181,10 +282,11 @@ def _build(environ, *, store, s3_client, proof_sink):
             raise _ConfigHold("proof sink missing or malformed")
     lock_source = _ServingEvidenceLockSource(
         loader, key, account_id=account_id, bucket=bucket, base=base)
-    try:
-        lock_source.verified_document()
-    except media.ImmutableMediaError as exc:
-        raise _ConfigHold(str(exc)) from None
+    if verify_initial:
+        try:
+            lock_source.verified_document()
+        except media.ImmutableMediaError as exc:
+            raise _ConfigHold(str(exc)) from None
     return {
         "bucket": bucket,
         "account_id": account_id,
@@ -196,7 +298,8 @@ def _build(environ, *, store, s3_client, proof_sink):
     }
 
 
-def activate(environ=None, *, store=None, s3_client=None, proof_sink=None):
+def activate(environ=None, *, store=None, s3_client=None, proof_sink=None,
+             control_s3_client=None, verify_initial=True):
     """Return the server-owned RuntimeActivation; NEVER raises.
 
     Every trusted value comes from ``environ`` (os.environ in production) or
@@ -209,7 +312,9 @@ def activate(environ=None, *, store=None, s3_client=None, proof_sink=None):
         return RuntimeActivation(None, "environment mapping unavailable")
     try:
         config = _build(environ, store=store, s3_client=s3_client,
-                        proof_sink=proof_sink)
+                        proof_sink=proof_sink,
+                        control_s3_client=control_s3_client,
+                        verify_initial=verify_initial)
         return RuntimeActivation(config, "")
     except _ConfigHold as exc:
         return RuntimeActivation(None, exc.reason)
@@ -218,5 +323,12 @@ def activate(environ=None, *, store=None, s3_client=None, proof_sink=None):
 
 
 def verifier_config_or_none(environ=None, *, store=None):
-    """Store hook entry point: the pinned config dict, or None (held)."""
-    return activate(environ, store=store).verifier_config
+    """Store hook entry point: the pinned config dict, or None (held).
+
+    Lazy document verification: a long-lived store constructed during a
+    temporary attestation transport outage still receives a complete pinned
+    config, so the NEXT send's fresh fetch can succeed once the transport
+    recovers. No send is ever authorized during the outage because the
+    signed lock source re-fetches and re-verifies on every verification.
+    """
+    return activate(environ, store=store, verify_initial=False).verifier_config
