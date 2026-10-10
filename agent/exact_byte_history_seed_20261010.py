@@ -874,9 +874,12 @@ def emit_seed_sql(tenants, targets, proofs, members, coverage, observations,
         '-- table: the owner role has NO SELECT privilege on it. A separately',
         '-- privileged, read-only gate-OFF readback receipt is required BEFORE',
         '-- and AFTER apply; keeping the gate OFF is a separate release gate.',
-        '-- The applying login must ALSO hold SELECT on public.content_calendar:',
-        '-- the migration grants exact_byte_owner_20261010 no privilege there,',
-        '-- and the SHARE lock + snapshot pre-guard below require it.',
+        '-- The applying login must ALSO hold SELECT and UPDATE on',
+        '-- public.content_calendar through a controlled operator role:',
+        '-- PostgreSQL 17 requires UPDATE for the SHARE lock, though this seed',
+        '-- never updates calendar rows. Do not grant that privilege to',
+        '-- exact_byte_owner_20261010; record any temporary operator grant',
+        '-- and revocation in the release receipt.',
         '-- Lock discipline (mirrors exact_byte_activate_20261010 exactly, so',
         '-- lock ordering cannot deadlock against activation/send): bounded',
         '-- lock_timeout/statement_timeout first, then the shared transaction',
@@ -1163,8 +1166,10 @@ def run(reader, mapping_data, *, fetcher, baseline_min=BASELINE_MIN_ROWS,
     manifest['readback_sql_sha256'] = _sha256_text(readback_sql)
     manifest['verification'] = {
         'before': 'Confirm migration applied and login inherits '
-                  'exact_byte_owner_20261010; record a separately privileged '
-                  'read-only gate-OFF receipt; freeze manifest digests.',
+                  'exact_byte_owner_20261010 and separately holds SELECT and '
+                  'UPDATE on content_calendar for SHARE lock; record a '
+                  'separately privileged read-only gate-OFF receipt; freeze '
+                  'manifest digests.',
         'apply': 'psql the seed SQL as that login; it is one READ COMMITTED '
                  'transaction whose guards roll back everything on mismatch.',
         'readback': 'Run the readback SQL; it raises on any digest/count/'

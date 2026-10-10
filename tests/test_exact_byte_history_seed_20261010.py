@@ -825,6 +825,8 @@ def test_seed_sql_uses_migration_advisory_key_and_share_lock():
         'lock table public.content_calendar in share mode;')
     result = run_ok([make_row(1)], make_mapping())
     assert "hashtextextended('exact_byte_send_20261010', 0)" in result.seed_sql
+    assert 'must ALSO hold SELECT and UPDATE' in result.seed_sql
+    assert 'UPDATE on content_calendar for SHARE lock' in result.manifest['verification']['before']
 
 
 def test_generated_sql_uses_only_insert_authority_tables():

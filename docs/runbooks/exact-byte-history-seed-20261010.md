@@ -99,9 +99,13 @@ advisory lock via the `seed_lock` trigger, which is re-entrant in-session.
 
 **Operator privilege requirement:** the applying login must inherit
 `exact_byte_owner_20261010` (insert authority on the seed tables) AND hold
-SELECT on `public.content_calendar` — the migration grants the owner role no
-privilege on `content_calendar`, and the SHARE lock plus the snapshot
-pre-guard read require it. Grant that read separately and record it.
+SELECT and UPDATE on `public.content_calendar` through a separately controlled
+operator role. PostgreSQL 17 requires UPDATE (or a broader write privilege)
+for `LOCK TABLE public.content_calendar IN SHARE MODE`; SELECT alone fails even
+though the seed never updates calendar rows. Verify these privileges before
+the seed transaction. Do not grant UPDATE to `exact_byte_owner_20261010` or
+leave an ad hoc operator grant in place after the run; record the operator
+identity and any temporary grant/revocation in the release receipt.
 
 Guards:
 
