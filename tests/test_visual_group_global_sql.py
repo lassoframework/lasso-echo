@@ -42,8 +42,12 @@ def test_activation_is_last_and_imports_under_existing_barrier_before_arm():
     assert "'global_history_imported', true" in sql
     assert "where c.issue<>'ready'" in sql
     assert "where h.issue<>'ready'" in sql
+    assert "public.visual_global_coverage() c\n      where c.issue<>'ready'" in sql
+    assert "public.visual_global_history_coverage() h\n      where h.issue<>'ready'" in sql
     assert "where c.tenant_id=v_tenant" not in sql
-    assert "where h.tenant_id=v_tenant_text" not in sql
+    # A tenant-scoped incident count is included in the activation receipt;
+    # that must not scope either fleet-wide coverage check above.
+    assert "select count(*) into v_incident_rows from public.visual_global_historical_incident h where h.tenant_id=v_tenant_text" in sql
 
 
 def test_byte_hash_alias_requires_explicit_source_or_derived_namespace():
@@ -169,8 +173,8 @@ def test_import_and_activation_enumerate_phase1_objects_and_fail_closed():
     assert "visual_global_scene_object_member" in importer
     assert "visual_global_object_lineage" in importer
     assert "occupied scene has incomplete byte evidence" in importer
-    assert "staged history has no original date" in importer
-    assert "lrow.state='published'" in importer
+    assert "consumed history has no verified original date" in importer
+    assert "v_source:=jsonb_build_object('ledger',to_jsonb(lrow),'sibling_ids'" in importer
     assert "visual_global_claim_fingerprint_set" in importer
     assert "visual_global_claim_scene(public.content_calendar,boolean,boolean)" in activation
     assert "visual_global_object_attestation" in activation
@@ -292,19 +296,26 @@ def test_source_rendition_rpc_consumes_owner_receipts_without_claiming_usage():
     assert "grant execute on function public.visual_global_prepare_source_rendition(text,text,uuid,uuid,uuid,text)\n  to service_role" in sql
 
 
-def test_import_orders_keyed_ledgers_before_null_key_historical_subsets():
+def test_import_orders_local_ledgers_before_all_published_incidents():
     sql = _sql("DRAFT_visual_global_history_20261002.sql")
     importer = sql.split(
         "create or replace function public.visual_global_import_history()", 1
     )[1].split("end;\n$$;", 1)[0]
     keyed = importer.index(
         "for lrow in select l.* from public.visual_group_usage_ledger l")
-    historical = importer.index("where c.visual_group_key is null")
-    assert keyed < historical
+    historical = importer.index(
+        "for r in select c.* from public.content_calendar c\n      where (c.status='published' or c.published_at is not null)"
+    )
+    live_reservations = importer.index(
+        "for lrow in select l.* from public.visual_group_usage_ledger l\n      where l.state='reserved'"
+    )
+    assert keyed < historical < live_reservations
     assert "visual_global_claim_historical_row" in importer
     assert "visual_global_row_verified_fingerprints(r,v_resolved)" in importer
     assert "visual_group_resolve_row" in importer
-    assert "'imported_null_key_rows',v_historical" in importer
+    assert "'imported_null_key_rows',v_null_key" in importer
+    assert "'imported_published_rows',v_historical" in importer
+    assert "'historical_incidents',(select count(*) from public.visual_global_historical_incident)" in importer
     assert "order by c.post_date,c.id" in importer
     coverage = sql.split(
         "create or replace function public.visual_global_coverage()", 1
@@ -313,7 +324,8 @@ def test_import_orders_keyed_ledgers_before_null_key_historical_subsets():
     assert "public.visual_global_row_verified_fingerprints(c,rg.resolved_group)" in coverage
     assert "'unresolved_group'" in coverage
     assert "'not_imported'" in coverage
-    assert "c.visual_group_key is null and m.state not in ('reserved','published')" in coverage
+    assert "public.visual_global_historical_row_covered(c,rg.resolved_group)" in coverage
+    assert "when (c.status='published' or c.published_at is not null)" in coverage
     history = sql.split(
         "create or replace function public.visual_global_history_coverage()", 1
     )[1].split("$$;", 1)[0]
@@ -323,40 +335,50 @@ def test_import_orders_keyed_ledgers_before_null_key_historical_subsets():
     assert "c.id=m.calendar_row_id and c.visual_group_key is null" in history
     assert "public.visual_group_resolve_row(c)=m.group_key" in history
     assert "c.account is not distinct from m.channel" in history
+    assert "global_runtime_claim_without_source_evidence" in history
+    assert "from public.visual_global_historical_incident h" in history
     assert "no blanket" in history
 
 
-def test_historical_claim_enforces_component_wide_date_barrier():
+def test_historical_claim_records_incidents_and_runtime_claims_respect_them():
     sql = _sql("DRAFT_visual_global_history_20261002.sql")
     claim = sql.split("create or replace function public.visual_global_claim_historical_row(", 1)[1].split("end;\n$$;", 1)[0]
-    assert claim.index("visual group has conflicting historical membership") < claim.index(
-        "linked visual scene has a conflicting component-wide usage date")
-    barrier = claim.split("linked visual scene has a conflicting component-wide usage date", 1)[0]
-    assert "public.visual_group_scene_members(" in barrier
-    assert "cm.state in ('reserved','published')" in barrier
-    assert "cm.used_date is distinct from p_date" in barrier
+    assert "historical attribution must match actual published row tenant/group/date/channel" in claim
+    assert "insert into public.visual_global_historical_incident" in claim
+    assert "on conflict (source_kind,source_key,source_state,tenant_id,group_key,fingerprint) do nothing" in claim
+    assert "historical incident source evidence drift" in claim
+    assert "insert into public.visual_global_usage" not in claim
+    assert "insert into public.visual_global_usage_member" not in claim
+    assert "linked visual scene has a conflicting component-wide usage date" not in claim
+
+    runtime_claim = sql.split("create or replace function public.visual_global_claim_fingerprint_set(", 1)[1].split("end;\n$$;", 1)[0]
+    assert "visual fingerprint or scene permanently consumed by historical incident" in runtime_claim
+    assert "from public.visual_global_historical_incident h" in runtime_claim
     coverage = sql.split("create or replace function public.visual_global_coverage()", 1)[1].split("$$;", 1)[0]
-    assert "'component_usage_date_conflict'" in coverage
-    assert coverage.index("'component_usage_date_conflict'") < coverage.index("'not_imported'")
+    assert "'component_usage_date_conflict'" not in coverage
+    assert "public.visual_global_historical_row_covered(c,rg.resolved_group)" in coverage
 
 
-def test_keyed_same_date_reservation_gains_append_only_published_attribution():
+def test_keyed_reservation_keeps_runtime_owner_and_published_incident_separate():
     sql = _sql("DRAFT_visual_global_history_20261002.sql")
-    assert "create table if not exists public.visual_global_published_attribution" in sql
-    assert "unique (tenant_id, group_key, fingerprint, calendar_row_id)" in sql
-    assert "alter table public.visual_global_published_attribution enable row level security" in sql
-    assert "on public.visual_global_published_attribution for each row execute function public.visual_global_immutable()" in sql
+    assert "create table if not exists public.visual_global_historical_incident" in sql
+    assert "unique (source_kind,source_key,source_state,tenant_id,group_key,fingerprint)" in sql
+    assert "alter table public.visual_global_historical_incident enable row level security" in sql
+    assert "revoke all on public.visual_global_historical_incident from public,anon,authenticated,service_role" in sql
+    assert "grant select on public.visual_global_historical_incident to service_role" in sql
+    assert "on public.visual_global_historical_incident for each row\n  execute function public.visual_global_immutable()" in sql
     claim = sql.split("create or replace function public.visual_global_claim_historical_row(", 1)[1].split("end;\n$$;", 1)[0]
-    member = claim.index("on conflict (tenant_id,group_key,fingerprint) do nothing")
-    receipt = claim.index("insert into public.visual_global_published_attribution")
-    assert member < receipt
-    assert "on conflict (tenant_id,group_key,fingerprint,calendar_row_id) do nothing" in claim
+    incident = claim.index("insert into public.visual_global_historical_incident")
+    assert "on conflict (source_kind,source_key,source_state,tenant_id,group_key,fingerprint) do nothing" in claim[incident:]
+    assert "insert into public.visual_global_usage" not in claim
+    assert "insert into public.visual_global_usage_member" not in claim
     importer = sql.split("create or replace function public.visual_global_import_history()", 1)[1].split("end;\n$$;", 1)[0]
     calendar_lock = importer.index("lock table public.content_calendar in share row exclusive mode nowait")
     auxiliary_locks = importer.index("lock table public.visual_group_usage_ledger")
-    attribution_lock = importer.index("public.visual_global_published_attribution", auxiliary_locks)
-    assert calendar_lock < auxiliary_locks < attribution_lock
+    incident_lock = importer.index("public.visual_global_historical_incident", auxiliary_locks)
+    assert calendar_lock < auxiliary_locks < incident_lock
     assert "in share row exclusive mode nowait" in importer[auxiliary_locks:]
     history = sql.split("create or replace function public.visual_global_history_coverage()", 1)[1].split("$$;", 1)[0]
-    assert history.count("public.visual_global_published_attribution pa") == 2
-    assert "pa.calendar_row_id=m.calendar_row_id" in history
+    assert "global_runtime_claim_without_source_evidence" in history
+    assert "from public.visual_global_historical_incident h" in history
+    assert "select h.tenant_id,h.group_key,h.fingerprint,h.used_date,h.source_state,'ready'" in history

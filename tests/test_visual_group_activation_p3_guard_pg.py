@@ -91,13 +91,15 @@ def test_business_behavior_unchanged():
     assert "'idempotent', true" in ACTIVATION
     assert 'perform public.visual_global_import_history();' in ACTIVATION
     assert 'public.visual_global_coverage()' in ACTIVATION
+    assert "public.visual_global_history_coverage() h" in ACTIVATION
+    assert "where h.issue<>'ready'" in ACTIVATION
     assert 'a.transaction_id = txid_current()' in ACTIVATION
     for needle in ('unknown, ambiguous or review-pending media identity',
-                   'missing permanent published usage ledger coverage',
+                   'published row missing immutable historical incident coverage',
                    'missing dated ledger reservation or active sibling coverage',
                    'unresolved historical review events',
                    'unresolved ambiguous usage',
-                   'cross-date occupied visual scene',
+                   'cross-date occupied staged visual scene',
                    'unmapped or foreign tenant calendar key',
                    'undated published row has no verified calendar post_date',
                    'legacy byte_hash lacks source/derived algorithm namespace'):

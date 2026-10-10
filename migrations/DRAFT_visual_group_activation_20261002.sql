@@ -59,6 +59,8 @@ create table if not exists public.visual_group_activation (
 do $$ begin
   if to_regclass('public.visual_global_identity') is null
      or to_regclass('public.visual_global_usage') is null
+     or to_regclass('public.visual_global_historical_incident') is null
+     or to_regprocedure('public.visual_global_historical_row_covered(public.content_calendar,text)') is null
      or to_regclass('public.visual_global_object_attestation') is null
      or to_regclass('public.visual_global_scene_object_member') is null
      or to_regclass('public.visual_global_object_lineage') is null
@@ -167,6 +169,10 @@ declare
   v_ledger_rows integer;
   v_sibling_rows integer;
   v_global_rows integer;
+  v_incident_rows integer;
+  v_row public.content_calendar;
+  v_resolved text;
+  v_fingerprints text[];
   v_proof jsonb;
 begin
   if nullif(btrim(p_gym_id), '') is null then
@@ -218,7 +224,8 @@ begin
     public.visual_group_reconciliation, public.tenant_alias,
     public.visual_global_object_attestation,
     public.visual_global_scene_object_member, public.visual_global_object_lineage,
-    public.visual_global_usage, public.visual_global_usage_member
+    public.visual_global_usage, public.visual_global_usage_member,
+    public.visual_global_published_attribution, public.visual_global_historical_incident
     in share row exclusive mode nowait;
 
   -- 2. Forward entry locks G then C, nonblocking, BEFORE any auxiliary write
@@ -311,6 +318,18 @@ begin
       using errcode='23514';
   end if;
 
+  -- Bind every already published row before backfill's one-date local ledger
+  -- sees it. This records all real past uses without picking or rewriting a
+  -- ledger winner. Unknown bytes/date/identity still abort the transaction.
+  for v_row in select c.* from public.content_calendar c
+      where c.gym_id=any(v_keys) and (c.status='published' or c.published_at is not null)
+      order by c.post_date,c.id loop
+    v_resolved:=public.visual_group_resolve_row(v_row);
+    v_fingerprints:=public.visual_global_row_verified_fingerprints(v_row,v_resolved);
+    perform public.visual_global_claim_historical_row(v_tenant_text,v_resolved,
+      v_row.post_date,v_row.id,v_row.account,v_fingerprints);
+  end loop;
+
   -- 4b. ACTUAL backfill for every covered alias key (not just one). Held rows
   -- become review events; the locked re-read below refuses on any of them, so
   -- a refusal rolls back ALL of these writes with the rest of the transaction.
@@ -335,17 +354,14 @@ begin
       using errcode = '23514';
   end if;
 
-  -- Permanent published usage must exist for every published row's group.
+  -- Every actual published row retains its own tenant/date/media incident.
+  -- A repeated historical row need not agree with a single-date local owner;
+  -- accepting its evidence never re-dates or overwrites that local ledger.
   if exists(select 1 from public.content_calendar r
-    where r.gym_id = any(v_keys)
-      and (r.status = 'published' or r.published_at is not null)
-      and not exists(select 1 from public.visual_group_usage_ledger l
-        where l.gym_id = v_tenant_text
-          and l.group_key = public.visual_group_resolve_row(r)
-          and l.state = 'published'
-          and r.post_date is not null and l.reserved_date = r.post_date)) then
-    raise exception 'activation refused: published row missing permanent published usage ledger coverage or date parity'
-      using errcode = '23514';
+    where r.gym_id=any(v_keys) and (r.status='published' or r.published_at is not null)
+      and not public.visual_global_historical_row_covered(r,public.visual_group_resolve_row(r))) then
+    raise exception 'activation refused: published row missing immutable historical incident coverage'
+      using errcode='23514';
   end if;
 
   -- Active unheld rows need a live dated reservation AND an active sibling.
@@ -370,6 +386,16 @@ begin
   -- confirm/reject of the same identity or a reconciliation receipt closed it.
   if exists(select 1 from public.visual_group_member_event e
     where e.gym_id = v_tenant_text and e.action = 'review_hold'
+      -- Only a known backfill repeat diagnostic with exact immutable row
+      -- evidence is accounted history. Human review, ambiguous-provider holds
+      -- and unknown/deleted rows keep their existing fail-closed behavior.
+      and not (e.actor='backfill_published_review' and e.alias_kind is null
+        and e.reason in ('historical_cross_date_visual_repeat','linked_scene_cross_date_hold')
+        and exists(select 1 from public.content_calendar c
+          where c.id::text=e.alias_value
+            and public.visual_group_tenant_id(c.gym_id)::text=e.gym_id
+            and public.visual_group_resolve_row(c)=e.group_key
+            and public.visual_global_historical_row_covered(c,e.group_key)))
       and not exists(select 1 from public.visual_group_reconciliation rc
         where rc.gym_id = e.gym_id and e.id = any(rc.hold_event_ids))
       and not exists(select 1 from public.visual_group_member_event n
@@ -392,19 +418,19 @@ begin
       using errcode = '23514';
   end if;
 
-  -- No cross-date occupied scene: within each linked scene component, every
-  -- live reservation must share ONE date (a NULL reserved_date is a distinct
-  -- unknown date and conflicts with any dated reservation).
+  -- Live staged reservations must share one verified date. Actual published
+  -- repetitions remain append-only incidents; the global claim below rejects
+  -- any live reservation conflicting with any historical date/tenant.
   if exists(select 1 from (
     select (select array_agg(m order by m)
             from public.visual_group_scene_members(l.gym_id, l.group_key) mm(m)) as component,
            count(distinct l.reserved_date) as date_count,
            bool_or(l.reserved_date is null) as has_unknown_date
     from public.visual_group_usage_ledger l
-    where l.gym_id = v_tenant_text
+    where l.gym_id = v_tenant_text and l.state='reserved'
     group by 1) c
     where c.date_count > 1 or (c.has_unknown_date and c.date_count>0)) then
-    raise exception 'activation refused: cross-date occupied visual scene; reconcile history first'
+    raise exception 'activation refused: cross-date occupied staged visual scene; reconcile history first'
       using errcode = '23514';
   end if;
 
@@ -431,6 +457,7 @@ begin
   select count(*) into v_ledger_rows from public.visual_group_usage_ledger l where l.gym_id = v_tenant_text;
   select count(*) into v_sibling_rows from public.visual_group_usage_sibling s where s.gym_id = v_tenant_text;
   select count(*) into v_global_rows from public.visual_global_usage_member m where m.tenant_id = v_tenant_text;
+  select count(*) into v_incident_rows from public.visual_global_historical_incident h where h.tenant_id=v_tenant_text;
 
   v_proof := jsonb_build_object(
     'tenant', v_tenant_text,
@@ -442,6 +469,7 @@ begin
     'ledger_rows', v_ledger_rows,
     'sibling_rows', v_sibling_rows,
     'global_member_rows', v_global_rows,
+    'historical_incident_rows', v_incident_rows,
     'global_history_imported', true,
     'backfills', v_backfills,
     'barrier', 'lock table content_calendar share row exclusive nowait; try forward graph G shared + census C; try advisory visual_tenant + sorted visual_backfill keys',
