@@ -11,6 +11,7 @@ from copy import deepcopy
 from datetime import datetime, timezone
 from types import SimpleNamespace
 import json
+import sys
 import time
 import uuid
 
@@ -179,18 +180,21 @@ def _row(bus, ticket, att=None, body=BODY, **over):
 
 
 def _dispatch(bus, row, posts, monkeypatch):
+    # The full suite can take fifteen minutes after this module is imported.
+    # Slack readback must use a timestamp newer than this dispatch's intent.
+    post_ts = str(time.time() + 120)
     monkeypatch.setattr(OB, "_post_support_resolution",
                         lambda *a, **kw: (posts.append(("post", a[5])),
                                           bus.rpc_events.append("post"),
-                                          NOW_TS)[-1])
+                                          post_ts)[-1])
     identity = SimpleNamespace(name="scout", bot_user_id=lambda: "U_SCOUT")
 
     def readback(channel, **_kw):
         return {"ok": True, "channel": channel,
-                "messages": [{"ts": NOW_TS, "text": posts[-1][1], "user": "U_SCOUT"}]}
+                "messages": [{"ts": post_ts, "text": posts[-1][1], "user": "U_SCOUT"}]}
 
     summary = {"posted": 0, "held": 0, "suppressed": 0, "skipped": 0, "resolved": 0}
-    OB._dispatch_one(bus, lambda *a, **kw: NOW_TS, deepcopy(row),
+    OB._dispatch_one(bus, lambda *a, **kw: post_ts, deepcopy(row),
                      identity=identity, log=bus.logs.append, summary=summary,
                      member_check=lambda _c, _u: True, readback=readback)
     return summary
@@ -372,6 +376,7 @@ def test_malformed_marked_notice_cannot_use_ordinary_or_code_fix_path(
 
 def test_attested_held_success_notice_dispatches_exact_body(monkeypatch):
     """Positive exact case: held ticket, NO PR, RPC attests -> exact post."""
+    monkeypatch.setattr(sys.modules[__name__], "NOW_TS", "1")
     ticket = _ticket()
     bus = HeldBus(ticket, None)
     bus.row = _row(bus, ticket)
