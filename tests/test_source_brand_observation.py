@@ -79,14 +79,14 @@ def snapshot(rows, policy=None, receipt=None):
 
 
 class Store:
-    def __init__(self, pol=None, keep_social=None):
+    def __init__(self, pol=None, keep_social=None, raw_website=RAW):
         self.policy = pol
         self.current_policy = copy.deepcopy(pol)
         self.receipt = dict(RECEIPT)
         self.observation_receipt = dict(RECEIPT)
         social = keep_social if keep_social is not None else (
             pol is None or pol['mode'] != 'website_only_no_connected_instagram_v2')
-        self.rows = [capture('website', RAW, '051a189e-5f91-44f4-bf89-a1549f7b9442')]
+        self.rows = [capture('website', raw_website, '051a189e-5f91-44f4-bf89-a1549f7b9442')]
         if social:
             self.rows.append(capture('social', b'{"caption":"Our gym is open", "ownerId":"123"}',
                                      'b4d4d171-fd4d-4393-8602-bc99960b05cd'))
@@ -344,13 +344,123 @@ def test_positive_citation_from_wrong_location_cannot_replace_selected_witness()
     assert not writes(store)
 
 
-def test_palette_duplicate_or_invalid_utf8_held_without_truncation():
-    for raw in (RAW+b' another #112233', RAW+b'\xff'):
-        store, model = Store(), Model()
-        store.rows[0]['raw_bytes'], store.rows[0]['bytes_sha256'] = '\\x'+raw.hex(), sha(raw)
-        with pytest.raises(ObservationHold):
-            producer(store, model).observe(GYM)
-        assert not writes(store) and not model.calls
+def test_palette_invalid_utf8_held_without_truncation():
+    store, model = Store(), Model()
+    raw = RAW + b'\xff'
+    store.rows[0]['raw_bytes'], store.rows[0]['bytes_sha256'] = '\\x'+raw.hex(), sha(raw)
+    with pytest.raises(ObservationHold):
+        producer(store, model).observe(GYM)
+    assert not writes(store) and not model.calls
+
+
+# Approved palette whose primary token repeats (real gym CSS repeats brand
+# tokens, e.g. #015ad2 x64): the approved offset is the first occurrence.
+REPEAT_RAW = (b'New text. Train here. :root{--a:#112233;--b:#445566}'
+              b' .btn{background:#112233}')
+
+
+def test_identical_recapture_with_repeated_palette_token_survives():
+    store, model = Store(raw_website=REPEAT_RAW), Model()
+    result = producer(store, model).observe(GYM)
+    assert result['state'] == 'verified'
+    params = writes(store)[0]
+    # Approved offset wins even though the token occurs twice.
+    assert params['p_primary_offset'] == REPEAT_RAW.index(b'#112233')
+    assert params['p_secondary_offset'] == REPEAT_RAW.index(b'#445566')
+
+
+def test_recapture_with_added_duplicate_token_still_verified_at_approved_offset():
+    store, model = Store(raw_website=REPEAT_RAW), Model()
+    raw = REPEAT_RAW + b' .nav{border-color:#112233}'
+    store.rows[0]['raw_bytes'], store.rows[0]['bytes_sha256'] = '\\x'+raw.hex(), sha(raw)
+    result = producer(store, model).observe(GYM)
+    assert result['state'] == 'verified'
+    assert writes(store)[0]['p_primary_offset'] == REPEAT_RAW.index(b'#112233')
+
+
+def test_shifted_identical_context_relocates_deterministically():
+    store, model = Store(raw_website=REPEAT_RAW), Model()
+    # Approved span moved, but the exact frozen 64-byte context around each
+    # approved token occurs exactly once with the token standalone at the
+    # corresponding offset: the only safe deterministic relocation.
+    raw = b'Pad. ' + REPEAT_RAW
+    store.rows[0]['raw_bytes'], store.rows[0]['bytes_sha256'] = '\\x'+raw.hex(), sha(raw)
+    result = producer(store, model).observe(GYM)
+    assert result['state'] == 'verified'
+    params = writes(store)[0]
+    assert params['p_primary_offset'] == raw.index(b'#112233') == 5 + REPEAT_RAW.index(b'#112233')
+    assert params['p_secondary_offset'] == raw.index(b'#445566') == 5 + REPEAT_RAW.index(b'#445566')
+
+
+def test_same_offset_changed_rule_without_frozen_context_holds():
+    store, model = Store(raw_website=REPEAT_RAW), Model()
+    # The color remains at the old byte offset, but belongs to a changed rule.
+    raw = REPEAT_RAW.replace(b'--a:#112233', b'--z:#112233')
+    assert raw.index(b'#112233') == REPEAT_RAW.index(b'#112233')
+    store.rows[0]['raw_bytes'], store.rows[0]['bytes_sha256'] = '\\x'+raw.hex(), sha(raw)
+    with pytest.raises(ObservationHold, match='palette_missing_or_changed'):
+        producer(store, model).observe(GYM)
+    assert not writes(store) and not model.calls
+
+
+def test_unrelated_rule_relocation_holds_on_changed_bytes():
+    store, model = Store(raw_website=REPEAT_RAW), Model()
+    # The approved declaration changed; a standalone copy of the token in an
+    # UNRELATED rule must never be adopted. There is no safe context
+    # relocation here, so the observation holds fail-closed.
+    raw = REPEAT_RAW.replace(b'--a:#112233', b'--a:#99aabb')
+    store.rows[0]['raw_bytes'], store.rows[0]['bytes_sha256'] = '\\x'+raw.hex(), sha(raw)
+    with pytest.raises(ObservationHold, match='palette_missing_or_changed'):
+        producer(store, model).observe(GYM)
+    assert not writes(store) and not model.calls
+
+
+def test_eight_digit_prefix_at_approved_offset_holds():
+    store, model = Store(raw_website=REPEAT_RAW), Model()
+    # Even at the approved offset, #112233cc is an eight-digit color, not the
+    # approved six-digit token: hold.
+    raw = REPEAT_RAW.replace(b'--a:#112233;', b'--a:#112233cc;')
+    store.rows[0]['raw_bytes'], store.rows[0]['bytes_sha256'] = '\\x'+raw.hex(), sha(raw)
+    with pytest.raises(ObservationHold, match='palette_missing_or_changed'):
+        producer(store, model).observe(GYM)
+    assert not writes(store) and not model.calls
+
+
+@pytest.mark.parametrize('raw', [
+    # Approved span changed, zero standalone occurrences left.
+    REPEAT_RAW.replace(b'#112233', b'#778899'),
+    # Approved span changed, two standalone occurrences: ambiguous, hold.
+    REPEAT_RAW.replace(b'--a:#112233', b'--a:#778899') + b' .x{color:#112233}',
+])
+def test_changed_bytes_without_unique_occurrence_hold(raw):
+    store, model = Store(raw_website=REPEAT_RAW), Model()
+    store.rows[0]['raw_bytes'], store.rows[0]['bytes_sha256'] = '\\x'+raw.hex(), sha(raw)
+    with pytest.raises(ObservationHold, match='palette_missing_or_changed'):
+        producer(store, model).observe(GYM)
+    assert not writes(store) and not model.calls
+
+
+def test_eight_digit_token_head_is_not_a_relocatable_occurrence():
+    store, model = Store(raw_website=REPEAT_RAW), Model()
+    # Approved span changed; remaining '#112233' is the head of the 8-digit
+    # token #112233cc, so there is no standalone occurrence: hold.
+    raw = REPEAT_RAW.replace(b'--a:#112233', b'--a:#778899').replace(
+        b'background:#112233}', b'background:#112233cc}')
+    store.rows[0]['raw_bytes'], store.rows[0]['bytes_sha256'] = '\\x'+raw.hex(), sha(raw)
+    with pytest.raises(ObservationHold, match='palette_missing_or_changed'):
+        producer(store, model).observe(GYM)
+    assert not writes(store) and not model.calls
+
+
+def test_fact_ambiguity_behavior_preserved_alongside_palette_fix():
+    # Fact text duplicated on an otherwise identical recapture still holds
+    # with the strict fact ambiguity rule; the palette still verifies.
+    store, model = Store(raw_website=REPEAT_RAW), Model()
+    raw = REPEAT_RAW + b' Train here'
+    store.rows[0]['raw_bytes'], store.rows[0]['bytes_sha256'] = '\\x'+raw.hex(), sha(raw)
+    with pytest.raises(ObservationHold, match='ambiguous_selected_byte_span'):
+        producer(store, model).observe(GYM)
+    assert not writes(store) and not model.calls
 
 
 def test_current_mapping_race_and_configuration_race_hold_before_rpc():
@@ -656,3 +766,120 @@ def test_v2_current_policy_race_during_assessment_holds():
     with pytest.raises(ObservationHold, match='configuration_or_mapping_changed_during_assessment'):
         p.observe(GYM)
     assert not writes(store)
+
+
+CSS = 'https://gym.example/styles/site.css'
+CSS_ID = '7a1c2e40-1f2b-4b3c-9a4d-2f6f0a1b2c3d'
+PAGE_ID = '051a189e-5f91-44f4-bf89-a1549f7b9442'
+
+
+def mapping_with_css():
+    return VerifiedMapping(GYM, 'gym_exact', 'mapping-1', {'receipt': 'mapping'},
+                           (WEB, CSS), (SOCIAL,), '123')
+
+
+def css_store(page_len=86822, css_len=173041, fact_in_css=False, page_extra=b''):
+    """Synthetic Swift River shape: ~173KB palette-only CSS plus ~86KB fact page."""
+    page = b'New text. Train here. Real program facts. :root{--a:#112233;--b:#445566} ' + page_extra
+    page += b'p' * (page_len - len(page))
+    css = b':root{--a:#112233;--b:#445566} '
+    if fact_in_css:
+        css += b'/* Train here */ '
+    css += b'c' * (css_len - len(css))
+    store = Store(raw_website=page)
+    css_row = dict(capture('website', css, CSS_ID),
+                   source_kind='website_asset', source_url=CSS)
+    store.rows.append(css_row)
+    fact_row = css_row if fact_in_css else store.rows[0]
+    fact_raw = css if fact_in_css else page
+    cs = [{**{k: v for k, v in c.items() if k not in ('raw_bytes', 'captured_at')},
+           'bytes_base64': base64.b64encode(bytes.fromhex(c['raw_bytes'][2:])).decode()}
+          for c in store.rows]
+    old = dict(schema_version=1, gym_id=GYM, echo_account_key='gym_exact',
+        fact_policy='delegated_supported_facts', captures=cs,
+        selected_facts=[dict(key='offer', capture_id=fact_row['id'],
+            bytes_sha256=fact_row['bytes_sha256'],
+            source_locator=CSS if fact_in_css else WEB,
+            byte_offset=fact_raw.index(b'Train here'), byte_length=10, text='Train here')],
+        palette=dict(capture_id=CSS_ID, bytes_sha256=css_row['bytes_sha256'],
+            primary='#112233', secondary='#445566',
+            primary_byte_offset=css.index(b'#112233'),
+            secondary_byte_offset=css.index(b'#445566')))
+    raw = canonical(old)
+    store.config['bundle'].update(capture_ids=[c['id'] for c in store.rows],
+        snapshot_bytes=raw, content_sha256=sha(raw.encode()))
+    store.config['approval_receipt']['content_sha256'] = store.config['bundle']['content_sha256']
+    original_rpc = store.rpc
+    def rpc(name, params):
+        if name == 'echo_source_brand_revalidate':
+            store.calls.append((name, copy.deepcopy(params)))
+            positive = params['p_validation_report']['selected_facts_status'] == 'supported_uncontradicted'
+            body = canonical(old) if positive else store.config['bundle']['snapshot_bytes']
+            store.observation = dict(id=1, gym_id=GYM, bundle_id=store.config['bundle']['id'],
+                configuration_sha256=store.config['bundle']['content_sha256'], snapshot_bytes=body,
+                content_sha256=sha(body.encode()), validator_revision=params['p_validator_revision'],
+                validation_report=params['p_validation_report'], created_at=NOW.isoformat())
+            return copy.deepcopy(store.observation)
+        return original_rpc(name, params)
+    store.rpc = rpc
+    return store, page, css
+
+
+def test_palette_only_css_omitted_from_assessor_text_but_bound_and_verified():
+    store, page, css = css_store()
+    assert len(page) + len(css) > MAX_EVIDENCE_BYTES  # would hold without the fix
+    model = Model()
+    result = producer(store, model, resolve=lambda gym: mapping_with_css()).observe(GYM)
+    assert result['state'] == 'verified'
+    evidence = json.loads(model.calls[0][2]['input'][1]['content'])
+    included = {c['id']: c for c in evidence['captures']}
+    assert CSS_ID not in included  # CSS raw text never sent to the fact assessor
+    assert included[PAGE_ID]['text'].encode() == page  # fact page complete, never truncated
+    bound = evidence['palette_only_captures']
+    assert len(bound) == 1 and bound[0]['id'] == CSS_ID and bound[0]['palette_only'] is True
+    assert bound[0]['bytes_sha256'] == sha(css) and 'text' not in bound[0]
+    params = writes(store)[0]
+    assert set(params['p_capture_ids']) == {c['id'] for c in store.rows}  # ALL in observation
+    assert params['p_palette_capture'] == CSS_ID
+    assert params['p_primary_offset'] == css.index(b'#112233')
+    observed = {c['id'] for c in json.loads(store.observation['snapshot_bytes'])['captures']}
+    assert observed == {c['id'] for c in store.rows}
+
+
+def test_css_same_offset_changed_rule_cannot_revalidate_palette():
+    store, page, css = css_store()
+    changed = css.replace(b'--a:#112233', b'--z:#112233')
+    assert changed.index(b'#112233') == css.index(b'#112233')
+    store.rows[-1]['raw_bytes'], store.rows[-1]['bytes_sha256'] = '\\x'+changed.hex(), sha(changed)
+    model = Model()
+    with pytest.raises(ObservationHold, match='palette_missing_or_changed'):
+        producer(store, model, resolve=lambda gym: mapping_with_css()).observe(GYM)
+    assert not writes(store) and not model.calls
+
+
+def test_oversized_non_css_fact_evidence_still_holds():
+    store, page, css = css_store(page_len=MAX_EVIDENCE_BYTES + 1)
+    model = Model()
+    with pytest.raises(ObservationHold, match='complete_evidence_exceeds_assessor_bound'):
+        producer(store, model, resolve=lambda gym: mapping_with_css()).observe(GYM)
+    assert not writes(store) and not model.calls
+
+
+def test_css_containing_selected_fact_is_never_omitted():
+    store, page, css = css_store(fact_in_css=True)
+    model = Model()
+    with pytest.raises(ObservationHold, match='complete_evidence_exceeds_assessor_bound'):
+        producer(store, model, resolve=lambda gym: mapping_with_css()).observe(GYM)
+    assert not writes(store) and not model.calls
+
+
+@pytest.mark.parametrize('field,value', [
+    ('gym_id', 'foreign'), ('bytes_sha256', '0' * 64),
+    ('fetched_at', '2020-01-01T00:00:00Z')])
+def test_css_asset_identity_and_staleness_still_hold(field, value):
+    store, page, css = css_store()
+    store.rows[-1][field] = value
+    model = Model()
+    with pytest.raises(ObservationHold):
+        producer(store, model, resolve=lambda gym: mapping_with_css()).observe(GYM)
+    assert not writes(store) and not model.calls

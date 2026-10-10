@@ -59,12 +59,30 @@ TEXTS = {
         "or ask a friend, so weigh trends across channels next to direct leads and signups.",
 }
 
+# Pre-guide packet fingerprints (2026-10-09, before the owned visual standard
+# joined brain_snapshot). Verified: each current packet with ONLY the
+# brain_snapshot["brand_voice/lasso_visual_standard.md"] entry removed hashes
+# back to exactly these values, so the original captions, source facts and
+# selected campaign identity are byte-identical.
 OCT9_PACKET_KEYS = {
     "6b2bd923-d2de-53e1-a588-aa4dd50eca48": "cc3d5aef5007e0331a746378cdca0288504545914d4ea8fb6ba5748bbb357d1f",
     "860b73e2-b37c-4ecb-b9fd-0e89028e2e61": "5694f05b7555a064e81fbd9b0b72a96e71a834412a3c6f94b9063b7f621a9af5",
     "f58249ad-2476-4d07-8403-f39f4171866b": "25bc345e267196cef4b67770a880a1a8f75fcca3368502ed1759bc4859d07276",
     "fe2c7f8e-2e5c-47a4-a916-707dd383ffa0": "39b77b0ae679dcf74712758d70b63fbd3d800623930faedc86c41265d13f456b",
 }
+
+# Full current packet fingerprints with the approved
+# lasso-grounded-editorial-2026-10-09-v1 visual standard guide riding
+# brain_snapshot (guide bytes sha256
+# 455eece295e4aed1dcbf1851dac0653e592faefd20ba27771a53c22cad60aec3).
+OCT9_PACKET_KEYS_CURRENT = {
+    "6b2bd923-d2de-53e1-a588-aa4dd50eca48": "d0790c0694387cd7c510f80fb12b48dc0850bbdaff83d4fd177e09184ab8b0b8",
+    "860b73e2-b37c-4ecb-b9fd-0e89028e2e61": "ce38cb49e817b0ec02b71d3c81822eaecdc9f8c43b1b6205f3e652d926befb2a",
+    "f58249ad-2476-4d07-8403-f39f4171866b": "0afba7f6a9bdcf37e7c94a928c1da3549b28b6f78cf4d3392c63e04f3cefcff7",
+    "fe2c7f8e-2e5c-47a4-a916-707dd383ffa0": "47ad5b96e8f0145fc247200b7527f2cba9893f7bf4ed30c90a44b643b06fb294",
+}
+
+VISUAL_GUIDE_KEY = "brand_voice/lasso_visual_standard.md"
 
 SUMMIT_ROWS = [row for row in CASES if row["pillar"] == "summit"]
 BOOK_ROWS = [row for row in CASES if row["pillar"] == "book"]
@@ -220,7 +238,19 @@ def test_inline_final_paragraph_yields_single_terminal_cta_not_body():
 @pytest.mark.parametrize("row", OCT9, ids=lambda row: row["id"][:8])
 def test_current_oct9_packets_are_unchanged(row):
     packet = author._source_packet(row)
-    assert author._sha(author._canonical(packet)) == OCT9_PACKET_KEYS[row["id"]]
+    # The only legitimate drift since the original fingerprints: the approved
+    # owned visual standard guide (lasso-grounded-editorial-2026-10-09-v1)
+    # joined brain_snapshot. Its entry must hash the current guide file bytes.
+    guide_sha = hashlib.sha256((author.ROOT / VISUAL_GUIDE_KEY).read_bytes()).hexdigest()
+    assert packet["brain_snapshot"][VISUAL_GUIDE_KEY] == guide_sha
+    # Semantic identity is unchanged: with ONLY that approved guide entry
+    # removed, the packet (original caption, source facts, campaign identity,
+    # every other brain snapshot entry) hashes back to the original fingerprint.
+    pre_guide = dict(packet, brain_snapshot={k: v for k, v in packet["brain_snapshot"].items()
+                                             if k != VISUAL_GUIDE_KEY})
+    assert author._sha(author._canonical(pre_guide)) == OCT9_PACKET_KEYS[row["id"]]
+    # And the full current packet matches its recorded legitimate fingerprint.
+    assert author._sha(author._canonical(packet)) == OCT9_PACKET_KEYS_CURRENT[row["id"]]
 
 
 def test_unknown_or_unsupported_topic_refuses_with_zero_calls():

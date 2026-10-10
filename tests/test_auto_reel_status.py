@@ -44,3 +44,23 @@ def test_automatic_rebuild_cannot_drop_approved_treatment(monkeypatch):
     store=SimpleNamespace(available=lambda:True,get_request=lambda *a,**kw:{'requested_by':'echo_auto_reels'})
     code,body=routes.handle_rebuild_story('gym','id',{'overlay_text':'Changed','identity_tokens':['Gym']},store=store)
     assert code==409 and 'legacy' in body['error']
+
+
+def test_exhausted_client_status_does_not_claim_team_review_or_automatic_retry():
+    from agent.story_studio_routes import _automatic_job_for_client
+    job = {'request_id':'internal-request', 'status':'exhausted', 'attempts':3,
+           'next_attempt_at':999, 'reason':'private validator details', 'clip_count':3}
+    result = _automatic_job_for_client(job)
+    assert result['status'] == 'exhausted'
+    assert result['reason'] == 'Echo stopped after reaching the retry limit. This reel is not scheduled.'
+    assert result['request_id'] == ''
+    assert 'private' not in str(result)
+
+
+def test_client_status_distinguishes_a_queued_retry_from_stopped_job():
+    from agent.story_studio_routes import _automatic_job_for_client
+    result = _automatic_job_for_client({'status':'held', 'next_attempt_at':999})
+    assert result['status'] == 'retrying'
+    assert result['reason'] == 'Echo could not finish this reel. Another attempt is queued.'
+    result = _automatic_job_for_client({'status':'held', 'next_attempt_at':0})
+    assert 'No retry is currently queued.' in result['reason']

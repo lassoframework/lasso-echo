@@ -3,7 +3,9 @@ import hashlib
 import json
 from pathlib import Path
 
-POLICY_VERSION = 'lasso-astra-2026-09-14-punctuation-v1'
+from . import lasso_visual_standard
+
+POLICY_VERSION = 'lasso-astra-2026-10-09-grounded-editorial-v2'
 
 
 def brain_snapshot():
@@ -16,8 +18,13 @@ def brain_snapshot():
     if not knowledge.is_absolute():
         knowledge = root / knowledge
     paths = [source, *sorted(knowledge.glob('**/*.md'))]
-    return {str(path.relative_to(root)) if path.is_relative_to(root) else str(path):
+    snapshot = {str(path.relative_to(root)) if path.is_relative_to(root) else str(path):
             hashlib.sha256(path.read_bytes()).hexdigest() for path in paths if path.is_file()}
+    # The owned visual standard is part of the brain: its exact loaded bytes ride
+    # every snapshot, and a missing or malformed guide raises (never silently
+    # omitted) via lasso_visual_standard.load_guidance.
+    snapshot[lasso_visual_standard.GUIDE_KEY] = lasso_visual_standard.guide_sha256()
+    return snapshot
 
 
 def reviewed_asset(path):
@@ -35,6 +42,9 @@ def reviewed_asset(path):
                 and evidence.get('brief_model') == 'gpt-6-astra'
                 and evidence.get('grade_status') == 'PASS'
                 and evidence.get('response_id') and evidence.get('review_response_id')
+                and evidence.get('style_conformant') is True
+                and evidence.get('style_violations') == []
+                and evidence.get('visual_standard_version') == lasso_visual_standard.VERSION
                 and evidence.get('image_sha256') == hashlib.sha256(image.read_bytes()).hexdigest()):
             return None
         return evidence

@@ -1,0 +1,16 @@
+{
+  "$schema": "https://railway.app/railway.schema.json",
+  "_comment": "TEMPLATE ONLY \u2014 NOT DEPLOYED. Provider identity refresh cron lane (agent.source_brand_provider_refresh_job). Closes the freshness gap between the DAILY 06:00 capture->observation pipeline (railway.source-pipeline.json) and the portal schema2 echo_source_brand_active contract, which treats an authenticated provider attestation older than 15 minutes as inactive. This lane re-runs ONLY the existing AuthenticatedZernioIdentityReader per approved, allowlisted gym (exact stored-profile mapping, health ownership authority, paired account match, fresh attestation write + exact readback). It NEVER captures websites, never ingests bytes, never runs observation, and adds no identity logic. Runs every 5 minutes, bounded and concurrent: at most 10 gyms per invocation, at most 10 workers, gyms refresh in parallel as independent tenant IDs. This shortens each pass so it fits inside the 15-minute attestation TTL, but freshness is NOT continuous or guaranteed: a missed or slow run may still let a gym's attestation expire if providers are slow, and a fleet larger than 10 gyms requires disjoint operator partitions/services (separate allowlists of <=10 gyms each, no gym claimed by two invocations). Any timeout or incomplete proof fails closed as a hold; an armed hold exits nonzero. Everything defaults OFF: before any use an operator must explicitly set ECHO_SOURCE_PROVIDER_REFRESH_JOB_ENABLED and ECHO_SOURCE_COLLECTOR_ENABLED to 'true', provide ECHO_SOURCE_PROVIDER_REFRESH_JOB_ALLOWLIST (exact canonical gym UUIDs, subset of the approved mapping), install the SAME private operator-owned approved-mappings authority file used by the capture lane (ECHO_SOURCE_CAPTURE_APPROVED_MAPPINGS_FILE), and provision the collector Supabase config and Zernio credential (see agent/source_brand_startup.py and docs/SOURCE_CAPTURE_STARTUP.md). No durable volume is required: this lane writes no journal. Any armed hold exits nonzero. No production values are provisioned here.",
+  "build": {
+    "builder": "NIXPACKS"
+  },
+  "deploy": {
+    "startCommand": "/opt/venv/bin/python -m agent.source_brand_provider_refresh_job",
+    "cronSchedule": "*/5 * * * *",
+    "restartPolicyType": "ON_FAILURE"
+  },
+  "variables": {
+    "ECHO_SOURCE_PROVIDER_REFRESH_JOB_ENABLED": "false",
+    "ECHO_SOURCE_COLLECTOR_ENABLED": "false"
+  }
+}

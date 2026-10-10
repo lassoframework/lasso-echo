@@ -14,6 +14,7 @@ import sqlite3
 import stat
 from contextlib import contextmanager
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from .source_brand_ingest import CaptureIngestError
 
@@ -165,8 +166,14 @@ class SourceBrandCaptureRunner:
                                                    'mapping': mapping.__dict__})
         captures = []
         for url in mapping.website_response_urls:
+            # An explicitly approved exact URL ending .css is a palette asset,
+            # not fact evidence. Classification is of the approved URL itself;
+            # no discovery and no new URL is ever introduced here.
+            kind = ('website_asset'
+                    if urlsplit(url).path.lower().endswith('.css') else 'website')
             scoped = hashlib.sha256((request_id + ':website:' + url).encode()).hexdigest()
-            captures.append(self.collector.collect_website(gym_id, url, request_id=scoped))
+            captures.append(self.collector.collect_website(gym_id, url, source_kind=kind,
+                                                           request_id=scoped))
         if mapping.social_locators:
             captures.append(self.collector.collect_social(gym_id, request_id=hashlib.sha256((request_id + ':instagram').encode()).hexdigest()))
         if self.collector._resolve(gym_id) != mapping:

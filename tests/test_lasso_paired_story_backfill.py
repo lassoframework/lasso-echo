@@ -16,6 +16,7 @@ DIGEST = "a" * 64
 
 def fixture(monkeypatch, *, account="instagram", logical=LOGICAL_ID,
             status="pending", existing=None):
+    from agent import lasso_visual_standard
     feed = {"id": FEED_ID, "gym_id": "lasso", "account": account,
             "format": "feed", "post_date": DAY, "slot_index": 0,
             "variant_status": "active", "status": status, "pillar": "guide",
@@ -30,6 +31,8 @@ def fixture(monkeypatch, *, account="instagram", logical=LOGICAL_ID,
                 "image_sha256": DIGEST,
                 "evidence": {"grade_status": "PASS", "image_sha256": DIGEST,
                              "policy_version": "review-v1", "aspect": "9:16",
+                             "style_conformant": True, "style_violations": [],
+                             "visual_standard_version": lasso_visual_standard.VERSION,
                              "pixels": "1080x1920", "verified_dimensions": {
                                  "width": 1080, "height": 1920,
                                  "image_sha256": DIGEST}},
@@ -242,7 +245,7 @@ def test_sql_insert_only_barriers_and_service_role():
 
 def test_variant_story_review_records_measured_9x16_before_artifact_save(tmp_path):
     from PIL import Image
-    from agent import infographic_evidence, variant_regen
+    from agent import infographic_evidence, lasso_visual_standard, variant_regen
 
     path = tmp_path / "reviewed-story.png"
     Image.new("RGB", (1080, 1920), "#ffffff").save(path)
@@ -253,6 +256,8 @@ def test_variant_story_review_records_measured_9x16_before_artifact_save(tmp_pat
               "brain_snapshot": infographic_evidence.brain_snapshot(),
               "brief_model": "gpt-6-astra", "grade_status": "PASS",
               "response_id": "render-id", "review_response_id": "review-id",
+              "style_conformant": True, "style_violations": [],
+              "visual_standard_version": lasso_visual_standard.VERSION,
               "image_sha256": digest}
     review_path = Path(str(path) + ".review.json")
     review_path.write_text(json.dumps(receipt))
@@ -267,7 +272,7 @@ def test_variant_story_review_records_measured_9x16_before_artifact_save(tmp_pat
 
 def test_variant_story_wrong_pixels_never_stamp_review(tmp_path):
     from PIL import Image
-    from agent import infographic_evidence, variant_regen
+    from agent import infographic_evidence, lasso_visual_standard, variant_regen
 
     path = tmp_path / "wrong-story.png"
     Image.new("RGB", (1080, 1350), "#ffffff").save(path)
@@ -277,8 +282,31 @@ def test_variant_story_wrong_pixels_never_stamp_review(tmp_path):
               "brain_snapshot": infographic_evidence.brain_snapshot(),
               "brief_model": "gpt-6-astra", "grade_status": "PASS",
               "response_id": "render-id", "review_response_id": "review-id",
+              "style_conformant": True, "style_violations": [],
+              "visual_standard_version": lasso_visual_standard.VERSION,
               "image_sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
     review_path = Path(str(path) + ".review.json")
     review_path.write_text(json.dumps(receipt))
+    assert not variant_regen._attest_reviewed_story_dimensions(path)
+    assert "aspect" not in json.loads(review_path.read_text())
+
+
+def test_variant_story_review_missing_style_protocol_never_stamps(tmp_path):
+    """A 9:16 PASS receipt without style protocol evidence is not a reviewed asset."""
+    from PIL import Image
+    from agent import infographic_evidence, variant_regen
+
+    path = tmp_path / "unstyled-story.png"
+    Image.new("RGB", (1080, 1920), "#ffffff").save(path)
+    receipt = {"infographic_copy": {"headline": "Approved", "facts": ["Fact"],
+              "cta": "", "footer": ""},
+              "policy_version": infographic_evidence.POLICY_VERSION,
+              "brain_snapshot": infographic_evidence.brain_snapshot(),
+              "brief_model": "gpt-6-astra", "grade_status": "PASS",
+              "response_id": "render-id", "review_response_id": "review-id",
+              "image_sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
+    review_path = Path(str(path) + ".review.json")
+    review_path.write_text(json.dumps(receipt))
+    assert infographic_evidence.reviewed_asset(path) is None
     assert not variant_regen._attest_reviewed_story_dimensions(path)
     assert "aspect" not in json.loads(review_path.read_text())

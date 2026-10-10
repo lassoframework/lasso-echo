@@ -428,11 +428,17 @@ def _paired_lasso_feed_published(story, store):
             and matches[0].get("late_post_id") is not None)
 
 
+def _owned_visual_enabled(row):
+    from .lasso_current_artifact import owned, ACCOUNTS
+    return owned(row) and config.lasso_infographic_quality_enabled(ACCOUNTS[row['account']])
+
+
 def _paired_lasso_story_prepared(feed, store):
     """Fail closed unless the DB proves one exact usable Story for this feed."""
     try:
         reader = getattr(store, "lasso_paired_story_ready_for_feed")
-        return reader(feed["id"]) is True
+        from .lasso_current_artifact import current_pair
+        return reader(feed["id"]) is True and (not _owned_visual_enabled(feed) or current_pair(store,feed))
     except Exception:
         return False
 
@@ -1682,6 +1688,12 @@ def publish_due(run_date, *, gym_id="lasso", store=None, publisher=None,
         # final cleaned row before any claim/network call — but ONLY when the
         # caption actually moved, so a clean row pays no extra RPC.
         paired_proven_caption = row.get("caption") if paired_lasso_feed else None
+        from .lasso_current_artifact import owned as _style_owned, current_pair as _current_style_pair
+        owned_style_row = _owned_visual_enabled(row)
+        if owned_style_row and not _current_style_pair(store,row):
+            _note_repeat_failure(row_id,gym_id,RuntimeError('current owned visual review unavailable'))
+            waiting.append(row_id)
+            continue
 
         account = _account_for(row, gym_id)
         if account is None:
@@ -1972,6 +1984,23 @@ def publish_due(run_date, *, gym_id="lasso", store=None, publisher=None,
                     reject_reason="leased_feed_source_mismatch")
                 if not _reverted:
                     recovery_required.append(row_id)
+                failed.append(row_id)
+                continue
+
+        # Owned Story as well as feed: use the actual post-claim source and
+        # current visual evidence before any durable content stamp/provider I/O.
+        if owned_style_row:
+            try:
+                _styled = store.get_row(gym_id,row_id)
+            except Exception:
+                _styled = None
+            _style_lease_ok = (isinstance(_styled,dict) and _styled.get('status')=='publishing'
+                and bool(claim_token) and str(_styled.get('publish_claim_token') or '')==str(claim_token)
+                and all(_styled.get(k)==row.get(k) for k in _PAIRED_FEED_SOURCE_FIELDS))
+            if not _style_lease_ok or not _current_style_pair(store,_styled):
+                _reverted = _revert_to_pending(store=store,row_id=row_id,gym_id=gym_id,
+                    expected_claim_token=claim_token,reject_reason='lasso_current_visual_proof_missing')
+                if not _reverted: recovery_required.append(row_id)
                 failed.append(row_id)
                 continue
 

@@ -215,6 +215,35 @@ def test_no_enforce_ask_leaves_ask_as_field_only():
     assert spec.ask_frame == []
 
 
+def test_noun_offer_requires_exact_approval_and_generic_story_stays_strict():
+    with pytest.raises(ov.OverlayRejected):
+        ov.build_overlay('EXPERT COACHING', identity_tokens=['Gym'], ask='No Sweat Intro', enforce_ask=True)
+    spec = ov.build_overlay('EXPERT COACHING', identity_tokens=['Gym'], ask='No Sweat Intro',
+                            enforce_ask=True, approved_offer='No Sweat Intro')
+    assert spec.ask == 'NO SWEAT INTRO'
+    assert spec.ask_frame == ['NO SWEAT INTRO']
+    assert ov.count_asks('No Sweat Intro') == 0
+
+
+@pytest.mark.parametrize('ask', ['No Sweat Intro tomorrow', 'No Sweat Intro and Free Trial',
+                                'No Sweat Intro Free Trial',
+                                'No Sweat Intro. No Sweat Intro.', '30 Day Trial',
+                                'Guaranteed Results Consultation', 'A welcoming community'])
+def test_approval_does_not_allow_arbitrary_noun_prose_or_multiple_offers(ask):
+    with pytest.raises(ov.OverlayRejected):
+        ov.build_overlay('EXPERT COACHING', identity_tokens=['Gym'], ask=ask,
+                         enforce_ask=True, approved_offer=ask)
+
+
+def test_approved_offer_cannot_be_repeated_in_body_or_replaced():
+    with pytest.raises(ov.OverlayRejected):
+        ov.build_overlay('TRY THE NO SWEAT INTRO', identity_tokens=['Gym'], ask='No Sweat Intro',
+                         enforce_ask=True, approved_offer='No Sweat Intro')
+    with pytest.raises(ov.OverlayRejected):
+        ov.build_overlay('EXPERT COACHING', identity_tokens=['Gym'], ask='Free Trial',
+                         enforce_ask=True, approved_offer='No Sweat Intro')
+
+
 # ---- cards -----------------------------------------------------------------
 def test_stat_card_name_number_place():
     s = ov.stat_card("Mike Collins", "1:04:24", "Stockholm")

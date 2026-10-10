@@ -252,23 +252,54 @@ _ASK_RE = re.compile(
     r"share|link in bio|try (a|your))\b",
     re.IGNORECASE)
 
+# Offer names may be the client's exact approved CTA without an imperative.
+# Keep this bounded to evergreen offer labels, never arbitrary approved prose,
+# dates, multiple offers, urgency, numbers or invented instructions.
+_OFFER_RE = re.compile(
+    r"(?:(?:free|complimentary|introductory|initial|first|fitness|personal training|"
+    r"no sweat)\s+){0,2}"
+    r"(?:intro(?: session)?|consult|consultation|class|session|assessment|"
+    r"trial(?: class|session)?|tour)[.!]?", re.I)
+
+
+def approved_offer_ask(text, approved_offer) -> bool:
+    """Recognize one exact, source-approved evergreen offer label.
+
+    The caller supplies approval evidence; ordinary Story text gets no allowance.
+    No words are added to turn an approved label into an imperative.
+    """
+    if not isinstance(text, str) or not isinstance(approved_offer, str):
+        return False
+    normalized = " ".join(text.split())
+    approved = " ".join(approved_offer.split())
+    return (bool(normalized) and len(normalized) <= 120
+            and normalized.casefold() == approved.casefold()
+            and _OFFER_RE.fullmatch(normalized) is not None)
+
 
 def count_asks(text) -> int:
     """How many call-to-action phrases a block of overlay text carries."""
     return len(_ASK_RE.findall(str(text or "")))
 
 
-def assert_one_ask_frame(body_frames, ask_text):
+def assert_one_ask_frame(body_frames, ask_text, *, approved_offer=""):
     """Enforce spec §1: the render ends with EXACTLY ONE ask frame, and the BODY
     frames carry ZERO asks (the ask is not sprinkled through the montage — the Roxx
     put zero asks on their 5 biggest; we put exactly one, at the end). Raises
     OverlayRejected on a violation. Returns the single ask frame (a list of lines)."""
     body_ask_count = sum(count_asks(" ".join(fr)) for fr in body_frames)
+    if approved_offer_ask(approved_offer, approved_offer):
+        # An approved noun offer repeated in body copy is still a second ask.
+        body = " ".join(" ".join(fr) for fr in body_frames)
+        offer = " ".join(approved_offer.split()).rstrip(".!")
+        body_ask_count += len(re.findall(r"(?<!\w)" + re.escape(offer) + r"(?!\w)", body, re.I))
     if body_ask_count:
         raise OverlayRejected(
             f"body overlay carries {body_ask_count} ask(s); the ask belongs only on "
             f"the single end-frame (spec §1: exactly one ask frame)")
     asks_on_end = count_asks(ask_text)
+    if asks_on_end == 0 and approved_offer_ask(ask_text, approved_offer):
+        asks_on_end = 1
     if asks_on_end != 1:
         raise OverlayRejected(
             f"end-frame carries {asks_on_end} ask(s); a Story render must end with "
@@ -277,7 +308,7 @@ def assert_one_ask_frame(body_frames, ask_text):
 
 
 def build_overlay(raw_text, *, identity_tokens=(), gym=None, ask="", grounded_from="brief",
-                  low_confidence=False, enforce_ask=False):
+                  low_confidence=False, enforce_ask=False, approved_offer=""):
     """Turn a grounded overlay string into a validated OverlaySpec.
 
     Applies, IN ORDER: copy_gate scrub (no dashes, on-image too) -> ALL-CAPS layout
@@ -346,7 +377,7 @@ def build_overlay(raw_text, *, identity_tokens=(), gym=None, ask="", grounded_fr
     # the ask is simply stored.
     ask_frame = []
     if enforce_ask:
-        ask_frame = assert_one_ask_frame(frames, ask_text)
+        ask_frame = assert_one_ask_frame(frames, ask_text, approved_offer=approved_offer)
     return OverlaySpec(frames=frames, grounded_from=grounded_from, flags=flags,
                        ask=ask_text, ask_frame=ask_frame, identity_line=identity_line)
 
