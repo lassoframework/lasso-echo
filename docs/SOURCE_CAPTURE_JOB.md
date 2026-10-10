@@ -56,7 +56,12 @@ repo file; nothing here is live wiring.
 - Real operator-installed approved mapping receipts (none ship in this repo);
   dedicated collector Supabase credentials and a durable private volume for
   the journals; portal #793's draft SQL/RPC contract; an explicitly approved
-  activation of the three runner flags plus this job flag.
+  activation of the three runner flags plus this job flag. Installation of the
+  authority file is via the container-side CLI
+  `python -m agent.source_brand_approval_install` (stdin-only mapping bytes,
+  staged and loader-validated, atomic replace), documented in
+  docs/SOURCE_CAPTURE_STARTUP.md; remote Railway stdin forwarding is unproven,
+  so this is a container-side method, not a verified remote command.
 - Until those exist, an armed run holds at startup with the corresponding hold
   code (e.g. `private_mapping_authority_required`) and captures nothing.
 - Tests are offline synthetic evidence only; no production call, migration,
