@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import subprocess
 import uuid
+import os
+import getpass
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -25,10 +27,19 @@ ORIGINALS = (
 
 
 def _psql(db: str, sql: str, *, check: bool = True) -> subprocess.CompletedProcess:
+    host = os.environ.get("ENG_SEPT5_TEST_PGHOST", "/tmp")
+    port = os.environ.get("ENG_SEPT5_TEST_PGPORT", "5432")
+    user = os.environ.get("ENG_SEPT5_TEST_PGUSER", getpass.getuser())
+    if host not in ("/tmp", "127.0.0.1", "localhost") or port != "5432" \
+            or user not in (getpass.getuser(), "postgres"):
+        raise AssertionError("ENG September 5 PG tests require a local disposable database")
+    env = os.environ.copy()
+    if "ENG_SEPT5_TEST_PGPASSWORD" in env:
+        env["PGPASSWORD"] = env.pop("ENG_SEPT5_TEST_PGPASSWORD")
     result = subprocess.run(
-        ["psql", "-X", "-h", "/tmp", "-p", "5432", "-d", db,
+        ["psql", "-X", "-h", host, "-p", port, "-U", user, "-d", db,
          "-v", "ON_ERROR_STOP=1", "-A", "-t", "-c", sql],
-        text=True, capture_output=True,
+        text=True, capture_output=True, env=env, timeout=30,
     )
     if check and result.returncode:
         raise AssertionError(result.stderr)
