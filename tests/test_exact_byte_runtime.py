@@ -178,6 +178,16 @@ def test_activate_never_raises():
     assert runtime.verifier_config_or_none({}) is None
 
 
+def test_store_hook_checks_local_attestation_at_startup(tmp_path, monkeypatch):
+    monkeypatch.setattr(runtime, "_r2_read_only_client", lambda *a: FakeS3())
+    env = full_env(tmp_path)
+    attestation = Path(env[runtime.ENV_ATTESTATION_PATH])
+    attestation.unlink()
+    assert runtime.verifier_config_or_none(env) is None
+    attestation.write_bytes(signed_attestation_bytes(tmp_path))
+    assert runtime.verifier_config_or_none(env) is not None
+
+
 def test_sink_failure_holds_adapter_decision(tmp_path, monkeypatch):
     import time as _time
     env = full_env(tmp_path)

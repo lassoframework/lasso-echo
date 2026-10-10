@@ -325,10 +325,8 @@ def activate(environ=None, *, store=None, s3_client=None, proof_sink=None,
 def verifier_config_or_none(environ=None, *, store=None):
     """Store hook entry point: the pinned config dict, or None (held).
 
-    Lazy document verification: a long-lived store constructed during a
-    temporary attestation transport outage still receives a complete pinned
-    config, so the NEXT send's fresh fetch can succeed once the transport
-    recovers. No send is ever authorized during the outage because the
-    signed lock source re-fetches and re-verifies on every verification.
+    A local attestation file is checked at startup as before. Remote control
+    evidence is checked at each send, so a long-lived store can recover from
+    a temporary transport outage without authorizing a send during it.
     """
-    return activate(environ, store=store, verify_initial=False).verifier_config
+    return activate(environ, store=store).verifier_config
