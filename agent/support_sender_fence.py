@@ -9,6 +9,7 @@ import hashlib
 import json
 import os
 import socket
+import stat
 import threading
 import uuid
 from contextlib import contextmanager
@@ -36,6 +37,143 @@ _READBACK_KEY = "support_resolution_send_readback"
 _LANE_KEYS = ("lane", "generation", "unresolved", "paused", "drained", "operation_id")
 _INVENTORY_PAGE = 200
 _INVENTORY_MAX_PAGES = 1000
+
+# PROPOSED Portal durable support cutover reservation contract (pending Portal
+# finalization; Echo validates strictly and fails closed on ANY deviation):
+#
+#   support_cutover_status(p_reservation_id uuid, p_owner_epoch bigint) -> {
+#     "reservation_id": <echoed uuid string>, "owner_epoch": <echoed int>,
+#     "state": "held", "is_current": true,
+#     "lanes": {"support-resolution-send": {"generation": int, "operation_id": str,
+#                                           "paused": true, "unresolved": 0},
+#               "support-ticket-close":   { ... same shape ... }}}
+#
+#   support_admission_inventory_guarded(p_reservation_id, p_owner_epoch, p_lane,
+#       p_limit, p_after_started, p_after_invocation) -> {
+#     "reservation_id": <echoed>, "owner_epoch": <echoed>, "lane": <echoed>,
+#     "generation": <pinned int>, "operation_id": <pinned str>, "paused": true,
+#     "lanes": { BOTH pinned lane tuples, exactly as the status receipt },
+#     "limit": int, "returned": int, "has_more": bool,
+#     "next_after_started": str|null, "next_after_invocation": uuid|null,
+#     "invocations": [ ... same row shape as support_admission_inventory ... ]}
+#
+# One serialized Portal receipt pins BOTH durable lanes under the held
+# reservation; Echo never infers a cross-lane snapshot from a status_pair or
+# from two independent per-lane status reads. The reservation is re-read after
+# all scans and must match the pre-scan receipt exactly.
+_RESERVATION_ID_ENV = "SUPPORT_CUTOVER_RESERVATION_ID"
+_OWNER_EPOCH_ENV = "SUPPORT_CUTOVER_OWNER_EPOCH"
+
+# The observation counter catches transitions seen by another local operation.
+# A cutover receipt additionally requires an atomic control file and compares
+# its identity/change metadata across the database scan. That catches a file
+# replacement away and back even when no Python thread observes the middle.
+_CONTROL_OBSERVATION = {"control": None, "sequence": 0}
+
+
+def _control_file_fingerprint():
+    path = os.getenv("SUPPORT_MESSAGES_FENCE_CONTROL_FILE")
+    if not path:
+        return None
+    try:
+        info = os.lstat(path)
+    except OSError:
+        return None
+    if not stat.S_ISREG(info.st_mode):
+        return None
+    return (path, info.st_dev, info.st_ino, info.st_ctime_ns,
+            info.st_mtime_ns, info.st_size)
+
+
+def _control_sequence():
+    """Observe control with a stable file fingerprint when one is configured."""
+    before = _control_file_fingerprint()
+    current = control()
+    after = _control_file_fingerprint()
+    fingerprint = before if before is not None and before == after else None
+    with _LOCK:
+        if (_CONTROL_OBSERVATION["control"] is not None
+                and _CONTROL_OBSERVATION["control"] != current):
+            _CONTROL_OBSERVATION["sequence"] += 1
+        _CONTROL_OBSERVATION["control"] = current
+        return current, _CONTROL_OBSERVATION["sequence"], fingerprint
+
+
+def _valid_reservation_id(value):
+    if not _inventory_uuid(value):
+        return False
+    return value == str(uuid.UUID(value))
+
+
+def _valid_owner_epoch(value):
+    return type(value) is int and 0 < value <= 2**53 - 1
+
+
+def _reservation_credentials(reservation_id, owner_epoch):
+    """Explicit receipt arguments win; operator env is the fallback. Fail closed."""
+    if reservation_id is None:
+        reservation_id = os.getenv(_RESERVATION_ID_ENV) or None
+    if owner_epoch is None:
+        raw = os.getenv(_OWNER_EPOCH_ENV)
+        if raw:
+            try:
+                owner_epoch = int(raw, 10)
+            except ValueError:
+                owner_epoch = raw  # fails validation below
+    if reservation_id is None and owner_epoch is None:
+        return None, None, None
+    if not _valid_reservation_id(reservation_id) or not _valid_owner_epoch(owner_epoch):
+        return None, None, "reservation_credentials_malformed"
+    return reservation_id, owner_epoch, None
+
+
+def _validated_pinned_lane(value):
+    """One pinned durable lane tuple: generation, operation id, paused, unresolved."""
+    if not isinstance(value, dict):
+        return None
+    generation, unresolved = value.get("generation"), value.get("unresolved")
+    if (type(generation) is not int or not 0 <= generation <= 2**53 - 1
+            or type(unresolved) is not int or unresolved != 0
+            or value.get("paused") is not True
+            or not isinstance(value.get("operation_id"), str)
+            or not value["operation_id"]):
+        return None
+    return {"generation": generation, "operation_id": value["operation_id"],
+            "paused": True, "unresolved": 0}
+
+
+def _pinned_lanes(value):
+    if not isinstance(value, dict):
+        return None
+    pinned = {}
+    for lane in _LANES:
+        pin = _validated_pinned_lane(value.get(lane))
+        if pin is None:
+            return None
+        pinned[lane] = pin
+    return pinned
+
+
+def _validated_cutover_status(value, reservation_id, owner_epoch):
+    """Strict fail-closed validation of the proposed reservation status receipt.
+
+    Requires the exact echoed reservation id and owner epoch, state "held", a
+    current/active reservation pointer, and BOTH durable support-effect lanes
+    pinned with paused=true and unresolved=0. Released, resumed, malformed or
+    mismatched receipts are never a drain basis.
+    """
+    if not isinstance(value, dict):
+        return None
+    if (value.get("reservation_id") != reservation_id
+            or value.get("owner_epoch") != owner_epoch
+            or value.get("state") != "held"
+            or value.get("is_current") is not True):
+        return None
+    pinned = _pinned_lanes(value.get("lanes"))
+    if pinned is None:
+        return None
+    return {"reservation_id": reservation_id, "owner_epoch": owner_epoch,
+            "lanes": pinned}
 
 
 def _validated_lane_status(value, lane):
@@ -102,6 +240,75 @@ def _scan_lane_inventory(bus, lane, status):
                 or page["generation"] != status["generation"]
                 or page.get("operation_id") != status["operation_id"]
                 or page.get("paused") is not True):
+            return [], [malformed]
+        previous = ((after_started, after_invocation)
+                    if after_started is not None else None)
+        for row in rows:
+            key = (row.get("started_at") if isinstance(row, dict) else None,
+                   row.get("invocation_id") if isinstance(row, dict) else None)
+            if (not isinstance(row, dict)
+                    or not isinstance(key[0], str) or not key[0]
+                    or not _inventory_uuid(key[1])
+                    or row.get("lane") != lane
+                    or key in seen or key[1] in seen_ids
+                    or (previous is not None and key <= previous)):
+                return [], [malformed]
+            seen.add(key)
+            seen_ids.add(key[1])
+            previous = key
+            items.append(row)
+        next_started = page.get("next_after_started")
+        next_invocation = page.get("next_after_invocation")
+        if rows:
+            if next_started != items[-1].get("started_at") or \
+                    next_invocation != items[-1].get("invocation_id"):
+                return [], [malformed]
+        elif page["has_more"] or next_started is not None or next_invocation is not None:
+            return [], [malformed]
+        if not page["has_more"]:
+            return items, []
+        after_started, after_invocation = next_started, next_invocation
+    return [], [f"admission_inventory_unbounded:{lane}"]
+
+
+def _scan_lane_inventory_guarded(bus, lane, reservation):
+    """Fail-closed paginated 0633 inventory scan pinned to a held reservation.
+
+    Every page must echo the reservation id and owner epoch and pin BOTH durable
+    lane tuples exactly as the pre-scan reservation receipt; any change,
+    omission or mismatch stops the scan and blocks. A partial scan is never a
+    drain basis.
+    """
+    inventory = getattr(bus, "support_admission_inventory_guarded", None)
+    if not callable(inventory):
+        return [], [f"admission_inventory_unavailable:{lane}"]
+    malformed = f"admission_inventory_malformed:{lane}"
+    items, seen, seen_ids = [], set(), set()
+    after_started = after_invocation = None
+    for _ in range(_INVENTORY_MAX_PAGES):
+        try:
+            page = inventory(reservation["reservation_id"],
+                             reservation["owner_epoch"], lane,
+                             limit=_INVENTORY_PAGE,
+                             after_started=after_started,
+                             after_invocation=after_invocation)
+        except Exception as exc:
+            return [], [f"admission_inventory_read:{lane}:{type(exc).__name__}"]
+        rows = page.get("invocations") if isinstance(page, dict) else None
+        if (not isinstance(page, dict) or not isinstance(rows, list)
+                or page.get("reservation_id") != reservation["reservation_id"]
+                or page.get("owner_epoch") != reservation["owner_epoch"]
+                or type(page.get("limit")) is not int
+                or page["limit"] != _INVENTORY_PAGE
+                or type(page.get("returned")) is not int
+                or page["returned"] != len(rows) or len(rows) > _INVENTORY_PAGE
+                or type(page.get("has_more")) is not bool
+                or (page["has_more"] and len(rows) != _INVENTORY_PAGE)
+                or page.get("lane") != lane
+                or page.get("generation") != reservation["lanes"][lane]["generation"]
+                or page.get("operation_id") != reservation["lanes"][lane]["operation_id"]
+                or page.get("paused") is not True
+                or _pinned_lanes(page.get("lanes")) != reservation["lanes"]):
             return [], [malformed]
         previous = ((after_started, after_invocation)
                     if after_started is not None else None)
@@ -283,24 +490,35 @@ def guarded(lane, refused, *, receipt_on_pause=False):
     return decorate
 
 
-def receipt(bus=None):
+def receipt(bus=None, *, reservation_id=None, owner_epoch=None):
     """Fresh local acknowledgment. DB posting/uncertainty is never auto-recovered here.
 
     No replica id is synthesized: process UUID and hostname identify this process only.
     The operator must inventory replicas and match each UUID, generation and deployed SHA.
+
+    With a durable Portal cutover reservation (explicit arguments or the
+    SUPPORT_CUTOVER_RESERVATION_ID / SUPPORT_CUTOVER_OWNER_EPOCH env), drain
+    requires one serialized, held reservation receipt pinning BOTH durable lanes
+    plus guarded paginated inventory scans that re-echo it on every page. Without
+    a reservation the legacy per-lane path runs and always stays blocked on the
+    missing atomic cross-lane snapshot. fleet_drained is always False: no
+    process-local receipt can assert fleet-wide drain.
     """
+    reservation_id, owner_epoch, credential_error = _reservation_credentials(
+        reservation_id, owner_epoch)
     with _LOCK:
-        state = control()
+        state, sequence, file_fingerprint = _control_sequence()
         active = dict(_ACTIVE)
     blockers = []
+    reservation_held = False
+    admission_drained = False
+    if credential_error:
+        blockers.append(credential_error)
     if state["enabled"] and state["paused"]:
         if bus is None:
             blockers.append("database_not_checked")
         else:
             try:
-                lane_status = getattr(bus, "support_admission_status_lane", None)
-                if not callable(lane_status):
-                    raise RuntimeError("admission_lane_unavailable")
                 uncertain = bus.support_uncertain_outbound(limit=1000)
                 if not isinstance(uncertain, list) or len(uncertain) >= 1000:
                     blockers.append("uncertain_scan_incomplete")
@@ -346,57 +564,135 @@ def receipt(bus=None):
                                     "fixer_route_pending", "outreach_delivery_uncertain",
                                     "slack_replay_delivery_uncertain"))):
                             blockers.append(f"{status}:{row.get('id', 'unknown')}")
-                # Both support-effect lanes must be paused/drained with a fully
-                # verified paginated 0633 invocation inventory. A lane
-                # operation/generation change anywhere during the scans
-                # invalidates every conclusion drawn from them.
-                observed_lane_statuses = {}
-                for lane in _LANES:
-                    before = _validated_lane_status(lane_status(lane), lane)
-                    if before is None:
-                        blockers.append(f"admission_lane_invalid:{lane}")
-                        continue
-                    observed_lane_statuses[lane] = before
-                    items, scan_blockers = _scan_lane_inventory(bus, lane, before)
-                    blockers.extend(scan_blockers)
-                    if not scan_blockers:
-                        for item in items:
-                            blocker = _verify_invocation(bus, lane, item)
-                            if blocker:
-                                blockers.append(blocker)
-                        unresolved = sum(1 for item in items if item["unresolved"])
-                        if unresolved != before["unresolved"]:
-                            blockers.append(f"admission_inventory_inconsistent:{lane}")
-                    after = _validated_lane_status(lane_status(lane), lane)
-                    if after is None:
-                        blockers.append(f"admission_lane_invalid:{lane}")
-                    elif any(after.get(key) != before.get(key)
-                             for key in _LANE_KEYS):
-                        blockers.append(f"admission_lane_changed:{lane}")
-                # Lane one may resume while lane two is being scanned. Check
-                # both again after all inventory and message reads complete.
-                for lane, before in observed_lane_statuses.items():
-                    final = _validated_lane_status(lane_status(lane), lane)
-                    if final is None or any(final.get(key) != before.get(key)
-                                            for key in _LANE_KEYS):
-                        blockers.append(f"admission_lane_changed:{lane}")
-                # Separate RPCs cannot observe both controls atomically. The
-                # first lane may resume after its final read while the second
-                # lane is being read, with no generation change on resume.
-                # Keep local drain blocked until Portal exposes a paired,
-                # serialized status receipt and release holds it through cutover.
-                blockers.append("admission_cross_lane_snapshot_unverified")
+                if credential_error is None and reservation_id is not None:
+                    # Durable cutover reservation path: one serialized Portal
+                    # receipt pins BOTH lanes under the held reservation, and
+                    # every guarded inventory page must re-echo the reservation
+                    # id, owner epoch and both pinned lane tuples.
+                    status_fn = getattr(bus, "support_cutover_status", None)
+                    if not callable(status_fn):
+                        blockers.append("reservation_cutover_status_unavailable")
+                    else:
+                        reservation = _validated_cutover_status(
+                            status_fn(reservation_id, owner_epoch),
+                            reservation_id, owner_epoch)
+                        if reservation is None:
+                            blockers.append("reservation_cutover_invalid")
+                        else:
+                            lanes_drained = True
+                            for lane in _LANES:
+                                items, scan_blockers = _scan_lane_inventory_guarded(
+                                    bus, lane, reservation)
+                                blockers.extend(scan_blockers)
+                                if scan_blockers:
+                                    lanes_drained = False
+                                    continue
+                                for item in items:
+                                    blocker = _verify_invocation(bus, lane, item)
+                                    if blocker:
+                                        blockers.append(blocker)
+                                unresolved = sum(
+                                    1 for item in items if item["unresolved"])
+                                if unresolved != 0:
+                                    blockers.append(
+                                        f"admission_inventory_inconsistent:{lane}")
+                                    lanes_drained = False
+                            # Re-read the reservation after all scans: any
+                            # release, resume, re-pin or pointer change during
+                            # the reads invalidates every conclusion from them.
+                            after = _validated_cutover_status(
+                                status_fn(reservation_id, owner_epoch),
+                                reservation_id, owner_epoch)
+                            if after is None:
+                                blockers.append("reservation_cutover_invalid")
+                            elif after != reservation:
+                                blockers.append("reservation_cutover_changed")
+                            else:
+                                reservation_held = True
+                                admission_drained = lanes_drained
+                elif credential_error is None:
+                    lane_status = getattr(bus, "support_admission_status_lane", None)
+                    if not callable(lane_status):
+                        raise RuntimeError("admission_lane_unavailable")
+                    # Both support-effect lanes must be paused/drained with a fully
+                    # verified paginated 0633 invocation inventory. A lane
+                    # operation/generation change anywhere during the scans
+                    # invalidates every conclusion drawn from them.
+                    observed_lane_statuses = {}
+                    for lane in _LANES:
+                        before = _validated_lane_status(lane_status(lane), lane)
+                        if before is None:
+                            blockers.append(f"admission_lane_invalid:{lane}")
+                            continue
+                        observed_lane_statuses[lane] = before
+                        items, scan_blockers = _scan_lane_inventory(bus, lane, before)
+                        blockers.extend(scan_blockers)
+                        if not scan_blockers:
+                            for item in items:
+                                blocker = _verify_invocation(bus, lane, item)
+                                if blocker:
+                                    blockers.append(blocker)
+                            unresolved = sum(1 for item in items if item["unresolved"])
+                            if unresolved != before["unresolved"]:
+                                blockers.append(f"admission_inventory_inconsistent:{lane}")
+                        after = _validated_lane_status(lane_status(lane), lane)
+                        if after is None:
+                            blockers.append(f"admission_lane_invalid:{lane}")
+                        elif any(after.get(key) != before.get(key)
+                                 for key in _LANE_KEYS):
+                            blockers.append(f"admission_lane_changed:{lane}")
+                    # Lane one may resume while lane two is being scanned. Check
+                    # both again after all inventory and message reads complete.
+                    for lane, before in observed_lane_statuses.items():
+                        final = _validated_lane_status(lane_status(lane), lane)
+                        if final is None or any(final.get(key) != before.get(key)
+                                                for key in _LANE_KEYS):
+                            blockers.append(f"admission_lane_changed:{lane}")
+                    # Separate RPCs cannot observe both controls atomically. The
+                    # first lane may resume after its final read while the second
+                    # lane is being read, with no generation change on resume.
+                    # Keep local drain blocked until Portal exposes a paired,
+                    # serialized status receipt and release holds it through cutover.
+                    blockers.append("admission_cross_lane_snapshot_unverified")
             except Exception as exc:
                 blockers.append(f"database_read:{type(exc).__name__}")
-    # A control replacement during DB read invalidates this acknowledgment.
-    if control() != state:
+    # Recheck local control AND active operations under _LOCK after DB reads.
+    # The transition sequence also catches an ABA flip (pause/generation changed
+    # away and back during the reads) observed by any in-process control read.
+    with _LOCK:
+        after_state, after_sequence, after_file_fingerprint = _control_sequence()
+        after_active = dict(_ACTIVE)
+    if after_sequence != sequence or after_state != state:
         blockers.append("control_changed_during_read")
+    if (reservation_id is not None and
+            (file_fingerprint is None or after_file_fingerprint != file_fingerprint)):
+        blockers.append("control_file_changed_or_unavailable")
+    if after_active != active:
+        blockers.append("active_operations_changed_during_read")
+        for lane, count in after_active.items():
+            if count and not active.get(lane):
+                active[lane] = count
     sha = os.getenv("RAILWAY_GIT_COMMIT_SHA") or os.getenv("SUPPORT_MESSAGES_DEPLOYED_SHA")
     replica = os.getenv("RAILWAY_REPLICA_ID")
-    local_drained = (state["enabled"] and state["paused"] and not state["error"]
-                     and not active and not blockers and bool(sha))
+    local_operations_drained = bool(state["enabled"] and state["paused"]
+                                    and not state["error"] and not active
+                                    and not after_active
+                                    and after_sequence == sequence
+                                    and (reservation_id is None or
+                                         (file_fingerprint is not None and
+                                          after_file_fingerprint == file_fingerprint)))
+    # Every historical completed send stays blocked until an immutable Portal
+    # binding plus a direct Slack provider readback is wired and verified here,
+    # so effects_reconciled can never be true while any invocation blocker or
+    # uncertain/posting/held row remains.
+    effects_reconciled = bool(reservation_held and not blockers)
+    local_drained = (local_operations_drained and not blockers and bool(sha))
     return {**state, "process_id": _PROCESS, "pid": os.getpid(),
             "observed_at": datetime.now(timezone.utc).isoformat(),
             "hostname": socket.gethostname(), "replica_id": replica,
             "deployed_sha": sha, "active": active, "blockers": blockers,
+            "local_operations_drained": local_operations_drained,
+            "admission_drained": bool(admission_drained),
+            "effects_reconciled": effects_reconciled,
+            "reservation_held": bool(reservation_held),
             "local_drained": bool(local_drained), "fleet_drained": False}

@@ -923,6 +923,44 @@ class Bus:
             raise BusError(400, "support admission inventory malformed")
         return result
 
+    def support_cutover_status(self, reservation_id, owner_epoch):
+        """Proposed durable support cutover reservation receipt (Portal contract
+        pending finalization; see agent/support_sender_fence.py). Fail closed on
+        transport or malformed receipts; callers validate every field."""
+        body = {"p_reservation_id": reservation_id, "p_owner_epoch": int(owner_epoch)}
+        r = self._client().post(self._rest("rpc/support_cutover_status"),
+                                data=json.dumps(body),
+                                headers=self._headers(), timeout=30)
+        if r.status_code >= 400:
+            raise BusError(r.status_code, "support cutover status unavailable")
+        result = r.json()
+        if not isinstance(result, dict):
+            raise BusError(400, "support cutover status malformed")
+        return result
+
+    def support_admission_inventory_guarded(self, reservation_id, owner_epoch,
+                                            lane, *, limit=200,
+                                            after_started=None,
+                                            after_invocation=None):
+        """Proposed read-only paginated invocation inventory pinned to a held
+        cutover reservation (Portal contract pending finalization; see
+        agent/support_sender_fence.py). Fail closed; never retries."""
+        if (after_started is None) != (after_invocation is None):
+            raise BusError(400, "support admission inventory cursor malformed")
+        body = {"p_reservation_id": reservation_id, "p_owner_epoch": int(owner_epoch),
+                "p_lane": lane, "p_limit": int(limit),
+                "p_after_started": after_started,
+                "p_after_invocation": after_invocation}
+        r = self._client().post(self._rest("rpc/support_admission_inventory_guarded"),
+                                data=json.dumps(body),
+                                headers=self._headers(), timeout=30)
+        if r.status_code >= 400:
+            raise BusError(r.status_code, "guarded support admission inventory unavailable")
+        result = r.json()
+        if not isinstance(result, dict):
+            raise BusError(400, "guarded support admission inventory malformed")
+        return result
+
     def outbox(self, status="ready", limit=50, identity=None):
         """Outbound rows in one delivery state, oldest first. `identity` narrows to rows this
         bot wrote (attachments.identity), so two identities' loops never read each other's
