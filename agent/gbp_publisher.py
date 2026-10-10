@@ -88,6 +88,12 @@ def publish(draft, account, http=None):
     if publishing_blocked(base):
         raise GbpError("Echo publishing held: account revoked or subscription canceled")
 
+    from .delivered_byte_send_guard import enabled, require, ExactByteSendHold
+    if enabled():
+        # Legacy direct-v4 has no persisted calendar claim or immutable-object
+        # verifier. It cannot prove equivalent authority for this destination.
+        raise ExactByteSendHold("legacy GBP exact byte authority unavailable")
+
     token = _token()
     if not token:
         raise MissingToken("No GBP access token set for this location.")
@@ -103,6 +109,9 @@ def publish(draft, account, http=None):
     client = http or _requests()
     url = (f"{config.GBP_API_BASE}/accounts/{config.GBP_ACCOUNT_ID}"
            f"/locations/{config.GBP_LOCATION_ID}/localPosts")
+    # Even if the flag is disabled after acquiring another lane's permit, a
+    # legacy direct send cannot silently escape that active authority scope.
+    require({}, [])
     resp = client.post(
         url,
         json=body,

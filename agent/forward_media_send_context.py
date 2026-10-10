@@ -16,9 +16,11 @@ import threading
 import time
 
 from . import forward_media_guard as guard
+from . import delivered_byte_send_guard as exact_guard
 
 _SCOPE=ContextVar('forward_media_send_scope',default=None)
 _CALL=ContextVar('forward_media_provider_call',default=None)
+_EXACT_CALL=ContextVar('exact_byte_provider_call',default=None)
 _PLATFORM={'instagram':('instagram','_ig'),'facebook':('facebook_page','_fb')}
 _VIDEO=re.compile(r'\.(mp4|mov|m4v|webm|avi)(?:[?#]|$)',re.I)
 
@@ -68,8 +70,47 @@ def _read_one(store,table,params):
     return rows[0]
 
 
+def immutable_verifier_for_store(store):
+    """Resolve only server-owned storage dependencies, never outgoing metadata.
+
+    Production initialization must supply this private configuration using a
+    read-only authenticated origin client, signed lock source and durable sink.
+    Missing or malformed configuration leaves the armed lane held.
+    """
+    from . import r2_immutable_media as media
+    config = getattr(getattr(store, '_s', store), '_immutable_media_verifier_config', None)
+    if not isinstance(config, dict):
+        return None
+    required = {'bucket', 'account_id', 'public_base_url', 's3', 'lock_source',
+                'retention_seconds', 'proof_sink'}
+    if (not required <= config.keys()
+            or not isinstance(config['lock_source'], media.SignedLockRuleSource)
+            or not callable(config['proof_sink'])):
+        return None
+    try:
+        return media.trusted_bool_adapter(**config)
+    except Exception:
+        return None
+
+
 @contextmanager
-def authorized_send(store,row,claim_token):
+def authorized_send(store,row,claim_token,*,immutable_verifier=None,read_bytes=None):
+    """Apply the exact fence and existing broad scope.
+
+    Explicit verifier/reader injection is for isolated trusted integration tests.
+    Production obtains its verifier exclusively from server-owned store setup.
+    """
+    verifier = immutable_verifier
+    if verifier is None and exact_guard.enabled():
+        verifier = immutable_verifier_for_store(store)
+    with exact_guard.authorized_send(getattr(store,'_s',store),row,claim_token,
+                                    immutable_verifier=verifier,read_bytes=read_bytes):
+        with _broad_authorized_send(store,row,claim_token):
+            yield
+
+
+@contextmanager
+def _broad_authorized_send(store,row,claim_token):
     """Explicit trusted bridge scope; always closes even on exceptions.
 
     No credentials/factory fallback. Once scope is used it cannot authorize a
@@ -181,8 +222,7 @@ def _revalidate(lease):
 
 def guarded_publisher(provider):
     def decorate(fn):
-        @wraps(fn)
-        def wrapped(draft,account,*args,**kwargs):
+        def invoke(draft,account,*args,**kwargs):
             if not guard.enabled(): return fn(draft,account,*args,**kwargs)
             from . import config
             if (not config.publish_enabled() or (provider=='zernio' and not config.zernio_publish_enabled())
@@ -217,11 +257,39 @@ def guarded_publisher(provider):
                         raise ProviderSendHold('generated outcome requires reconciliation',attempted=True) from None
                 return result
             finally: _CALL.reset(token)
+        @wraps(fn)
+        def wrapped(draft,account,*args,**kwargs):
+            _exact_boundary_hold()
+            permit=exact_guard.active_permit()
+            call_token=_EXACT_CALL.set((permit,provider,_actor()))
+            try:
+                return invoke(draft,account,*args,**kwargs)
+            finally:
+                _EXACT_CALL.reset(call_token)
         return wrapped
     return decorate
 
 
+def _exact_boundary_hold(*,continuation_provider=None):
+    """Validate ambient authority without consuming the provider mutation."""
+    permit=exact_guard.active_permit()
+    if permit is None:
+        if exact_guard.enabled():
+            raise ProviderSendHold('exact provider payload authorization required')
+        return
+    if type(permit) is not exact_guard.SendPermit:
+        raise ProviderSendHold('trusted exact byte scope required',attempted=True)
+    with permit._lock:
+        continuation=_EXACT_CALL.get()
+        same_call=(continuation_provider is not None and isinstance(continuation,tuple)
+                   and len(continuation)==3 and continuation[0] is permit
+                   and continuation[1]==continuation_provider and continuation[2]==_actor())
+        if permit.closed or (permit.consumed and not same_call):
+            raise ProviderSendHold('exact byte authorization already consumed', attempted=True)
+
+
 def boundary(provider,*,draft=None,account=None,format=None,target=None,attempt=False,caption=None):
+    _exact_boundary_hold(continuation_provider=provider)
     if not guard.enabled(): return
     active=_CALL.get()
     if not isinstance(active,tuple) or len(active)!=3 or active[1]!=provider or type(active[0]) is not _Lease:
@@ -262,6 +330,10 @@ def delivered_bytes(data,url):
 
 
 def unsupported(kind):
+    _exact_boundary_hold()
+    if exact_guard.enabled() or exact_guard.active_permit() is not None:
+        raise ProviderSendHold('separate '+kind+' exact authority required',
+                               attempted=exact_guard.active_permit() is not None)
     if guard.enabled():
         active=_CALL.get()
         raise ProviderSendHold('separate '+kind+' authority required',
