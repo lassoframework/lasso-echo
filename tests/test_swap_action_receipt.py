@@ -147,7 +147,7 @@ class _ReceiptStore:
                 "members": [{k: m.get(k) for k in
                              ("format", "account", "post_date", "status", "caption",
                               "image_url", "thumbnail_url", "source_media_url",
-                              "source_media_asset_id")}
+                              "source_media_asset_id", "media_not_ready_reason")}
                             | {"calendar_row_id": m["id"]} for m in members]}
 
     def action_receipt_claim(self, account_key, action_id, fingerprint,
@@ -203,9 +203,14 @@ class _ReceiptStore:
             rid = member["calendar_row_id"]
             row = self._rows[rid]
             if row.get("status") not in ("pending", "coach_review") \
-                    or str(row.get("image_url") or "") != str(member.get("image_url") or ""):
+                    or str(row.get("image_url") or "") != str(member.get("image_url") or "") \
+                    or row.get("media_not_ready_reason") != member.get("media_not_ready_reason") \
+                    or row.get("media_not_ready_reason") not in \
+                    (None, "cross_date_media_repeat_needs_new_visual"):
                 raise pcs.ReceiptConflictError(409, f"stale eligible sibling or "
                                                     f"media hold on row {rid}")
+            if row.get("media_not_ready_reason") and media_by_id[rid]["image_url"] == row["image_url"]:
+                raise pcs.ReceiptConflictError(409, "held repeat replacement is not distinct")
         for member in members:
             rid = member["calendar_row_id"]
             row = self._rows[rid]
@@ -214,6 +219,7 @@ class _ReceiptStore:
             row["source_media_url"] = media.get("source_media_url")
             row["thumbnail_url"] = media.get("thumbnail_url")
             row["source_media_asset_id"] = media.get("source_media_asset_id")
+            row["media_not_ready_reason"] = None
             outcomes.append({"id": rid, "swapped": True,
                              "image_url": media.get("image_url"),
                              "source_media_asset_id": media.get("source_media_asset_id")})
@@ -325,6 +331,38 @@ def test_fresh_action_succeeds_with_one_atomic_apply(monkeypatch):
     assert store._rows[ROW1]["caption"] == "a caption the gym is happy with"
     assert body["caption"] == "a caption the gym is happy with"
     assert "svc-key-secret" not in repr(rc)
+
+
+def test_receipt_path_releases_only_verified_cross_date_repeat_hold(monkeypatch):
+    row = _row()
+    row["media_not_ready_reason"] = "cross_date_media_repeat_needs_new_visual"
+    store = _ReceiptStore([row])
+    _wire(monkeypatch)
+    _wire_legacy_original_proof(monkeypatch)
+    status, body = ps.handle_swap_media(GYM, ROW1, "actor-1", action_id="act-held",
+                                        sb_store=store, picker=_picker([]))
+    assert status == 200 and body["ok"] is True
+    assert store._rows[ROW1]["media_not_ready_reason"] is None
+    assert store._rows[ROW1]["status"] == "pending"
+    assert [event[0] for event in store.calls].count("apply") == 1
+    replay, replay_body = ps.handle_swap_media(
+        GYM, ROW1, "actor-1", action_id="act-held", sb_store=store, picker=_picker([]))
+    assert replay == 200 and replay_body["idempotent"] is True
+
+
+def test_receipt_path_refuses_same_original_bytes_before_claim(monkeypatch):
+    row = _row()
+    row["media_not_ready_reason"] = "cross_date_media_repeat_needs_new_visual"
+    store = _ReceiptStore([row])
+    _wire(monkeypatch)
+    monkeypatch.setattr(media_guard, "swap_original_identity",
+                        lambda *a, **k: {"sha256": "same", "source_asset_id": None})
+    status, body = ps.handle_swap_media(GYM, ROW1, "actor-1", action_id="act-held",
+                                        sb_store=store, picker=_picker([]))
+    assert status == 409 and body["reason"] == "media_evidence_unavailable"
+    assert "claim" not in [event[0] for event in store.calls]
+    assert "apply" not in [event[0] for event in store.calls]
+    assert store._rows[ROW1]["media_not_ready_reason"] == row["media_not_ready_reason"]
 
 
 def test_exact_terminal_replay_never_reads_the_row(monkeypatch):
