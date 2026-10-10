@@ -197,7 +197,8 @@ def _validated_cutover_status(value, reservation_id, owner_epoch):
     if pinned is None:
         return None
     for lane, prefix in ((_LANE, "send"), (_CLOSE_LANE, "close")):
-        if (value.get(f"{prefix}_generation") != pinned[lane]["generation"]
+        if (type(value.get(f"{prefix}_generation")) is not int
+                or value.get(f"{prefix}_generation") != pinned[lane]["generation"]
                 or value.get(f"{prefix}_operation_id") != pinned[lane]["operation_id"]):
             return None
     lanes = {}
@@ -211,8 +212,10 @@ def _validated_cutover_status(value, reservation_id, owner_epoch):
                 or type(live.get("unresolved")) is not int
                 or live["unresolved"] != 0
                 or live.get("reservation_id") != reservation_id
+                or type(live.get("generation")) is not int
                 or live.get("generation") != pinned[lane]["generation"]
                 or live.get("operation_id") != pinned[lane]["operation_id"]
+                or type(live.get("pinned_generation")) is not int
                 or live.get("pinned_generation") != pinned[lane]["generation"]
                 or live.get("pinned_operation_id") != pinned[lane]["operation_id"]):
             return None
@@ -387,10 +390,14 @@ def _scan_lane_inventory_guarded(bus, lane, reservation):
                 or type(page.get("has_more")) is not bool
                 or (page["has_more"] and len(rows) != _INVENTORY_PAGE)
                 or page.get("lane") != lane
+                or "next_after_started" not in page
+                or "next_after_invocation" not in page
+                or type(page.get("send_generation")) is not int
                 or page.get("send_generation")
                 != reservation["lanes"][_LANE]["generation"]
                 or page.get("send_operation_id")
                 != reservation["lanes"][_LANE]["operation_id"]
+                or type(page.get("close_generation")) is not int
                 or page.get("close_generation")
                 != reservation["lanes"][_CLOSE_LANE]["generation"]
                 or page.get("close_operation_id")

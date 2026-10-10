@@ -278,6 +278,69 @@ def test_page_missing_field_blocks(pause, missing):
     assert result["admission_drained"] is False
 
 
+@pytest.mark.parametrize("lane,field,value", [
+    ("support-resolution-send", "flat", True),
+    ("support-resolution-send", "flat", 1.0),
+    ("support-ticket-close", "flat", True),
+    ("support-ticket-close", "flat", 1.0),
+    ("support-resolution-send", "generation", True),
+    ("support-resolution-send", "generation", 1.0),
+    ("support-ticket-close", "pinned_generation", True),
+    ("support-ticket-close", "pinned_generation", 1.0),
+])
+def test_non_int_generation_equal_to_pin_blocks(pause, lane, field, value):
+    prefix = "send" if lane == "support-resolution-send" else "close"
+    status = _status()
+    status["pinned"][lane]["generation"] = 1
+    status[f"{prefix}_generation"] = 1
+    status[lane]["generation"] = 1
+    status[lane]["pinned_generation"] = 1
+    if field == "flat":
+        status[f"{prefix}_generation"] = value
+    else:
+        status[lane][field] = value
+    bus = GuardedBus(statuses=[status])
+    result = fence.receipt(bus, reservation_id=RESERVATION_ID, owner_epoch=EPOCH)
+    assert "reservation_cutover_invalid" in result["blockers"]
+    assert result["reservation_held"] is False
+    assert result["local_drained"] is False
+
+
+@pytest.mark.parametrize("prefix,value", [
+    ("send", True), ("send", 1.0),
+    ("close", True), ("close", 1.0),
+])
+def test_page_non_int_generation_equal_to_pin_blocks(pause, prefix, value):
+    lane = "support-resolution-send"
+    pinned_lane = lane if prefix == "send" else "support-ticket-close"
+    status = _status()
+    status["pinned"][pinned_lane]["generation"] = 1
+    status[f"{prefix}_generation"] = 1
+    status[pinned_lane]["generation"] = 1
+    status[pinned_lane]["pinned_generation"] = 1
+    page = _page(lane, pinned=status["pinned"],
+                 send_generation=status["send_generation"],
+                 close_generation=status["close_generation"])
+    page[f"{prefix}_generation"] = value
+    bus = GuardedBus(statuses=[status, status], pages={lane: page})
+    result = fence.receipt(bus, reservation_id=RESERVATION_ID, owner_epoch=EPOCH)
+    assert f"admission_inventory_malformed:{lane}" in result["blockers"]
+    assert result["admission_drained"] is False
+    assert result["local_drained"] is False
+
+
+@pytest.mark.parametrize("missing", ["next_after_started", "next_after_invocation"])
+def test_empty_page_missing_cursor_key_blocks(pause, missing):
+    lane = "support-resolution-send"
+    page = _page(lane)
+    del page[missing]
+    bus = GuardedBus(pages={lane: page})
+    result = fence.receipt(bus, reservation_id=RESERVATION_ID, owner_epoch=EPOCH)
+    assert f"admission_inventory_malformed:{lane}" in result["blockers"]
+    assert result["admission_drained"] is False
+    assert result["local_drained"] is False
+
+
 def test_multi_page_inventory_cursor_preserved(pause, monkeypatch):
     monkeypatch.setattr(fence, "_INVENTORY_PAGE", 2)
     lane = "support-resolution-send"
