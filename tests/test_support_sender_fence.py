@@ -1,3 +1,4 @@
+import hashlib
 import json
 import threading
 import pytest
@@ -12,9 +13,23 @@ from agent import echo_ticket_worker
 LANE_STATUS = {"lane": "support-resolution-send", "generation": 1, "unresolved": 0,
                "paused": True, "drained": True, "operation_id": "op-test"}
 
-LEASE = {"lane": "support-resolution-send", "invocation_id": "inv-1", "generation": 1}
+BODY = "Update from the LASSO team: this one is handled."
+BODY_SHA = hashlib.sha256(BODY.encode()).hexdigest()
+BINDING = {"message_id": "admitted-row",
+           "ticket": {"id": "ticket-1", "request_version": 3},
+           "sender_identity": "echo", "sender": "U-bot-1", "channel": "C-chan-1",
+           "thread_ts": "1700.000001", "body_sha256": BODY_SHA, "request_key": "rk-1"}
+LEASE = {"lane": "support-resolution-send", "invocation_id": "inv-1", "generation": 1,
+         "deployment": "dep-1", "build": "sha-1", "binding": BINDING,
+         "not_before": "2026-10-10T00:00:00+00:00"}
 COMPLETION = {"recorded": True, "lane": "support-resolution-send",
               "invocation_id": "inv-1", "outcome": "completed", "generation": 1}
+READBACK = {"delivery_readback_verified": True, "delivery_readback_channel": "C-chan-1",
+            "delivery_readback_thread_ts": "1700.000001",
+            "delivery_readback_ts": "1700.000002", "delivery_readback_sender": "U-bot-1",
+            "delivery_readback_body_sha256": BODY_SHA,
+            "delivery_readback_request_key": "rk-1",
+            "delivery_readback_request_version": 3}
 
 
 class Bus:
@@ -338,14 +353,26 @@ def test_paused_standalone_producers_and_release_handler_do_not_write(monkeypatc
 
 # ---- portal 0633 durable admission lane binding (fail closed) --------------------
 
-def _admission_row(status='posted', lease=None, completion=None):
+def _admission_row(status='posted', lease=None, completion=None, readback=None,
+                   **overrides):
     att = {}
     if lease is not None:
         att['support_resolution_send_admission'] = lease
     if completion is not None:
         att['support_resolution_send_completion'] = completion
-    return {'id': 'admitted-row', 'direction': 'outbound', 'delivery_status': status,
-            'attachments': att}
+    if readback is not None:
+        att['support_resolution_send_readback'] = readback
+    row = {'id': 'admitted-row', 'direction': 'outbound', 'delivery_status': status,
+           'ticket_id': 'ticket-1', 'body': BODY, 'delivery_request_version': 3,
+           'slack_ts': '1700.000002', 'attachments': att}
+    row.update(overrides)
+    return row
+
+
+def _trusted_row(**overrides):
+    return _admission_row(lease=dict(LEASE, binding=dict(BINDING)),
+                          completion=dict(COMPLETION), readback=dict(READBACK),
+                          **overrides)
 
 
 @pytest.mark.parametrize('status_override', [
@@ -408,34 +435,133 @@ def test_unavailable_admission_lane_blocks_drain(monkeypatch, tmp_path):
     assert not fence.receipt(NoLane())['local_drained']
 
 
-def test_unresolved_admission_marked_row_blocks_drain_at_any_status(monkeypatch, tmp_path):
+def test_fully_bound_completed_admission_row_and_zero_unresolved_lane_allows_drain(
+        monkeypatch, tmp_path):
+    pause(monkeypatch, tmp_path)
+    class AdmissionBus(Bus):
+        def support_uncertain_outbound(self, limit=1000):
+            return [_trusted_row()]
+    receipt = fence.receipt(AdmissionBus())
+    assert receipt['blockers'] == []
+    assert receipt['local_drained']
+
+
+def test_current_notice_flat_verified_readback_allows_drain(monkeypatch, tmp_path):
+    pause(monkeypatch, tmp_path)
+    row = _admission_row(lease=dict(LEASE, binding=dict(BINDING)),
+                         completion=dict(COMPLETION))
+    row['attachments'].update(READBACK)
+    class AdmissionBus(Bus):
+        def support_uncertain_outbound(self, limit=1000):
+            return [row]
+    assert fence.receipt(AdmissionBus())['local_drained']
+
+
+def test_admission_lease_without_trusted_completion_blocks_at_any_status(
+        monkeypatch, tmp_path):
     pause(monkeypatch, tmp_path)
     for status in ('posted', 'failed', 'ready', 'held'):
         class AdmissionBus(Bus):
             def support_uncertain_outbound(self, limit=1000):
-                return [_admission_row(status=status, lease=dict(LEASE))]
+                return [_admission_row(status=status, lease=dict(LEASE, binding=dict(BINDING)))]
         receipt = fence.receipt(AdmissionBus())
         assert not receipt['local_drained'], status
         assert 'admission_unresolved:admitted-row' in receipt['blockers']
 
 
-def test_admission_row_without_trusted_completion_blocks_drain(monkeypatch, tmp_path):
-    pause(monkeypatch, tmp_path)
-    for completion in (None, 'done', {'recorded': True, 'lane': 'other'},
-                       {**COMPLETION, 'invocation_id': 'other'},
-                       {**COMPLETION, 'recorded': False},
-                       {**COMPLETION, 'generation': 2},
-                       {**COMPLETION, 'outcome': 'unknown'}):
-        class AdmissionBus(Bus):
-            def support_uncertain_outbound(self, limit=1000):
-                return [_admission_row(lease=dict(LEASE), completion=completion)]
-        assert not fence.receipt(AdmissionBus())['local_drained'], completion
-
-
-def test_completed_admission_row_with_trusted_completion_allows_drain(monkeypatch,
-                                                                      tmp_path):
+@pytest.mark.parametrize('status', ['ready', 'failed', 'held'])
+def test_completed_admission_row_not_terminal_posted_blocks_drain(
+        monkeypatch, tmp_path, status):
     pause(monkeypatch, tmp_path)
     class AdmissionBus(Bus):
         def support_uncertain_outbound(self, limit=1000):
-            return [_admission_row(lease=dict(LEASE), completion=dict(COMPLETION))]
-    assert fence.receipt(AdmissionBus())['local_drained']
+            return [_trusted_row(status=status)]
+    receipt = fence.receipt(AdmissionBus())
+    assert not receipt['local_drained']
+    assert 'admission_unresolved:admitted-row' in receipt['blockers']
+
+
+@pytest.mark.parametrize('row_override', [
+    {'id': 'other-row'},                              # copied lease: wrong message id
+    {'ticket_id': 'ticket-2'},                        # wrong ticket id
+    {'delivery_request_version': 4},                  # stale request version
+    {'body': 'tampered body'},                        # body sha mismatch
+    {'slack_ts': None},                               # posted without Slack timestamp
+    {'slack_ts': ''},
+    {'slack_ts': '1700.999999'},                      # readback ts mismatch
+])
+def test_lease_binding_mismatch_blocks_drain(monkeypatch, tmp_path, row_override):
+    pause(monkeypatch, tmp_path)
+    class AdmissionBus(Bus):
+        def support_uncertain_outbound(self, limit=1000):
+            return [_trusted_row(**row_override)]
+    receipt = fence.receipt(AdmissionBus())
+    assert not receipt['local_drained'], row_override
+    assert 'admission_unresolved:admitted-row' in receipt['blockers'] or \
+        f"admission_unresolved:{row_override.get('id')}" in receipt['blockers']
+
+
+@pytest.mark.parametrize('lease', [
+    {k: v for k, v in LEASE.items() if k != 'binding'},      # missing binding
+    {**LEASE, 'binding': None},
+    {**LEASE, 'binding': {'message_id': 'admitted-row'}},    # binding without ticket
+    {**LEASE, 'binding': {**BINDING, 'message_id': 'other-row'}},  # copied lease
+    {**LEASE, 'binding': {**BINDING, 'body_sha256': '0' * 64}},
+    {**LEASE, 'binding': {**BINDING, 'sender': 'U-other'}},
+    {**LEASE, 'binding': {**BINDING, 'channel': 'C-other'}},
+    {**LEASE, 'binding': {**BINDING, 'sender': ''}},
+    {**LEASE, 'binding': {**BINDING, 'thread_ts': '1700.000009'}},
+    {**LEASE, 'binding': {**BINDING, 'ticket': {'id': 'ticket-1', 'request_version': '3'}}},
+    {**LEASE, 'lane': 'other-lane'},
+    {**LEASE, 'invocation_id': ''},
+    {**LEASE, 'generation': '1'},
+])
+def test_untrusted_lease_blocks_drain(monkeypatch, tmp_path, lease):
+    pause(monkeypatch, tmp_path)
+    class AdmissionBus(Bus):
+        def support_uncertain_outbound(self, limit=1000):
+            return [_admission_row(lease=lease, completion=dict(COMPLETION),
+                                   readback=dict(READBACK))]
+    receipt = fence.receipt(AdmissionBus())
+    assert not receipt['local_drained'], lease
+
+
+@pytest.mark.parametrize('readback', [
+    None, 'proof', {},                                    # missing readback
+    {**READBACK, 'delivery_readback_verified': False},
+    {**READBACK, 'delivery_readback_ts': '1700.000009'},
+    {**READBACK, 'delivery_readback_body_sha256': '0' * 64},
+    {**READBACK, 'delivery_readback_sender': 'U-other'},
+    {**READBACK, 'delivery_readback_channel': 'C-other'},
+    {**READBACK, 'delivery_readback_thread_ts': '1700.000009'},
+    {**READBACK, 'delivery_readback_request_version': 4},
+])
+def test_missing_or_unverified_readback_blocks_drain(monkeypatch, tmp_path, readback):
+    pause(monkeypatch, tmp_path)
+    class AdmissionBus(Bus):
+        def support_uncertain_outbound(self, limit=1000):
+            return [_admission_row(lease=dict(LEASE, binding=dict(BINDING)),
+                                   completion=dict(COMPLETION), readback=readback)]
+    receipt = fence.receipt(AdmissionBus())
+    assert not receipt['local_drained'], readback
+
+
+@pytest.mark.parametrize('completion', [
+    None, 'done',                                          # missing receipt
+    {'recorded': True, 'lane': 'other'},
+    {**COMPLETION, 'invocation_id': 'other'},
+    {**COMPLETION, 'recorded': False},
+    {**COMPLETION, 'generation': 2},
+    {**COMPLETION, 'generation': '1'},
+    {**COMPLETION, 'outcome': 'unknown'},
+    {**COMPLETION, 'outcome': None},
+    {k: v for k, v in COMPLETION.items() if k != 'outcome'},
+])
+def test_untrusted_completion_receipt_blocks_drain(monkeypatch, tmp_path, completion):
+    pause(monkeypatch, tmp_path)
+    class AdmissionBus(Bus):
+        def support_uncertain_outbound(self, limit=1000):
+            return [_admission_row(lease=dict(LEASE, binding=dict(BINDING)),
+                                   completion=completion, readback=dict(READBACK))]
+    receipt = fence.receipt(AdmissionBus())
+    assert not receipt['local_drained'], completion

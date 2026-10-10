@@ -435,7 +435,8 @@ def _post_support_resolution(bus, post, row, ticket, identity, body, channel,
                 or finished.get("invocation_id") != invocation):
             raise SupportResolutionAdmissionError("Support send completion ACK unconfirmed")
         _support_send_after_post(bus, current, ts, meta={
-            "support_resolution_send_completion": {**finished, "generation": generation}})
+            "support_resolution_send_completion": {
+                **finished, "generation": generation, "outcome": "completed"}})
         return ts
     except Exception as exc:
         # An acquired-but-unconfirmed receipt or POST cannot be completed by

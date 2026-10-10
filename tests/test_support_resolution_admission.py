@@ -142,6 +142,7 @@ def test_real_0624_lane_and_message_cas_bind_one_verified_send(case):
     assert lease['binding']['body_sha256'] == hashlib.sha256(case.body.encode()).hexdigest()
     assert row['slack_ts'] == ts
     assert row['attachments']['support_resolution_send_readback']['delivery_readback_verified']
+    assert row['attachments']['support_resolution_send_completion']['outcome'] == 'completed'
     assert invocations(case)[0]['outcome'] == 'completed'
     assert invocations(case)[0]['unresolved'] is False
     assert invocations(case)[0]['deployment'] == lease['deployment'] == 'test-deployment'

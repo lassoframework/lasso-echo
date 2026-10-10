@@ -753,7 +753,8 @@ def _send(ticket, who, ident, *, open_group_dm, post_first_message, record_outbo
                 current_notice_bus, lease, outcome="completed")
             lease_state["closed"] = True
             receipt_meta = {"support_resolution_send_completion":
-                            {**finished_ack, "generation": lease["generation"]}}
+                            {**finished_ack, "generation": lease["generation"],
+                             "outcome": "completed"}}
             receipt_row = current_notice_bus.transition_fixer_delivery(
                 row_id, "posting", slack_ts=ts, meta_update=receipt_meta,
                 expected_intent=intent, expected_ts=ts)

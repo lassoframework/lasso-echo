@@ -5,6 +5,7 @@ The env pause is also supported, but changing deployment env can restart replica
 All support operations admitted before pause finish; new operations do not mutate rows.
 """
 import functools
+import hashlib
 import json
 import os
 import socket
@@ -47,18 +48,67 @@ def _validated_lane_status(value):
     return value
 
 
-def _trusted_admission_completion(att):
-    """A completed 0633 row needs the finish receipt recorded against its exact lease."""
+def _trusted_admission_completion(row):
+    """A completed 0633 row needs its finish receipt bound to this exact scanned row.
+
+    Fail closed unless the admission lease binding matches the row id, ticket id,
+    request version and message body sha256, the row is terminal posted with a
+    Slack timestamp, and a verified readback proof confirms the exact body,
+    timestamp, authenticated sender and channel recorded in the lease binding.
+    """
+    if not isinstance(row, dict):
+        return False
+    att = row.get("attachments")
+    if not isinstance(att, dict):
+        return False
     lease, done = att.get(_ADMISSION_KEY), att.get(_COMPLETION_KEY)
-    return (isinstance(lease, dict) and isinstance(done, dict)
-            and lease.get("lane") == _LANE and done.get("recorded") is True
-            and done.get("lane") == _LANE
-            and isinstance(lease.get("invocation_id"), str)
-            and bool(lease["invocation_id"])
-            and done.get("invocation_id") == lease["invocation_id"]
-            and type(lease.get("generation")) is int
-            and done.get("generation") == lease["generation"]
-            and done.get("outcome") in (None, "completed"))
+    # The ordinary outbox stores the proof under a dedicated key. The current
+    # notice sender stores the same verified fields directly in attachments.
+    proof = att.get("support_resolution_send_readback")
+    if proof is None and att.get("delivery_readback_verified") is True:
+        proof = att
+    if not isinstance(lease, dict) or not isinstance(done, dict) or not isinstance(proof, dict):
+        return False
+    binding = lease.get("binding")
+    if not isinstance(binding, dict) or not isinstance(binding.get("ticket"), dict):
+        return False
+    body = row.get("body")
+    body_sha = hashlib.sha256(body.encode()).hexdigest() if isinstance(body, str) else None
+    slack_ts = row.get("slack_ts")
+    return (
+        # Lease binding pinned to the exact scanned message and ticket row.
+        binding.get("message_id") == row.get("id")
+        and binding["ticket"].get("id") == row.get("ticket_id")
+        and type(binding["ticket"].get("request_version")) is int
+        and binding["ticket"]["request_version"] == row.get("delivery_request_version")
+        and body_sha is not None and binding.get("body_sha256") == body_sha
+        # Terminal posted with a Slack timestamp.
+        and row.get("delivery_status") == "posted"
+        and isinstance(slack_ts, str) and bool(slack_ts)
+        # Verified readback proof of the exact posted message.
+        and proof.get("delivery_readback_verified") is True
+        and proof.get("delivery_readback_ts") == slack_ts
+        and proof.get("delivery_readback_body_sha256") == binding["body_sha256"]
+        and proof.get("delivery_readback_request_version")
+            == binding["ticket"]["request_version"]
+        # Authenticated sender/channel where row data supports them.
+        and isinstance(binding.get("sender"), str) and bool(binding["sender"])
+        and proof.get("delivery_readback_sender") == binding["sender"]
+        and isinstance(binding.get("channel"), str) and bool(binding["channel"])
+        and proof.get("delivery_readback_channel") == binding["channel"]
+        and proof.get("delivery_readback_thread_ts") == binding.get("thread_ts")
+        and proof.get("delivery_readback_request_key") == binding.get("request_key")
+        and (att.get("identity") is None
+             or att.get("identity") == binding.get("sender_identity"))
+        # Completion receipt recorded against the exact lease invocation/generation.
+        and lease.get("lane") == _LANE and done.get("lane") == _LANE
+        and done.get("recorded") is True
+        and done.get("outcome") == "completed"
+        and isinstance(lease.get("invocation_id"), str) and bool(lease["invocation_id"])
+        and done.get("invocation_id") == lease["invocation_id"]
+        and type(lease.get("generation")) is int
+        and type(done.get("generation")) is int
+        and done.get("generation") == lease["generation"])
 
 
 def control():
@@ -166,7 +216,7 @@ def receipt(bus=None):
                             blockers.append("uncertain_row_malformed")
                             continue
                         if (row["attachments"].get(_ADMISSION_KEY) is not None
-                                and not _trusted_admission_completion(row["attachments"])):
+                                and not _trusted_admission_completion(row)):
                             blockers.append(f"admission_unresolved:{row['id']}")
                         if any(row["attachments"].get(key) for key in (
                                 "fixer_slack_delivery_uncertain", "fixer_route_uncertain",
