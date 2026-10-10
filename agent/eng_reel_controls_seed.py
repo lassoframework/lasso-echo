@@ -47,6 +47,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import re
 import sys
@@ -203,7 +204,16 @@ def _validate_worker_state(status: Any) -> dict:
     if len(matches) != 1:
         raise ReelSeedError("original_job_unavailable")
     job = matches[0]
-    if job.get("status") != "exhausted" or job.get("next_attempt_at"):
+    # Older exhausted jobs retain their final retry timestamp. The worker's
+    # status projection marks them exhausted by attempt count; a past retry
+    # timestamp does not make them runnable again.
+    retry_at = job.get("next_attempt_at")
+    if job.get("status") != "exhausted" or (
+            retry_at is not None
+            and (isinstance(retry_at, bool)
+                 or not isinstance(retry_at, (int, float))
+                 or not math.isfinite(retry_at)
+                 or not 0 <= retry_at <= datetime.now(timezone.utc).timestamp())):
         raise ReelSeedError("original_job_not_terminal_hold")
     if job.get("reason") != PORTRAIT_HOLD_REASON:
         raise ReelSeedError("original_job_not_portrait_hold")
