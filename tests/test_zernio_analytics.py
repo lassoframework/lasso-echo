@@ -423,7 +423,8 @@ def test_before_after_trend_split_when_no_baseline():
     """No pre-Echo baseline but real history older than the window -> a rolling TREND split:
     basis='trend', and impressions (like every metric) gets an honest before->after (here a
     DECLINE, never dressed up). A brand-new gym with only recent posts stays basis=None."""
-    now = datetime(2026, 8, 26, tzinfo=timezone.utc)
+    # _dated_post is anchored to UTCNOW; keep the split on that same clock.
+    now = UTCNOW
     # Older posts (60-90d ago) strong; recent posts (within 30d) weaker -> honest decline.
     old = [_dated_post(75, analytics={"reach": 500, "impressions": 900, "likes": 40}),
            _dated_post(65, analytics={"reach": 500, "impressions": 900, "likes": 40})]
