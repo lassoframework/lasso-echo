@@ -422,6 +422,29 @@ def _legacy_feed_original(library_path, rendered_key, delivered_bytes):
     return os.path.join(library_path, raw_key), original
 
 
+def _historical_recovery_identity(account_key, row, store, reader):
+    """Optional trusted authority for a HISTORICAL held GBP row whose raw
+    original is no longer local (agent.historical_gbp_original_recovery;
+    flag + exact gym allowlist + operator-seeded DB binding + immutable
+    receipt, all default closed). Only consulted after the ordinary
+    local-original paths cannot apply; any configured-but-wrong evidence
+    raises (same refusal), and an unconfigured row falls through to the
+    ordinary refusal unchanged. Never weakens the distinct-original gate:
+    the returned identity feeds the same downstream comparison."""
+    if (row.get("account") != "googlebusiness"
+            or row.get("format") not in ("update", "photo")
+            or row.get("media_not_ready_reason") != "cross_date_media_repeat_needs_new_visual"):
+        return None
+    try:
+        from . import historical_gbp_original_recovery as hgr
+    except Exception:  # noqa: BLE001 - module absent: no recovery authority
+        return None
+    try:
+        return hgr.receipt_identity(store, account_key, row, read_bytes=reader)
+    except hgr.RecoveryUnavailable:
+        return None
+
+
 def swap_original_identity(account_key, row, store, *, pick=None, read_bytes=None,
                            library_path=None, byte_cache=None):
     """Resolve an original from tenant asset bytes or an exact local source.
@@ -508,7 +531,12 @@ def swap_original_identity(account_key, row, store, *, pick=None, read_bytes=Non
         key = media_key(source)
         keys = library_keys(lib) if lib else set()
         if key not in keys:
-            if (lib and not row.get("source_media_url")
+            recovered = _historical_recovery_identity(account_key, row, store,
+                                                      reader)
+            if recovered is not None:
+                if recovered["sha256"] != digest or recovered["source_url"] != source:
+                    raise ValueError("recovery original identity conflicts")
+            elif (lib and not row.get("source_media_url")
                     and not row.get("drive_file_id")
                     and row.get("format") == "feed" and key.endswith(_REFRAME_SUFFIX)):
                 source, raw = _legacy_feed_original(lib, key, raw)
