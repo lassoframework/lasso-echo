@@ -82,7 +82,7 @@ def test_static_business_refusals_unchanged():
     for fragment in (
         "global history import requires READ COMMITTED",
         "global history import refused: published event lacks ledger owner",
-        "global history import refused: staged history has no original date",
+        "global history import refused: consumed history has no verified original date",
         "global history import refused: occupied scene has incomplete byte evidence",
         "global history import refused: calendar coverage incomplete",
         "global history import refused: published history is unresolved",
@@ -90,9 +90,9 @@ def test_static_business_refusals_unchanged():
         "global history import refused: post-import coverage incomplete",
     ):
         assert fragment in body, fragment
-    # Keyed full-set import still runs before null-key historical attribution.
-    assert body.index("visual_global_claim_fingerprint_set") < body.index(
-        "visual_global_claim_historical_row")
+    # Published history is bound before live reserved claims are admitted.
+    assert body.index("perform public.visual_global_claim_historical_row(") < body.index(
+        "perform public.visual_global_claim_fingerprint_set(")
     assert body.index("visual_global_coverage()") < body.index(
         "visual_global_claim_fingerprint_set")
     # Return shape unchanged.

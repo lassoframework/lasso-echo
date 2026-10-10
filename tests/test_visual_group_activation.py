@@ -43,7 +43,7 @@ LOW = ACTIVATION.lower()
 # Message families Sol's repaired SQL raises. Regexes (not exact strings) so
 # wording stays SQL-owner territory; behavior, not phrasing, is asserted.
 CONTENTION = re.compile(r'contention|try again|temporaril|busy|lock not available|55P03', re.I)
-DATE_PARITY = re.compile(r'date parity|cross-date occupied visual scene|published usage.*date|distinct.*date|more than one.*date', re.I)
+DATE_PARITY = re.compile(r'date parity|cross-date occupied staged visual scene|published usage.*date|distinct.*date|more than one.*date', re.I)
 NULL_DATE = re.compile(r'null.*(posting|post_?)?date|date.*null|missing.*post.*date|undated', re.I)
 
 # --------------------------------------------------------------------------
@@ -100,11 +100,11 @@ def test_fresh_read_committed_required():
 
 def test_all_refusal_paths_raise_inside_transaction():
     for needle in ('unknown, ambiguous or review-pending media identity',
-                   'missing permanent published usage ledger coverage',
+                   'published row missing immutable historical incident coverage',
                    'missing dated ledger reservation or active sibling coverage',
                    'unresolved historical review events',
                    'unresolved ambiguous usage',
-                   'cross-date occupied visual scene',
+                   'cross-date occupied staged visual scene',
                    'unmapped or foreign tenant calendar key'):
         assert needle in LOW
     # Every refusal is a raise inside the RPC: the caller's transaction rolls
