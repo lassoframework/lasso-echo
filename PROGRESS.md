@@ -2,8 +2,9 @@
 
 - [~] The read-only shared Help Center scan classifies client-facing tickets against current gym and message evidence. Its actionable list includes every ticket still shown as working and new requests stuck in received status; the latter alert only after 30 minutes.
 - [~] A default-off internal reminder lane claims one notice per ticket/request version/UTC day and routes Echo, portal and website tickets to their armed owner identity. Dispatch rechecks the exact ticket, gym, messages and age before posting. Durable Slack intent and timestamp readback prevent automatic resend after an uncertain outcome; those notices remain held for exact recovery.
+- [~] Degraded or unrouted passes now produce a bounded health notice to the reviewed private #echosupport channel, with bot identity and exact Slack readback required before confirmed status. Uncertain alert sends remain unconfirmed and retry at the next hourly opportunity. This is still unproven in the deployed runtime.
 - [~] Focused local tests passed and a separate reviewer accepted the default-off implementation. The 19-ticket fixture is synthetic. No client resolution message, ticket closeout or production delivery is claimed.
-- [ ] Verify the live census, wire a confirmed human alert for degraded/unrouted notices, merge/deploy, enable the lane and read back actual internal receipts. Each ticket still requires independent fix verification, truthful client resolution receipt, guarded close and closed-status readback.
+- [ ] Verify the live census, deployed support-channel route and actual health/reminder receipts, then merge/deploy and enable the lane. Each ticket still requires independent fix verification, truthful client resolution receipt, guarded close and closed-status readback.
 
 ## FIXER current notice release repairs (2026-10-07, PR #317)
 

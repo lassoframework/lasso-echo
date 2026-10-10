@@ -1262,6 +1262,23 @@ def _daily_scheduler(store):
                           f"client tickets: {_support_scan_result.get('skipped', [])}")
             except Exception as e:
                 print(f"[client-support-scan-reminder] pass failed: {type(e).__name__}")
+                _support_scan_result = {"ok": False, "reason": "job_failed"}
+            # A degraded scan or unqueued ticket must reach a human. The health
+            # sender is independently flag-gated and verifies the exact internal
+            # Slack receipt; an uncertain post is never logged as delivered.
+            try:
+                from .jobs.client_support_reminder_health import run as _health_run
+                _health_result = _health_run(_support_scan_result)
+                if _health_result.get("state") == "confirmed":
+                    print("[client-support-scan-reminder] health alert confirmed "
+                          f"channel={_health_result.get('channel')} "
+                          f"ts={_health_result.get('slack_ts')}")
+                elif _health_result.get("state") not in {"healthy", "disabled"}:
+                    print("[client-support-scan-reminder] CRITICAL health alert "
+                          f"unconfirmed: {_health_result.get('reason', _health_result.get('state'))}")
+            except Exception as e:
+                print(f"[client-support-scan-reminder] CRITICAL health alert failed: "
+                      f"{type(e).__name__}")
         # CLIENT MEDIA SYNC frequent lane: dormant unless AGENT_CLIENT_MEDIA_SYNC.
         # Picks up a client gym's fresh R2 upload PROMPTLY (throttled to
         # AGENT_CLIENT_MEDIA_SYNC_MINUTES, default 5) and auto-builds its DRAFT
