@@ -176,6 +176,16 @@ def test_internal_posted_kind_does_not_qualify():
     assert res["category"] == r.EXCEPTION
 
 
+def test_postclose_ack_is_visible_but_never_original_completion():
+    for guarded in (True, False):
+        ticket = _ticket(client_delivery_guard_required=guarded)
+        for marker in ({"purpose": "support_postclose_ack"}, {"postclose_ack": True}):
+            ack = _guarded_msg(ticket, kind="status", resolve_notice=True, **marker)
+            assert r._receipt_is_client_visible(ack)
+            assert r.qualifying_completion_receipt(ticket, [ack]) is None
+            assert r.classify_ticket(ticket, [ack], gym=REAL_GYM)["reason"] == "terminal_missing_completion_receipt"
+
+
 def test_unposted_or_inbound_does_not_qualify():
     t = _ticket(client_delivery_guard_required=False)
     inbound = {"direction": "inbound", "delivery_status": "posted",

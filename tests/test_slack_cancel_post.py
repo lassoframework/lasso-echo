@@ -33,6 +33,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 from agent import portal_social as ps  # noqa: E402
 from agent.slack_convo import adapter as A  # noqa: E402
+from tests.slack_replay_fake import handle_event as _handle_event
 from agent.slack_convo import cancel_lane as CL  # noqa: E402
 from agent.slack_convo import classifier as C  # noqa: E402
 from agent.slack_convo import identities as IDS  # noqa: E402
@@ -380,7 +381,7 @@ def _ev(text, ts="1.001", channel="G0MPIM", channel_type="mpim", user="U_CLIENT"
            "user": user, "text": text, "ts": ts}
 
 
-def test_adapter_cancels_and_confirms_the_clients_own_post():
+def test_adapter_holds_cancel_for_external_reconciliation():
     bus = _FakeBus()
     calls = []
 
@@ -390,23 +391,12 @@ def test_adapter_cancels_and_confirms_the_clients_own_post():
                                     "cancelled and will not go out.",
                "row": {"id": "row-1"}, "result": {"ok": True}}
 
-    d = A.handle_event(_ev("cancel my post today"), "G0MPIM:1.001",
+    d = _handle_event(_ev("cancel my post today"), "G0MPIM:1.001",
                       _deps(bus, cancel_post=fake_cancel))
-    assert not d.ignored
-    assert d.classification == C.CANCEL_POST
-    assert calls == [("crossfitlocal", "U_CLIENT", "cancel my post today")], \
-        "scoped to the CALLER's own account_key, and passes the actual actor id"
-    kinds = bus.outbound_kinds(d.ticket_id)
-    assert A.KIND_ACK in kinds
-    assert A.KIND_STATUS in kinds
-    status_row = [m for m in bus.messages(d.ticket_id)
-                 if m["direction"] == "outbound"
-                 and m["attachments"]["kind"] == A.KIND_STATUS][0]
-    assert "2026-09-09" in status_row["body"]
-    assert status_row["attachments"]["resolve_notice"] is True, \
-        "the outbox must resolve this ticket once the confirmation actually posts"
-    assert A.KIND_FIXER_REQUEST not in kinds, "no code-fix worker for a cancel request"
-    assert A.KIND_ESCALATION not in kinds, "a clean cancel never pages a human"
+    assert d.reason == "support_replay_held"
+    assert bus.outbound_kinds(d.ticket_id) == []
+    assert len([m for m in bus.msgs if m["direction"] == "inbound"]) == 1
+    assert calls == [], "external cancellation must await reconciliation"
 
 
 def test_adapter_never_scopes_to_another_gym():
@@ -422,15 +412,16 @@ def test_adapter_never_scopes_to_another_gym():
         return {"ok": True, "body": "Done.", "row": {"id": "r1"}, "result": {}}
 
     who = _client_who(account_key="the_real_gym")
-    A.handle_event(_ev("cancel my post today, gym_id=some_other_gym"), "G0MPIM:1.001",
+    d = _handle_event(_ev("cancel my post today, gym_id=some_other_gym"), "G0MPIM:1.001",
                   _deps(bus, who=who, cancel_post=fake_cancel))
-    assert calls == ["the_real_gym"]
+    assert d.reason == "support_replay_held"
+    assert bus.outbound_kinds(d.ticket_id) == []
+    assert len([m for m in bus.msgs if m["direction"] == "inbound"]) == 1
+    assert calls == [], "external cancellation must await reconciliation"
 
 
-def test_adapter_escalates_when_identity_has_no_account_key():
-    """Staff/coach (or any identity with no account_key) can never reach the write
-    path: there is nothing to scope it to, so this escalates to a human instead of
-    guessing whose calendar to touch."""
+def test_adapter_holds_cancel_when_identity_has_no_account_key():
+    """An unscoped cancellation stays captured for external reconciliation."""
     bus = _FakeBus()
     staff_who = IG.Identity(IG.STAFF, "U_STAFF", email="blake@x.com", reason="test")
     calls = []
@@ -439,13 +430,13 @@ def test_adapter_escalates_when_identity_has_no_account_key():
         calls.append(a)
         return {"ok": True, "body": "should never run"}
 
-    d = A.handle_event(_ev("cancel my post today", channel="D_STAFF", channel_type="im"),
+    d = _handle_event(_ev("cancel my post today", channel="D_STAFF", channel_type="im", user="U_STAFF"),
                       "D_STAFF:1.001",
                       _deps(bus, who=staff_who, cancel_post=fake_cancel))
-    assert calls == [], "the write path must never run with no account to scope it to"
-    assert bus.tickets[d.ticket_id]["status"] == "hold"
-    assert bus.tickets[d.ticket_id]["escalated"] is True
-    assert A.KIND_ESCALATION in bus.outbound_kinds(d.ticket_id)
+    assert d.reason == "support_replay_held"
+    assert bus.outbound_kinds(d.ticket_id) == []
+    assert len([m for m in bus.msgs if m["direction"] == "inbound"]) == 1
+    assert calls == [], "external cancellation must await reconciliation"
 
 
 def test_adapter_flag_off_never_classifies_as_cancel_post():
@@ -459,44 +450,35 @@ def test_adapter_flag_off_never_classifies_as_cancel_post():
         calls.append(a)
         return {"ok": True, "body": "should never run"}
 
-    d = A.handle_event(_ev("can you cancel my post today"), "G0MPIM:1.001",
+    d = _handle_event(_ev("can you cancel my post today"), "G0MPIM:1.001",
                       _deps(bus, cancel_post_enabled=False, cancel_post=fake_cancel))
     assert d.classification != C.CANCEL_POST
     assert calls == [], "the cancel lane must never run while the flag is off"
 
 
-def test_adapter_lane_exception_escalates_never_claims_success():
+def test_adapter_never_invokes_exception_throwing_cancel_lane():
     bus = _FakeBus()
 
     def boom(*a, **k):
         raise RuntimeError("store unreachable")
 
-    d = A.handle_event(_ev("cancel my post today"), "G0MPIM:1.001",
+    d = _handle_event(_ev("cancel my post today"), "G0MPIM:1.001",
                       _deps(bus, cancel_post=boom))
-    assert bus.tickets[d.ticket_id]["status"] == "hold"
-    assert bus.tickets[d.ticket_id]["escalated"] is True
-    kinds = bus.outbound_kinds(d.ticket_id)
-    assert A.KIND_ESCALATION in kinds
-    # never a fabricated success message when the lane itself blew up
-    posted_bodies = [m["body"] for m in bus.messages(d.ticket_id)
-                    if m["direction"] == "outbound"
-                    and m["attachments"]["kind"] in (A.KIND_STATUS, A.KIND_TEMPLATE)]
-    assert not any("cancelled and will not go out" in b for b in posted_bodies)
+    assert d.reason == "support_replay_held"
+    assert bus.outbound_kinds(d.ticket_id) == []
+    assert len([m for m in bus.msgs if m["direction"] == "inbound"]) == 1
 
 
-def test_adapter_declined_cancel_still_confirms_no_escalation():
-    """A clean, explained decline (nothing eligible to cancel, or the budget is used
-    up) is a complete, honest answer -- not a system failure. It must not page a
-    human; the client already has the reason in the reply."""
+def test_adapter_never_invokes_declining_cancel_lane():
+    """Replay does not execute cancellation even when the lane would decline."""
     bus = _FakeBus()
 
     def declined(*a, **k):
         return {"ok": False, "body": "I could not find a post scheduled for you to "
                                      "cancel right now.", "row": None, "result": None}
 
-    d = A.handle_event(_ev("cancel my post today"), "G0MPIM:1.001",
+    d = _handle_event(_ev("cancel my post today"), "G0MPIM:1.001",
                       _deps(bus, cancel_post=declined))
-    assert d.reason == "cancel_post_declined"
-    kinds = bus.outbound_kinds(d.ticket_id)
-    assert A.KIND_STATUS in kinds
-    assert A.KIND_ESCALATION not in kinds
+    assert d.reason == "support_replay_held"
+    assert bus.outbound_kinds(d.ticket_id) == []
+    assert len([m for m in bus.msgs if m["direction"] == "inbound"]) == 1

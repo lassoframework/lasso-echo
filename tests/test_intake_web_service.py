@@ -27,6 +27,8 @@ def server(monkeypatch):
         if name.startswith("AGENT_INTAKE_TOKEN_"):
             monkeypatch.delenv(name, raising=False)
     monkeypatch.delenv("AGENT_INTAKE_ENABLED", raising=False)
+    monkeypatch.delenv("RAILWAY_GIT_COMMIT_SHA", raising=False)
+    monkeypatch.delenv("RAILWAY_SERVICE_NAME", raising=False)
     srv = build_server(port=0)
     t = threading.Thread(target=srv.serve_forever, daemon=True)
     t.start()

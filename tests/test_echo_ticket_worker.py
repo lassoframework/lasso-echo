@@ -244,6 +244,7 @@ def _calls():
         log["posted"].append((channel_id, text))
         return {"ok": True, "ts": "9999.1"}
 
+    post_first_message.verify_sender = lambda: {"ok": True, "user_id": "U_ECHO"}
     return log, open_group_dm, post_first_message
 
 
@@ -894,6 +895,8 @@ def test_real_outreach_pre_send_refusal_reaches_intake_hold_queue(monkeypatch, r
     monkeypatch.setenv("SLACK_CONVO_ECHO_CURRENT_NOTICE_ENABLED",
                        str(reason != "current_notice_disabled"))
     monkeypatch.setenv("AGENT_SLACK_BOT_USER_ID", "U_ECHO")
+    monkeypatch.setattr(W._out, "_current_notice_admission_status",
+                        lambda _bus: {"generation": 7})
     bus = FakeBus([_ticket(raw_text="is my instagram connected?", request_version=5)])
     reservations = []
     def begin(*_a, **_kw):
@@ -935,6 +938,8 @@ def test_real_outreach_pre_send_refusal_reaches_intake_hold_queue(monkeypatch, r
 def test_real_preflight_exception_preserves_a_concurrent_new_request(monkeypatch, failure):
     monkeypatch.setenv("SLACK_CONVO_ECHO_CURRENT_NOTICE_ENABLED", "true")
     monkeypatch.setenv("AGENT_SLACK_BOT_USER_ID", "U_ECHO")
+    monkeypatch.setattr(W._out, "_current_notice_admission_status",
+                        lambda _bus: {"generation": 7})
     bus = FakeBus([_ticket(raw_text="is my instagram connected?", request_version=5)])
     log, open_dm, post = _calls()
     _, notice = _notices()
@@ -1310,6 +1315,8 @@ def test_current_attempt_refusal_uses_one_confirmed_staff_alert(monkeypatch, rea
 def test_real_outreach_claim_refusal_does_not_double_alert(monkeypatch, reason, first_alert_fails):
     monkeypatch.setenv("SLACK_CONVO_ECHO_CURRENT_NOTICE_ENABLED", "true")
     monkeypatch.setenv("AGENT_SLACK_BOT_USER_ID", "U_ECHO")
+    monkeypatch.setattr(W._out, "_current_notice_admission_status",
+                        lambda _bus: {"generation": 7})
     bus = FakeBus([_ticket(raw_text="is my instagram connected?", request_version=5)])
     log, open_dm, post = _calls()
     _, notice = _notices()

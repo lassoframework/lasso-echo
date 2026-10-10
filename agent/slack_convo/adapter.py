@@ -64,6 +64,8 @@ HARDENING (2026-09-03 re-audit wave 2):
 """
 from dataclasses import dataclass, field
 
+from .. import support_sender_fence as _fence
+
 from . import classifier as _cls
 from . import identity_gate as _ig
 from . import brain as _brain
@@ -781,6 +783,8 @@ def _fresh_ticket(bus, tid):
         return {"id": tid}
 
 
+@_fence.guarded("hold_answer_producer", lambda: {"tier": "",
+    "why": "support_sender_paused", "client_notified": False})
 def hold_answer_for_team(bus, *, ticket, ident_name, recipient_kind, user, account_key,
                          surface, body, held_message_id, verdict, person="",
                          write_hold_notice_fn=None, fixer_authored=False, unarmed_flag="",
@@ -818,6 +822,7 @@ def hold_answer_for_team(bus, *, ticket, ident_name, recipient_kind, user, accou
     return {"tier": tier, "why": why, "client_notified": notified}
 
 
+@_fence.guarded("client_hold_producer", lambda: False)
 def _client_hold_notice(bus, tid, *, ident_name, recipient_kind, surface, verdict, tier,
                         notice_text=None, log=print):
     """The client's line, once per ticket per tier. Fails CLOSED on a read fault (a second
@@ -889,6 +894,7 @@ def follow_up_already_routed(ticket):
     return bool(hold) and hold.get("reason") == FOLLOW_UP_MARKER
 
 
+@_fence.guarded("follow_up_producer", lambda: False)
 def route_follow_up_promise(bus, ticket, *, ident_name, body, recipient_kind="client",
                             surface="", person="", log=print):
     """The answer posted (or is queued to post) and promised a human follow-up: keep the
@@ -1125,17 +1131,18 @@ def handle_event(event, event_id, deps):
         return _ignore("staff_conversation", surface, who.kind)
 
     # V-m4: greetings / thanks never open a ticket or page anyone.
-    if _cls.is_chatter(text):
+    chatter = _cls.is_chatter(text)
+    if chatter and _fence.control()["enabled"]:
+        from . import replay
+        chatter = replay.benign_chatter(text)
+    if chatter:
         if existing is None:
             return _ignore("chatter", surface, who.kind)
-        _, dup = deps.bus.record_inbound(
-            ticket_id=existing["id"], slack_event_id=event_id, slack_ts=event.get("ts"),
-            author_type=author_type_for(who) if who.is_human_known else "client",
-            author_id=user, body=text, meta={"surface": surface, "chatter": True,
-                                             "raw_event_id": event.get("_raw_event_id") or ""})
-        return Decision("ticketed" if not dup else "ignored",
-                        "chatter_noted" if not dup else "duplicate_event", surface, who.kind,
-                        existing["id"], False, "", [], duplicate=dup)
+        return _capture_and_replay(
+            deps=deps, event=event, event_id=event_id, ticket=existing, who=who,
+            surface=surface, text=text, created=False, classification=_cls.FOLLOW_UP,
+            unknown_in_channel=not who.is_human_known and surface == SURFACE_MENTION,
+            rate_limited=False, request_type=None, chatter=True)
 
     # RT-m6: an unknown person @mentioning us in a channel: internal escalation only, never a
     # template into a public channel. In a DM / group DM the template is written (held).
@@ -1211,17 +1218,49 @@ def handle_event(event, event_id, deps):
         return _ignore("other_ticket_identity", surface, who.kind)
     tid = ticket["id"]
 
-    # 8) THE INBOUND ROW FIRST. Duplicate event id -> we already did all of this; stop.
-    _, dup = deps.bus.record_inbound(
-        ticket_id=tid, slack_event_id=event_id, slack_ts=event.get("ts"),
-        author_type=author_type_for(who) if who.is_human_known else "client",
-        author_id=user, body=text,
-        meta={"surface": surface, "raw_event_id": event.get("_raw_event_id") or "",
-              "identity_reason": who.reason})
-    if dup:
-        return Decision(action="ignored", reason="duplicate_event", surface=surface,
-                        identity_kind=who.kind, ticket_id=tid, duplicate=True)
+    # Atomic capture owns the inbound event and its requester cycle even while
+    # reply production is disabled. Pending replay remains recoverable at cutover.
+    return _capture_and_replay(
+        deps=deps, event=event, event_id=event_id, ticket=ticket, who=who,
+        surface=surface, text=text, created=created, classification=classification,
+        unknown_in_channel=unknown_in_channel, rate_limited=rate_limited,
+        request_type=request_type)
 
+
+def _capture_and_replay(*, deps, event, event_id, ticket, who, surface, text, created,
+                        classification, unknown_in_channel, rate_limited, request_type,
+                        chatter=False):
+    from . import replay
+    tid = ticket["id"]
+    captured = replay.capture(
+        deps, event=event, event_id=event_id, ticket=ticket, who=who,
+        surface=surface, text=text, created=created, classification=classification,
+        unknown_in_channel=unknown_in_channel, rate_limited=rate_limited,
+        request_type=request_type, chatter=chatter)
+    item = captured["item"]
+    if not _fence.control()["enabled"]:
+        return Decision("ticketed", "support_atomic_replay_required", surface, who.kind,
+                        tid, created, classification or "", [],
+                        duplicate=captured.get("duplicate") is True)
+    with _fence.admission("slack_adapter_producer") as allowed:
+        if not allowed:
+            return Decision("ticketed", "support_sender_paused", surface, who.kind,
+                            tid, created, classification or "", [],
+                            duplicate=captured.get("duplicate") is True)
+        receipt = replay.process(deps, item["id"])
+    if receipt.get("state") == "committed" and not captured.get("duplicate"):
+        return Decision(**receipt["decision"])
+    if receipt.get("state") == "held":
+        deps.log(f"[slack-convo/{deps.identity.name}] replay HELD "
+                 f"id={item['id']} ticket={tid} reason={receipt.get('reason')}")
+    return Decision("ticketed", f"support_replay_{receipt.get('state', 'invalid')}",
+                    surface, who.kind, tid, created, classification or "", [],
+                    duplicate=captured.get("duplicate") is True)
+
+
+def _dispatch_recorded_event(*, deps, ident, who, user, text, surface, channel, tid,
+                             ticket, created, classification, unknown_in_channel,
+                             rate_limited, request_type):
     out = []
     lane = ticket.get("lane") or (ident.default_lane if ident.default_lane in ident.allowed_lanes
                                   else "hold")
@@ -1249,8 +1288,15 @@ def handle_event(event, event_id, deps):
         # them; INTERNAL_KINDS (escalation/hold_notice/fixer_request) are untouched here --
         # fixer_request_text already escapes its own untrusted text (RT-M1/RA-M1).
         safe_body = _slack_escape(body) if kind in CONVERSATIONAL_KINDS else body
+        outbound_fence = {}
+        if kind in CONVERSATIONAL_KINDS:
+            version = ticket.get("request_version")
+            if type(version) is not int or version < 0:
+                raise ValueError("conversational reply request version unavailable")
+            outbound_fence["expected_request_version"] = version
         row = deps.bus.record_outbound(ticket_id=tid, author_type=author_type or ident.name,
-                                       body=safe_body, delivery_status=status, kind=kind, meta=m)
+                                       body=safe_body, delivery_status=status, kind=kind, meta=m,
+                                       **outbound_fence)
         out.append(kind)
         if status == "held" and hold_handled:
             # D72: the caller runs hold_answer_for_team (card + client notice + ticket).
@@ -1647,6 +1693,7 @@ def _slack_escape(text):
     return (text or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
+@_fence.guarded("hold_card_producer", lambda: None)
 def write_hold_notice(bus, *, ident_name, tid, recipient_kind, user, account_key, kind, body,
                       held_message_id, surface, why="", no_draft=False, person=""):
     """The tap card as a row. Shared with the outbox (V-M8: a row the outbox moves to held at

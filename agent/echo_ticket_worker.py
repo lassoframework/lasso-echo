@@ -43,6 +43,7 @@ import time
 import uuid
 
 from . import config
+from . import support_sender_fence as _fence
 from .slack_convo import adapter as _a
 from .slack_convo import classifier as _cls
 from .slack_convo import identities as _ids
@@ -601,6 +602,8 @@ def _escalate_unresolved(bus, ticket, *, reason, identity_name="echo", log=print
     log(f"[ticket-worker/{identity_name}] escalated ticket={tid} reason={reason}")
 
 
+@_fence.guarded("portal_intake", lambda: {"processed": 0, "paused": 1},
+                receipt_on_pause=True)
 def intake_pass(bus, *, slack_lookup_email, slack_user_info, portal_lookup, open_group_dm,
                post_first_message, write_hold_notice, product=PRODUCT, source=SOURCE,
                identity_name="echo", operator_ids=(), fetch_state=None, llm=None,
@@ -1300,6 +1303,8 @@ def _outbound_escalations_today(bus, tid):
                and str(m.get("created_at") or "") >= start)
 
 
+@_fence.guarded("portal_fixed", lambda: {"notified": 0, "paused": 1},
+                receipt_on_pause=True)
 def fixed_pass(bus, *, open_group_dm, post_first_message, product=PRODUCT,
               identity_name="echo", mark_message=None, claim_message=None,
               stamp_ticket=None, readback=None, member_check=None, log=print):

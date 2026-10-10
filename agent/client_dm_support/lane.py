@@ -63,6 +63,8 @@ everything past `_actionable` is acted on and counted.
 """
 from __future__ import annotations
 
+from .. import support_sender_fence as _fence
+
 from . import arming as _arm
 from . import conditions as _c
 from . import no_ad_rail as _tripwire
@@ -487,6 +489,8 @@ def poll(bus, *, product=DEFAULT_PRODUCT, limit=5):
     return out, True
 
 
+@_fence.guarded("client_dm_delivery_producer", lambda: {"reply": False,
+    "card": False, "undelivered": 0, "paused": 1})
 def _deliver(bus, ticket, identity, decision, arm, surface):
     """Write the client reply (when armed) and ALWAYS write the human card.
 
@@ -582,6 +586,9 @@ def _card_text(ticket, decision, arm, wrote):
     return "\n".join(lines)
 
 
+@_fence.guarded("client_dm_producer", lambda: {"ok": True, "mode": "paused",
+    "reason": "support_sender_paused", "handled": 0, "replies": 0, "cards": 0,
+    "escalated": 0, "undelivered": 0, "paused": 1})
 def run_once(*, bus=None, identity=None, limit=5, product=None, deps=None):
     """One pass, for ONE bot identity. Never raises. Always returns a summary that
     distinguishes OFF from BROKEN from IDLE by name and by count.

@@ -21,6 +21,8 @@ parameter does not emit -- so ON CONFLICT would fail with "no unique or exclusio
 matching" at runtime. Catching the violation is the reliable form.
 """
 import json
+import os
+from urllib.parse import urlparse
 import re
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -137,6 +139,58 @@ class Bus:
         self._url = (url if url is not None else config.supabase_url())
         self._key = (service_key if service_key is not None else config.supabase_service_key())
         self._http = http
+
+    def read_authenticated_client_closed_projection(self, ticket, completion_message_id):
+        """Legacy contract name: machine parity, not authenticated client access.
+
+        Acceptance still requires a separate live client UI canary. No retries.
+        """
+        secret = os.environ.get("SUPPORT_CLOSED_PROJECTION_SECRET", "")
+        url = os.environ.get("SUPPORT_CLOSED_PROJECTION_URL", "")
+        parsed = urlparse(url)
+        if (os.environ.get("SUPPORT_CLOSED_PROJECTION_ENABLED") != "true" or not secret or
+                parsed.scheme != "https" or parsed.netloc != "ops.lassoframework.com" or
+                parsed.username or parsed.password or parsed.query or parsed.fragment or
+                parsed.path != "/api/internal/support/closed-projection"):
+            return None
+        if not isinstance(ticket, dict) or any(not _UUID.fullmatch(str(v or "")) for v in
+                (ticket.get("id"), ticket.get("client_id"), completion_message_id)):
+            return None
+        try:
+            response = self._client().post(url, headers={"Authorization": f"Bearer {secret}",
+                "Content-Type": "application/json", "Accept": "application/json"},
+                json={"ticket_id": ticket["id"], "gym_id": ticket["client_id"],
+                      "completion_message_id": completion_message_id},
+                timeout=10, allow_redirects=False)
+            if response.status_code != 200:
+                return None
+            result = response.json()
+            from ..support_historical_closeout import _identity_matches
+            fixer = (ticket.get("verification_after") or {}).get("fixer") or {}
+            recovery = fixer.get("historical_receipt_recovery") or {}
+            if (not isinstance(result, dict) or not _identity_matches(result, ticket) or
+                    result.get("ticket_id") != ticket["id"] or
+                    result.get("authenticated_client_id") != ticket["client_id"] or
+                    result.get("completion_message_id") != completion_message_id or
+                    recovery.get("notice_message_id") != completion_message_id or
+                    recovery.get("request_version") != ticket.get("request_version") or
+                    fixer.get("request_key_version") != ticket.get("request_version") or
+                    recovery.get("request_key") != fixer.get("request_key") or
+                    result.get("request_key") != fixer.get("request_key") or
+                    not _HASH.fullmatch(str(result.get("request_key") or "")) or
+                    result.get("display_status") != "done" or
+                    result.get("client_delivery_confirmed") is not True or
+                    result.get("authentication_kind") != "machine_projection_parity" or
+                    result.get("live_client_ui_canary_required") is not True or
+                    not str(result.get("observation_ref") or "").startswith("portal-machine-projection:") or
+                    not result.get("completion_slack_ts")):
+                return None
+            stamp = datetime.fromisoformat(result["observed_at"].replace("Z", "+00:00"))
+            if not 0 <= (datetime.now(timezone.utc) - stamp).total_seconds() <= 60:
+                return None
+            return result
+        except Exception:
+            return None
 
     # ---- transport ----------------------------------------------------------------------
     def available(self):
@@ -361,6 +415,84 @@ class Bus:
         if r.status_code >= 400:
             raise BusError(r.status_code, (r.text or "")[:200])
         return r.json()
+
+    def reserve_historical_receipt(self, ticket, *, request_key, evidence_ref,
+                                   body_sha256, notice_id):
+        """One exact 14-argument 0640 attempt; never retry an ambiguous response."""
+        body = {"p_ticket_id": ticket["id"], "p_request_version": ticket["request_version"]}
+        for field in ("source", "product", "client_id", "bot_identity", "slack_user_id",
+                      "slack_channel_id", "slack_thread_ts", "resolved_at"):
+            body["p_" + field] = ticket.get(field)
+        body.update(p_request_key=request_key, p_evidence_ref=evidence_ref,
+                    p_notice_body_sha256=body_sha256, p_notice_message_id=notice_id)
+        r = self._client().post(self._rest("rpc/fixer_reserve_historical_receipt_recovery"),
+                               data=json.dumps(body), headers=self._headers(), timeout=30)
+        if r.status_code >= 400:
+            raise BusError(r.status_code, "historical reserve unavailable")
+        return r.json()
+
+    def finalize_historical_receipt(self, *, ticket_id, notice_id, note,
+                                    invocation_id, generation, deployment, build):
+        """One exact 7-argument RPC; caller owns 0636 admission and readback."""
+        body = {"p_ticket_id": ticket_id, "p_notice_message_id": notice_id,
+                "p_note": note, "p_admission_invocation_id": invocation_id,
+                "p_admission_generation": generation,
+                "p_admission_deployment": deployment, "p_admission_build": build}
+        r = self._client().post(self._rest("rpc/fixer_finalize_historical_receipt"),
+                               data=json.dumps(body), headers=self._headers(), timeout=30)
+        if r.status_code >= 400:
+            raise BusError(r.status_code, "historical finalize unavailable")
+        return r.json()
+
+    def fixer_validate_historical_receipt_dispatch(self, expected):
+        """Check the exact pending 0640 reservation with the service-role RPC.
+
+        This read-only result is reservation consistency, not send authority.
+        The caller must independently recheck the full requester transcript,
+        sender, member, admission lease and exact notice immediately before POST.
+        """
+        if not isinstance(expected, dict) or not all(key in expected for key in (
+                "ticket_id", "request_version", "notice_id", "request_key",
+                "body_sha256", "source", "product", "client_id", "bot_identity",
+                "slack_user_id", "channel", "thread_ts", "reservation")):
+            return None
+        version = expected["request_version"]
+        if (not _UUID.fullmatch(str(expected["ticket_id"] or ""))
+                or not _UUID.fullmatch(str(expected["notice_id"] or ""))
+                or type(version) is not int or version < 0
+                or not _HASH.fullmatch(str(expected["request_key"] or ""))
+                or not _HASH.fullmatch(str(expected["body_sha256"] or ""))
+                or not isinstance(expected["source"], str) or not expected["source"]
+                or not isinstance(expected["product"], str) or not expected["product"]
+                or not isinstance(expected["bot_identity"], str)
+                or not expected["bot_identity"]
+                or not isinstance(expected["channel"], str)
+                or not expected["channel"].strip()
+                or not isinstance(expected["reservation"], str)
+                or not expected["reservation"].strip()):
+            return None
+        body = {
+            "p_ticket_id": expected["ticket_id"],
+            "p_request_version": version,
+            "p_notice_message_id": expected["notice_id"],
+            "p_request_key": expected["request_key"],
+            "p_intended_body_sha256": expected["body_sha256"],
+            "p_source": expected["source"],
+            "p_product": expected["product"],
+            "p_client_id": expected["client_id"],
+            "p_bot_identity": expected["bot_identity"],
+            "p_slack_user_id": expected["slack_user_id"],
+            "p_slack_channel_id": expected["channel"],
+            "p_slack_thread_ts": expected["thread_ts"],
+        }
+        r = self._client().post(self._rest("rpc/fixer_validate_historical_receipt_reservation"),
+                                data=json.dumps(body), headers=self._headers(), timeout=30)
+        if r.status_code >= 400:
+            raise BusError(r.status_code, "historical receipt validator unavailable")
+        if r.json() is not True:
+            return None
+        return {"ok": True, "notice_id": expected["notice_id"],
+                "reservation": expected["reservation"]}
 
     def begin_current_notice(self, ticket, notice_id, *, unrouted=False):
         """Reserve one exact notice before its outbound INSERT (portal 0384)."""
@@ -842,6 +974,17 @@ class Bus:
             "attachments->>receipt": "is.null",
             "created_at": f"gte.{since_iso}", "select": "id"})
         return len(rows)
+
+    def support_uncertain_outbound(self, limit=1000):
+        """Status-independent read: uncertainty survives even a mistaken status edit."""
+        markers = ("fixer_slack_delivery_uncertain", "fixer_route_uncertain",
+                   "fixer_route_pending", "outreach_delivery_uncertain",
+                   "slack_replay_delivery_uncertain")
+        return self._get(_MESSAGES, {
+            "direction": "eq.outbound", "select": "*", "order": "created_at.asc,id.asc",
+            "limit": str(int(limit)),
+            "or": "(" + ",".join(f"attachments->>{key}.not.is.null" for key in markers) + ")",
+        })
 
     def outbox(self, status="ready", limit=50, identity=None):
         """Outbound rows in one delivery state, oldest first. `identity` narrows to rows this
