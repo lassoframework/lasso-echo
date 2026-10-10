@@ -31,6 +31,10 @@ from .. import config
 _TICKETS = "support_tickets"
 _MESSAGES = "support_messages"
 
+# Whole-attachment CAS key-removal sentinel: updates may map a key to _REMOVE to
+# drop it from the merged jsonb in the same compare-and-set write.
+_REMOVE = object()
+
 OPEN_STATUSES = ("new", "triage", "fixing", "verification", "hold", "approved")
 _UUID = re.compile(
     r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\Z")
@@ -843,6 +847,121 @@ class Bus:
             "created_at": f"gte.{since_iso}", "select": "id"})
         return len(rows)
 
+    # Portal 0633 durable send admission: a row stamped with this lease but without a
+    # trusted completion has an UNKNOWN durable effect no matter what delivery_status
+    # a later edit left behind. It must block any drain acknowledgment until the
+    # admission lane itself reports zero unresolved for the paused generation.
+    SUPPORT_SEND_LANE = "support-resolution-send"
+    SUPPORT_SEND_ADMISSION_KEY = "support_resolution_send_admission"
+
+    def support_uncertain_outbound(self, limit=1000):
+        """Status-independent read: uncertainty survives even a mistaken status edit."""
+        markers = ("fixer_slack_delivery_uncertain", "fixer_route_uncertain",
+                   "fixer_route_pending", "outreach_delivery_uncertain",
+                   "slack_replay_delivery_uncertain", self.SUPPORT_SEND_ADMISSION_KEY)
+        return self._get(_MESSAGES, {
+            "direction": "eq.outbound", "select": "*", "order": "created_at.asc,id.asc",
+            "limit": str(int(limit)),
+            "or": "(" + ",".join(f"attachments->>{key}.not.is.null" for key in markers) + ")",
+        })
+
+    def support_admission_status_lane(self, lane=SUPPORT_SEND_LANE):
+        """Fresh portal 0633 durable admission lane status, fail closed on transport
+        or malformed receipts. Callers validate the payload; this never retries."""
+        r = self._client().post(self._rest("rpc/support_admission_status_lane"),
+                                data=json.dumps({"p_lane": lane}),
+                                headers=self._headers(), timeout=30)
+        if r.status_code >= 400:
+            raise BusError(r.status_code, "support admission status unavailable")
+        result = r.json()
+        if not isinstance(result, dict):
+            raise BusError(400, "support admission status malformed")
+        return result
+
+    def support_admission_send_receipt(self, *, invocation_id, generation,
+                                       ticket_id, request_version, message_id,
+                                       slack_ts):
+        """Transport-level portal 0633 one-shot Slack timestamp receipt.
+
+        Records the single Slack API ts against the exact admitted send
+        binding. Fail closed on transport or malformed receipts; callers
+        validate every returned field and never retry an uncertain call --
+        a duplicate receipt is itself a durable effect and never reposted.
+        """
+        body = {"p_invocation_id": invocation_id, "p_generation": generation,
+                "p_ticket_id": ticket_id, "p_expected_request_version": request_version,
+                "p_message_id": message_id, "p_slack_ts": slack_ts}
+        r = self._client().post(self._rest("rpc/support_admission_send_receipt"),
+                                data=json.dumps(body),
+                                headers=self._headers(), timeout=30)
+        if r.status_code >= 400:
+            raise BusError(r.status_code, "support admission send receipt unavailable")
+        result = r.json()
+        if not isinstance(result, dict):
+            raise BusError(400, "support admission send receipt malformed")
+        return result
+
+    def support_admission_inventory(self, lane, *, limit=200, after_started=None,
+                                    after_invocation=None):
+        """Read-only portal 0633 paginated invocation inventory, fail closed.
+
+        Keyset cursor: (after_started, after_invocation) move together or not at
+        all. Never retries; callers validate every page field before trusting it.
+        """
+        if (after_started is None) != (after_invocation is None):
+            raise BusError(400, "support admission inventory cursor malformed")
+        body = {"p_lane": lane, "p_limit": int(limit),
+                "p_after_started": after_started,
+                "p_after_invocation": after_invocation}
+        r = self._client().post(self._rest("rpc/support_admission_inventory"),
+                                data=json.dumps(body),
+                                headers=self._headers(), timeout=30)
+        if r.status_code >= 400:
+            raise BusError(r.status_code, "support admission inventory unavailable")
+        result = r.json()
+        if not isinstance(result, dict):
+            raise BusError(400, "support admission inventory malformed")
+        return result
+
+    def support_cutover_reservation_status(self, reservation_id, epoch):
+        """Frozen Portal DRAFT_0639 durable cutover reservation status receipt
+        (public.support_cutover_reservation_status(uuid,bigint)). Fail closed on
+        transport or malformed receipts; callers validate every field."""
+        body = {"p_reservation_id": reservation_id, "p_epoch": int(epoch)}
+        r = self._client().post(self._rest("rpc/support_cutover_reservation_status"),
+                                data=json.dumps(body),
+                                headers=self._headers(), timeout=30)
+        if r.status_code >= 400:
+            raise BusError(r.status_code, "support cutover reservation status unavailable")
+        result = r.json()
+        if not isinstance(result, dict):
+            raise BusError(400, "support cutover reservation status malformed")
+        return result
+
+    def support_cutover_reservation_inventory(self, reservation_id, epoch,
+                                              lane, *, limit=200,
+                                              after_started=None,
+                                              after_invocation=None):
+        """Frozen Portal DRAFT_0639 read-only paginated invocation inventory
+        pinned to the held cutover reservation
+        (public.support_cutover_reservation_inventory(uuid,bigint,text,integer,
+        timestamptz,uuid)). Fail closed; never retries."""
+        if (after_started is None) != (after_invocation is None):
+            raise BusError(400, "support cutover inventory cursor malformed")
+        body = {"p_reservation_id": reservation_id, "p_epoch": int(epoch),
+                "p_lane": lane, "p_limit": int(limit),
+                "p_after_started": after_started,
+                "p_after_invocation": after_invocation}
+        r = self._client().post(self._rest("rpc/support_cutover_reservation_inventory"),
+                                data=json.dumps(body),
+                                headers=self._headers(), timeout=30)
+        if r.status_code >= 400:
+            raise BusError(r.status_code, "support cutover reservation inventory unavailable")
+        result = r.json()
+        if not isinstance(result, dict):
+            raise BusError(400, "support cutover reservation inventory malformed")
+        return result
+
     def outbox(self, status="ready", limit=50, identity=None):
         """Outbound rows in one delivery state, oldest first. `identity` narrows to rows this
         bot wrote (attachments.identity), so two identities' loops never read each other's
@@ -1202,7 +1321,9 @@ class Bus:
             if (not row or row.get("delivery_status") != "held"
                     or not eligible(row, snapshot)):
                 return None
-            next_att = {**snapshot, **updates(row, snapshot)}
+            patch = updates(row, snapshot)
+            next_att = {key: value for key, value in {**snapshot, **patch}.items()
+                        if value is not _REMOVE}
             match = {
                 "id": f"eq.{message_id}",
                 "delivery_status": "eq.held",
@@ -1279,6 +1400,7 @@ class Bus:
                                       expected_intent, expected_ts):
         """Promote a held uncertain delivery only after exact Slack readback."""
         if (not isinstance(proof, dict)
+                or proof.get("delivery_readback_verified") is not True
                 or not isinstance(expected_ts, str) or not expected_ts
                 or proof.get("delivery_readback_ts") != expected_ts):
             return None
@@ -1292,7 +1414,10 @@ class Bus:
                      or (att.get("delivery_readback_verified") is True
                          and att.get("delivery_readback_ts") == expected_ts))
                 and _row.get("slack_ts") == expected_ts),
-            updates=lambda _row, _att: proof,
+            # Clear the uncertainty marker in the same whole-attachment CAS that
+            # promotes the row, retaining the exact proof and durable intent.
+            updates=lambda _row, _att: {**proof,
+                                        "fixer_slack_delivery_uncertain": _REMOVE},
             fields={"delivery_status": "posted",
                     "slack_ts": proof["delivery_readback_ts"]},
             match_update=lambda _row, _att: {"slack_ts": f"eq.{expected_ts}"})
@@ -1381,15 +1506,23 @@ class Bus:
             eligible=lambda _row, _att: True,
             updates=lambda _row, _att: {"fixer_staff_alerted": True})
 
-    def pending_fixer_finalization(self, identity, limit=100):
+    def pending_fixer_finalization(self, identity, limit=100, after=None):
         """Verified Slack posts whose ticket close may have been interrupted."""
-        return self._get(_MESSAGES, {
+        params = {
             "direction": "eq.outbound", "delivery_status": "eq.posted",
             "attachments->>identity": f"eq.{identity}",
             "attachments->>fixer_slack_delivery_intent": "not.is.null",
             "attachments->>fixer_delivery_finalized_at": "is.null",
-            "select": "*", "order": "created_at.desc", "limit": str(int(limit)),
-        })
+            "select": "*", "order": "created_at.asc,id.asc",
+            "limit": str(int(limit)),
+        }
+        if after:
+            ts = str(after.get("created_at") or "").replace('"', "")
+            mid = str(after.get("id") or "").replace('"', "")
+            if ts and mid:
+                params["or"] = (f'(created_at.gt."{ts}",'
+                                f'and(created_at.eq."{ts}",id.gt."{mid}"))')
+        return self._get(_MESSAGES, params)
 
     def fixer_receipt_exists(self, message_id, ticket_id, kind):
         """Require the complete immutable identity of a FIXER delivery receipt."""

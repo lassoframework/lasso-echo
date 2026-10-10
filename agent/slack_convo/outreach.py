@@ -36,10 +36,15 @@ REFUSAL PATHS (Blake's own words, restated as hard gates -- both have tests):
 """
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import hashlib
+import json
+import os
 import uuid
 
 from .. import config
+from .. import support_sender_fence as _fence
 from . import identity_gate as _ig
+from . import outbox as _ob
 from .adapter import _slack_escape, KIND_OUTREACH_REQUEST
 
 # Same operator id as CLAUDE.md / the portal's digest-dm.ts (Approver Slack id, LASSO
@@ -211,6 +216,207 @@ def first_message_text(ticket, ident):
             f"I am on it and will follow up here.")
 
 
+def _current_notice_sender_proof(ident, verifier):
+    """Authenticate the EXACT poster captured by this send before any client POST.
+
+    Mirrors outbox._verify_support_post_sender for the current-notice lane: the
+    verifier is the auth.test callable bound to the same Slack transport that will
+    POST (wired as post_first_message.verify_sender), and its proof must match this
+    identity's own bot user id. Any unavailability, exception or mismatch fails
+    closed -- no reservation, no row, no Slack call.
+    """
+    expected = ident.bot_user_id()
+    if not isinstance(expected, str) or not expected.strip() or not callable(verifier):
+        return None
+    try:
+        proof = verifier()
+    except Exception:  # noqa: BLE001 - sender authentication unavailable fails closed
+        return None
+    if (not isinstance(proof, dict) or proof.get("ok") is not True
+            or proof.get("user_id") != expected):
+        return None
+    return expected
+
+
+def _current_notice_admission_status(bus):
+    """Portal 0633 support-resolution-send lane status, fail closed.
+
+    Returns the validated status dict only when the exact Railway deployment/build
+    env is present and the durable lane answers unpaused and well formed. A paused,
+    drained-inconsistent, malformed or unreachable lane returns None, so the caller
+    refuses BEFORE reserving a notice -- zero Slack posts, nothing to reconcile.
+    """
+    if (not os.environ.get("RAILWAY_DEPLOYMENT_ID", "").strip()
+            or not os.environ.get("RAILWAY_GIT_COMMIT_SHA", "").strip()):
+        return None
+    try:
+        status = _ob._support_send_rpc(bus, "support_admission_status_lane",
+                                       {"p_lane": _ob.SUPPORT_SEND_LANE})
+    except Exception:  # noqa: BLE001 - an unreachable admission lane fails closed
+        return None
+    generation, unresolved = status.get("generation"), status.get("unresolved")
+    if (status.get("lane") != _ob.SUPPORT_SEND_LANE
+            or type(generation) is not int or not 0 <= generation <= 2**53 - 1
+            or type(unresolved) is not int or unresolved < 0
+            or type(status.get("paused")) is not bool
+            or type(status.get("drained")) is not bool
+            or status["drained"] != (status["paused"] and unresolved == 0)
+            or not isinstance(status.get("operation_id"), str)
+            or not status["operation_id"]
+            or status["paused"]):
+        return None
+    return status
+
+
+def _admit_current_notice_send(bus, *, ticket, row, ident, sender, channel_id, text,
+                               generation, verifier, readback, member_check):
+    """Portal 0633 durable admission for one initially unrouted current-notice send.
+
+    Same contract as outbox._post_support_resolution, adapted to the unrouted
+    first-contact row. The 0633 bound acquisition revalidates the exact ticket
+    id, request version and message id inside the lane transaction; the
+    immutable invocation id is derived only from the binding persisted onto
+    this exact claimed posting row by message CAS BEFORE acquisition. The captured poster is re-authenticated
+    after acquisition, before any Slack POST, and Blake's exact channel membership
+    is rechecked in that same post-acquisition window: a revocation during the
+    network round trips cancels the send before the one POST, never after. An
+    acquired-but-unconfirmed attempt is finished 'unknown' and NEVER retried; the
+    caller's uncertain path holds the row, so nothing replays.
+    """
+    deployment = os.environ.get("RAILWAY_DEPLOYMENT_ID", "").strip()
+    build = os.environ.get("RAILWAY_GIT_COMMIT_SHA", "").strip()
+    version = ticket.get("request_version")
+    att = row.get("attachments") or {}
+    if (not deployment or not build or not sender
+            or type(version) is not int or version < 0
+            or not isinstance(ticket.get("slack_user_id"), str)
+            or not ticket["slack_user_id"].strip()
+            or row.get("delivery_status") != "posting"
+            or row.get("body") != text or row.get("ticket_id") != ticket["id"]
+            or type(row.get("delivery_request_version")) is not int
+            or row["delivery_request_version"] != version
+            or row.get("slack_ts")
+            or att.get(_ob.SUPPORT_SEND_ADMISSION_KEY)
+            or not callable(readback)):
+        raise _ob.SupportResolutionAdmissionError(
+            "Current notice send exact deployment/request/sender/readback unavailable")
+    try:
+        uuid.UUID(ticket["id"])
+        uuid.UUID(row["id"])
+    except Exception as exc:  # noqa: BLE001 - non-UUID ids can never bind durably
+        raise _ob.SupportResolutionAdmissionError(
+            "Current notice send ticket/row id is not a UUID") from exc
+    binding = {
+        "ticket": {k: ticket.get(k) for k in _ob._SUPPORT_BIND_FIELDS},
+        "message_id": row["id"], "sender_identity": getattr(ident, "name", ""),
+        "sender": sender, "channel": channel_id, "thread_ts": None,
+        "body_sha256": hashlib.sha256(text.encode()).hexdigest(),
+        "request_key": att.get("request_key"),
+    }
+    invocation = str(uuid.uuid5(uuid.NAMESPACE_URL, "lasso/support-resolution-send/v1/" +
+        json.dumps(binding, sort_keys=True, separators=(",", ":"))))
+    lease = {"lane": _ob.SUPPORT_SEND_LANE, "invocation_id": invocation,
+             "generation": generation, "deployment": deployment, "build": build,
+             "binding": binding, "not_before": datetime.now(timezone.utc).isoformat()}
+    current = _ob._support_send_cas(bus, row,
+                                    meta={_ob.SUPPORT_SEND_ADMISSION_KEY: lease})
+    try:
+        receipt = _ob._support_send_rpc(bus, "support_admission_acquire_send", {
+            "p_expected_generation": generation,
+            "p_invocation_id": invocation, "p_deployment": deployment,
+            "p_build": build, "p_ticket_id": ticket["id"],
+            "p_expected_request_version": version, "p_message_id": row["id"],
+            "p_client_id": ticket.get("client_id"),
+            "p_bot_identity": getattr(ident, "name", ""),
+            "p_slack_user_id": ticket.get("slack_user_id"),
+            "p_sender_slack_user_id": sender,
+            "p_slack_channel_id": channel_id,
+            "p_slack_thread_ts": None,
+            "p_content_sha256": binding["body_sha256"]})
+        # Every returned immutable field must echo the exact send intent,
+        # including a null tenant (client-less Slack ticket) and the null
+        # top-level thread of this first-contact notice.
+        if (receipt.get("admitted") is not True
+                or receipt.get("lane") != _ob.SUPPORT_SEND_LANE
+                or receipt.get("invocation_id") != invocation
+                or type(receipt.get("generation")) is not int
+                or receipt["generation"] != generation
+                or receipt.get("ticket_id") != ticket["id"]
+                or type(receipt.get("request_version")) is not int
+                or receipt["request_version"] != version
+                or receipt.get("message_id") != row["id"]
+                or receipt.get("ticket_source") != ticket.get("source")
+                or receipt.get("ticket_classification") != ticket.get("classification")
+                or receipt.get("ticket_status") != ticket.get("status")
+                or receipt.get("client_id") != ticket.get("client_id")
+                or receipt.get("bot_identity") != getattr(ident, "name", "")
+                or receipt.get("slack_user_id") != ticket.get("slack_user_id")
+                or receipt.get("sender_slack_user_id") != sender
+                or receipt.get("slack_channel_id") != channel_id
+                or receipt.get("slack_thread_ts") is not None
+                or receipt.get("route_pending_at_admission") is not True
+                or receipt.get("content_sha256") != binding["body_sha256"]):
+            raise _ob.SupportResolutionAdmissionError(
+                "Current notice send durable admission denied or receipt mismatch")
+        readback_floor = _ob._support_send_readback_floor(
+            receipt, lease["not_before"])
+        if _current_notice_sender_proof(ident, verifier) != sender:
+            raise _ob.SupportResolutionAdmissionError(
+                "Current notice sender changed during send admission")
+        # Exact membership is checked before the final ticket/row/sender
+        # snapshots. Its network call can itself change the current request.
+        if not callable(member_check):
+            raise _ob.SupportResolutionAdmissionError(
+                "Current notice send membership recheck unavailable after admission")
+        try:
+            member = member_check(channel_id, BLAKE_SLACK_USER_ID)
+        except Exception as exc:  # noqa: BLE001 - membership is mandatory
+            raise _ob.SupportResolutionAdmissionError(
+                "Current notice send membership recheck failed after admission"
+                ) from exc
+        if not member:
+            raise _ob.SupportResolutionAdmissionError(
+                "Current notice Blake membership changed after admission")
+        latest_ticket = bus.ticket(ticket["id"])
+        latest = bus.message(row["id"])
+        if (not isinstance(latest_ticket, dict)
+                or any(latest_ticket.get(k) != ticket.get(k)
+                       for k in _ob._SUPPORT_BIND_FIELDS)
+                or latest != current
+                or ident.bot_user_id() != sender):
+            raise _ob.SupportResolutionAdmissionError(
+                "Current notice send ticket, row or sender changed after admission")
+        return {**lease, "readback_floor": readback_floor}
+    except Exception as exc:
+        # An acquired-but-unconfirmed receipt cannot be completed by assumption.
+        # 0633 unknown remains unresolved; never retry acquisition or POST.
+        try:
+            _ob._support_send_rpc(bus, "support_admission_finish_lane", {
+                "p_lane": _ob.SUPPORT_SEND_LANE, "p_invocation_id": invocation,
+                "p_generation": generation, "p_outcome": "unknown"})
+        except Exception:  # noqa: BLE001 - a failed finish ACK stays unresolved
+            pass
+        if isinstance(exc, _ob.SupportResolutionAdmissionError):
+            raise
+        raise _ob.SupportResolutionAdmissionError(
+            f"Current notice send admission/effect unconfirmed: "
+            f"{type(exc).__name__}") from exc
+
+
+def _finish_current_notice_admission(bus, lease, *, outcome):
+    """Close one acquired 0633 lease; the caller treats any failure as uncertain."""
+    receipt = _ob._support_send_rpc(bus, "support_admission_finish_lane", {
+        "p_lane": _ob.SUPPORT_SEND_LANE, "p_invocation_id": lease["invocation_id"],
+        "p_generation": lease["generation"], "p_outcome": outcome})
+    if (receipt.get("recorded") is not True
+            or receipt.get("lane") != _ob.SUPPORT_SEND_LANE
+            or receipt.get("invocation_id") != lease["invocation_id"]):
+        raise _ob.SupportResolutionAdmissionError(
+            "Current notice send completion ACK unconfirmed")
+    return receipt
+
+
+
 def initiate(ticket, who, ident, *, open_group_dm, post_first_message, record_outbound,
             stamp_ticket=None, message_text=None, mark_message=None, claim_message=None,
             completion=False, ticket_lookup=None, reconcile_uncertain=None,
@@ -276,6 +482,7 @@ def initiate(ticket, who, ident, *, open_group_dm, post_first_message, record_ou
                 member_check=member_check, log=log)
 
 
+@_fence.guarded("direct_outreach", lambda: OutreachResult(opened=False, reason="support_sender_paused"))
 def _send(ticket, who, ident, *, open_group_dm, post_first_message, record_outbound,
          stamp_ticket=None, message_text=None, message_text_already_escaped=False,
          mark_message=None, claim_message=None, completion=False,
@@ -319,10 +526,13 @@ def _send(ticket, who, ident, *, open_group_dm, post_first_message, record_outbo
 
     notice_id = ""
     attempt_token = ""
+    notice_sender = None
+    admission_status = None
     if current_notice:
+        verifier = getattr(post_first_message, "verify_sender", None)
         if (current_notice_bus is None or not callable(readback)
                 or not callable(member_check) or not ident.bot_user_id()
-                or not callable(claim_message)):
+                or not callable(claim_message) or not callable(verifier)):
             return OutreachResult(opened=True, channel_id=channel_id,
                                   reason="current_notice_preflight_unavailable")
         try:
@@ -335,6 +545,21 @@ def _send(ticket, who, ident, *, open_group_dm, post_first_message, record_outbo
         if not blake_is_member:
             return OutreachResult(opened=True, channel_id=channel_id,
                                   reason="blake_membership_unverified")
+        # Authenticate the exact captured poster and the durable 0633 send lane
+        # BEFORE anything is reserved: a wrong sender or a paused/unreachable lane
+        # fails closed here with zero Slack posts and nothing to reconcile.
+        notice_sender = _current_notice_sender_proof(ident, verifier)
+        if not notice_sender:
+            log(f"[outreach] current notice sender authentication failed "
+                f"ticket={ticket.get('id')}")
+            return OutreachResult(opened=True, channel_id=channel_id,
+                                  reason="current_notice_sender_mismatch")
+        admission_status = _current_notice_admission_status(current_notice_bus)
+        if admission_status is None:
+            log(f"[outreach] current notice send admission lane unavailable "
+                f"ticket={ticket.get('id')}")
+            return OutreachResult(opened=True, channel_id=channel_id,
+                                  reason="current_notice_admission_unavailable")
         notice_id = str(uuid.uuid4())
         try:
             attempt_token = current_notice_bus.begin_current_notice(
@@ -454,10 +679,26 @@ def _send(ticket, who, ident, *, open_group_dm, post_first_message, record_outbo
         # The same designated row carries the first and only customer message.
         # Persist intent before Slack, read back the returned exact timestamp,
         # then let 0384 bind the route while the row is still posting.
-        from . import outbox as _ob
+        # An acquired 0633 lease whose durable send effect was never proven
+        # completed is finished 'unknown' exactly once (mirroring
+        # outbox._post_support_resolution): it never returns to the automatic
+        # send queue and is never retried, whatever the failure below was.
+        lease_state = {"lease": None, "closed": False}
 
         def uncertain(reason):
             log(f"[outreach] current notice uncertain row={row_id}: {reason}")
+            lease = lease_state["lease"]
+            if lease is not None and not lease_state["closed"]:
+                lease_state["closed"] = True
+                try:
+                    _ob._support_send_rpc(
+                        current_notice_bus, "support_admission_finish_lane", {
+                            "p_lane": _ob.SUPPORT_SEND_LANE,
+                            "p_invocation_id": lease["invocation_id"],
+                            "p_generation": lease["generation"],
+                            "p_outcome": "unknown"})
+                except Exception:  # noqa: BLE001 - a failed finish ACK stays unresolved
+                    pass
             try:
                 current_notice_bus.hold_uncertain_fixer_delivery(row_id, reason)
             except Exception:  # noqa: BLE001 - never retry an uncertain Slack post
@@ -497,10 +738,24 @@ def _send(ticket, who, ident, *, open_group_dm, post_first_message, record_outbo
                     or fresh.get("escalated") or fresh.get("hold_tier") is not None
                     or not member_check(channel_id, BLAKE_SLACK_USER_ID)):
                 return uncertain("request or destination changed before Slack")
+            lease = _admit_current_notice_send(
+                current_notice_bus, ticket=ticket, row=prepared, ident=ident,
+                sender=notice_sender, channel_id=channel_id, text=text,
+                generation=admission_status["generation"], verifier=verifier,
+                readback=readback, member_check=member_check)
+            lease_state["lease"] = lease
             posted = post_first_message(channel_id, text)
             ts = posted.get("ts") if isinstance(posted, dict) and posted.get("ok") else None
             if not isinstance(ts, str) or not ts:
                 return uncertain("Slack post returned no confirmed timestamp")
+            try:
+                _ob._support_send_receipt(
+                    current_notice_bus, invocation=lease["invocation_id"],
+                    generation=lease["generation"], ticket_id=ticket["id"],
+                    version=ticket["request_version"], message_id=row_id, ts=ts)
+            except Exception as exc:  # noqa: BLE001 - lost/duplicate/ambiguous ACK
+                return uncertain("current notice send receipt unconfirmed: "
+                                 f"{type(exc).__name__}")
             stamped = current_notice_bus.record_fixer_delivery_timestamp(row_id, intent, ts)
             if not stamped:
                 # A stale sweep may have moved posting to held while Slack was
@@ -513,7 +768,10 @@ def _send(ticket, who, ident, *, open_group_dm, post_first_message, record_outbo
                         row_id, intent, ts)
             if not stamped or stamped.get("slack_ts") != ts:
                 return uncertain("Slack timestamp was not persisted")
-            proof, reason = _ob._readback_fixer_message(readback, intent, ts=ts)
+            proof, reason = _ob._readback_fixer_message(
+                readback, {**intent, "not_before": max(
+                    _ob._parse_ts(intent["not_before"]),
+                    _ob._parse_ts(lease["readback_floor"])).isoformat()}, ts=ts)
             if not proof:
                 return uncertain(reason)
             verified = current_notice_bus.transition_fixer_delivery(
@@ -527,6 +785,29 @@ def _send(ticket, who, ident, *, open_group_dm, post_first_message, record_outbo
             if not verified or (verified.get("attachments") or {}).get(
                     "delivery_readback_verified") is not True:
                 return uncertain("exact Slack readback could not be persisted")
+            # The durable send effect (timestamp persisted + exact readback) is
+            # complete. Close the 0633 lease and persist the confirmed completion
+            # receipt BEFORE the route bind: a bind/promote failure then leaves a
+            # held row whose receipt already proves the send, so exact recovery
+            # (_finish_pending_route_notice) may finish it, while any attempt
+            # whose durable completion was never proven stays held forever.
+            finished_ack = _finish_current_notice_admission(
+                current_notice_bus, lease, outcome="completed")
+            lease_state["closed"] = True
+            receipt_meta = {"support_resolution_send_completion":
+                            {**finished_ack, "generation": lease["generation"],
+                             "outcome": "completed"}}
+            receipt_row = current_notice_bus.transition_fixer_delivery(
+                row_id, "posting", slack_ts=ts, meta_update=receipt_meta,
+                expected_intent=intent, expected_ts=ts)
+            if not receipt_row:
+                # A stale sweep parked the row while Slack answered; retain the
+                # confirmed receipt on that same held row (never a resend).
+                receipt_row = current_notice_bus.record_held_current_notice_readback(
+                    row_id, {**proof, **receipt_meta},
+                    expected_intent=intent, expected_ts=ts)
+            if not receipt_row or not _ob._support_send_completed(receipt_row):
+                return uncertain("durable send completion receipt was not persisted")
             if not current_notice_bus.bind_current_notice_route(
                     ticket["id"], ticket["request_version"], notice_id,
                     attempt_token, channel_id, ts):
@@ -663,6 +944,8 @@ class ApprovalRequestResult:
     reason: str = ""
 
 
+@_fence.guarded("outreach_approval_producer", lambda: ApprovalRequestResult(
+    requested=False, reason="support_sender_paused"))
 def request_approval(ticket, who, ident, *, record_outbound, write_hold_notice,
                      message_text=None, log=print):
     """Write the held outreach content (the actual first-message text, kind
@@ -706,6 +989,7 @@ def request_approval(ticket, who, ident, *, record_outbound, write_hold_notice,
     return ApprovalRequestResult(requested=True, held_message_id=held_id, reason="held")
 
 
+@_fence.guarded("outreach_release", lambda: OutreachResult(opened=False, reason="support_sender_paused"))
 def release_approved_outreach(message_id, ticket, who, ident, *, get_held_message,
                               open_group_dm, post_first_message, record_outbound,
                               stamp_ticket=None, mark_message=None, claim_message=None,

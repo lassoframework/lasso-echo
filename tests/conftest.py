@@ -17,6 +17,26 @@ import os
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _legacy_adapter_replay_rpc(_isolated_db, monkeypatch, request):
+    """Legacy routing suites exercise the production atomic replay planner.
+
+    This is restricted to suites with in-memory adapter buses. SQL replay and
+    sender fence acceptance suites retain their own real transports and flags.
+    """
+    if request.module.__name__.rsplit(".", 1)[-1] not in {
+        "test_slack_convo", "test_client_dm_end_to_end",
+        "test_slack_cancel_post", "test_no_silent_holds",
+        "test_slack_convo_ticket_owner",
+    }:
+        return
+    from agent.slack_convo import replay
+    from tests.slack_replay_fake import ReplayRPC
+    monkeypatch.setattr(replay, "rpc", ReplayRPC())
+    monkeypatch.setenv("SUPPORT_MESSAGES_FENCE_ENABLED", "true")
+    monkeypatch.setenv("SUPPORT_MESSAGES_FENCE_PAUSED", "false")
+    monkeypatch.setenv("SUPPORT_MESSAGES_FENCE_GENERATION", "offline-routing")
+
 def pytest_configure(config):
     config.addinivalue_line(
         "markers",
