@@ -33,9 +33,11 @@ the operator must still identify every actual sender process and reconcile the
 durable outbox before accepting a fleet drain. A sender without a receipt hook
 must be accounted for through the operational shutdown boundary below.
 
-`local_drained` requires paused valid control, no admitted operations, a known
-SHA, and successful complete bounded scans with no posting rows or held delivery
-intent/uncertainty. A scan reaching 1000 rows blocks acknowledgment rather than
+The original `local_drained` checks required paused valid control, no admitted
+operations, a known SHA, and successful complete bounded scans with no posting
+rows or held delivery intent/uncertainty. The October 10 admission release hold
+below adds an unconditional blocker until durable invocation inventory exists.
+A scan reaching 1000 rows blocks acknowledgment rather than
 asserting complete coverage. Unknown/malformed rows or read errors block drain.
 No row is changed by receipt collection. Ordinary queued or approval-held rows
 are preserved. Any ambiguous posting/uncertain row requires independently
@@ -101,3 +103,24 @@ Added checks cover paused no-poll/no-write producer refusal, preserved inbound
 source/tenant/identity and event deduplication for Echo/Scout/Ranger/Wrangler,
 already-admitted adapter and client DM writes after pause, and standalone approval,
 release, hold and reminder refusal. No production mutation or send occurred.
+
+## October 10 admission release hold
+
+Portal 0633 reports unresolved invocation count but does not expose a complete
+ticket and message bound invocation inventory. Its invocation table has no
+ticket, request version, or message ID columns, and raw table reads are revoked
+from the Echo service role. `support_messages.attachments` can be changed by
+service writers, so a lease, completion stamp, and Slack readback copied into
+that JSON cannot independently establish the durable invocation outcome.
+Removing the lease marker from JSON can also evade a message scan.
+
+The current draft therefore reports `admission_inventory_unverified` and
+never reports `local_drained: true` under the 0633 contract, even when the
+lane says zero unresolved. An observed admission marker additionally reports
+`admission_external_verification_required:<message id>`. Do not use this draft
+receipt to resume or release support senders. Before that can change, a
+separate Portal owner must supply a guarded inventory bound to the exact
+ticket, request, message, invocation, deployment, generation, and completed
+outcome, together with independent provider readback of the posted Slack
+message. The Echo fence then needs a fresh independent review and controlled
+live verification. This draft remains undeployed and its sender controls OFF.

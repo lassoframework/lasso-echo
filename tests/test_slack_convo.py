@@ -476,6 +476,10 @@ class FakeBus:
                     "fixer_slack_delivery_intent") != expected_intent
                 or row.get("slack_ts") != expected_ts):
             return None
+        for m in self.msgs:
+            if m["id"] == mid:
+                (m.get("attachments") or {}).pop(
+                    "fixer_slack_delivery_uncertain", None)
         return self.mark_message(mid, "posted", slack_ts=proof["delivery_readback_ts"],
                                  meta_update=proof)
 
@@ -4019,6 +4023,13 @@ def test_held_fixer_attachment_cas_retries_without_losing_concurrent_updates(ope
             mid, {"delivery_readback_ts": "9.999", "delivery_readback_verified": True},
             expected_intent={"channel": "C_CLIENT"}, expected_ts="9.999")
         assert changed["delivery_status"] == "posted"
+        # The uncertainty marker is cleared atomically in the same CAS write.
+        assert "fixer_slack_delivery_uncertain" not in changed["attachments"]
+        assert changed["attachments"]["fixer_slack_delivery_intent"] == {
+            "channel": "C_CLIENT"}
+        assert changed["attachments"]["delivery_readback_ts"] == "9.999"
+        assert "fixer_slack_delivery_uncertain" not in json.loads(
+            http.patch_calls[1]["data"])["attachments"]
     elif operation == "reserve":
         changed = bus.reserve_uncertain_fixer_alert_retry(mid, None, "later")
         assert changed["attachments"]["fixer_alert_retry_after"] == "later"
@@ -4030,6 +4041,73 @@ def test_held_fixer_attachment_cas_retries_without_losing_concurrent_updates(ope
     assert changed["attachments"]["concurrent_marker"] == "preserve-me"
     assert json.loads(http.patch_calls[1]["params"]["attachments"][3:])[
         "concurrent_marker"] == "preserve-me"
+
+
+def test_reconcile_held_fixer_delivery_clears_uncertain_marker_on_promotion():
+    mid = str(uuid.uuid4())
+    intent = {"channel": "C_CLIENT", "body": "done", "sender": "U_ECHO_BOT"}
+    proof = {"delivery_readback_verified": True, "delivery_readback_ts": "9.999",
+             "delivery_readback_sender": "U_ECHO_BOT"}
+    row = {
+        "id": mid, "delivery_status": "held", "slack_ts": "9.999",
+        "attachments": {
+            "identity": "echo", "fixer_slack_delivery_uncertain": True,
+            "fixer_slack_delivery_intent": intent, "held_why": "timeout",
+        },
+    }
+
+    class _Response:
+        status_code = 200
+        text = ""
+
+        def __init__(self, payload):
+            self.payload = payload
+
+        def json(self):
+            return self.payload
+
+    class _Http:
+        def __init__(self):
+            self.patch_calls = []
+
+        def get(self, _url, **_kwargs):
+            return _Response([json.loads(json.dumps(row))])
+
+        def patch(self, _url, **kwargs):
+            self.patch_calls.append(kwargs)
+            expected_snapshot = json.loads(kwargs["params"]["attachments"][3:])
+            if (expected_snapshot != row["attachments"]
+                    or row["delivery_status"] != "held"
+                    or kwargs["params"]["slack_ts"] != "eq.9.999"):
+                return _Response([])
+            row.update(json.loads(kwargs["data"]))
+            return _Response([json.loads(json.dumps(row))])
+
+    http = _Http()
+    bus = Bus(url="https://example.supabase.co", service_key="service", http=http)
+    assert bus.reconcile_held_fixer_delivery(
+        mid, {**proof, "delivery_readback_verified": False},
+        expected_intent=intent, expected_ts="9.999") is None
+    assert http.patch_calls == []
+    assert row["attachments"]["fixer_slack_delivery_uncertain"] is True
+    changed = bus.reconcile_held_fixer_delivery(
+        mid, proof, expected_intent=intent, expected_ts="9.999")
+
+    assert len(http.patch_calls) == 1
+    assert changed["delivery_status"] == "posted"
+    assert changed["slack_ts"] == "9.999"
+    att = changed["attachments"]
+    # Marker atomically cleared by the same whole-attachment CAS; proof and the
+    # exact durable intent are retained.
+    assert "fixer_slack_delivery_uncertain" not in att
+    assert att["fixer_slack_delivery_intent"] == intent
+    assert att["held_why"] == "timeout"
+    assert att["delivery_readback_verified"] is True
+    assert att["delivery_readback_ts"] == "9.999"
+    assert att["delivery_readback_sender"] == "U_ECHO_BOT"
+    # A second promotion attempt finds no held uncertain row and does nothing.
+    assert bus.reconcile_held_fixer_delivery(
+        mid, proof, expected_intent=intent, expected_ts="9.999") is None
 
 
 def test_fixer_timestamp_cas_retries_after_posting_becomes_held():

@@ -11,7 +11,6 @@ import pytest
 import requests
 
 from agent import echo_ticket_worker as worker
-from agent import support_sender_fence as sender_fence
 from agent.slack_convo import outbox, outreach
 from agent.slack_convo.bus import Bus, BusError, _suppressed_current_notice_alert_id
 
@@ -296,7 +295,6 @@ def test_admitted_send_records_lease_before_post_and_completion_after():
     assert att["support_resolution_send_completion"]["recorded"] is True
     assert att["support_resolution_send_completion"]["generation"] == 7
     assert att["support_resolution_send_completion"]["outcome"] == "completed"
-    assert sender_fence._trusted_admission_completion(bus.row)
 
 
 def test_paused_admission_lane_zero_posts_and_no_reservation():

@@ -100,7 +100,8 @@ def test_waits_for_admitted_send(monkeypatch, tmp_path):
     release.set()
     thread.join(2)
     receipt = fence.receipt(Bus())
-    assert receipt['local_drained']
+    assert not receipt['local_drained']
+    assert 'admission_inventory_unverified' in receipt['blockers']
     assert not receipt['fleet_drained']
     assert receipt['generation'] == '0619-test'
 
@@ -141,13 +142,15 @@ def test_malformed_held_scan_never_acknowledges_drain(monkeypatch, tmp_path, row
     assert 'held_row_malformed' in receipt['blockers']
 
 
-def test_valid_ordinary_held_row_allows_local_drain(monkeypatch, tmp_path):
+def test_valid_ordinary_held_row_still_lacks_invocation_inventory(monkeypatch, tmp_path):
     pause(monkeypatch, tmp_path)
     class Held(Bus):
         def outbox(self, status, limit):
             return [{'id': 'held-row', 'direction': 'outbound', 'delivery_status': 'held',
                      'attachments': {}}] if status == 'held' else []
-    assert fence.receipt(Held())['local_drained']
+    receipt = fence.receipt(Held())
+    assert not receipt['local_drained']
+    assert 'admission_inventory_unverified' in receipt['blockers']
 
 
 @pytest.mark.parametrize('identity', ['echo', 'scout'])
@@ -183,7 +186,8 @@ def test_portal_only_paused_polls_emit_live_process_receipt(monkeypatch, tmp_pat
     assert observed['deployed_sha'] == 'test-sha'
     assert observed['observed_at']
     assert observed['active'] == {}
-    assert observed['local_drained']
+    assert not observed['local_drained']
+    assert 'admission_inventory_unverified' in observed['blockers']
     assert observed['fleet_drained'] is False
 
 
@@ -198,7 +202,8 @@ def test_receipt_emits_after_admitted_pass_finishes(monkeypatch, tmp_path):
         return {'processed': 1}
     assert running_pass(Bus(), log=lines.append) == {'processed': 1}
     observed = json.loads(lines[0].removeprefix('[support-sender-fence] '))
-    assert observed['local_drained']
+    assert not observed['local_drained']
+    assert 'admission_inventory_unverified' in observed['blockers']
     assert observed['active'] == {}
 
 
@@ -435,18 +440,32 @@ def test_unavailable_admission_lane_blocks_drain(monkeypatch, tmp_path):
     assert not fence.receipt(NoLane())['local_drained']
 
 
-def test_fully_bound_completed_admission_row_and_zero_unresolved_lane_allows_drain(
+def test_completed_admission_row_fails_closed_pending_external_verification(
         monkeypatch, tmp_path):
+    # 0633 revoked raw invocation SELECT and attachments is mutable: even a fully
+    # self-consistent lease/completion/readback JSON is never a drain basis.
     pause(monkeypatch, tmp_path)
     class AdmissionBus(Bus):
         def support_uncertain_outbound(self, limit=1000):
             return [_trusted_row()]
     receipt = fence.receipt(AdmissionBus())
-    assert receipt['blockers'] == []
-    assert receipt['local_drained']
+    assert not receipt['local_drained']
+    assert ('admission_external_verification_required:admitted-row'
+            in receipt['blockers'])
 
 
-def test_current_notice_flat_verified_readback_allows_drain(monkeypatch, tmp_path):
+def test_no_admission_zero_unresolved_still_lacks_inventory(monkeypatch, tmp_path):
+    pause(monkeypatch, tmp_path)
+    class PlainBus(Bus):
+        def support_uncertain_outbound(self, limit=1000):
+            return [_admission_row()]
+    receipt = fence.receipt(PlainBus())
+    assert 'admission_inventory_unverified' in receipt['blockers']
+    assert not receipt['local_drained']
+
+
+def test_current_notice_flat_verified_readback_still_fails_closed(
+        monkeypatch, tmp_path):
     pause(monkeypatch, tmp_path)
     row = _admission_row(lease=dict(LEASE, binding=dict(BINDING)),
                          completion=dict(COMPLETION))
@@ -454,7 +473,10 @@ def test_current_notice_flat_verified_readback_allows_drain(monkeypatch, tmp_pat
     class AdmissionBus(Bus):
         def support_uncertain_outbound(self, limit=1000):
             return [row]
-    assert fence.receipt(AdmissionBus())['local_drained']
+    receipt = fence.receipt(AdmissionBus())
+    assert not receipt['local_drained']
+    assert ('admission_external_verification_required:admitted-row'
+            in receipt['blockers'])
 
 
 def test_admission_lease_without_trusted_completion_blocks_at_any_status(
@@ -466,7 +488,8 @@ def test_admission_lease_without_trusted_completion_blocks_at_any_status(
                 return [_admission_row(status=status, lease=dict(LEASE, binding=dict(BINDING)))]
         receipt = fence.receipt(AdmissionBus())
         assert not receipt['local_drained'], status
-        assert 'admission_unresolved:admitted-row' in receipt['blockers']
+        assert ('admission_external_verification_required:admitted-row'
+                in receipt['blockers'])
 
 
 @pytest.mark.parametrize('status', ['ready', 'failed', 'held'])
@@ -478,7 +501,8 @@ def test_completed_admission_row_not_terminal_posted_blocks_drain(
             return [_trusted_row(status=status)]
     receipt = fence.receipt(AdmissionBus())
     assert not receipt['local_drained']
-    assert 'admission_unresolved:admitted-row' in receipt['blockers']
+    assert ('admission_external_verification_required:admitted-row'
+            in receipt['blockers'])
 
 
 @pytest.mark.parametrize('row_override', [
@@ -497,8 +521,9 @@ def test_lease_binding_mismatch_blocks_drain(monkeypatch, tmp_path, row_override
             return [_trusted_row(**row_override)]
     receipt = fence.receipt(AdmissionBus())
     assert not receipt['local_drained'], row_override
-    assert 'admission_unresolved:admitted-row' in receipt['blockers'] or \
-        f"admission_unresolved:{row_override.get('id')}" in receipt['blockers']
+    row_id = row_override.get('id', 'admitted-row')
+    assert (f'admission_external_verification_required:{row_id}'
+            in receipt['blockers'])
 
 
 @pytest.mark.parametrize('lease', [

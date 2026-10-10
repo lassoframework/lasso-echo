@@ -31,6 +31,10 @@ from .. import config
 _TICKETS = "support_tickets"
 _MESSAGES = "support_messages"
 
+# Whole-attachment CAS key-removal sentinel: updates may map a key to _REMOVE to
+# drop it from the merged jsonb in the same compare-and-set write.
+_REMOVE = object()
+
 OPEN_STATUSES = ("new", "triage", "fixing", "verification", "hold", "approved")
 _UUID = re.compile(
     r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\Z")
@@ -1233,7 +1237,9 @@ class Bus:
             if (not row or row.get("delivery_status") != "held"
                     or not eligible(row, snapshot)):
                 return None
-            next_att = {**snapshot, **updates(row, snapshot)}
+            patch = updates(row, snapshot)
+            next_att = {key: value for key, value in {**snapshot, **patch}.items()
+                        if value is not _REMOVE}
             match = {
                 "id": f"eq.{message_id}",
                 "delivery_status": "eq.held",
@@ -1310,6 +1316,7 @@ class Bus:
                                       expected_intent, expected_ts):
         """Promote a held uncertain delivery only after exact Slack readback."""
         if (not isinstance(proof, dict)
+                or proof.get("delivery_readback_verified") is not True
                 or not isinstance(expected_ts, str) or not expected_ts
                 or proof.get("delivery_readback_ts") != expected_ts):
             return None
@@ -1323,7 +1330,10 @@ class Bus:
                      or (att.get("delivery_readback_verified") is True
                          and att.get("delivery_readback_ts") == expected_ts))
                 and _row.get("slack_ts") == expected_ts),
-            updates=lambda _row, _att: proof,
+            # Clear the uncertainty marker in the same whole-attachment CAS that
+            # promotes the row, retaining the exact proof and durable intent.
+            updates=lambda _row, _att: {**proof,
+                                        "fixer_slack_delivery_uncertain": _REMOVE},
             fields={"delivery_status": "posted",
                     "slack_ts": proof["delivery_readback_ts"]},
             match_update=lambda _row, _att: {"slack_ts": f"eq.{expected_ts}"})
