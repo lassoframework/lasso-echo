@@ -290,3 +290,56 @@ def finalize_historical_receipt(bus, *, expected_ticket, selected_notice_id,
         # The effect may have succeeded; a failed readback is never retry authority.
         bus._historical_close_uncertain=True
         raise
+
+
+
+def postclose_notice_id(ticket):
+    """One stable row per ticket request; uncertainty never rotates this ID."""
+    return str(uuid.uuid5(uuid.NAMESPACE_URL,
+        f'lasso/support-postclose-ack/v1/{ticket["id"]}/{ticket["request_version"]}'))
+
+
+def prepare_postclose_acknowledgement(bus, *, expected_ticket, completion_message_id, review):
+    """Prepare only after real authenticated client Closed readback.
+
+    The required trusted Bus observer is intentionally not implemented here.
+    Missing adapter denies both preparation and dispatch. Never send from this
+    function; an existing row is returned for inspection, never reset or released.
+    """
+    from .slack_convo.outbox import POSTCLOSE_BODY, _postclose_ack_fresh_request
+    ticket = bus.ticket(expected_ticket['id'])
+    if (not isinstance(ticket,dict) or not _identity_matches(ticket,expected_ticket)
+            or not _historical_receipt_state(ticket) or not ticket.get('slack_user_id')
+            or not isinstance(review,dict)):
+        raise HistoricalCloseoutError('postclose identity or review unavailable')
+    body = POSTCLOSE_BODY.format(recipient=ticket['slack_user_id'],scope=review.get('verified_scope'))
+    _reviewed_resolution(ticket,body,review)
+    completion = _posted_notice(bus,ticket,completion_message_id)
+    mid = postclose_notice_id(ticket)
+    att = dict(kind='status',identity=ticket['bot_identity'],fixer=True,
+        purpose='support_postclose_ack',postclose_ack=True,resolve_notice=False,
+        recipient_kind='client',delivery_identity_fence=True,
+        request_version=ticket['request_version'],request_key=_current_fixer_request_key(bus,ticket),
+        postclose_resolved_at=ticket['resolved_at'],postclose_review=review,
+        postclose_completion_message_id=completion_message_id,
+        postclose_completion_body_sha256=hashlib.sha256(completion['body'].encode()).hexdigest())
+    # Preserve the exact root/thread behavior of the already delivered receipt.
+    if (completion.get('attachments') or {}).get('surface'):
+        att['surface']=completion['attachments']['surface']
+    for field in ('source','product','classification','client_id','bot_identity',
+                  'slack_user_id','slack_channel_id','slack_thread_ts'):
+        att['delivery_expected_'+field]=ticket.get(field)
+    att['delivery_expected_status']='resolved'
+    row=dict(id=mid,ticket_id=ticket['id'],direction='outbound',author_type=ticket['bot_identity'],
+        body=body,delivery_request_version=ticket['request_version'],attachments=att)
+    if not _postclose_ack_fresh_request(bus,ticket,att,row):
+        raise HistoricalCloseoutError('authenticated client Closed projection unavailable or stale')
+    existing=bus.message(mid)
+    if existing:
+        if (existing.get('ticket_id')!=ticket['id'] or existing.get('body')!=body
+                or existing.get('attachments',{}).get('postclose_completion_message_id')!=completion_message_id):
+            raise HistoricalCloseoutError('postclose row identity collision; reconcile')
+        return existing
+    return bus.record_outbound(ticket_id=ticket['id'],author_type=ticket['bot_identity'],
+        body=body,delivery_status='ready',kind='status',meta=att,
+        expected_request_version=ticket['request_version'],message_id=mid)
