@@ -574,6 +574,19 @@ class SupabaseCalendarStore:
         #: RPC, never through mutable calendar rows.
         self.last_forward_stage = None
         self.last_forward_stage_attempt = None
+        # Server-owned exact-byte immutable-media verifier configuration,
+        # populated ONLY from operator-pinned env when the exact-byte send
+        # guard is armed. None (armed lane stays held) when the guard is off
+        # or any env is missing/malformed; rows can never influence it.
+        self._immutable_media_verifier_config = None
+        try:
+            from . import delivered_byte_send_guard as _exact_guard
+            if _exact_guard.enabled():
+                from . import exact_byte_runtime as _exact_runtime
+                self._immutable_media_verifier_config = (
+                    _exact_runtime.verifier_config_or_none(store=self))
+        except Exception:
+            self._immutable_media_verifier_config = None
 
     #: Set once when a write proves echo_social_connections.late_account_id is not
     #: deployed on this environment, so the sweep stops re-attempting it every gym.

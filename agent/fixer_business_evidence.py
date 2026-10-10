@@ -132,6 +132,7 @@ class CheckCtx:
     thumbnail_probe: object = None
     approved_cta_probe: object = None
     job_status_probe: object = None
+    form_probe: object = None
 
 
 def _parse_utc_timestamp(value):
@@ -654,7 +655,103 @@ def _check_automatic_reel_and_thumbnails_ready(ctx):
     return Observation(True, True, f'reel:{rid}:{projected["status"]}:{len(ids)}_thumbnails')
 
 
+def automatic_reel_controls_params_valid(params):
+    """Only the original automatic reel request UUID; nothing else is an input."""
+    return (isinstance(params, dict) and set(params) == {'request_id'}
+            and isinstance(params.get('request_id'), str)
+            and _PORTAL_GYM_ID.fullmatch(params['request_id']) is not None)
+
+
+# Raw operator/validator failure text that must never reach a client as evidence:
+# internal team routing, review workflow, overlay validator output and CTA copy
+# failures are diagnoses for Echo staff, not a truthful owner-facing state.
+_REEL_UNSAFE_TEXT = re.compile(
+    r'team|reviewing|overlay|end-frame|call to action|caption needs', re.I)
+# This check proves status/CTA repair only. A completion or provider-publication
+# claim is outside its scope and can never be accepted from it.
+_REEL_COMPLETION_CLAIM = re.compile(
+    r'\b(?:reel|video|post)\s+(?:is\s+)?complet(?:e|ed)\b|'
+    r'\b(?:published|posted|live on|delivered to)\b', re.I)
+_REEL_ALLOWED_STATUSES = frozenset(
+    {'staged', 'running', 'held', 'uncertain', 'exhausted', 'waiting_pool'})
+_REEL_ALLOWED_CLIENT_STATUSES = frozenset(
+    {'staged', 'running', 'waiting_pool', 'retrying', 'exhausted'})
+
+
+def _check_automatic_reel_controls_repaired(ctx):
+    """Reported reel status is truthful and the tenant upload form is video-capable.
+
+    Proves the status/CTA repair only: a portrait or media safety hold on the
+    original request still passes, because the hold is a truthful stopped state.
+    Reel completion and provider publication are never claimed here.
+    """
+    if not automatic_reel_controls_params_valid(ctx.params):
+        raise CheckRefused('bad_params')
+    gym = _resolve_echo_gym_key(ctx.read, ctx.gym_key)
+    rid = ctx.params['request_id']
+    statuses = _read_rows(ctx, 'auto_reel_status', {
+        'gym_id': f'eq.{gym}', 'select': 'gym_id,snapshot,updated_at', 'limit': '2'}, 2)
+    if len(statuses) != 1 or statuses[0].get('gym_id') != gym:
+        raise CheckUnavailable('reel_status_unavailable')
+    stamp = _parse_utc_timestamp(statuses[0].get('updated_at'))
+    if ctx.observed_at.tzinfo is None or ctx.observed_at.utcoffset() is None:
+        raise CheckUnavailable('observer_clock_unreadable')
+    if not 0 <= (ctx.observed_at - stamp).total_seconds() <= 900:
+        raise CheckUnavailable('reel_status_stale')
+    snapshot = statuses[0].get('snapshot') or {}
+    if snapshot.get('gym') != gym or snapshot.get('ok') is not True:
+        raise CheckUnavailable('reel_status_unavailable')
+    jobs = [j for j in snapshot.get('jobs', [])
+            if isinstance(j, dict) and j.get('request_id') == rid]
+    if len(jobs) != 1:
+        raise CheckUnavailable('reel_job_unavailable')
+    job = jobs[0]
+    if job.get('status') not in _REEL_ALLOWED_STATUSES:
+        # Includes any terminal 'completed'-style state: this check never
+        # certifies completion, so an out-of-contract status is a contradiction.
+        return Observation(True, False, f'reel_controls:{rid}:status_unknown',
+                           'reel_status_unknown')
+    if not callable(ctx.job_status_probe):
+        raise CheckUnavailable('worker_status_reader_unavailable')
+    actual = ctx.job_status_probe(gym, rid)
+    if not isinstance(actual, dict) or actual.get('request_id') != rid:
+        raise CheckUnavailable('worker_status_unavailable')
+    status_fields = ('status', 'reason', 'updated_at', 'clip_count', 'next_attempt_at')
+    if any(actual.get(field) != job.get(field) for field in status_fields):
+        raise CheckUnavailable('worker_mirror_status_mismatch')
+    for source in (job.get('reason'), actual.get('reason')):
+        if _REEL_UNSAFE_TEXT.search(str(source or '')):
+            return Observation(True, False, f'reel_controls:{rid}:unsafe_reason',
+                               'raw_error_text_remaining')
+        if _REEL_COMPLETION_CLAIM.search(str(source or '')):
+            return Observation(True, False, f'reel_controls:{rid}:completion_claim',
+                               'completion_claim_rejected')
+    from .story_studio_routes import _automatic_job_for_client
+    projected = _automatic_job_for_client(job)
+    if (projected is None
+            or projected.get('status') not in _REEL_ALLOWED_CLIENT_STATUSES):
+        return Observation(True, False, f'reel_controls:{rid}:status_claim_unsafe',
+                           'status_claim_unsafe')
+    if (_REEL_UNSAFE_TEXT.search(str(projected.get('reason') or ''))
+            or _REEL_COMPLETION_CLAIM.search(str(projected.get('reason') or ''))):
+        return Observation(True, False, f'reel_controls:{rid}:status_claim_unsafe',
+                           'status_claim_unsafe')
+    if not callable(ctx.form_probe):
+        raise CheckUnavailable('form_probe_unavailable')
+    form = ctx.form_probe(gym)
+    if form is None:
+        raise CheckUnavailable('upload_form_unavailable')
+    if form is not True:
+        return Observation(True, False, f'reel_controls:{rid}:form_failed',
+                           'upload_form_not_video_capable')
+    return Observation(True, True, f'reel_controls:{rid}:{projected["status"]}')
+
+
 CHECKS = MappingProxyType({
+    'automatic_reel_controls_repaired': CheckSpec(
+        'automatic_reel_controls_repaired', _check_automatic_reel_controls_repaired,
+        params={'request_id': 'original automatic reel UUID'},
+        description='current original reel status is truthful, worker-mirrored and client-safe, and the tenant upload form at the fixed intake origin is video-capable with Send disabled until a clip is chosen; a valid portrait/media hold still passes; does not prove reel completion or provider publication'),
     'automatic_reel_and_thumbnails_ready': CheckSpec(
         'automatic_reel_and_thumbnails_ready', _check_automatic_reel_and_thumbnails_ready,
         params={'request_id':'original automatic reel UUID', 'asset_ids':'exact source clips',
@@ -782,7 +879,8 @@ def _observe(check_id, *, gym_key, request_key, merged_sha, params=None, deps=No
                    params=params, read=read, observed_at=captured,
                    ticket_id=ticket_id if isinstance(ticket_id, str) else '',
                    receipt_read=deps.get('receipt_read'), thumbnail_probe=deps.get('thumbnail_probe'),
-                   approved_cta_probe=deps.get('approved_cta_probe'), job_status_probe=deps.get('job_status_probe'))
+                   approved_cta_probe=deps.get('approved_cta_probe'), job_status_probe=deps.get('job_status_probe'),
+                   form_probe=deps.get('form_probe'))
     try:
         seen = spec.run(ctx)
     except CheckRefused as refused:
