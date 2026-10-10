@@ -14,6 +14,7 @@ LANE_STATUS = {"lane": "support-resolution-send", "generation": 1, "unresolved":
                "paused": True, "drained": True, "operation_id": "op-test"}
 CLOSE_STATUS = {"lane": "support-ticket-close", "generation": 1, "unresolved": 0,
                 "paused": True, "drained": True, "operation_id": "op-test-close"}
+CROSS_LANE_BLOCKER = 'admission_cross_lane_snapshot_unverified'
 
 BODY = "Update from the LASSO team: this one is handled."
 BODY_SHA = hashlib.sha256(BODY.encode()).hexdigest()
@@ -119,7 +120,8 @@ def test_waits_for_admitted_send(monkeypatch, tmp_path):
     release.set()
     thread.join(2)
     receipt = fence.receipt(Bus())
-    assert receipt['local_drained'] and receipt['blockers'] == []
+    assert not receipt['local_drained']
+    assert receipt['blockers'] == [CROSS_LANE_BLOCKER]
     assert not receipt['fleet_drained']
     assert receipt['generation'] == '0619-test'
 
@@ -160,7 +162,7 @@ def test_malformed_held_scan_never_acknowledges_drain(monkeypatch, tmp_path, row
     assert 'held_row_malformed' in receipt['blockers']
 
 
-def test_valid_ordinary_held_row_drains_with_verified_empty_inventory(
+def test_valid_ordinary_held_row_stays_blocked_without_atomic_lane_snapshot(
         monkeypatch, tmp_path):
     pause(monkeypatch, tmp_path)
     class Held(Bus):
@@ -168,8 +170,8 @@ def test_valid_ordinary_held_row_drains_with_verified_empty_inventory(
             return [{'id': 'held-row', 'direction': 'outbound', 'delivery_status': 'held',
                      'attachments': {}}] if status == 'held' else []
     receipt = fence.receipt(Held())
-    assert receipt['blockers'] == []
-    assert receipt['local_drained']
+    assert receipt['blockers'] == [CROSS_LANE_BLOCKER]
+    assert not receipt['local_drained']
     assert receipt['fleet_drained'] is False
 
 
@@ -213,8 +215,8 @@ def test_portal_only_paused_polls_emit_live_process_receipt(monkeypatch, tmp_pat
     assert observed['deployed_sha'] == 'test-sha'
     assert observed['observed_at']
     assert observed['active'] == {}
-    assert observed['local_drained']
-    assert observed['blockers'] == []
+    assert not observed['local_drained']
+    assert observed['blockers'] == [CROSS_LANE_BLOCKER]
     assert observed['fleet_drained'] is False
 
 
@@ -229,8 +231,8 @@ def test_receipt_emits_after_admitted_pass_finishes(monkeypatch, tmp_path):
         return {'processed': 1}
     assert running_pass(Bus(), log=lines.append) == {'processed': 1}
     observed = json.loads(lines[0].removeprefix('[support-sender-fence] '))
-    assert observed['local_drained']
-    assert observed['blockers'] == []
+    assert not observed['local_drained']
+    assert observed['blockers'] == [CROSS_LANE_BLOCKER]
     assert observed['active'] == {}
     assert observed['fleet_drained'] is False
 
@@ -485,14 +487,14 @@ def test_completed_admission_row_fails_closed_pending_external_verification(
             in receipt['blockers'])
 
 
-def test_no_admission_zero_invocation_inventory_drains(monkeypatch, tmp_path):
+def test_no_admission_zero_invocation_inventory_still_needs_atomic_lane_snapshot(monkeypatch, tmp_path):
     pause(monkeypatch, tmp_path)
     class PlainBus(Bus):
         def support_uncertain_outbound(self, limit=1000):
             return [_admission_row()]
     receipt = fence.receipt(PlainBus())
-    assert receipt['blockers'] == []
-    assert receipt['local_drained']
+    assert receipt['blockers'] == [CROSS_LANE_BLOCKER]
+    assert not receipt['local_drained']
     assert receipt['fleet_drained'] is False
 
 
@@ -746,6 +748,34 @@ def test_first_lane_resume_during_second_lane_scan_blocks_drain(
     assert 'admission_lane_changed:support-resolution-send' in receipt['blockers']
 
 
+def test_send_lane_resumes_during_final_close_status_read_cannot_ack_drain(
+        monkeypatch, tmp_path):
+    """Both individual final reads can look valid despite a cross-lane race."""
+    pause(monkeypatch, tmp_path)
+    class Interleaved(Bus):
+        def __init__(self):
+            self.status_reads = {'support-resolution-send': 0,
+                                 'support-ticket-close': 0}
+            self.send_resumed = False
+        def support_admission_status_lane(self, lane='support-resolution-send'):
+            self.status_reads[lane] += 1
+            if lane == 'support-ticket-close' and self.status_reads[lane] == 3:
+                # The send lane resumes after its final status read and before
+                # this last close-lane status RPC returns. Resume need not
+                # advance the admission generation.
+                assert self.status_reads['support-resolution-send'] == 3
+                self.send_resumed = True
+            return _status_for(lane)
+    bus = Interleaved()
+    receipt = fence.receipt(bus)
+    assert bus.send_resumed
+    assert bus.status_reads == {'support-resolution-send': 3,
+                                'support-ticket-close': 3}
+    assert receipt['blockers'] == [CROSS_LANE_BLOCKER]
+    assert not receipt['local_drained']
+    assert receipt['fleet_drained'] is False
+
+
 @pytest.mark.parametrize('override', [
     {'limit': 50},                                     # page size mismatch
     {'returned': 0},                                   # returned count mismatch
@@ -904,5 +934,6 @@ def test_verified_inventory_never_sets_fleet_drain(monkeypatch, tmp_path):
     # No process-local evidence, however complete, may assert a fleet-wide drain.
     pause(monkeypatch, tmp_path)
     receipt = fence.receipt(Bus())
-    assert receipt['local_drained'] and receipt['blockers'] == []
+    assert not receipt['local_drained']
+    assert receipt['blockers'] == [CROSS_LANE_BLOCKER]
     assert receipt['fleet_drained'] is False

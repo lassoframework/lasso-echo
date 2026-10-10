@@ -380,6 +380,12 @@ def receipt(bus=None):
                     if final is None or any(final.get(key) != before.get(key)
                                             for key in _LANE_KEYS):
                         blockers.append(f"admission_lane_changed:{lane}")
+                # Separate RPCs cannot observe both controls atomically. The
+                # first lane may resume after its final read while the second
+                # lane is being read, with no generation change on resume.
+                # Keep local drain blocked until Portal exposes a paired,
+                # serialized status receipt and release holds it through cutover.
+                blockers.append("admission_cross_lane_snapshot_unverified")
             except Exception as exc:
                 blockers.append(f"database_read:{type(exc).__name__}")
     # A control replacement during DB read invalidates this acknowledgment.
