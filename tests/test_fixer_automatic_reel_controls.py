@@ -10,6 +10,8 @@ import pytest
 
 from agent import fixer_business_evidence as be
 from agent import fixer_ops
+from agent import support_thumbnail_probe
+from agent.slack_convo import outbox
 
 NOW = datetime(2026, 10, 10, 18, tzinfo=timezone.utc)
 GYM = '11111111-1111-4111-8111-111111111111'
@@ -185,6 +187,22 @@ def test_business_endpoint_defaults_off_for_new_check(monkeypatch):
     monkeypatch.setenv('ECHO_REEL_CONTROLS_PROOF', 'true')
     assert fixer_ops._run_business_evidence(body, {}) != (
         503, {'error': 'business_check_disabled'})
+
+
+def test_slack_dispatch_rechecks_reel_status_and_upload_form(monkeypatch):
+    data = tables()
+    job = data['auto_reel_status'][0]['snapshot']['jobs'][0]
+    monkeypatch.setattr(support_thumbnail_probe, 'probe_job_status',
+                        lambda gym, rid: copy.deepcopy(job))
+    monkeypatch.setattr(fixer_ops, 'probe_upload_form', lambda gym: True)
+    bus = SimpleNamespace(_get=read_factory(data))
+    deps = outbox._business_evidence_deps(bus, CHECK)
+    assert observe(data, deps)['verified'] is True
+    monkeypatch.setattr(fixer_ops, 'probe_upload_form', lambda gym: False)
+    assert observe(data, outbox._business_evidence_deps(bus, CHECK))['verified'] is False
+    job['status'] = 'completed'
+    monkeypatch.setattr(fixer_ops, 'probe_upload_form', lambda gym: True)
+    assert observe(data, outbox._business_evidence_deps(bus, CHECK))['verified'] is False
 
 
 GOOD_FORM = (
