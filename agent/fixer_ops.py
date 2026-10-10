@@ -232,6 +232,9 @@ def _business_params_valid(check_id, params):
     if check_id == "automatic_reel_and_thumbnails_ready":
         from .fixer_business_evidence import automatic_reel_params_valid
         return bool(automatic_reel_params_valid(params))
+    if check_id == "automatic_reel_controls_repaired":
+        from .fixer_business_evidence import automatic_reel_controls_params_valid
+        return bool(automatic_reel_controls_params_valid(params))
     if check_id == "story_calendar_media_ready":
         from .fixer_business_seed import validate_story_target, validate_story_created_at, SeedError
         if set(params) != {"row_id", "calendar_gym_key", "account", "post_date", "created_at"}:
@@ -333,6 +336,95 @@ def _current_swap_request_key(deps, ticket_id):
     return _business_request_key(read, rows[0])
 
 
+_UPLOAD_FORM_ORIGIN = "https://echo-intake-web-production.up.railway.app"
+_REEL_CONTROLS_PROOF_FLAG = "ECHO_REEL_CONTROLS_PROOF"
+_UPLOAD_FORM_MAX_BYTES = 512 * 1024
+_UPLOAD_ACTION_MAX_BYTES = 32 * 1024
+_UPLOAD_FORM_FILE_INPUT = re.compile(
+    r'<input\b(?=[^>]*\btype=["\']file["\'])(?=[^>]*\baccept=["\'][^"\']*video)[^>]*>',
+    re.I)
+_UPLOAD_FORM_SEND_DISABLED = re.compile(
+    r'<button\b(?=[^>]*\bid=["\']send["\'])(?=[^>]*\bdisabled\b)[^>]*>', re.I)
+_UPLOAD_FORM_GATED_ENABLE = re.compile(
+    r'sendBtn\.disabled\s*=\s*pending\.length\s*===?\s*0')
+
+
+def probe_upload_form(gym, *, http=None, token_resolver=None):
+    """Worker-owned readback of the exact tenant upload form at the fixed intake origin.
+
+    True = 200 HTML page with a video-capable file chooser and Send disabled until
+    a clip is chosen; False = page contradicts that; None = read unavailable. The
+    token comes from the worker-owned current-token resolver, is never accepted
+    from a caller, is never logged, and the page is only read -- never submitted.
+    """
+    try:
+        import time
+        import requests
+        from .intake_web import _current_token_for
+        token = (token_resolver or _current_token_for)(gym)
+        if not isinstance(token, str) or not re.fullmatch(
+            r"[A-Za-z0-9_-]{2,128}\.[A-Za-z0-9_-]{8,128}", token
+        ):
+            return None
+        deadline = time.monotonic() + 10
+        target = f"{_UPLOAD_FORM_ORIGIN}/u/{token}"
+        # Read the same client API the portal uses. A working uploader alone
+        # does not prove its button points to that uploader.
+        with (http or requests).get(
+            f"{_UPLOAD_FORM_ORIGIN}/portal/{token}/studio/story?automatic=1",
+            stream=True, timeout=(5, 5), allow_redirects=False,
+        ) as response:
+            if response.status_code != 200:
+                return False if response.status_code in (403, 404) else None
+            if "application/json" not in response.headers.get("Content-Type", "").lower():
+                return False
+            if int(response.headers.get("Content-Length") or 0) > _UPLOAD_ACTION_MAX_BYTES:
+                return False
+            action_bytes = bytearray()
+            for chunk in response.iter_content(4096):
+                if time.monotonic() > deadline:
+                    return None
+                action_bytes.extend(chunk)
+                if len(action_bytes) > _UPLOAD_ACTION_MAX_BYTES:
+                    return False
+        action_body = json.loads(bytes(action_bytes))
+        automatic = action_body.get("automatic_reels") if isinstance(action_body, dict) else None
+        action = automatic.get("upload_action") if isinstance(automatic, dict) else None
+        if (not isinstance(action_body, dict) or action_body.get("ok") is not True
+                or not isinstance(automatic, dict) or automatic.get("enabled") is not True
+                or automatic.get("ok") is not True
+                or not isinstance(action, dict) or action.get("url") != target
+                or action.get("label") != "Upload video clips"):
+            return False
+        with (http or requests).get(f"{_UPLOAD_FORM_ORIGIN}/u/{token}",
+                                    stream=True, timeout=(5, 5),
+                                    allow_redirects=False) as response:
+            if response.status_code != 200:
+                return False if response.status_code in (403, 404) else None
+            ctype = response.headers.get("Content-Type", "").lower()
+            if "text/html" not in ctype:
+                return False
+            if int(response.headers.get("Content-Length") or 0) > _UPLOAD_FORM_MAX_BYTES:
+                return False
+            data = bytearray()
+            for chunk in response.iter_content(16384):
+                if time.monotonic() > deadline:
+                    return None
+                data.extend(chunk)
+                if len(data) > _UPLOAD_FORM_MAX_BYTES:
+                    return False
+        body = bytes(data).decode("utf-8", "replace")
+        if not _UPLOAD_FORM_FILE_INPUT.search(body):
+            return False
+        if not _UPLOAD_FORM_SEND_DISABLED.search(body):
+            return False
+        if not _UPLOAD_FORM_GATED_ENABLE.search(body):
+            return False
+        return True
+    except Exception:  # noqa: BLE001 - any probe fault is evidence-unavailable
+        return None
+
+
 def _run_business_evidence(raw_body, deps, now=None):
     """Validate Scout's exact pointer contract and run one read-only Echo check."""
     if raw_body and len(raw_body) > MAX_BODY_BYTES:
@@ -357,6 +449,11 @@ def _run_business_evidence(raw_body, deps, now=None):
             or not isinstance(merged_sha, str) or not _BUSINESS_RELEASE_SHA.fullmatch(merged_sha)
             or not isinstance(check_id, str) or not _business_params_valid(check_id, params)):
         return 400, {"error": "bad_request", "detail": "invalid business evidence identity or check"}
+    # A new business check is unavailable until its two-service release is
+    # explicitly armed. The authenticated endpoint remains default off.
+    if (check_id == "automatic_reel_controls_repaired"
+            and os.environ.get(_REEL_CONTROLS_PROOF_FLAG) != "true"):
+        return 503, {"error": "business_check_disabled"}
     # This one business check reads the keyed swap receipt. Keep other business
     # evidence checks available on their existing read-only surfaces, but never
     # let intake-web substitute a receipt from its separate store.
@@ -404,7 +501,8 @@ def _run_business_evidence(raw_body, deps, now=None):
         deps={"read": read, "receipt_read": receipt_read,
               "thumbnail_probe": deps.get("thumbnail_probe") or probe_thumbnail,
               "approved_cta_probe": deps.get("approved_cta_probe") or probe_approved_cta,
-              "job_status_probe": deps.get("job_status_probe") or probe_job_status},
+              "job_status_probe": deps.get("job_status_probe") or probe_job_status,
+              "form_probe": deps.get("form_probe") or probe_upload_form},
         ticket_id=ticket_id, now=now)
     if not isinstance(record, dict):
         return 503, {"error": "evidence_unavailable"}
