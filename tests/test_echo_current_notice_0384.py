@@ -4,6 +4,7 @@ from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 from threading import Barrier, Lock
 from types import SimpleNamespace
+import hashlib
 import json
 import time
 
@@ -41,7 +42,9 @@ class NoticeBus:
         self.events = []
         self.admission = {"generation": 7, "unresolved": 0, "paused": False,
                           "acquire_denied": False, "finish_fails": False,
-                          "finishes": [], "calls": []}
+                          "receipt_fails": False, "receipt_rewrite": None,
+                          "receipts": [], "finishes": [], "calls": [],
+                          "acquire_bodies": []}
 
     # -- portal 0633 support-resolution-send admission transport ----------------
     def _client(self):
@@ -52,6 +55,15 @@ class NoticeBus:
                 body = json.loads(data or "{}")
                 name = url.rsplit("rpc/", 1)[-1]
                 bus.admission["calls"].append(name)
+                if name == "support_admission_acquire_send":
+                    bus.admission["acquire_bodies"].append(body)
+
+                class Resp2:
+                    def __init__(self, status_code):
+                        self.status_code = status_code
+
+                    def json(self):
+                        return None
 
                 class Resp:
                     status_code = 200
@@ -65,8 +77,8 @@ class NoticeBus:
                                     "drained": bus.admission["paused"]
                                     and bus.admission["unresolved"] == 0,
                                     "operation_id": "op-test"}
-                        if name == "support_admission_acquire_bound":
-                            if bus.admission["acquire_denied"]:
+                        if name == "support_admission_acquire_send":
+                            if bus.admission["acquire_denied"] or body["p_client_id"] is None:
                                 return {"admitted": False,
                                         "lane": "support-resolution-send",
                                         "invocation_id": body["p_invocation_id"],
@@ -77,7 +89,41 @@ class NoticeBus:
                                     "generation": body["p_expected_generation"],
                                     "ticket_id": body["p_ticket_id"],
                                     "request_version": body["p_expected_request_version"],
-                                    "message_id": body["p_message_id"]}
+                                    "message_id": body["p_message_id"],
+                                    "ticket_source": bus.current["source"],
+                                    "ticket_classification": bus.current["classification"],
+                                    "ticket_status": bus.current["status"],
+                                    "client_id": body["p_client_id"],
+                                    "bot_identity": body["p_bot_identity"],
+                                    "slack_user_id": body["p_slack_user_id"],
+                                    "sender_slack_user_id": body["p_sender_slack_user_id"],
+                                    "slack_channel_id": body["p_slack_channel_id"],
+                                    "slack_thread_ts": body["p_slack_thread_ts"],
+                                    "route_pending_at_admission": True,
+                                    "bound_at": datetime.now(timezone.utc).isoformat(),
+                                    "content_sha256": body["p_content_sha256"]}
+                        if name == "support_admission_send_receipt":
+                            bus.admission["receipts"].append(body)
+                            if bus.admission["receipt_fails"]:
+                                return Resp2(400)
+                            if bus.admission["receipt_rewrite"] is not None:
+                                return {"recorded": True,
+                                        "lane": "support-resolution-send",
+                                        "invocation_id": body["p_invocation_id"],
+                                        "generation": body["p_generation"],
+                                        "ticket_id": body["p_ticket_id"],
+                                        "request_version": body["p_expected_request_version"],
+                                        "message_id": body["p_message_id"],
+                                        "slack_ts_receipt": body["p_slack_ts"],
+                                        **bus.admission["receipt_rewrite"]}
+                            return {"recorded": True,
+                                    "lane": "support-resolution-send",
+                                    "invocation_id": body["p_invocation_id"],
+                                    "generation": body["p_generation"],
+                                    "ticket_id": body["p_ticket_id"],
+                                    "request_version": body["p_expected_request_version"],
+                                    "message_id": body["p_message_id"],
+                                    "slack_ts_receipt": body["p_slack_ts"]}
                         if name == "support_admission_finish_lane":
                             bus.admission["finishes"].append(body["p_outcome"])
                             if bus.admission["finish_fails"]:
@@ -283,9 +329,21 @@ def test_admitted_send_records_lease_before_post_and_completion_after():
     assert result.delivered and len(posts) == 1
     calls = bus.admission["calls"]
     assert calls[0] == "support_admission_status_lane"
-    assert calls.index("support_admission_acquire_bound") < bus.events.index("slack_post")
-    assert calls.index("support_admission_acquire_bound") < calls.index(
+    assert calls.index("support_admission_acquire_send") < bus.events.index("slack_post")
+    assert calls.index("support_admission_send_receipt") < calls.index(
         "support_admission_finish_lane")
+    # The top-level current notice binds a null thread and the exact body hash.
+    receipt_call = bus.admission["receipts"][0]
+    assert receipt_call["p_slack_ts"] == result.posted_ts
+    acquire_call = next(body for body in bus.admission["acquire_bodies"])
+    assert acquire_call["p_slack_thread_ts"] is None
+    assert acquire_call["p_client_id"] == "gym-1"
+    assert acquire_call["p_sender_slack_user_id"] == "U_ECHO"
+    assert acquire_call["p_bot_identity"] == "echo"
+    assert acquire_call["p_slack_user_id"] == "U_CLIENT"
+    assert acquire_call["p_slack_channel_id"] == "G_CLIENT"
+    assert acquire_call["p_content_sha256"] == hashlib.sha256(
+        posts[0][1].encode()).hexdigest()
     assert bus.admission["finishes"] == ["completed"]
     att = bus.row["attachments"]
     lease = att["support_resolution_send_admission"]
@@ -445,7 +503,7 @@ def test_membership_change_after_acquisition_never_posts(mode):
     bus = NoticeBus()
 
     def member_check(_channel, _user):
-        if "support_admission_acquire_bound" in bus.admission["calls"]:
+        if "support_admission_acquire_send" in bus.admission["calls"]:
             if mode == "unreadable":
                 raise RuntimeError("conversations.members unavailable")
             return False
@@ -465,7 +523,7 @@ def test_request_change_during_membership_recheck_never_posts():
     bus = NoticeBus()
 
     def member_check(_channel, _user):
-        if "support_admission_acquire_bound" in bus.admission["calls"]:
+        if "support_admission_acquire_send" in bus.admission["calls"]:
             bus.current["request_version"] = 4
         return True
 
@@ -476,6 +534,41 @@ def test_request_change_during_membership_recheck_never_posts():
     assert bus.admission["finishes"] == ["unknown"]
     assert bus.row["delivery_status"] == "held"
     assert "bind" not in bus.events and "posted" not in bus.events
+
+
+@pytest.mark.parametrize("failure", ["lost_or_duplicate_400", "wrong_ts", "wrong_message"])
+def test_send_receipt_ack_failure_holds_unknown_and_never_reposts(failure):
+    """A lost, duplicate or ambiguous send-receipt ACK holds the exact row
+    'unknown' after the one Slack post; nothing is ever reposted."""
+    bus = NoticeBus()
+    if failure == "lost_or_duplicate_400":
+        # The durable contract answers 400 for a duplicate receipt; a lost ACK
+        # is the same transport failure from the caller's side.
+        bus.admission["receipt_fails"] = True
+    elif failure == "wrong_ts":
+        bus.admission["receipt_rewrite"] = {"slack_ts_receipt": "0.000001"}
+    else:
+        bus.admission["receipt_rewrite"] = {
+            "message_id": "00000000-0000-0000-0000-000000000000"}
+    _snapshot, result, posts = _send(bus)
+    assert len(posts) == 1
+    assert result.reason == "current_notice_uncertain"
+    assert len(bus.admission["receipts"]) == 1
+    assert bus.admission["finishes"] == ["unknown"]
+    assert bus.row["delivery_status"] == "held"
+    assert "bind" not in bus.events and "posted" not in bus.events
+
+
+def test_client_less_website_current_notice_is_denied():
+    """An unrouted website notice needs a tenant to claim its proposed DM."""
+    bus = NoticeBus()
+    bus.current.update({"client_id": None})
+    _snapshot, result, posts = _send(bus)
+    assert not result.delivered and posts == []
+    acquire_call = bus.admission["acquire_bodies"][0]
+    assert acquire_call["p_client_id"] is None
+    assert acquire_call["p_slack_thread_ts"] is None
+    assert bus.admission["finishes"] == ["unknown"]
 
 
 def _pending_route_recovery(receipt):

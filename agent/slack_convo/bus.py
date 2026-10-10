@@ -878,6 +878,29 @@ class Bus:
             raise BusError(400, "support admission status malformed")
         return result
 
+    def support_admission_send_receipt(self, *, invocation_id, generation,
+                                       ticket_id, request_version, message_id,
+                                       slack_ts):
+        """Transport-level portal 0633 one-shot Slack timestamp receipt.
+
+        Records the single Slack API ts against the exact admitted send
+        binding. Fail closed on transport or malformed receipts; callers
+        validate every returned field and never retry an uncertain call --
+        a duplicate receipt is itself a durable effect and never reposted.
+        """
+        body = {"p_invocation_id": invocation_id, "p_generation": generation,
+                "p_ticket_id": ticket_id, "p_expected_request_version": request_version,
+                "p_message_id": message_id, "p_slack_ts": slack_ts}
+        r = self._client().post(self._rest("rpc/support_admission_send_receipt"),
+                                data=json.dumps(body),
+                                headers=self._headers(), timeout=30)
+        if r.status_code >= 400:
+            raise BusError(r.status_code, "support admission send receipt unavailable")
+        result = r.json()
+        if not isinstance(result, dict):
+            raise BusError(400, "support admission send receipt malformed")
+        return result
+
     def support_admission_inventory(self, lane, *, limit=200, after_started=None,
                                     after_invocation=None):
         """Read-only portal 0633 paginated invocation inventory, fail closed.

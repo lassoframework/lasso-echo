@@ -1,7 +1,7 @@
 """Offline 0633 bound send admission proof, using disposable PostgreSQL 17 only.
 
-The fixture is the unchanged portal DRAFT_0633 bound-admission contract at
-66489fcb. No live deployment, migration, identity lookup, Slack call or lane
+The fixture is the unchanged portal DRAFT_0633 immutable send-intent
+contract (acquire_send + one-shot send_receipt). No live deployment, migration, identity lookup, Slack call or lane
 activation is performed.
 """
 import copy
@@ -28,6 +28,7 @@ class AdmissionTransport(Transport):
         super().__init__(engine)
         self.rpc_calls = []
         self.rewrite_receipt = None
+        self.rewrite_send_receipt = None
         self.lose_patch_once = False
 
     def post(self, url, **kwargs):
@@ -35,8 +36,11 @@ class AdmissionTransport(Transport):
         if '/rpc/' in url:
             self.rpc_calls.append((name, json.loads(kwargs['data'])))
         result = super().post(url, **kwargs)
-        if self.rewrite_receipt and name == 'support_admission_acquire_bound':
+        if self.rewrite_receipt and name == 'support_admission_acquire_send':
             data = self.rewrite_receipt(result.json())
+            return SimpleNamespace(status_code=200, json=lambda: data)
+        if self.rewrite_send_receipt and name == 'support_admission_send_receipt':
+            data = self.rewrite_send_receipt(result.json())
             return SimpleNamespace(status_code=200, json=lambda: data)
         return result
 
@@ -66,7 +70,7 @@ class AdmissionTransport(Transport):
 def admission_engine(pg_engine):
     fixture = Path(__file__).parent/'fixtures/support_admission_0633_frozen.sql'
     assert hashlib.sha256(fixture.read_bytes()).hexdigest() == (
-        'dfaf9a7082a2b7330cc91a4de62043e227bb7873a827e8a286919a005a8e6e5f')
+        'fcc0cbece319f625c4b9f9a8b6f25d0d63d212e13cf2ac359c43891440769ae4')
     pg_engine.sql(fixture.read_text())
     return pg_engine
 
@@ -155,6 +159,19 @@ def test_real_0633_bound_lane_and_message_cas_bind_one_verified_send(case):
     assert bindings[0]['ticket_id'] == case.ticket['id']
     assert bindings[0]['message_id'] == case.row['id']
     assert bindings[0]['request_version'] == 1
+    assert bindings[0]['client_id'] == 'gym-one'
+    assert bindings[0]['bot_identity'] == 'echo'
+    assert bindings[0]['slack_user_id'] == 'U_CLIENT'
+    assert bindings[0]['sender_slack_user_id'] == 'U_ECHO'
+    assert bindings[0]['slack_channel_id'] == 'C_CLIENT'
+    assert bindings[0]['slack_thread_ts'] == '1.001'
+    assert bindings[0]['content_sha256'] == lease['binding']['body_sha256']
+    assert bindings[0]['slack_ts_receipt'] == ts
+    assert bindings[0]['receipt_recorded_at'] is not None
+    rpc_names = [name for name, _ in case.transport.rpc_calls]
+    assert (rpc_names.index('support_admission_acquire_send')
+            < rpc_names.index('support_admission_send_receipt')
+            < rpc_names.index('support_admission_finish_lane'))
     page = case.bus.support_admission_inventory('support-resolution-send', limit=2)
     assert page['returned'] == 1 and page['has_more'] is False
     assert page['invocations'][0]['invocation_id'] == lease['invocation_id']
@@ -188,7 +205,7 @@ def test_paused_lane_holds_without_acquire_or_send(case):
 
 def test_pause_between_status_and_acquire_wins(case):
     def pause_at_acquire(name, body):
-        if name == 'support_admission_acquire_bound':
+        if name == 'support_admission_acquire_send':
             case.engine.sql("update support_admission_control set paused=true,generation=1 where lane='support-resolution-send'")
     case.transport.before_call = pause_at_acquire
     with pytest.raises(outbox.SupportResolutionAdmissionError):
@@ -204,13 +221,16 @@ def test_disallowed_build_cannot_send(case, monkeypatch):
     assert not case.sent and not invocations(case)
 
 
-@pytest.mark.parametrize('stage', ['support_admission_acquire_bound', 'support_admission_finish_lane'])
+@pytest.mark.parametrize('stage', ['support_admission_acquire_send',
+                                   'support_admission_send_receipt',
+                                   'support_admission_finish_lane'])
 def test_lost_ack_never_reacquires_or_resends(case, stage):
     case.transport.lose_once.add(stage)
     with pytest.raises(outbox.SupportResolutionAdmissionError):
         send(case)
-    assert len(case.sent) == (stage == 'support_admission_finish_lane')
-    assert invocations(case)[0]['outcome'] == ('unknown' if stage.endswith('acquire_bound') else 'completed')
+    assert len(case.sent) == (stage != 'support_admission_acquire_send')
+    assert invocations(case)[0]['outcome'] == (
+        'completed' if stage == 'support_admission_finish_lane' else 'unknown')
     assert outbox._hold_support_send(case.bus, case.row, 'ACK uncertainty', lambda *_: None)
     held = case.bus.message(case.row['id'])
     assert held['delivery_status'] == 'held'
@@ -220,7 +240,79 @@ def test_lost_ack_never_reacquires_or_resends(case, stage):
     outbox._dispatch_one(case.bus, case.post, case.bus.message(held['id']),
                          identity=case.identity, log=lambda *_: None, summary=summary)
     assert summary['skipped'] == 1
-    assert sum(name == 'support_admission_acquire_bound' for name, _ in case.transport.rpc_calls) == 1
+    assert sum(name == 'support_admission_acquire_send' for name, _ in case.transport.rpc_calls) == 1
+
+
+def test_send_receipt_recorded_once_and_exact(case):
+    ts = send(case)
+    bindings = case.engine.rows('support_admission_bindings')
+    assert bindings[0]['slack_ts_receipt'] == ts
+    assert invocations(case)[0]['outcome'] == 'completed'
+    # A second receipt call -- even with the same timestamp -- is refused by
+    # the durable contract, and never triggers another Slack post.
+    with pytest.raises(outbox.SupportResolutionAdmissionError):
+        outbox._support_send_receipt(
+            case.bus, invocation=bindings[0]['invocation_id'],
+            generation=bindings[0]['generation'], ticket_id=case.ticket['id'],
+            version=1, message_id=case.row['id'], ts=ts)
+    assert len(case.sent) == 1
+
+
+@pytest.mark.parametrize('patch', [{'lane': 'ranger-lane'}, {'generation': 99},
+                                  {'invocation_id': str(uuid.uuid4())},
+                                  {'recorded': 'true'}, {'ticket_id': str(uuid.uuid4())},
+                                  {'request_version': 2}, {'message_id': str(uuid.uuid4())},
+                                  {'slack_ts_receipt': '0.000001'}])
+def test_malformed_send_receipt_ack_stays_unknown(case, patch):
+    case.transport.rewrite_send_receipt = lambda result: {**result, **patch}
+    with pytest.raises(outbox.SupportResolutionAdmissionError):
+        send(case)
+    assert len(case.sent) == 1
+    assert invocations(case)[0]['outcome'] == 'unknown'
+    # Held forever: a manual status edit cannot permit another effect.
+    case.bus.mark_message(case.row['id'], 'ready')
+    summary = {'skipped': 0}
+    outbox._dispatch_one(case.bus, case.post, case.bus.message(case.row['id']),
+                         identity=case.identity, log=lambda *_: None, summary=summary)
+    assert summary['skipped'] == 1
+    assert len(case.sent) == 1
+
+
+def test_lost_readback_after_receipt_stays_unknown(case):
+    def lost(channel, **kwargs):
+        raise TimeoutError('readback lost after Slack committed')
+    with pytest.raises(outbox.SupportResolutionAdmissionError):
+        send(case, readback=lost)
+    assert len(case.sent) == 1 and invocations(case)[0]['outcome'] == 'unknown'
+    case.bus.mark_message(case.row['id'], 'ready')
+    summary = {'skipped': 0}
+    outbox._dispatch_one(case.bus, case.post, case.bus.message(case.row['id']),
+                         identity=case.identity, log=lambda *_: None, summary=summary)
+    assert summary['skipped'] == 1
+    assert len(case.sent) == 1
+
+
+def test_client_less_slack_ticket_binds_null_tenant(case):
+    case.bus.set_ticket(case.ticket['id'], client_id=None, source='slack_conversation')
+    ticket = {**case.ticket, 'client_id': None, 'source': 'slack_conversation'}
+    ts = send(case, ticket=ticket)
+    assert len(case.sent) == 1
+    bindings = case.engine.rows('support_admission_bindings')
+    assert bindings[0]['client_id'] is None
+    assert bindings[0]['slack_user_id'] == 'U_CLIENT'
+    assert bindings[0]['slack_ts_receipt'] == ts
+    assert invocations(case)[0]['outcome'] == 'completed'
+
+
+def test_top_level_resolution_binds_null_thread(case):
+    case.bus.set_ticket(case.ticket['id'], slack_thread_ts=None)
+    ticket = {**case.ticket, 'slack_thread_ts': None}
+    ts = send(case, ticket=ticket, thread_ts=None)
+    assert len(case.sent) == 1
+    bindings = case.engine.rows('support_admission_bindings')
+    assert bindings[0]['slack_thread_ts'] is None
+    assert bindings[0]['slack_ts_receipt'] == ts
+    assert invocations(case)[0]['outcome'] == 'completed'
 
 
 def test_lost_message_cas_ack_never_acquires_or_sends(case):
@@ -232,7 +324,18 @@ def test_lost_message_cas_ack_never_acquires_or_sends(case):
 
 
 @pytest.mark.parametrize('patch', [{'lane': 'ranger-lane'}, {'generation': True},
-                                  {'invocation_id': str(uuid.uuid4())}, {'admitted': 'true'}])
+                                  {'invocation_id': str(uuid.uuid4())}, {'admitted': 'true'},
+                                  {'client_id': None}, {'client_id': 'gym-other'},
+                                  {'bot_identity': 'ranger'}, {'slack_user_id': 'U_OTHER'},
+                                  {'sender_slack_user_id': 'U_RANGER'},
+                                  {'slack_channel_id': 'C_OTHER'},
+                                  {'slack_thread_ts': None}, {'slack_thread_ts': '9.999'},
+                                  {'ticket_source': 'website_tab'},
+                                  {'ticket_classification': 'other'},
+                                  {'ticket_status': 'resolved'},
+                                  {'route_pending_at_admission': True},
+                                  {'content_sha256': '0' * 64},
+                                  {'bound_at': None}, {'bound_at': 'invalid'}])
 def test_malformed_acquire_receipt_cannot_send(case, patch):
     case.transport.rewrite_receipt = lambda result: {**result, **patch}
     with pytest.raises(outbox.SupportResolutionAdmissionError):
@@ -241,23 +344,36 @@ def test_malformed_acquire_receipt_cannot_send(case, patch):
     assert invocations(case)[0]['outcome'] == 'unknown'
 
 
+def test_readback_requires_authoritative_admission_time(case):
+    case.transport.rewrite_receipt = lambda result: {
+        **result, 'bound_at': '2100-01-01T00:00:00+00:00'}
+    with pytest.raises(outbox.SupportResolutionAdmissionError):
+        send(case)
+    assert len(case.sent) == 1
+    assert invocations(case)[0]['outcome'] == 'unknown'
+    assert case.bus.message(case.row['id'])['slack_ts'] == case.sent[0]['ts']
+
+
 @pytest.mark.parametrize('field,value', [('source', 'portal_form'), ('request_version', 2),
                                        ('slack_channel_id', 'C_OTHER'), ('client_id', 'gym-other'),
                                        ('bot_identity', 'ranger')])
 def test_request_route_tenant_sender_drift_after_acquire_cannot_send(case, field, value):
     def change(name, body):
-        if name == 'support_admission_acquire_bound':
+        if name == 'support_admission_acquire_send':
             case.bus.set_ticket(case.ticket['id'], **{field: value})
     case.transport.before_call = change
     with pytest.raises(outbox.SupportResolutionAdmissionError):
         send(case)
     assert not case.sent
-    if field == 'request_version':
-        # 0633 revalidates the exact ticket request version inside the lane
-        # transaction: a stale version is rejected BEFORE any invocation exists.
-        assert not invocations(case)
-    else:
+    if field == 'source':
+        # The ticket source is not an acquire_send routing term; the drift is
+        # caught by the post-admission snapshot recheck instead.
         assert invocations(case)[0]['outcome'] == 'unknown'
+    else:
+        # acquire_send revalidates the exact request version, route, tenant and
+        # identity inside the lane transaction: drift is rejected BEFORE any
+        # invocation exists.
+        assert not invocations(case)
 
 
 @pytest.mark.parametrize('window', ['auth', 'status', 'acquire'])
@@ -295,7 +411,7 @@ def test_resolution_rechecks_real_replay_authority_after_admission_windows(
     def rpc(bus, name, body):
         result = original_rpc(bus, name, body)
         if (window == 'status' and name == 'support_admission_status_lane'
-                or window == 'acquire' and name == 'support_admission_acquire_bound'):
+                or window == 'acquire' and name == 'support_admission_acquire_send'):
             revoke()
         return result
 
@@ -407,7 +523,7 @@ def test_real_outbox_paused_send_is_held_and_ticket_open(case):
 
 def test_real_outbox_lost_acquisition_ack_never_sends_on_next_poll(case):
     ready_case(case)
-    case.transport.lose_once.add('support_admission_acquire_bound')
+    case.transport.lose_once.add('support_admission_acquire_send')
     summary = outbox.run_once(case.bus, case.post, identity=case.identity,
                               readback=case.readback, log=lambda *_: None)
     assert summary['held'] == 1
@@ -488,7 +604,7 @@ def test_missing_sender_or_readback_never_acquires(case):
 
 def test_operator_release_revoked_during_admission_never_sends(case):
     def revoke(name, body):
-        if name == 'support_admission_acquire_bound':
+        if name == 'support_admission_acquire_send':
             case.bus.mark_message(case.row['id'], 'posting', meta_update={'released_by': None})
     case.transport.before_call = revoke
     with pytest.raises(outbox.SupportResolutionAdmissionError):
@@ -509,7 +625,7 @@ def test_client_safety_flag_revoked_during_admission_never_sends(case, monkeypat
     case.att['released_by'] = None
     case.bus.mark_message(case.row['id'], 'posting', meta_update={'released_by': None})
     def revoke(name, body):
-        if name == 'support_admission_acquire_bound':
+        if name == 'support_admission_acquire_send':
             monkeypatch.setenv(flag, 'false')
     case.transport.before_call = revoke
     with pytest.raises(outbox.SupportResolutionAdmissionError):
@@ -637,7 +753,7 @@ def test_injected_post_without_sender_verifier_is_held(case, kind):
 
 def test_captured_sender_changes_after_admission_never_posts(case):
     def change(name, args):
-        if name == 'support_admission_acquire_bound':
+        if name == 'support_admission_acquire_send':
             case.post.verify_sender = lambda: {'ok': True, 'user_id': 'U_RANGER'}
     case.transport.before_call = change
     with pytest.raises(outbox.SupportResolutionAdmissionError):

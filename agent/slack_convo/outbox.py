@@ -162,6 +162,43 @@ def _support_send_rpc(bus, name, body):
     return result
 
 
+def _support_send_receipt(bus, *, invocation, generation, ticket_id, version,
+                          message_id, ts):
+    """Record the one Slack API timestamp against the exact admitted binding.
+
+    Exactly one call per acquired invocation. A lost ACK, a duplicate receipt
+    or any returned-field mismatch raises, and the caller finishes the
+    invocation 'unknown' and holds -- the durable effect is never reposted.
+    """
+    receipt = _support_send_rpc(bus, "support_admission_send_receipt", {
+        "p_invocation_id": invocation, "p_generation": generation,
+        "p_ticket_id": ticket_id, "p_expected_request_version": version,
+        "p_message_id": message_id, "p_slack_ts": ts})
+    if (receipt.get("recorded") is not True or receipt.get("lane") != SUPPORT_SEND_LANE
+            or receipt.get("invocation_id") != invocation
+            or type(receipt.get("generation")) is not int
+            or receipt["generation"] != generation
+            or receipt.get("ticket_id") != ticket_id
+            or type(receipt.get("request_version")) is not int
+            or receipt["request_version"] != version
+            or receipt.get("message_id") != message_id
+            or receipt.get("slack_ts_receipt") != ts):
+        raise SupportResolutionAdmissionError("Support send receipt ACK unconfirmed")
+    return receipt
+
+
+def _support_send_readback_floor(admission, local_not_before):
+    """Use the later of the persisted admission and local posting boundaries."""
+    bound_at = admission.get("bound_at")
+    if not isinstance(bound_at, str):
+        raise SupportResolutionAdmissionError("Support send admission timestamp missing")
+    pinned = _parse_ts(bound_at)
+    local = _parse_ts(local_not_before)
+    if pinned is None or local is None:
+        raise SupportResolutionAdmissionError("Support send admission timestamp invalid")
+    return max(pinned, local).isoformat()
+
+
 def _support_send_cas(bus, row, *, meta=None, slack_ts=None, state=None, after_post=False):
     """Keep the exact row, body, request version and attachment claimant snapshot."""
     allowed_states = {"posting", "held"} if after_post else {"posting"}
@@ -324,9 +361,10 @@ def _post_support_resolution(bus, post, row, ticket, identity, body, channel,
                              member_check=None, require_member=False):
     """Admit each client resolution against the DB pause, then prove its exact send.
 
-    0633 bound acquisition revalidates the exact ticket id, request version and
-    message id inside the lane-serializing transaction. The immutable invocation
-    id is derived from the binding stored by message CAS BEFORE acquisition.
+    0633 send acquisition revalidates the exact ticket id, request version,
+    message id, tenant, requester, sender, route, thread and body hash inside
+    the lane-serializing transaction. The immutable invocation id is derived
+    from the binding stored by message CAS BEFORE acquisition.
     No local/preview identity fallback and no feature flag can bypass this
     send boundary.
     """
@@ -350,7 +388,9 @@ def _post_support_resolution(bus, post, row, ticket, identity, body, channel,
                 or type(version) is not int or version < 0
                 or not isinstance(ticket.get("source"), str) or not ticket["source"].strip()
                 or ticket.get("bot_identity") != identity.name
-                or ticket.get("slack_channel_id") != channel):
+                or ticket.get("slack_channel_id") != channel
+                or not isinstance(ticket.get("slack_user_id"), str)
+                or not ticket["slack_user_id"].strip()):
             raise SupportResolutionAdmissionError("Support send exact deployment/request/sender/readback unavailable")
         uuid.UUID(ticket["id"])
         uuid.UUID(row["id"])
@@ -390,19 +430,41 @@ def _post_support_resolution(bus, post, row, ticket, identity, body, channel,
                  "generation": generation, "deployment": deployment, "build": build,
                  "binding": binding, "not_before": datetime.now(timezone.utc).isoformat()}
         current = _support_send_cas(bus, current, meta={SUPPORT_SEND_ADMISSION_KEY: lease})
-        receipt = _support_send_rpc(bus, "support_admission_acquire_bound", {
-            "p_lane": SUPPORT_SEND_LANE, "p_expected_generation": generation,
+        receipt = _support_send_rpc(bus, "support_admission_acquire_send", {
+            "p_expected_generation": generation,
             "p_invocation_id": invocation, "p_deployment": deployment, "p_build": build,
             "p_ticket_id": ticket["id"], "p_expected_request_version": version,
-            "p_message_id": row["id"]})
+            "p_message_id": row["id"],
+            "p_client_id": ticket.get("client_id"),
+            "p_bot_identity": identity.name,
+            "p_slack_user_id": ticket.get("slack_user_id"),
+            "p_sender_slack_user_id": sender,
+            "p_slack_channel_id": channel,
+            "p_slack_thread_ts": thread_ts,
+            "p_content_sha256": binding["body_sha256"]})
+        # Every returned immutable field must echo the exact send intent,
+        # including a null tenant (client-less Slack ticket) and a null
+        # top-level thread.
         if (receipt.get("admitted") is not True or receipt.get("lane") != SUPPORT_SEND_LANE
                 or receipt.get("invocation_id") != invocation
                 or type(receipt.get("generation")) is not int or receipt["generation"] != generation
                 or receipt.get("ticket_id") != ticket["id"]
                 or type(receipt.get("request_version")) is not int
                 or receipt["request_version"] != version
-                or receipt.get("message_id") != row["id"]):
+                or receipt.get("message_id") != row["id"]
+                or receipt.get("ticket_source") != ticket.get("source")
+                or receipt.get("ticket_classification") != ticket.get("classification")
+                or receipt.get("ticket_status") != ticket.get("status")
+                or receipt.get("client_id") != ticket.get("client_id")
+                or receipt.get("bot_identity") != identity.name
+                or receipt.get("slack_user_id") != ticket.get("slack_user_id")
+                or receipt.get("sender_slack_user_id") != sender
+                or receipt.get("slack_channel_id") != channel
+                or receipt.get("slack_thread_ts") != thread_ts
+                or receipt.get("route_pending_at_admission") is not False
+                or receipt.get("content_sha256") != binding["body_sha256"]):
             raise SupportResolutionAdmissionError("Support send durable admission denied or receipt mismatch")
+        readback_floor = _support_send_readback_floor(receipt, lease["not_before"])
         if _verify_support_post_sender(post, identity) != sender:
             raise SupportResolutionAdmissionError("Support sender changed during send admission")
         if require_member and not (channel.startswith(("C", "G")) and callable(member_check)
@@ -428,9 +490,12 @@ def _post_support_resolution(bus, post, row, ticket, identity, body, channel,
         ts = post(channel, body, thread_ts=thread_ts, blocks=None)
         if not isinstance(ts, str) or not ts:
             raise SupportResolutionAdmissionError("Support Slack timestamp unconfirmed")
+        _support_send_receipt(bus, invocation=invocation, generation=generation,
+                              ticket_id=ticket["id"], version=version,
+                              message_id=row["id"], ts=ts)
         current = _support_send_after_post(bus, current, ts)
         intent = {"channel": channel, "thread_ts": thread_ts, "body": body,
-                  "sender": sender, "not_before": lease["not_before"],
+                  "sender": sender, "not_before": readback_floor,
                   "request_version": version, "request_key": att.get("request_key")}
         proof, reason = _readback_fixer_message(readback, intent, ts=ts)
         if not proof:

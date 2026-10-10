@@ -55,6 +55,7 @@ class FakeBus:
         self._atomic_lock = threading.Lock()
         self._support_lane_generation = 1
         self._support_lane_invocations = {}
+        self._support_lane_receipts = {}
 
     def _client(self):
         return self
@@ -73,7 +74,7 @@ class FakeBus:
                       "paused": False, "unresolved": sum(
                           value != "completed" for value in self._support_lane_invocations.values()),
                       "drained": False, "operation_id": "test-open"}
-        elif name == "support_admission_acquire_bound":
+        elif name == "support_admission_acquire_send":
             ident = args["p_invocation_id"]
             ticket = self.ticket(args["p_ticket_id"])
             message = self.message(args["p_message_id"])
@@ -81,16 +82,48 @@ class FakeBus:
                         and ident not in self._support_lane_invocations
                         and ticket is not None and message is not None
                         and ticket.get("request_version") == args["p_expected_request_version"]
+                        and ticket.get("client_id") == args["p_client_id"]
+                        and ticket.get("bot_identity") == args["p_bot_identity"]
+                        and ticket.get("slack_user_id") == args["p_slack_user_id"]
+                        and ticket.get("slack_channel_id") == args["p_slack_channel_id"]
                         and message.get("ticket_id") == args["p_ticket_id"]
                         and message.get("direction") == "outbound"
                         and message.get("delivery_request_version") == args["p_expected_request_version"])
             if admitted:
                 self._support_lane_invocations[ident] = "running"
-            result = {"admitted": admitted, "lane": args["p_lane"],
+                self._support_lane_receipts[ident] = None
+            result = {"admitted": admitted, "lane": "support-resolution-send",
                       "invocation_id": ident, "generation": self._support_lane_generation,
                       "ticket_id": args["p_ticket_id"],
                       "request_version": args["p_expected_request_version"],
-                      "message_id": args["p_message_id"]}
+                      "message_id": args["p_message_id"],
+                      "ticket_source": ticket.get("source"),
+                      "ticket_classification": ticket.get("classification"),
+                      "ticket_status": ticket.get("status"),
+                      "client_id": args["p_client_id"],
+                      "bot_identity": args["p_bot_identity"],
+                      "slack_user_id": args["p_slack_user_id"],
+                      "sender_slack_user_id": args["p_sender_slack_user_id"],
+                      "slack_channel_id": args["p_slack_channel_id"],
+                      "slack_thread_ts": args["p_slack_thread_ts"],
+                      "route_pending_at_admission": False,
+                      "bound_at": datetime.now(timezone.utc).isoformat(),
+                      "content_sha256": args["p_content_sha256"]}
+        elif name == "support_admission_send_receipt":
+            ident = args["p_invocation_id"]
+            if (self._support_lane_invocations.get(ident) is None
+                    or ident not in self._support_lane_receipts
+                    or self._support_lane_receipts[ident] is not None
+                    or args["p_generation"] != self._support_lane_generation):
+                return SimpleNamespace(status_code=400, json=lambda: None)
+            self._support_lane_receipts[ident] = args["p_slack_ts"]
+            ticket = self.ticket(args["p_ticket_id"])
+            result = {"recorded": True, "lane": "support-resolution-send",
+                      "invocation_id": ident, "generation": self._support_lane_generation,
+                      "ticket_id": args["p_ticket_id"],
+                      "request_version": args["p_expected_request_version"],
+                      "message_id": args["p_message_id"],
+                      "slack_ts_receipt": args["p_slack_ts"]}
         elif name == "support_admission_finish_lane":
             ident = args["p_invocation_id"]
             outcome = self._support_lane_invocations.get(ident)
@@ -99,7 +132,9 @@ class FakeBus:
             recorded = (outcome is not None
                         and args["p_generation"] == self._support_lane_generation
                         and args["p_outcome"] in ("completed", "unknown")
-                        and outcome in ("running", args["p_outcome"]))
+                        and outcome in ("running", args["p_outcome"])
+                        and (args["p_outcome"] != "completed"
+                             or self._support_lane_receipts.get(ident) is not None))
             result = {"recorded": recorded,
                       "lane": args["p_lane"], "invocation_id": ident}
             if recorded:
@@ -2179,7 +2214,7 @@ def test_fixer_client_reply_waits_for_verified_current_deployment(monkeypatch):
     bus.tickets[tid] = {
         "id": tid, "source": "slack_conversation", "status": "hold", "bot_identity": "echo", "identity_kind": "client",
         "client_id": BUSINESS_PORTAL_GYM_ID,
-        "slack_channel_id": "C_CLIENT", "slack_thread_ts": "1.0", "fix_pr_url": pr,
+        "slack_user_id": "U_CLIENT", "slack_channel_id": "C_CLIENT", "slack_thread_ts": "1.0", "fix_pr_url": pr,
         "verification_after": {"exit_code": 0, "fixer": {"merged_sha": sha,
                                         "deployment_check": {"verified": True, "sha": sha}}},
     }
@@ -2280,7 +2315,7 @@ def test_fixer_correction_during_slack_post_keeps_ticket_open(monkeypatch):
     bus.tickets[tid] = {
         "id": tid, "source": "slack_conversation", "status": "merged", "bot_identity": "echo",
         "identity_kind": "client", "client_id": BUSINESS_PORTAL_GYM_ID,
-        "slack_channel_id": "C_CLIENT", "slack_thread_ts": "1.0", "fix_pr_url": pr,
+        "slack_user_id": "U_CLIENT", "slack_channel_id": "C_CLIENT", "slack_thread_ts": "1.0", "fix_pr_url": pr,
         "verification_after": {"exit_code": 0, "fixer": {"merged_sha": sha,
             "deployment_check": {"verified": True, "sha": sha}}},
     }
@@ -2519,7 +2554,7 @@ def test_grounded_fixer_answer_includes_blake_without_requiring_deploy_proof(
         "id": tid, "source": "slack_conversation", "status": "verification", "product": "echo",
         "classification": "answerable_question", "escalated": False,
         "bot_identity": "echo", "identity_kind": "client",
-        "slack_channel_id": "C_CLIENT", "slack_thread_ts": "1.0",
+        "slack_user_id": "U_CLIENT", "slack_channel_id": "C_CLIENT", "slack_thread_ts": "1.0",
         "verification_after": {"facts": {"instagram": "connected"}},
     }
     bus.record_inbound(ticket_id=tid, author_type="client",

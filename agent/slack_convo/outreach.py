@@ -289,6 +289,8 @@ def _admit_current_notice_send(bus, *, ticket, row, ident, sender, channel_id, t
     att = row.get("attachments") or {}
     if (not deployment or not build or not sender
             or type(version) is not int or version < 0
+            or not isinstance(ticket.get("slack_user_id"), str)
+            or not ticket["slack_user_id"].strip()
             or row.get("delivery_status") != "posting"
             or row.get("body") != text or row.get("ticket_id") != ticket["id"]
             or type(row.get("delivery_request_version")) is not int
@@ -319,11 +321,21 @@ def _admit_current_notice_send(bus, *, ticket, row, ident, sender, channel_id, t
     current = _ob._support_send_cas(bus, row,
                                     meta={_ob.SUPPORT_SEND_ADMISSION_KEY: lease})
     try:
-        receipt = _ob._support_send_rpc(bus, "support_admission_acquire_bound", {
-            "p_lane": _ob.SUPPORT_SEND_LANE, "p_expected_generation": generation,
+        receipt = _ob._support_send_rpc(bus, "support_admission_acquire_send", {
+            "p_expected_generation": generation,
             "p_invocation_id": invocation, "p_deployment": deployment,
             "p_build": build, "p_ticket_id": ticket["id"],
-            "p_expected_request_version": version, "p_message_id": row["id"]})
+            "p_expected_request_version": version, "p_message_id": row["id"],
+            "p_client_id": ticket.get("client_id"),
+            "p_bot_identity": getattr(ident, "name", ""),
+            "p_slack_user_id": ticket.get("slack_user_id"),
+            "p_sender_slack_user_id": sender,
+            "p_slack_channel_id": channel_id,
+            "p_slack_thread_ts": None,
+            "p_content_sha256": binding["body_sha256"]})
+        # Every returned immutable field must echo the exact send intent,
+        # including a null tenant (client-less Slack ticket) and the null
+        # top-level thread of this first-contact notice.
         if (receipt.get("admitted") is not True
                 or receipt.get("lane") != _ob.SUPPORT_SEND_LANE
                 or receipt.get("invocation_id") != invocation
@@ -332,9 +344,22 @@ def _admit_current_notice_send(bus, *, ticket, row, ident, sender, channel_id, t
                 or receipt.get("ticket_id") != ticket["id"]
                 or type(receipt.get("request_version")) is not int
                 or receipt["request_version"] != version
-                or receipt.get("message_id") != row["id"]):
+                or receipt.get("message_id") != row["id"]
+                or receipt.get("ticket_source") != ticket.get("source")
+                or receipt.get("ticket_classification") != ticket.get("classification")
+                or receipt.get("ticket_status") != ticket.get("status")
+                or receipt.get("client_id") != ticket.get("client_id")
+                or receipt.get("bot_identity") != getattr(ident, "name", "")
+                or receipt.get("slack_user_id") != ticket.get("slack_user_id")
+                or receipt.get("sender_slack_user_id") != sender
+                or receipt.get("slack_channel_id") != channel_id
+                or receipt.get("slack_thread_ts") is not None
+                or receipt.get("route_pending_at_admission") is not True
+                or receipt.get("content_sha256") != binding["body_sha256"]):
             raise _ob.SupportResolutionAdmissionError(
                 "Current notice send durable admission denied or receipt mismatch")
+        readback_floor = _ob._support_send_readback_floor(
+            receipt, lease["not_before"])
         if _current_notice_sender_proof(ident, verifier) != sender:
             raise _ob.SupportResolutionAdmissionError(
                 "Current notice sender changed during send admission")
@@ -361,7 +386,7 @@ def _admit_current_notice_send(bus, *, ticket, row, ident, sender, channel_id, t
                 or ident.bot_user_id() != sender):
             raise _ob.SupportResolutionAdmissionError(
                 "Current notice send ticket, row or sender changed after admission")
-        return lease
+        return {**lease, "readback_floor": readback_floor}
     except Exception as exc:
         # An acquired-but-unconfirmed receipt cannot be completed by assumption.
         # 0633 unknown remains unresolved; never retry acquisition or POST.
@@ -723,6 +748,14 @@ def _send(ticket, who, ident, *, open_group_dm, post_first_message, record_outbo
             ts = posted.get("ts") if isinstance(posted, dict) and posted.get("ok") else None
             if not isinstance(ts, str) or not ts:
                 return uncertain("Slack post returned no confirmed timestamp")
+            try:
+                _ob._support_send_receipt(
+                    current_notice_bus, invocation=lease["invocation_id"],
+                    generation=lease["generation"], ticket_id=ticket["id"],
+                    version=ticket["request_version"], message_id=row_id, ts=ts)
+            except Exception as exc:  # noqa: BLE001 - lost/duplicate/ambiguous ACK
+                return uncertain("current notice send receipt unconfirmed: "
+                                 f"{type(exc).__name__}")
             stamped = current_notice_bus.record_fixer_delivery_timestamp(row_id, intent, ts)
             if not stamped:
                 # A stale sweep may have moved posting to held while Slack was
@@ -735,7 +768,10 @@ def _send(ticket, who, ident, *, open_group_dm, post_first_message, record_outbo
                         row_id, intent, ts)
             if not stamped or stamped.get("slack_ts") != ts:
                 return uncertain("Slack timestamp was not persisted")
-            proof, reason = _ob._readback_fixer_message(readback, intent, ts=ts)
+            proof, reason = _ob._readback_fixer_message(
+                readback, {**intent, "not_before": max(
+                    _ob._parse_ts(intent["not_before"]),
+                    _ob._parse_ts(lease["readback_floor"])).isoformat()}, ts=ts)
             if not proof:
                 return uncertain(reason)
             verified = current_notice_bus.transition_fixer_delivery(
