@@ -36,10 +36,12 @@ class FakeBus:
     a select that asks for raw text.
     """
 
-    def __init__(self, tickets, gyms=None, messages=None, fail_table=None):
+    def __init__(self, tickets, gyms=None, messages=None, fail_table=None,
+                 adoptions=None):
         self._tickets = list(tickets)
         self._gyms = dict(gyms or {})
         self._messages = list(messages or [])
+        self._adoptions = list(adoptions or [])
         self._fail_table = fail_table
         self.calls = []
 
@@ -56,7 +58,8 @@ class FakeBus:
         select = params.get("select", "")
         assert "body" not in select and "raw_text" not in select
         rows = {"support_tickets": self._tickets, "gyms": list(self._gyms.values()),
-                "support_messages": self._messages}[table]
+                "support_messages": self._messages,
+                "fixer_posted_notice_adoptions": self._adoptions}[table]
 
         def keep(row):
             src = params.get("source")
@@ -395,3 +398,185 @@ def test_no_write_method_ever_called():
     assert bus.calls and all(isinstance(c[1], dict) for c in bus.calls)
     # FakeBus write stubs (_insert/_patch/_post/_delete/_upsert) raise
     # AssertionError; reaching this point proves none of them fired.
+
+
+# --- consumed posted-notice adoption (Portal 0645) -----------------------------
+
+ADOPTION_TICKET_ID = "cd08b049-1bf6-4b71-bb80-35d42d9d9de2"
+ADOPTION_NOTICE_ID = "20adfae9-986b-4391-a74c-671e9d807d3e"
+_ADOPTION_RESOLVED_AT = "2026-10-09T21:30:00+00:00"
+
+
+def _eng_grow_ticket(**over):
+    base = {
+        "id": ADOPTION_TICKET_ID,
+        "product": "echo",
+        "source": "website_tab",
+        "status": "resolved",
+        "resolved_at": _ADOPTION_RESOLVED_AT,
+        "request_version": 1,
+        "client_id": DALE_GYM["id"],
+        "bot_identity": "echo",
+        "slack_user_id": "U06P23E3Y2Y",
+        "classification": "answerable_question",
+        "is_test": False,
+        "client_delivery_guard_required": True,
+        "created_at": "2026-10-09T20:00:00+00:00",
+        "raw_text": "SECRET TICKET TEXT",
+    }
+    base.update(over)
+    return base
+
+
+def _adoption_notice(ticket, **over):
+    msg = {
+        "id": ADOPTION_NOTICE_ID,
+        "ticket_id": ticket["id"],
+        "created_at": "2026-10-09T21:00:00+00:00",
+        "direction": "outbound",
+        "author_type": "echo",
+        "slack_ts": "1791573331.865259",
+        "delivery_status": "posted",
+        "delivery_request_version": 1,
+        "attachments": {
+            "kind": "status",
+            "operator_disposition": "provider limitation, no technical fix",
+            "delivery_readback_verified": True,
+            "delivery_readback_ts": "1791573331.865259",
+            "delivery_readback_channel": "C0BUJKCCX6C",
+            "delivery_readback_sender": "U0BE39F02KV",
+        },
+        "body": "SECRET MESSAGE BODY",
+    }
+    msg.update(over)
+    return msg
+
+
+def _adoption_proof(ticket, **over):
+    snapshot = {
+        "id": ADOPTION_TICKET_ID,
+        "product": "echo",
+        "source": "website_tab",
+        "status": "verification",
+        "resolved_at": None,
+        "request_version": 1,
+        "client_id": DALE_GYM["id"],
+        "bot_identity": "echo",
+        "slack_user_id": "U06P23E3Y2Y",
+        "classification": "answerable_question",
+    }
+    body_sha = "b98d25c16a4ea90b045cab49aa1b3560c569ca661cc8c078f71c5ccabdada23d"
+    receipt = {
+        "identity_binding": "exact_historical_notice",
+        "notice_message_id": ADOPTION_NOTICE_ID,
+        "history_match_count": 1,
+        "client_msg_id": None,
+        "channel": "C0BUJKCCX6C",
+        "sender": "U0BE39F02KV",
+        "ts": "1791573331.865259",
+        "thread_ts": None,
+        "recipient_user_id": "U06P23E3Y2Y",
+        "recipient_membership_verified": True,
+        "body_sha256": body_sha,
+        "verified": True,
+        "method": "slack_api_readback",
+        "observed_at": "2026-10-09T21:05:00+00:00",
+        "evidence_ref": "evidence/adoption.json",
+        "evidence_sha256": "c" * 64,
+    }
+    review = {
+        "passed": True,
+        "scope": "provider limitation disposition; no Grow connection",
+        "reviewer": "independent-reviewer",
+        "author_identity": "echo-fixer",
+        "evidence_ref": "evidence/review.json",
+        "evidence_sha256": "d" * 64,
+        "ticket_id": ADOPTION_TICKET_ID,
+        "notice_message_id": ADOPTION_NOTICE_ID,
+        "transcript_sha256": "a" * 64,
+        "ticket_snapshot": snapshot,
+        "receipt": receipt,
+        "body_sha256": body_sha,
+    }
+    row = {
+        "ticket_id": ADOPTION_TICKET_ID,
+        "notice_message_id": ADOPTION_NOTICE_ID,
+        "ticket_snapshot": snapshot,
+        "transcript_sha256": "a" * 64,
+        "receipt": receipt,
+        "independent_review": review,
+        "created_at": "2026-10-09T21:10:00+00:00",
+        "consumed_at": _ADOPTION_RESOLVED_AT,
+    }
+    row.update(over)
+    return row
+
+
+def test_consumed_adoption_satisfies_eng_grow_terminal_ticket():
+    t = _eng_grow_ticket()
+    bus = FakeBus([t], GYMS, [_adoption_notice(t)],
+                  adoptions=[_adoption_proof(t)])
+    report = s.scan_support_bus(bus)
+    assert report["ok"]
+    assert report["counts"]["satisfied"] == 1
+    assert report["counts"]["exception"] == 0
+    assert report["client_visible_working"] == 0
+    assert report["actionable"] == []
+    # The proof table was queried by exact ticket_id, selecting no body.
+    adoption_calls = [c for c in bus.calls
+                      if c[0] == "fixer_posted_notice_adoptions"]
+    assert len(adoption_calls) == 1
+    assert adoption_calls[0][1]["ticket_id"] == f"eq.{ADOPTION_TICKET_ID}"
+    assert "body" not in adoption_calls[0][1]["select"]
+
+
+def test_unconsumed_adoption_stays_actionable():
+    t = _eng_grow_ticket()
+    bus = FakeBus([t], GYMS, [_adoption_notice(t)],
+                  adoptions=[_adoption_proof(t, consumed_at=None)])
+    report = s.scan_support_bus(bus)
+    assert report["ok"]
+    assert report["counts"]["exception"] == 1
+    assert report["exceptions"] == [{
+        "ticket_id": ADOPTION_TICKET_ID,
+        "reason": "terminal_missing_completion_receipt",
+    }]
+    assert report["actionable"][0]["reason"] == (
+        "terminal_missing_completion_receipt")
+
+
+def test_adoption_read_failure_fails_closed():
+    t = _eng_grow_ticket()
+    bus = FakeBus([t], GYMS, [_adoption_notice(t)],
+                  fail_table="fixer_posted_notice_adoptions")
+    report = s.scan_support_bus(bus)
+    assert report == {"ok": False, "error": s.FAIL_ADOPTION_READ}
+    assert "boom" not in str(report) and "SECRET" not in str(report)
+
+
+def test_malformed_adoption_page_fails_closed():
+    t = _eng_grow_ticket()
+
+    class BadBus(FakeBus):
+        def _get(self, table, params):
+            if table == "fixer_posted_notice_adoptions":
+                return "not-a-list"
+            return super()._get(table, params)
+
+    report = s.scan_support_bus(
+        BadBus([t], GYMS, [_adoption_notice(t)]))
+    assert report == {"ok": False, "error": s.FAIL_ADOPTION_READ}
+
+
+def test_non_terminal_tickets_never_read_adoption_table():
+    tickets = [_ticket(1, status="working", resolved_at=None)]
+    bus = FakeBus(tickets, GYMS)
+    report = s.scan_support_bus(bus)
+    assert report["ok"]
+    assert all(c[0] != "fixer_posted_notice_adoptions" for c in bus.calls)
+
+
+def test_other_terminal_tickets_never_read_special_adoption_table():
+    bus = FakeBus([_ticket(1)], GYMS)
+    assert s.scan_support_bus(bus)["ok"]
+    assert all(c[0] != "fixer_posted_notice_adoptions" for c in bus.calls)

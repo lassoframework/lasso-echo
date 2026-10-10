@@ -13,12 +13,18 @@ classifier. It:
   * fetches all support_messages per ticket by exact ticket_id with keyset
     paging, selecting metadata columns plus attachments only -- NEVER
     body/raw_text;
+  * reads immutable consumed posted-notice adoption proofs
+    (fixer_posted_notice_adoptions) by exact ticket_id for terminal tickets
+    lacking an ordinary completion receipt, so the atomically closed ENG Grow
+    ticket is satisfied by its consumed proof rather than flagged
+    terminal_missing_completion_receipt;
   * classifies via reconcile() and returns ticket IDs, categories, reasons and
     counts only -- never raw ticket text, attachments, gym names/slugs, or
     arbitrary error strings.
 
-Fail closed: any ticket/gym/message read error, malformed page, or pagination
-fault returns {"ok": False} with a fixed reason string and NO partial results.
+Fail closed: any ticket/gym/message/adoption read error, malformed page, or
+pagination fault returns {"ok": False} with a fixed reason string and NO
+partial results.
 This module performs no writes, no sends, no scheduling, no alerts, and never
 calls a client-visible send/closeout method.
 """
@@ -26,12 +32,15 @@ from __future__ import annotations
 
 from agent.jobs.client_support_reconciler import (
     CLIENT_FACING_SOURCES,
+    ADOPTION_TICKET_ID,
     EXCEPTION,
     ANOMALY,
     OUT_OF_SCOPE,
     SATISFIED,
+    TERMINAL_STATUSES,
     PaginationError,
     fetch_pages,
+    qualifying_completion_receipt,
     reconcile,
 )
 
@@ -41,15 +50,25 @@ _TICKET_FIELDS = (
     "is_test,created_at"
 )
 _MESSAGE_FIELDS = (
-    "id,ticket_id,created_at,direction,delivery_status,"
+    "id,ticket_id,created_at,author_type,slack_ts,direction,delivery_status,"
     "delivery_request_version,attachments"
 )
 _GYM_FIELDS = "id,slug"
+# Immutable consumed posted-notice adoption proofs (Portal migration 0645,
+# public.fixer_posted_notice_adoptions, service_role SELECT only). Read only
+# for terminal tickets with no ordinary qualifying completion receipt. The
+# adopted CLIENT disposition message satisfies closure; the separately posted
+# post-close acknowledgement never does.
+_ADOPTION_TABLE = "fixer_posted_notice_adoptions"
+_ADOPTION_FIELDS = ("ticket_id,notice_message_id,ticket_snapshot,"
+                    "transcript_sha256,receipt,independent_review,"
+                    "created_at,consumed_at")
 
 # Fixed failure reasons -- never leak raw exception text into a report.
 FAIL_TICKET_READ = "ticket_read_failed"
 FAIL_GYM_READ = "gym_read_failed"
 FAIL_MESSAGE_READ = "message_read_failed"
+FAIL_ADOPTION_READ = "adoption_read_failed"
 FAIL_BUS_UNAVAILABLE = "bus_unavailable"
 FAIL_CLASSIFICATION = "classification_failed"
 
@@ -152,8 +171,39 @@ def scan_support_bus(bus=None, *, page_size=500, max_pages=1000):
             return _failed(FAIL_MESSAGE_READ)
         pairs.append((ticket, messages))
 
+    # Consumed posted-notice adoption proofs: exact-ticket reads from the
+    # trusted immutable table, only for terminal tickets whose messages carry
+    # no ordinary qualifying completion receipt. Any read failure fails the
+    # whole scan closed with a fixed reason -- never a partial report.
+    adoption_rows = {}
+    for ticket, messages in pairs:
+        # 0645 has a CHECK constraint for this one ticket. Avoid querying a
+        # special-purpose table for unrelated closures or older deployments.
+        if ticket.get("id") != ADOPTION_TICKET_ID:
+            continue
+        status = ticket.get("status")
+        if not isinstance(status, str):
+            continue
+        if status.strip().lower() not in TERMINAL_STATUSES:
+            continue
+        if qualifying_completion_receipt(ticket, messages) is not None:
+            continue
+        try:
+            rows = get(_ADOPTION_TABLE,
+                       {"select": _ADOPTION_FIELDS,
+                        "ticket_id": f"eq.{ticket['id']}",
+                        "limit": "2"})
+        except Exception:
+            return _failed(FAIL_ADOPTION_READ)
+        if (not isinstance(rows, list)
+                or any(not isinstance(r, dict) for r in rows)):
+            return _failed(FAIL_ADOPTION_READ)
+        if rows:
+            adoption_rows[ticket["id"]] = rows
+
     try:
-        summary = reconcile(pairs, gym_for=gym_cache.get)
+        summary = reconcile(pairs, gym_for=gym_cache.get,
+                            adoption_for=adoption_rows.get)
     except Exception:
         return _failed(FAIL_CLASSIFICATION)
 
