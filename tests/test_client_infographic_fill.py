@@ -372,7 +372,7 @@ def test_indexed_drive_photo_holds_infographic_even_with_drive_flags_off(
     """2026-10-02 regression (8e06dbf): the indexed Drive inventory is authoritative
     even when the staging lane is disabled. A pickable approved client photo must
     hold the Astra fallback with BOTH Drive flags off."""
-    from agent import gym_media_index
+    from agent import astra_prompt, gym_media_index
     from tests.gym_media_fakes import make_asset, bound_review_fields
 
     photo = make_asset("ph1", gym_id="gymx", kind="photo", title="team.jpg")
@@ -392,6 +392,12 @@ def test_indexed_drive_photo_holds_infographic_even_with_drive_flags_off(
 
     monkeypatch.setattr(gym_media_index, "default_store",
                         lambda: DriveIndexWithPhoto())
+    # A missing gym website or palette must not block an eligible gym photo.
+    # Reaching the palette loader here would turn a photo-first decision into
+    # an unrelated website dependency.
+    monkeypatch.setattr(astra_prompt, "load_gym_brand_palette",
+                        lambda *_: (_ for _ in ()).throw(
+                            AssertionError("palette lookup preceded photo choice")))
     monkeypatch.setenv("GYM_DRIVE_STAGE", "false")
     monkeypatch.setenv("GYM_DRIVE_CONNECT", "false")
     _sources()
