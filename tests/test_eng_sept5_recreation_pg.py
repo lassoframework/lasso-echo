@@ -9,6 +9,7 @@ import subprocess
 import uuid
 import os
 import getpass
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -26,7 +27,7 @@ ORIGINALS = (
 )
 
 
-def _psql(db: str, sql: str, *, check: bool = True) -> subprocess.CompletedProcess:
+def _connection(db: str):
     host = os.environ.get("ENG_SEPT5_TEST_PGHOST", "/tmp")
     port = os.environ.get("ENG_SEPT5_TEST_PGPORT", "5432")
     user = os.environ.get("ENG_SEPT5_TEST_PGUSER", getpass.getuser())
@@ -36,9 +37,14 @@ def _psql(db: str, sql: str, *, check: bool = True) -> subprocess.CompletedProce
     env = os.environ.copy()
     if "ENG_SEPT5_TEST_PGPASSWORD" in env:
         env["PGPASSWORD"] = env.pop("ENG_SEPT5_TEST_PGPASSWORD")
+    return (["psql", "-X", "-qAt", "-h", host, "-p", port, "-U", user, "-d", db,
+             "-v", "ON_ERROR_STOP=1"], env)
+
+
+def _psql(db: str, sql: str, *, check: bool = True) -> subprocess.CompletedProcess:
+    command, env = _connection(db)
     result = subprocess.run(
-        ["psql", "-X", "-h", host, "-p", port, "-U", user, "-d", db,
-         "-v", "ON_ERROR_STOP=1", "-A", "-t", "-c", sql],
+        [*command, "-c", sql],
         text=True, capture_output=True, env=env, timeout=30,
     )
     if check and result.returncode:
@@ -220,6 +226,38 @@ def test_concurrent_planner_slot_refuses_and_preserves_staged_rows(pg):
     assert _psql(pg, "select state from public.eng_sept5_recreation_receipt").stdout.strip() == "staged"
     assert _psql(pg, "select count(*) from public.content_calendar where logical_post_id='"
                  + LOGICAL + "' and variant_status='candidate'").stdout.strip() == "3"
+
+
+def test_original_edit_wins_race_before_finalization_and_is_refused(pg):
+    _gate(pg)
+    _begin(pg)
+    batch, rows = _stage(pg)
+    _psql(pg, f"select public.eng_sept5_recreation_bind('{batch}')")
+    command, env = _connection(pg)
+    editor = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                              stderr=subprocess.PIPE, text=True, env=env)
+    try:
+        editor.stdin.write("begin;\n")
+        editor.stdin.write("update public.content_calendar set status='pending' where id='"
+                           + ORIGINALS[0][0] + "';\n")
+        editor.stdin.write("select 'original_locked';\n")
+        editor.stdin.flush()
+        assert editor.stdout.readline().strip() == "original_locked"
+        with ThreadPoolExecutor(max_workers=1) as workers:
+            pending = workers.submit(_psql, pg,
+                f"select public.eng_sept5_recreation_finalize('{batch}',{_candidate_json(rows)})",
+                check=False)
+            time.sleep(0.2)
+            assert not pending.done(), "finalization ran past a concurrent original-row edit"
+            editor.stdin.write("commit;\n")
+            editor.stdin.flush()
+            assert pending.result(timeout=10).returncode != 0
+    finally:
+        if editor.poll() is None:
+            editor.stdin.write("rollback;\n\\q\n")
+            editor.stdin.flush()
+        editor.communicate(timeout=10)
+    assert _psql(pg, "select state from public.eng_sept5_recreation_receipt").stdout.strip() == "staged"
 
 
 def test_bind_refuses_extra_or_wrong_candidate(pg):

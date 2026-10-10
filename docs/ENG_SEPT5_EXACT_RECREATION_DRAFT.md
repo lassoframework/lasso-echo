@@ -23,7 +23,7 @@ support ticket version, exact inbound transcript hash, full original row
 snapshots, tenant and future date. It permits one reservation and refuses a
 different date or changed request. `bind` accepts only an inactive, staged
 forward batch with three exact tenant/account/format/date candidates and zero
-old rows. `finalize` rechecks the ticket, transcript, originals and member IDs,
+old rows. `finalize` locks and rechecks the ticket, transcript, original rows and member IDs,
 then calls the existing trusted forward staged finalizer in the same database
 transaction. A returned terminal receipt is persisted; an exact replay reads
 it without another activation. Concurrent planner slot occupancy or byte

@@ -210,7 +210,14 @@ begin
     or jsonb_array_length(p_candidates)<>3 then
    raise exception 'ENG recreation finalization not current' using errcode='23514'; end if;
  select * into t from public.support_tickets where id=r.ticket_id for update;
- if not found or to_jsonb(t) is distinct from r.ticket_snapshot
+ -- Freeze the three historical denied rows through the downstream activation
+ -- transaction. A concurrent edit that wins first must complete before this
+ -- request rechecks the original snapshots and then be refused.
+ perform 1 from public.content_calendar where id=any(array[
+  '2ad9f097-e7cc-49a2-b348-30c8e1cda80d'::uuid,
+  'b1bb4d63-fda7-4b1e-9303-dff3483f4387'::uuid,
+  'ff792b3e-be08-4c4e-b0f5-0347e075a9ba'::uuid]) order by id for update;
+ if t.id is null or to_jsonb(t) is distinct from r.ticket_snapshot
     or public.eng_sept5_inbound_sha256() is distinct from r.inbound_sha256
     or not public.eng_sept5_originals_current(r.original_snapshots) then
    raise exception 'ENG request or denied originals changed' using errcode='23514'; end if;
