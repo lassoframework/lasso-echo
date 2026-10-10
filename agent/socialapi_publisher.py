@@ -207,6 +207,29 @@ def _resolve(resp, draft, account):
         f"held for retry.")
 
 
+
+
+def _exact_byte_fence(slug, sapi_account_id, media_url, data, mime):
+    """Exact delivered-byte fence (AGENT_EXACT_BYTE_SEND_GUARD, default OFF)
+    before the SocialAPI upload + create-post attempt.
+
+    Preflight the payload; the raw upload consumes authority and binds its
+    returned media ID to a single create_post continuation. The actual
+    upload bytes are pinned to the permit image SHA256 before upload. Video or
+    missing media has no exact-byte schema: an empty target can never match a
+    committed permit, so the armed fence holds with zero mutations. Flag OFF
+    with no scope: require() returns None and behavior is unchanged.
+    """
+    from . import delivered_byte_send_guard as exact
+    if not media_url or mime.startswith("video/"):
+        exact.require({}, [])
+        return
+    target = ({"provider": "socialapi", "platform": slug,
+               "account_id": str(sapi_account_id)} if sapi_account_id else {})
+    exact.check_payload(target, [media_url], image_bytes=data)
+    return target if exact.active_permit() is not None else None
+
+
 from .forward_media_send_context import guarded_publisher, boundary, delivered_bytes
 
 
@@ -273,13 +296,20 @@ def publish(draft, account, http=None):
         delivered_bytes(data,media_url)
         filename, mime = _media_meta(media_url)
         boundary('socialapi',draft=draft,account=account,attempt=True,caption=text)
-        media_id = socialapi_client.upload_media(data, filename, mime, http=client)
+        exact_target = _exact_byte_fence(slug, sapi_account_id, media_url, data, mime)
+        upload_kwargs = ({'exact_target': exact_target, 'image_url': media_url,
+                          'post_content_type': content_type, 'post_text': text}
+                         if exact_target is not None else {})
+        media_id = socialapi_client.upload_media(data, filename, mime, http=client, **upload_kwargs)
         if not media_id:
             raise SocialApiPublishError("SocialAPI returned no media_id for the upload.")
         boundary('socialapi',draft=draft,account=account,attempt=True,caption=text)
+        from .delivered_byte_send_guard import active_continuation
+        continuation = active_continuation()
+        post_kwargs = {'exact_continuation': continuation} if continuation is not None else {}
         resp = socialapi_client.create_post(
             sapi_account_id, text, [media_id], content_type=content_type,
-            http=client, idempotency_key=draft.draft_id)
+            http=client, idempotency_key=draft.draft_id, **post_kwargs)
     except MediaNotReady:
         # never raised here, but be explicit: do not release on a hold.
         raise

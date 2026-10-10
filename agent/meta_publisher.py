@@ -32,6 +32,35 @@ def _is_video(url):
     return bool(url) and is_video_url(url)
 
 
+
+
+# ---- exact delivered-byte fence (AGENT_EXACT_BYTE_SEND_GUARD, default OFF) ----
+# One permit consumes the FIRST mutation supplying the exact image URL.
+# A returned object ID binds one follow-up media_publish / photo_stories
+# mutation to that same attempt and target. The target comes from the payload,
+# never from caller metadata. Shapes with no exact-byte schema (carousel, video,
+# missing media) pass an empty target/url set, which can never match a committed
+# permit, so an armed fence holds with ZERO mutations. Flag OFF with no scope:
+# require() returns None and behavior is byte-for-byte unchanged.
+def _exact_require(provider_target, image_urls, thumbnail_url=None, *, caption=None, post_format=None):
+    from .delivered_byte_send_guard import require, check_content
+    if post_format is not None:
+        check_content(caption, post_format)
+    return require(provider_target, image_urls, thumbnail_url=thumbnail_url)
+
+
+def _exact_target(account_id, platform):
+    if not account_id:
+        return {}
+    return {"provider": "meta", "platform": platform, "account_id": str(account_id)}
+
+
+def _exact_unsupported():
+    # No exact-byte schema exists for this shape; an empty target can never
+    # match a committed permit, so the armed fence holds before any mutation.
+    _exact_require({}, [])
+
+
 class PublishError(Exception):
     pass
 
@@ -334,6 +363,12 @@ def _publish_instagram(client, account, draft, caption, token):
     base = config.GRAPH_API_BASE
     boundary('meta',draft=draft,account=account,format='feed',target=ig_id,attempt=True,caption=caption)
     media_param = "video_url" if draft.platform and _is_video(draft.creative_public_url) else "image_url"
+    if media_param == "image_url":
+        permit = _exact_require(_exact_target(ig_id, Platform.INSTAGRAM), [draft.creative_public_url],
+                                caption=caption, post_format='feed')
+    else:
+        permit = None
+        _exact_unsupported()
     # step 1: create container
     r1 = client.post(
         f"{base}/{ig_id}/media",
@@ -342,13 +377,17 @@ def _publish_instagram(client, account, draft, caption, token):
     )
     _raise_for_status(r1)
     container_id = r1.json().get("id")
+    from .delivered_byte_send_guard import bind_continuation
+    continuation = bind_continuation(permit, _exact_target(ig_id, Platform.INSTAGRAM),
+                                     container_id, "meta:media_publish")
     # step 2: wait for FINISHED before publishing
     _await_container_ready(client, base, container_id, token, label="media",
                            max_tries=IMG_POLL_MAX_TRIES,
                            interval=IMG_POLL_INTERVAL_SEC,
                            grace=POST_FINISH_GRACE_SEC)
-    # step 3: publish with retry for 9007
-    r2 = _publish_container(client, base, ig_id, container_id, token)
+    # step 3: publish the bound container once when the exact fence is active.
+    r2 = _publish_container(client, base, ig_id, container_id, token,
+                            exact_continuation=continuation)
     return PublishResult(ok=True, mode="published", media_id=r2.json().get("id", ""))
 
 
@@ -361,6 +400,7 @@ def _publish_instagram_carousel(client, ig_id, draft, caption, token):
     while the publish flag is OFF. This path only runs once Blake arms publishing.
     """
     unsupported('carousel')
+    _exact_unsupported()
     base = config.GRAPH_API_BASE
     child_ids = []
     for url in draft.slide_urls:
@@ -405,15 +445,21 @@ POST_FINISH_RETRY_SEC = 5
 
 
 def _publish_container(client, base, ig_id, container_id, token,
-                       _sleep=time.sleep):
+                       _sleep=time.sleep, *, exact_continuation=None):
     """
     Call /{ig_id}/media_publish and return the response. Retries up to
     POST_FINISH_RETRIES times on error 9007 / subcode 2207027 ("The media is
     not ready for publishing") — IG sometimes lags briefly after FINISHED.
-    Raises MediaNotReady if all retries are exhausted, PublishError otherwise.
+    Without an exact permit, raises MediaNotReady if retries are exhausted.
+    With an exact permit, a not-ready response holds for reconciliation after
+    one follow-up mutation; no automatic retry may reuse its continuation.
     """
+    from .delivered_byte_send_guard import require_continuation, ExactByteSendHold
     for attempt in range(POST_FINISH_RETRIES + 1):
         boundary('meta',target=ig_id,attempt=True)
+        permit = require_continuation(exact_continuation,
+                                      _exact_target(ig_id, Platform.INSTAGRAM),
+                                      container_id, "meta:media_publish")
         r = client.post(
             f"{base}/{ig_id}/media_publish",
             data={"creation_id": container_id, "access_token": token},
@@ -431,6 +477,9 @@ def _publish_container(client, base, ig_id, container_id, token,
             err.get("error_subcode") == 2207027
             or err.get("code") == 9007
         )
+        if is_not_ready and permit is not None:
+            raise ExactByteSendHold("exact byte container continuation requires reconciliation",
+                                    definitive_no_post=False)
         if is_not_ready and attempt < POST_FINISH_RETRIES:
             _sleep(POST_FINISH_RETRY_SEC)
             continue
@@ -487,6 +536,7 @@ def _publish_instagram_reel(client, account, draft, caption, token, ig_id):
     while the publish flag is OFF. This path only runs once Blake arms publishing.
     """
     unsupported('video')
+    _exact_unsupported()
     if not draft.creative_public_url:
         raise PublishError(
             "Instagram Reels need a PUBLIC video URL. This creative has none. "
@@ -534,6 +584,12 @@ def _publish_instagram_story(client, account, draft, token):
     base = config.GRAPH_API_BASE
     boundary('meta',draft=draft,account=account,format='story',target=ig_id,attempt=True)
     media_param = "video_url" if _is_video(draft.creative_public_url) else "image_url"
+    if media_param == "image_url":
+        permit = _exact_require(_exact_target(ig_id, Platform.INSTAGRAM), [draft.creative_public_url],
+                                post_format='story')
+    else:
+        permit = None
+        _exact_unsupported()
     r1 = client.post(
         f"{base}/{ig_id}/media",
         data={"media_type": "STORIES", media_param: draft.creative_public_url,
@@ -542,13 +598,17 @@ def _publish_instagram_story(client, account, draft, token):
     )
     _raise_for_status(r1)
     container_id = r1.json().get("id")
+    from .delivered_byte_send_guard import bind_continuation
+    continuation = bind_continuation(permit, _exact_target(ig_id, Platform.INSTAGRAM),
+                                     container_id, "meta:media_publish")
     # STORIES containers are processed asynchronously just like feed media: publishing
-    # immediately returns 9007 "media not ready". Poll to FINISHED, then publish through
-    # the shared 9007 retry (same as the feed path). This is what stopped posts going out.
+    # immediately returns 9007 "media not ready". Poll to FINISHED before the
+    # bound publish. Automatic 9007 retries remain available only without an exact permit.
     _await_container_ready(client, base, container_id, token, label="story",
                            max_tries=IMG_POLL_MAX_TRIES, interval=IMG_POLL_INTERVAL_SEC,
                            grace=POST_FINISH_GRACE_SEC)
-    r2 = _publish_container(client, base, ig_id, container_id, token)
+    r2 = _publish_container(client, base, ig_id, container_id, token,
+                            exact_continuation=continuation)
     return PublishResult(ok=True, mode="published", media_id=r2.json().get("id", ""))
 
 
@@ -569,6 +629,7 @@ def _publish_fb_page_story(client, account, draft, token):
     base = config.GRAPH_API_BASE
     boundary('meta',draft=draft,account=account,format='story',target=page_id,attempt=True)
     if _is_video(draft.creative_public_url):
+        _exact_unsupported()
         r = client.post(
             f"{base}/{page_id}/video_stories",
             data={"file_url": draft.creative_public_url, "access_token": token},
@@ -577,6 +638,8 @@ def _publish_fb_page_story(client, account, draft, token):
         _raise_for_status(r)
         return PublishResult(ok=True, mode="published", media_id=r.json().get("id", ""))
     # Photo story: upload unpublished then attach
+    permit = _exact_require(_exact_target(page_id, Platform.FACEBOOK_PAGE), [draft.creative_public_url],
+                            post_format='story')
     r1 = client.post(
         f"{base}/{page_id}/photos",
         data={"url": draft.creative_public_url, "published": "false",
@@ -585,7 +648,12 @@ def _publish_fb_page_story(client, account, draft, token):
     )
     _raise_for_status(r1)
     photo_id = r1.json().get("id")
+    from .delivered_byte_send_guard import bind_continuation, require_continuation
+    continuation = bind_continuation(permit, _exact_target(page_id, Platform.FACEBOOK_PAGE),
+                                     photo_id, "meta:photo_stories")
     boundary('meta',draft=draft,account=account,format='story',target=page_id,attempt=True)
+    require_continuation(continuation, _exact_target(page_id, Platform.FACEBOOK_PAGE),
+                         photo_id, "meta:photo_stories")
     r2 = client.post(
         f"{base}/{page_id}/photo_stories",
         data={"photo_id": photo_id, "access_token": token},
@@ -619,6 +687,7 @@ def _publish_fb_page(client, account, draft, caption, token):
                                       or _is_video(draft.creative_path)):
         # A reel/video posts to the Page /videos endpoint (file_url), NOT /photos
         # (which rejects mp4 with "Can't Read Files"). description carries the caption.
+        _exact_unsupported()
         r = client.post(
             f"{base}/{page_id}/videos",
             data={"file_url": draft.creative_public_url, "description": caption,
@@ -626,12 +695,16 @@ def _publish_fb_page(client, account, draft, caption, token):
             timeout=60,
         )
     elif draft.creative_public_url:
+        _exact_require(_exact_target(page_id, Platform.FACEBOOK_PAGE), [draft.creative_public_url],
+                        caption=caption, post_format='feed')
         r = client.post(
             f"{base}/{page_id}/photos",
             data={"url": draft.creative_public_url, "caption": caption, "access_token": token},
             timeout=30,
         )
     else:
+        # Text-only: no image bytes; an armed fence with a media permit holds.
+        _exact_require(_exact_target(page_id, Platform.FACEBOOK_PAGE), [])
         r = client.post(
             f"{base}/{page_id}/feed",
             data={"message": caption, "access_token": token},

@@ -271,6 +271,89 @@ def _reauthorize_gbp_send(store, row, connection, token, snapshot, payload=None)
                                  'gallery' if payload is None else 'post')
 
 
+def _exact_hold_result(exc):
+    uncertain = not exc.definitive_no_post
+    return {"ok": False, "status": "publishing" if uncertain else "approved",
+            "late_post_id": "", "reject_reason": str(exc), "mode": "",
+            "held": "ambiguous_send" if uncertain else "exact_byte_verification"}
+
+
+def _exact_gbp_hold(store, row, token):
+    """Non-consuming scope validation; direct armed calls fail closed."""
+    from . import delivered_byte_send_guard as exact
+    permit = exact.active_permit()
+    if permit is None:
+        if not exact.enabled():
+            return None
+        try:
+            with exact.authorized_send(getattr(store, '_s', store), row, token):
+                return None
+        except exact.ExactByteSendHold as exc:
+            return _exact_hold_result(exc)
+    if type(permit) is not exact.SendPermit:
+        return _exact_hold_result(exact.ExactByteSendHold(
+            'trusted GBP exact scope required', definitive_no_post=False))
+    with permit._lock:
+        snapshot = permit.context.get('row_snapshot')
+        if (permit.closed or permit.consumed or permit.claim_token != token
+                or permit.context.get('calendar_row_id') != row.get('id')
+                or not isinstance(snapshot, dict) or not snapshot
+                or any(key not in row or row[key] != value for key, value in snapshot.items())):
+            return _exact_hold_result(exact.ExactByteSendHold(
+                'GBP exact scope differs from current row', definitive_no_post=False))
+    return None
+
+
+def _finish_exact_gbp_send(store, permit, result):
+    from . import delivered_byte_send_guard as exact
+    if permit.consumed:
+        receipt = result.get('late_post_id')
+        receipt = receipt.strip() if isinstance(receipt, str) else ''
+        accepted = (result.get('ok') is True and result.get('mode') == 'live'
+                    and bool(receipt) and not result.get('dedup'))
+        outcome = 'provider_accepted' if accepted else 'uncertain'
+        import json
+        evidence = {'source': 'gbp_provider_result', 'attempt_id': permit.attempt_id,
+                    'outcome': outcome}
+        if accepted:
+            evidence['provider_post_id'] = receipt
+        exact.record_outcome(getattr(store, '_s', store), permit, outcome,
+                             json.dumps(evidence, sort_keys=True))
+        if not accepted:
+            # A dedup ID belongs to an earlier attempt; a missing receipt cannot
+            # confirm this attempt. Preserve the claim for provider readback.
+            return _exact_hold_result(exact.ExactByteSendHold(
+                'GBP provider acceptance receipt unavailable; readback required',
+                definitive_no_post=False))
+    elif result.get('ok') is True and result.get('mode') == 'live':
+        raise exact.ExactByteSendHold('GBP acceptance lacks consumed byte authority',
+                                     definitive_no_post=False)
+    return result
+
+
+def _run_exact_gbp_send(store, row, token, send):
+    from . import delivered_byte_send_guard as exact
+    from .forward_media_send_context import immutable_verifier_for_store
+    # An inherited committed permit remains fenced after a flag flip.
+    permit = exact.active_permit()
+    if permit is not None:
+        hold = _exact_gbp_hold(store, row, token)
+        if hold:
+            return hold
+        try:
+            return _finish_exact_gbp_send(store, permit, send())
+        except exact.ExactByteSendHold as exc:
+            return _exact_hold_result(exc)
+    if not exact.enabled():
+        return send()
+    try:
+        with exact.authorized_send(getattr(store, '_s', store), row, token,
+                                  immutable_verifier=immutable_verifier_for_store(store)) as permit:
+            return _finish_exact_gbp_send(store, permit, send())
+    except exact.ExactByteSendHold as exc:
+        return _exact_hold_result(exc)
+
+
 def publish_gbp_row(row, connection, *, client, draft=True, now=None,
                     history_store=None, media_store=None, idempotency_key=None,
                     authority_store=None):
@@ -329,6 +412,17 @@ def publish_gbp_row(row, connection, *, client, draft=True, now=None,
     if issues:
         return {"ok": False, "status": "failed", "late_post_id": "",
                 "reject_reason": "rail check: " + "; ".join(issues), "mode": ""}
+    def send():
+        return _publish_gbp_row_send(row, connection, client=client, draft=draft,
+            now=now, history_store=history_store, media_store=media_store,
+            idempotency_key=idempotency_key, authority_store=authority_store)
+    if draft:
+        return send()
+    return _run_exact_gbp_send(authority_store, row, idempotency_key, send)
+
+
+def _publish_gbp_row_send(row, connection, *, client, draft, now, history_store,
+                          media_store, idempotency_key, authority_store):
     try:
         payload = build_gbp_payload_for_row(row, connection)
     except gbp.GbpPayloadError as e:
@@ -536,6 +630,14 @@ def publish_photo_drop(row, connection, *, client, draft=True, alert=None,
     if draft:
         return {"ok": True, "status": "published", "late_post_id": "",
                 "reject_reason": "", "mode": "draft"}
+    return _run_exact_gbp_send(authority_store, row, idempotency_key,
+        lambda: _publish_photo_drop_send(row, connection, client=client, alert=alert,
+            now=now, history_store=history_store, media_store=media_store,
+            idempotency_key=idempotency_key, authority_store=authority_store))
+
+
+def _publish_photo_drop_send(row, connection, *, client, alert, now, history_store,
+                             media_store, idempotency_key, authority_store):
     hold = _media_reuse_hold(row, now=now, history_store=history_store,
                              media_store=media_store)
     if hold:
@@ -842,7 +944,7 @@ def publish_due_gbp(store, client, *, run_date, draft=True, alert=None, now=None
                         except Exception:  # noqa: BLE001 - alerts never decide outcomes
                             pass
                     continue
-                if (str(res.get("held") or "").startswith("forward_media_")
+                if (str(res.get("held") or "").startswith(("forward_media_", "exact_byte_"))
                         and not claim_token):
                     # Ownership is unavailable: never use an unscoped rollback.
                     continue
