@@ -249,8 +249,15 @@ def test_import_business_behavior_unchanged(database):
     result = json.loads(sql("select public.visual_global_import_history()"))
     assert result["imported_null_key_rows"] == 1
     assert result["global_fingerprints"] == 1
-    assert sql("select state from public.visual_global_usage "
-               f"where fingerprint={q(scene['fingerprint'])}") == "published"
+    assert sql("select count(*) from public.visual_global_historical_incident "
+               "where source_kind='calendar' and source_state='published' "
+               f"and tenant_id={q(scene['tid'])} and group_key={q(scene['group'])} "
+               f"and fingerprint={q(scene['fingerprint'])} and used_date={q(D1)} "
+               "and channel='ig' and jsonb_array_length(byte_evidence)>0") == "1"
+    # Import records the actual published incident without inventing a
+    # runtime owner for an old null-key calendar row.
+    assert sql("select count(*) from public.visual_global_usage "
+               f"where fingerprint={q(scene['fingerprint'])}") == "0"
     assert sql("select coalesce(string_agg(issue,',' order by issue),'') "
                "from public.visual_global_coverage()") == "ready"
     # Re-import reports the one already-attributed historical row again;
