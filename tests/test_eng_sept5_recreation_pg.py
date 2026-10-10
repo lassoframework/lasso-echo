@@ -177,6 +177,36 @@ def test_concurrent_targets_one_durable_reservation(pg):
     assert _psql(pg, "select count(*) from public.eng_sept5_recreation_receipt").stdout.strip() == "1"
 
 
+def test_two_first_time_equal_begins_replay_after_ticket_serialization(pg):
+    _gate(pg)
+    command, env = _connection(pg)
+    ticket_owner = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                    stderr=subprocess.PIPE, text=True, env=env)
+    try:
+        ticket_owner.stdin.write("begin;\n")
+        ticket_owner.stdin.write("update public.support_tickets set status=status where id='"
+                                 + TICKET + "';\n")
+        ticket_owner.stdin.write("select 'ticket_locked';\n")
+        ticket_owner.stdin.flush()
+        assert ticket_owner.stdout.readline().strip() == "ticket_locked"
+        with ThreadPoolExecutor(max_workers=2) as workers:
+            first = workers.submit(_begin, pg, 2, check=False)
+            second = workers.submit(_begin, pg, 2, check=False)
+            time.sleep(0.2)
+            assert not first.done() and not second.done()
+            ticket_owner.stdin.write("commit;\n")
+            ticket_owner.stdin.flush()
+            outcomes = [first.result(timeout=10), second.result(timeout=10)]
+            assert all(result.returncode == 0 and result.stdout.strip() == "reserved"
+                       for result in outcomes)
+    finally:
+        if ticket_owner.poll() is None:
+            ticket_owner.stdin.write("rollback;\n\\q\n")
+            ticket_owner.stdin.flush()
+        ticket_owner.communicate(timeout=10)
+    assert _psql(pg, "select count(*) from public.eng_sept5_recreation_receipt").stdout.strip() == "1"
+
+
 @pytest.mark.parametrize("mutation", [
     "update public.support_tickets set request_version=1",
     f"insert into public.support_messages(id,ticket_id,direction,body) values ('{uuid.uuid4()}', '{TICKET}', 'inbound','new request')",

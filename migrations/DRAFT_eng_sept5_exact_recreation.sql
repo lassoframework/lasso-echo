@@ -114,6 +114,12 @@ begin
   'ff792b3e-be08-4c4e-b0f5-0347e075a9ba'::uuid]);
  if not public.eng_sept5_originals_current(v_originals) then
    raise exception 'ENG denied originals changed' using errcode='23514'; end if;
+ -- Two first-time calls can both observe no receipt before the ticket lock.
+ -- The ticket serialized them; reread without a receipt row lock so an
+ -- already-running finalizer that holds receipt -> waits ticket cannot cycle.
+ if r.ticket_id is null then
+   select * into r from public.eng_sept5_recreation_receipt where ticket_id=t.id;
+ end if;
  if r.ticket_id is not null then
    if r.ticket_snapshot is distinct from to_jsonb(t)
       or r.inbound_sha256 is distinct from v_inbound
