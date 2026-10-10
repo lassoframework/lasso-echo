@@ -56,6 +56,10 @@ def _post_first_message_factory(poster):
         if not (res or {}).get("ok"):
             return {"ok": False}
         return {"ok": True, "ts": res.get("ts") or ""}
+    # The current-notice send admission authenticates the EXACT transport captured
+    # by this POST via auth.test (same pattern as listener_wiring._default_post),
+    # even if this identity's environment changes after wiring is built.
+    post_first_message.verify_sender = poster.auth_test
     return post_first_message
 
 

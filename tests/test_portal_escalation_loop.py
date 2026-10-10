@@ -13,6 +13,7 @@ slack_channel_id as failed; a portal ticket has no Slack channel until a group D
 is opened.
 """
 from datetime import datetime, timezone
+from types import MethodType
 import time
 
 import pytest
@@ -635,7 +636,7 @@ def test_code_fix_resolve_requires_release_and_blake_in_conversation():
     assert all(item["channel"] == "C_FIXER" for item in sent)
 
 
-def test_verified_fix_notice_names_blake_in_group_dm():
+def test_verified_fix_notice_names_blake_in_group_dm(monkeypatch):
     bus = Bus([_ticket(classification="code_fix", status="merged",
                        client_id=BUSINESS_PORTAL_GYM_ID,
                        fix_pr_url="https://example.test/pr/1",
@@ -645,15 +646,47 @@ def test_verified_fix_notice_names_blake_in_group_dm():
     _verify_business(bus)
     assert OB.resolve_and_notify(bus, "t-1", approved_by="U_BLAKE", identity=ECHO,
                                  log=lambda *a: None)
+    # 0624 also binds to a UUID ticket ID; the rest of this file's minimal
+    # fixture uses the sequence label t-1 for convenience.
+    durable_ticket_id = "11111111-1111-4111-8111-111111111112"
+    ticket = bus.tickets.pop("t-1")
+    ticket["id"] = durable_ticket_id
+    bus.tickets[durable_ticket_id] = ticket
+    for message in bus.msgs:
+        if message.get("ticket_id") == "t-1":
+            message["ticket_id"] = durable_ticket_id
+    # 0624 binds the invocation to a canonical UUID message id. This minimal
+    # in-memory Bus uses sequence labels elsewhere, so give this send its real
+    # persisted-id shape before dispatch.
+    bus.of_kind(A.KIND_STATUS)[0]["id"] = "30205455-1555-4150-a69a-247a0b4c91ab"
     sent, post = _posts()
-    OB.run_once(bus, post, identity=ECHO, log=lambda *a: None,
+    # A client resolve notice now needs the same authenticated sender,
+    # durable 0624 admission/CAS and exact Slack readback as production.
+    from tests.test_slack_convo import FakeBus as AdmissionBus
+    bus.calls = []
+    bus._support_lane_generation = 1
+    bus._support_lane_invocations = {}
+    for name in ("_client", "_rest", "_headers", "post", "_patch"):
+        setattr(bus, name, MethodType(getattr(AdmissionBus, name), bus))
+    monkeypatch.setenv("RAILWAY_DEPLOYMENT_ID", "test-deployment")
+    monkeypatch.setenv("RAILWAY_GIT_COMMIT_SHA", BUSINESS_SHA)
+    post.verify_sender = lambda: {"ok": True, "user_id": "U_ECHO_BOT"}
+    post.readback = lambda channel, *, thread_ts=None, ts=None, oldest=None: {
+        "ok": True, "channel": channel,
+        "messages": [{"ts": item["ts"], "text": item["text"],
+                      "user": "U_ECHO_BOT", "thread_ts": item["thread_ts"]}
+                     for item in sent if item["channel"] == channel
+                     and item["ts"] == ts and item["thread_ts"] == thread_ts],
+    }
+    logs = []
+    OB.run_once(bus, post, identity=ECHO, log=logs.append,
                 member_check=lambda channel, user: channel == "G_CLIENT" and bool(user))
-    assert len(sent) == 1, bus.outbound_kinds()
+    assert len(sent) == 1, (bus.outbound_kinds(), logs[-2:])
     assert f"<@{OB.config.APPROVER_SLACK_ID}>" in sent[0]["text"]
     notice = bus.of_kind(A.KIND_STATUS)[0]
     assert notice["attachments"]["delivery_readback_verified"] is True
     assert notice["attachments"]["delivery_readback_channel"] == "G_CLIENT"
-    assert bus.ticket("t-1")["status"] == "resolved"
+    assert bus.ticket(durable_ticket_id)["status"] == "resolved"
 
 
 def test_a_ticket_with_no_slack_channel_and_no_portal_thread_still_fails():

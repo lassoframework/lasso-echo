@@ -37,6 +37,8 @@ from . import classifier as _cls
 from . import identity_gate as _ig
 from . import identities as _ids
 from . import outbox as _outbox
+from . import replay as _replay
+from .. import support_sender_fence as _fence
 from . import outreach as _outreach
 
 HEALTH_EVERY_SECONDS = 15 * 60
@@ -292,7 +294,7 @@ class ConvoWiring:
         self._pool = ThreadPoolExecutor(max_workers=MAX_CONCURRENT_EVENTS,
                                         thread_name_prefix=f"slack-convo-{identity.name}")
         self._post = post or self._default_post()
-        self._readback = readback or self._default_readback
+        self._readback = readback or getattr(self._post, "readback", None) or self._default_readback
         # Injectable, like `post` above, so a test can supply fakes without a real Slack
         # client; built lazily off the identity's own bot token (never Blake's, never a
         # different identity's) only if the outreach-release path is actually exercised.
@@ -329,6 +331,10 @@ class ConvoWiring:
             if not (res or {}).get("ok"):
                 raise RuntimeError(f"slack post failed: {(res or {}).get('error')}")
             return res.get("ts")
+        # Both proofs use the exact poster/token/transport captured by POST,
+        # even if this identity's environment changes after wiring is built.
+        post.verify_sender = poster.auth_test
+        post.readback = poster.read_conversation_messages
         return post
 
     def _poster(self):
@@ -430,6 +436,7 @@ class ConvoWiring:
                  f"{self.deps.identity_enabled()})")
         return self
 
+    @_fence.guarded("outreach_release_handler", lambda: False)
     def _release_outreach(self, message_id, row, actor):
         """Tap handler for a KIND_OUTREACH_REQUEST hold card. Reconstructs `ticket` and
         `who` from the held row and its parent ticket, then calls
@@ -493,6 +500,10 @@ class ConvoWiring:
         while not self._stop.is_set():
             try:
                 if self.deps.identity_enabled():
+                    replayed = _replay.run_once(self.deps)
+                    for k, v in replayed.items():
+                        if v:
+                            self.counts[f"replay:{k}"] += v
                     s = _outbox.run_once(self.deps.bus, self._post, identity=self.identity,
                                          log=self.log, readback=self._readback)
                     for k, v in s.items():
@@ -536,6 +547,7 @@ class ConvoWiring:
             seen.setdefault(want, 0)
         other = {k: v for k, v in self.counts.items() if not k.startswith("event:")}
         other.update(self.classifier_health())
+        other["support_sender_fence"] = _fence.receipt(self.deps.bus)
         return (f"[slack-convo/{self.identity.name}] health enabled="
                 f"{self.deps.identity_enabled()} events={dict(sorted(seen.items()))} "
                 f"other={dict(sorted(other.items()))}")

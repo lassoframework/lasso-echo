@@ -44,6 +44,10 @@ never a truncated prefix of it). When an answer posts, its ticket is marked reso
 ticket closes when the person has the answer, not before (V-M4).
 
 A post failure marks the row 'failed' and moves on; one bad row never stalls the queue.
+Client resolution sends additionally require portal 0624 durable admission for the
+exact Railway deployment/build. Missing, paused or uncertain admission holds the
+row. The message stores its ticket/source/version/destination/sender binding before
+acquisition; uncertain attempts never return to the automatic send queue.
 
 HARDENING (2026-09-03 re-audit wave 2):
   N2  Blake's tap on a held row used to be swallowed silently: release_held flipped it to
@@ -72,11 +76,14 @@ from datetime import datetime, timedelta, timezone
 import hashlib
 import math
 import json
+import os
 import re
 import time
+import uuid
 
 from . import adapter as _a
 from .. import config
+from .. import support_sender_fence as _fence
 
 # Surfaces where a reply goes TOP LEVEL rather than in a thread: DMs and group DMs (people do
 # not thread there), and a portal-bridge ticket, whose Slack home is the group DM this system
@@ -104,6 +111,347 @@ PORTAL_THREAD_SOURCES = frozenset({"portal_form", "website_tab"})
 RESOLVED_NOTICE = (
     "Update from the LASSO team: this one is handled. If that is not what you needed, "
     "reply here and we will pick it back up.")
+
+
+SUPPORT_SEND_LANE = "support-resolution-send"
+SUPPORT_SEND_ADMISSION_KEY = "support_resolution_send_admission"
+_SUPPORT_BIND_FIELDS = (
+    "id", "source", "product", "client_id", "request_version", "bot_identity",
+    "slack_user_id", "slack_channel_id", "slack_thread_ts", "status",
+    "classification", "escalated", "hold_tier", "verification_after",
+)
+
+
+class SupportResolutionAdmissionError(RuntimeError):
+    """A resolution attempt must stay held; its durable effect is never replayed."""
+
+
+def _verify_support_post_sender(post, identity):
+    """Require auth.test proof from the exact transport captured by this POST."""
+    expected = identity.bot_user_id()
+    verifier = getattr(post, "verify_sender", None)
+    if not isinstance(expected, str) or not expected.strip() or not callable(verifier):
+        raise SupportResolutionAdmissionError("Support reply authenticated sender verifier unavailable")
+    try:
+        proof = verifier()
+    except Exception as exc:
+        raise SupportResolutionAdmissionError("Support reply sender authentication unavailable") from exc
+    if (not isinstance(proof, dict) or proof.get("ok") is not True
+            or proof.get("user_id") != expected):
+        raise SupportResolutionAdmissionError("Support reply authenticated sender differs from ticket identity")
+    return expected
+
+
+def _support_resolution_row(ticket, att, kind, body):
+    recipient = att.get("recipient_kind") or ticket.get("identity_kind") or "client"
+    return (recipient not in ("staff", "coach") and (
+        att.get("resolve_notice") is True
+        or kind == _a.KIND_ANSWER and not _a.promises_human_follow_up(body)))
+
+
+def _support_send_rpc(bus, name, body):
+    """Frozen portal 0624 contract. Never retry an uncertain acquisition."""
+    response = bus._client().post(
+        bus._rest("rpc/" + name), data=json.dumps(body),
+        headers=bus._headers(), timeout=30)
+    if response.status_code >= 400:
+        raise SupportResolutionAdmissionError("Support send admission RPC unavailable")
+    result = response.json()
+    if not isinstance(result, dict):
+        raise SupportResolutionAdmissionError("Support send admission receipt malformed")
+    return result
+
+
+def _support_send_cas(bus, row, *, meta=None, slack_ts=None, state=None, after_post=False):
+    """Keep the exact row, body, request version and attachment claimant snapshot."""
+    allowed_states = {"posting", "held"} if after_post else {"posting"}
+    if row.get("delivery_status") not in allowed_states or not callable(getattr(bus, "_patch", None)):
+        raise SupportResolutionAdmissionError("Support send requires durable message CAS")
+    att = row.get("attachments")
+    fields = {}
+    if meta is not None:
+        fields["attachments"] = {**(att or {}), **meta}
+    if slack_ts is not None:
+        fields["slack_ts"] = slack_ts
+    if state is not None:
+        fields["delivery_status"] = state
+    match = {
+        "id": "eq." + row["id"], "ticket_id": "eq." + row["ticket_id"],
+        "delivery_status": "eq." + row["delivery_status"], "body": "eq." + row["body"],
+        "delivery_request_version": ("is.null" if row.get("delivery_request_version") is None
+                                     else "eq." + str(row["delivery_request_version"])),
+        "slack_ts": "is.null" if not row.get("slack_ts") else "eq." + row["slack_ts"],
+        "attachments": "is.null" if att is None else "eq." + json.dumps(
+            att, sort_keys=True, separators=(",", ":")),
+    }
+    changed = bus._patch("support_messages", match, fields)
+    if (not isinstance(changed, dict)
+            or any(changed.get(k) != v for k, v in fields.items())
+            or any(changed.get(k) != row.get(k) for k in (
+                "id", "ticket_id", "body", "direction", "delivery_request_version"))):
+        raise SupportResolutionAdmissionError("Support send message CAS unconfirmed")
+    return changed
+
+
+def _support_send_after_post(bus, frozen, ts, *, proof=None, meta=None):
+    """Retain the correlated timestamp/proof across a known stale quarantine.
+
+    This only records an effect that already happened; it never authorizes a
+    POST or changes held back to posting. Snapshot retries cannot repeat Slack.
+    """
+    original_att = frozen.get("attachments") or {}
+    quarantine_meta = {"held_why", "fixer_slack_delivery_uncertain",
+                       "support_resolution_send_held", "fixer_reconcile_next_at"}
+    updates = dict(meta or {})
+    if proof is not None:
+        updates["support_resolution_send_readback"] = proof
+    for _ in range(3):
+        current = bus.message(frozen["id"])
+        att = (current or {}).get("attachments") or {}
+        if (not current or current.get("delivery_status") not in {"posting", "held"}
+                or any(current.get(k) != frozen.get(k) for k in (
+                    "id", "ticket_id", "body", "direction", "delivery_request_version"))
+                or any(att.get(k) != value for k, value in original_att.items()
+                       if k not in quarantine_meta)
+                or current.get("slack_ts") not in (None, "", ts)
+                or current.get("delivery_status") == "held" and not (
+                    att.get("fixer_slack_delivery_uncertain") is True
+                    or att.get("support_resolution_send_held") is True)):
+            raise SupportResolutionAdmissionError("Support send timestamp/proof claimant changed")
+        if (current.get("slack_ts") == ts
+                and all(att.get(k) == v for k, v in updates.items())):
+            return current
+        try:
+            return _support_send_cas(bus, current, slack_ts=ts,
+                meta=updates or None,
+                after_post=True)
+        except Exception:
+            # The CAS may have committed before its ACK was lost, or a known
+            # quarantine may have won it. Read the exact snapshot on the next
+            # pass; no acquisition or Slack effect is retried here.
+            continue
+    raise SupportResolutionAdmissionError("Support send timestamp/proof persistence unconfirmed")
+
+
+def _support_send_completed(row):
+    """A proof-only recovery cannot clear an unknown durable send admission."""
+    att = (row or {}).get("attachments") or {}
+    lease = att.get(SUPPORT_SEND_ADMISSION_KEY)
+    if lease is None:
+        return True  # existing rows predate this durable admission contract
+    receipt = att.get("support_resolution_send_completion")
+    binding = lease.get("binding") if isinstance(lease, dict) else None
+    return (isinstance(lease, dict) and isinstance(receipt, dict)
+            and isinstance(binding, dict) and isinstance(binding.get("ticket"), dict)
+            and binding.get("message_id") == row.get("id")
+            and binding["ticket"].get("id") == row.get("ticket_id")
+            and binding["ticket"].get("request_version") == row.get("delivery_request_version")
+            and isinstance(lease.get("invocation_id"), str) and bool(lease["invocation_id"])
+            and type(lease.get("generation")) is int and lease["generation"] >= 0
+            and receipt.get("recorded") is True
+            and receipt.get("lane") == lease.get("lane") == SUPPORT_SEND_LANE
+            and receipt.get("invocation_id") == lease.get("invocation_id")
+            and type(receipt.get("generation")) is int
+            and receipt["generation"] == lease.get("generation"))
+
+
+def _ordinary_support_reply_boundary(bus, post, row, ticket, identity, body,
+                                     channel, thread_ts, kind, att,
+                                     member_check, require_member):
+    """Authentication is a network window. Recheck the complete send owner after it."""
+    before = bus.message(row["id"])
+    version = ticket.get("request_version")
+    expected_thread = None if att.get("surface") in TOP_LEVEL_SURFACES else ticket.get("slack_thread_ts")
+    stable_meta = ("identity", "kind", "released_by", "recipient_kind", "request_key",
+                   "request_version", "resolve_notice", "surface")
+    if (not before or before.get("delivery_status") != "posting"
+            or before.get("ticket_id") != ticket.get("id") or before.get("body") != body
+            or type(version) is not int or version < 0
+            or type(before.get("delivery_request_version")) is not int
+            or before["delivery_request_version"] != version or before.get("slack_ts")
+            or ticket.get("slack_channel_id") != channel or expected_thread != thread_ts
+            or not ticket.get("source") or ticket.get("bot_identity") != identity.name
+            or any((before.get("attachments") or {}).get(k) != att.get(k) for k in stable_meta)):
+        raise SupportResolutionAdmissionError("Ordinary support reply request/route/claimant unconfirmed")
+    sender = _verify_support_post_sender(post, identity)
+    if require_member and not (callable(member_check) and channel.startswith(("C", "G"))
+                               and member_check(channel, config.APPROVER_SLACK_ID)):
+        raise SupportResolutionAdmissionError("Ordinary support reply Blake membership changed")
+    if not att.get("released_by"):
+        recipient = att.get("recipient_kind") or ticket.get("identity_kind") or "client"
+        if not _recipient_armed(identity, recipient):
+            raise SupportResolutionAdmissionError("Ordinary support reply safety flag revoked")
+        if kind == _a.KIND_ANSWER:
+            verdict = _a.auto_answer_verdict(ticket.get("raw_text") or "", body,
+                                             grounded_by_fixer=bool(att.get("fixer")))
+            if (not config.slack_convo_auto_answer_armed(identity.name)
+                    or att.get("auto_answer_forbidden") or verdict.held):
+                raise SupportResolutionAdmissionError("Ordinary support answer safety gate revoked")
+        if att.get(_client_dm_lane_meta_key()):
+            from ..client_dm_support import arming as _cdm_arm
+            if _cdm_arm.preflight(identity.name).mode != _cdm_arm.MODE_LIVE:
+                raise SupportResolutionAdmissionError("Ordinary client DM support lane revoked")
+    from . import replay
+    if not replay.dispatch_allowed(bus, before, identity.name):
+        raise SupportResolutionAdmissionError("Ordinary support reply replay authority changed")
+    # All network/safety/replay checks precede these exact final snapshots.
+    if (bus.ticket(ticket["id"]) != ticket or bus.message(row["id"]) != before
+            or identity.bot_user_id() != sender):
+        raise SupportResolutionAdmissionError("Ordinary support reply changed during authentication")
+
+
+def _hold_support_send(bus, row, reason, log):
+    """No generic retry can release an admission with an uncertain ACK or send."""
+    try:
+        current = bus.message(row["id"])
+        if (current or {}).get("delivery_status") != "posting":
+            return False
+        if (current.get("attachments") or {}).get("slack_replay_id"):
+            return _hold_uncertain_replay(bus, current, reason, log)
+        if _fixer_client_row(current):
+            return _quarantine_fixer(bus, current["id"], reason, log)
+        _support_send_cas(bus, current, state="held", meta={
+            "held_why": reason, "support_resolution_send_held": True})
+        return True
+    except Exception as exc:  # claim/intent remain durable if quarantine fails
+        log(f"[slack-convo/outbox] support admission hold unconfirmed "
+            f"row={row.get('id')}: {type(exc).__name__}")
+        return False
+
+
+def _post_support_resolution(bus, post, row, ticket, identity, body, channel,
+                             thread_ts, readback, *, kind, att,
+                             member_check=None, require_member=False):
+    """Admit each client resolution against the DB pause, then prove its exact send.
+
+    0624 has no ticket parameters. Its immutable invocation id is derived from
+    the binding stored by message CAS BEFORE acquisition. No local/preview
+    identity fallback and no feature flag can bypass this send boundary.
+    """
+    if not _support_resolution_row(ticket, att, kind, body):
+        recipient = att.get("recipient_kind") or ticket.get("identity_kind") or "client"
+        # A stale staff stamp cannot waive sender authentication in a client's
+        # conversation. Only a ticket AND recipient known to be staff bypass it.
+        if (recipient not in ("staff", "coach")
+                or ticket.get("identity_kind") not in ("staff", "coach")):
+            _ordinary_support_reply_boundary(
+                bus, post, row, ticket, identity, body, channel, thread_ts, kind, att,
+                member_check, require_member)
+        return post(channel, body, thread_ts=thread_ts, blocks=None)
+    lease = None
+    try:
+        deployment = os.environ.get("RAILWAY_DEPLOYMENT_ID", "").strip()
+        build = os.environ.get("RAILWAY_GIT_COMMIT_SHA", "").strip()
+        sender = identity.bot_user_id()
+        version = ticket.get("request_version")
+        if (not deployment or not build or not sender or not callable(readback)
+                or type(version) is not int or version < 0
+                or not isinstance(ticket.get("source"), str) or not ticket["source"].strip()
+                or ticket.get("bot_identity") != identity.name
+                or ticket.get("slack_channel_id") != channel):
+            raise SupportResolutionAdmissionError("Support send exact deployment/request/sender/readback unavailable")
+        uuid.UUID(ticket["id"])
+        uuid.UUID(row["id"])
+        _verify_support_post_sender(post, identity)
+        current = bus.message(row["id"])
+        if (not current or current.get("delivery_status") != "posting"
+                or current.get("body") != body or current.get("ticket_id") != ticket["id"]
+                or type(current.get("delivery_request_version")) is not int
+                or current["delivery_request_version"] != version
+                or current.get("slack_ts")
+                or (current.get("attachments") or {}).get(SUPPORT_SEND_ADMISSION_KEY)
+                or any((current.get("attachments") or {}).get(k) != att.get(k)
+                       for k in ("identity", "kind", "released_by", "recipient_kind",
+                                 "request_key", "request_version", "resolve_notice"))):
+            raise SupportResolutionAdmissionError("Support send request/body/version claimant changed or already attempted")
+        status = _support_send_rpc(bus, "support_admission_status_lane", {"p_lane": SUPPORT_SEND_LANE})
+        generation, unresolved = status.get("generation"), status.get("unresolved")
+        if (status.get("lane") != SUPPORT_SEND_LANE
+                or type(generation) is not int or not 0 <= generation <= 2**53 - 1
+                or type(unresolved) is not int or unresolved < 0
+                or type(status.get("paused")) is not bool
+                or type(status.get("drained")) is not bool
+                or status["drained"] != (status["paused"] and unresolved == 0)
+                or not isinstance(status.get("operation_id"), str) or not status["operation_id"]
+                or status["paused"]):
+            raise SupportResolutionAdmissionError("Support send admission paused or status unconfirmed")
+        binding = {
+            "ticket": {k: ticket.get(k) for k in _SUPPORT_BIND_FIELDS},
+            "message_id": row["id"], "sender_identity": identity.name,
+            "sender": sender, "channel": channel, "thread_ts": thread_ts,
+            "body_sha256": hashlib.sha256(body.encode()).hexdigest(),
+            "request_key": att.get("request_key"),
+        }
+        invocation = str(uuid.uuid5(uuid.NAMESPACE_URL, "lasso/support-resolution-send/v1/" +
+            json.dumps(binding, sort_keys=True, separators=(",", ":"))))
+        lease = {"lane": SUPPORT_SEND_LANE, "invocation_id": invocation,
+                 "generation": generation, "deployment": deployment, "build": build,
+                 "binding": binding, "not_before": datetime.now(timezone.utc).isoformat()}
+        current = _support_send_cas(bus, current, meta={SUPPORT_SEND_ADMISSION_KEY: lease})
+        receipt = _support_send_rpc(bus, "support_admission_acquire_lane", {
+            "p_lane": SUPPORT_SEND_LANE, "p_expected_generation": generation,
+            "p_invocation_id": invocation, "p_deployment": deployment, "p_build": build})
+        if (receipt.get("admitted") is not True or receipt.get("lane") != SUPPORT_SEND_LANE
+                or receipt.get("invocation_id") != invocation
+                or type(receipt.get("generation")) is not int or receipt["generation"] != generation):
+            raise SupportResolutionAdmissionError("Support send durable admission denied or receipt mismatch")
+        if _verify_support_post_sender(post, identity) != sender:
+            raise SupportResolutionAdmissionError("Support sender changed during send admission")
+        if require_member and not (channel.startswith(("C", "G")) and callable(member_check)
+                                   and member_check(channel, config.APPROVER_SLACK_ID)):
+            raise SupportResolutionAdmissionError("Blake membership changed during support send admission")
+        if not att.get("released_by") and att.get(_client_dm_lane_meta_key()):
+            from ..client_dm_support import arming as _cdm_arm
+            if _cdm_arm.preflight(identity.name).mode != _cdm_arm.MODE_LIVE:
+                raise SupportResolutionAdmissionError("Client DM support lane revoked during send admission")
+        # Replay authority includes inbound history and verification snapshots
+        # that can change without advancing the ticket's request version.
+        from . import replay
+        if not replay.dispatch_allowed(bus, current, identity.name):
+            raise SupportResolutionAdmissionError("Support send replay authority changed after admission")
+        latest_ticket = bus.ticket(ticket["id"])
+        latest = bus.message(row["id"])
+        if (not latest_ticket or any(latest_ticket.get(k) != ticket.get(k) for k in _SUPPORT_BIND_FIELDS)
+                or latest != current or identity.bot_user_id() != sender
+                or (not att.get("released_by") and (
+                    not _recipient_armed(identity, att.get("recipient_kind") or ticket.get("identity_kind") or "client")
+                    or kind == _a.KIND_ANSWER and not config.slack_convo_auto_answer_armed(identity.name)))):
+            raise SupportResolutionAdmissionError("Support send ticket, sender or release changed after admission")
+        ts = post(channel, body, thread_ts=thread_ts, blocks=None)
+        if not isinstance(ts, str) or not ts:
+            raise SupportResolutionAdmissionError("Support Slack timestamp unconfirmed")
+        current = _support_send_after_post(bus, current, ts)
+        intent = {"channel": channel, "thread_ts": thread_ts, "body": body,
+                  "sender": sender, "not_before": lease["not_before"],
+                  "request_version": version, "request_key": att.get("request_key")}
+        proof, reason = _readback_fixer_message(readback, intent, ts=ts)
+        if not proof:
+            raise SupportResolutionAdmissionError(reason)
+        current = _support_send_after_post(bus, current, ts, proof=proof)
+        finished = _support_send_rpc(bus, "support_admission_finish_lane", {
+            "p_lane": SUPPORT_SEND_LANE, "p_invocation_id": invocation,
+            "p_generation": generation, "p_outcome": "completed"})
+        if (finished.get("recorded") is not True or finished.get("lane") != SUPPORT_SEND_LANE
+                or finished.get("invocation_id") != invocation):
+            raise SupportResolutionAdmissionError("Support send completion ACK unconfirmed")
+        _support_send_after_post(bus, current, ts, meta={
+            "support_resolution_send_completion": {**finished, "generation": generation}})
+        return ts
+    except Exception as exc:
+        # An acquired-but-unconfirmed receipt or POST cannot be completed by
+        # assumption. 0624 unknown remains unresolved; failed finish ACK leaves
+        # a running invocation unresolved too. Never retry acquisition or POST.
+        if lease:
+            try:
+                _support_send_rpc(bus, "support_admission_finish_lane", {
+                    "p_lane": SUPPORT_SEND_LANE, "p_invocation_id": lease["invocation_id"],
+                    "p_generation": lease["generation"], "p_outcome": "unknown"})
+            except Exception:
+                pass
+        if isinstance(exc, SupportResolutionAdmissionError):
+            raise
+        raise SupportResolutionAdmissionError(
+            f"Support send admission/effect unconfirmed: {type(exc).__name__}") from exc
 
 
 def portal_deliverable(ticket):
@@ -1067,6 +1415,16 @@ def _finish_pending_route_notice(bus, row, proof, identity, log, summary):
         if not verified or (verified.get("attachments") or {}).get(
                 "delivery_readback_verified") is not True:
             return False
+        # An admitted 0624 send is closed only when its confirmed durable
+        # completion receipt was persisted before this bind (the primary path
+        # records it ahead of bind_current_notice_route). Absent, unknown or
+        # mismatched receipts stay held -- never bind, promote or resolve on
+        # uncertainty. Legacy proof-only rows predate the admission contract
+        # and keep their existing proof-only recovery below.
+        if not _support_send_completed(verified):
+            log(f"[slack-convo/outbox] pending route notice lacks durable send "
+                f"completion receipt row={row.get('id')}")
+            return False
         current_ticket = bus.ticket(row["ticket_id"])
         if (not current_ticket
                 or current_ticket.get("request_version") != row.get(
@@ -1128,6 +1486,9 @@ def _claim(bus, row, log):
     claimed_at = datetime.now(timezone.utc).isoformat()
     modern_claim = getattr(bus, "claim_fixer_message", None)
     try:
+        if "slack_replay_id" in (row.get("attachments") or {}):
+            from . import replay
+            return replay.claim_delivery(bus, row)
         if _fixer_client_row(row) and callable(modern_claim):
             claimed = modern_claim(
                 row["id"], row.get("attachments"), claimed_at,
@@ -1162,6 +1523,20 @@ def _claim(bus, row, log):
     return current or True
 
 
+def _hold_uncertain_replay(bus, row, why, log):
+    """A legacy replay send can have reached Slack. Never turn it back to ready."""
+    current = bus.message(row["id"])
+    if not current or current.get("delivery_status") != "posting":
+        return False
+    from . import replay
+    held = replay.hold_delivery(bus, current, why)
+    quarantined = bool(held and held.get("delivery_status") == "held")
+    if quarantined:
+        log(f"[slack-convo/outbox] replay delivery requires reconciliation "
+            f"row={row['id']}: {why}")
+    return quarantined
+
+
 def _recover_stale_claims(bus, identity, log, now=None, readback=None, summary=None):
     """Reconcile rows orphaned in ``posting`` after CLAIM_TIMEOUT_SECONDS.
 
@@ -1193,6 +1568,21 @@ def _recover_stale_claims(bus, identity, log, now=None, readback=None, summary=N
         if _age_seconds(row, now) < CLAIM_TIMEOUT_SECONDS:
             continue  # plausibly still in flight; do not steal it
         try:
+            # Stale-posting precedence: admission hold, then replay quarantine,
+            # then plain reminder receipt recovery. A reminder that also bears a
+            # replay/admission marker is caught above and never enters reminder
+            # recovery, so a dual-marker row cannot bypass the sender fence.
+            if (row.get("attachments") or {}).get(SUPPORT_SEND_ADMISSION_KEY):
+                if _hold_support_send(bus, row, "Prior support resolution admission requires reconciliation", log):
+                    n += 1
+                    count("quarantined_held")
+                continue
+            if (row.get("attachments") or {}).get("slack_replay_id"):
+                if _hold_uncertain_replay(
+                        bus, row, "Replay claim expired; prior Slack outcome is unknown", log):
+                    n += 1
+                    count("quarantined_held")
+                continue
             if _scan_reminder_candidate(row):
                 _recover_scan_reminder(bus, row, identity, readback, log, summary)
                 continue
@@ -1630,6 +2020,10 @@ def _recover_config_missing_fixer(bus, identity, readback, log, now=None):
 
 def _finalize_fixer_post(bus, ticket, row, identity, log, summary):
     """Idempotently finish the ticket step after verified Slack delivery."""
+    if not _support_send_completed(row):
+        log(f"[slack-convo/outbox] FIXER resolution awaits durable send admission reconciliation "
+            f"row={row.get('id')}")
+        return
     att = row.get("attachments") or {}
     intent = att.get("fixer_slack_delivery_intent") or {}
     if (row.get("delivery_status") != "posted"
@@ -1876,6 +2270,7 @@ def _blake_is_member(identity, channel, user):
     return False
 
 
+@_fence.guarded("outbox", lambda: {"paused": 1})
 def run_once(bus, post, *, identity, log=print, limit=50, now=None,
              member_check=None, readback=None):
     """Process up to `limit` ready rows for THIS identity.
@@ -1914,6 +2309,12 @@ def run_once(bus, post, *, identity, log=print, limit=50, now=None,
         try:
             _dispatch_one(bus, post, row, identity=identity, log=log, summary=summary,
                           now=now, readback=readback, member_check=member_check)
+        except SupportResolutionAdmissionError as exc:
+            log(f"[slack-convo/outbox] support resolution held row={row.get('id')}: {exc}")
+            if _hold_support_send(bus, row, str(exc), log):
+                summary["held"] += 1
+            else:
+                summary["skipped"] += 1
         except UncertainFixerDelivery as exc:
             log(f"[slack-convo/outbox] FIXER delivery uncertain row={row.get('id')}: {exc}")
             try:
@@ -1939,6 +2340,16 @@ def run_once(bus, post, *, identity, log=print, limit=50, now=None,
                 summary["skipped"] += 1
         except Exception as e:  # noqa: BLE001 - one row never stalls the queue
             log(f"[slack-convo/outbox] row {row.get('id')} failed: {type(e).__name__}")
+            if (row.get("attachments") or {}).get("slack_replay_id"):
+                try:
+                    if _hold_uncertain_replay(
+                            bus, row, "Replay send or receipt outcome requires reconciliation", log):
+                        summary["held"] += 1
+                    else:
+                        summary["skipped"] += 1
+                except Exception:  # leave the durable claim for stale quarantine
+                    summary["skipped"] += 1
+                continue
             try:
                 bus.mark_message(row["id"], "failed")
             except Exception:  # noqa: BLE001
@@ -2402,6 +2813,14 @@ def _recover_scan_reminder(bus, row, identity, readback, log, summary):
 def _dispatch_one(bus, post, row, *, identity, log, summary, now=None,
                   member_check=None, readback=None):
     att = row.get("attachments") or {}
+    # Ready-dispatch precedence: an admission-marked row is skipped before the
+    # reminder branch; a reminder bearing a replay marker is separately skipped
+    # as anomalous inside _dispatch_scan_reminder.
+    if att.get(SUPPORT_SEND_ADMISSION_KEY):
+        # Even an operator release/status edit cannot mint another acquisition
+        # after a lost ACK. The frozen invocation and Slack receipt need review.
+        summary["skipped"] += 1
+        return
     if _scan_reminder_candidate(row):
         _dispatch_scan_reminder(bus, post, row, identity, log, summary, now=now, readback=readback)
         return
@@ -2591,6 +3010,12 @@ def _dispatch_one(bus, post, row, *, identity, log, summary, now=None,
             blocks = escalation_blocks(row, ticket)
         else:
             blocks = None
+        from . import replay as _replay
+        if not _replay.dispatch_allowed(bus, row, identity.name):
+            bus.mark_message(row["id"], "held", meta_update={
+                "held_why": "Slack replay request or safety authority changed before dispatch"})
+            summary["held"] += 1
+            return
         try:
             ts = post(channel, row["body"], thread_ts=None, blocks=blocks)
         except Exception as e:  # noqa: BLE001
@@ -2601,7 +3026,13 @@ def _dispatch_one(bus, post, row, *, identity, log, summary, now=None,
                 f"{channel} for ticket {ticket['id']}: {type(e).__name__}: {e}. "
                 f"Nobody has been told about this ticket.")
             raise
-        bus.mark_message(row["id"], "posted", slack_ts=ts)
+        if "slack_replay_id" in (row.get("attachments") or {}):
+            finished = _replay.finish_delivery(bus, row, ts)
+            if not finished or finished.get("delivery_status") != "posted":
+                summary["held"] += 1
+                return
+        else:
+            bus.mark_message(row["id"], "posted", slack_ts=ts)
         summary["posted"] += 1
         return
 
@@ -2891,6 +3322,12 @@ def _dispatch_one(bus, post, row, *, identity, log, summary, now=None,
                  where="released into the portal support thread they wrote from",
                  summary=summary)
         return
+    from . import replay as _replay
+    if not _replay.dispatch_allowed(bus, row, identity.name):
+        bus.mark_message(row["id"], "held", meta_update={
+            "held_why": "Slack replay request or safety authority changed before dispatch"})
+        summary["held"] += 1
+        return
     sent_body = row["body"]
     if fixer_customer_slack:
         mention = f"<@{config.APPROVER_SLACK_ID}>"
@@ -3046,7 +3483,12 @@ def _dispatch_one(bus, post, row, *, identity, log, summary, now=None,
             return
         ticket = latest
         try:
-            ts = post(channel, sent_body, thread_ts=thread_ts, blocks=None)
+            ts = _post_support_resolution(
+                bus, post, row, ticket, identity, sent_body, channel, thread_ts,
+                readback, kind=kind, att=att, member_check=member_check,
+                require_member=True)
+        except SupportResolutionAdmissionError:
+            raise
         except Exception as exc:  # noqa: BLE001 - a timeout can follow a successful post
             raise UncertainFixerDelivery(
                 f"Slack post outcome unknown: {type(exc).__name__}") from exc
@@ -3095,8 +3537,21 @@ def _dispatch_one(bus, post, row, *, identity, log, summary, now=None,
                 or (posted.get("attachments") or {}).get("delivery_readback_verified") is not True):
             raise UncertainFixerDelivery("Slack verified but posted state unconfirmed")
     else:
-        ts = post(channel, sent_body, thread_ts=thread_ts, blocks=None)
-        bus.mark_message(row["id"], "posted", slack_ts=ts)
+        if not _replay.dispatch_allowed(bus, row, identity.name):
+            bus.mark_message(row["id"], "held", meta_update={
+                "held_why": "Slack replay request or safety authority changed before Slack delivery"})
+            summary["held"] += 1
+            return
+        ts = _post_support_resolution(
+            bus, post, row, ticket, identity, sent_body, channel, thread_ts,
+            readback, kind=kind, att=att)
+        if "slack_replay_id" in (row.get("attachments") or {}):
+            finished = _replay.finish_delivery(bus, row, ts)
+            if not finished or finished.get("delivery_status") != "posted":
+                summary["held"] += 1
+                return
+        else:
+            bus.mark_message(row["id"], "posted", slack_ts=ts)
     summary["posted"] += 1
     if fixer_customer_slack:
         _finalize_fixer_post(bus, ticket, posted, identity, log, summary)
@@ -3189,6 +3644,11 @@ def _after_answer_posted(bus, ticket, row, kind, summary, att, identity, log=pri
     with the person. An answer that promised a HUMAN follow-up does not close the ticket --
     it is routed to the FIXER with adapter.FOLLOW_UP_MARKER (idempotent: the Slack adapter
     may already have done this at draft time). Every other answer resolves as before."""
+    if "slack_replay_id" in (row.get("attachments") or {}):
+        # Replay's draft-time routing already committed atomically. An older
+        # posted answer may neither resolve nor re-route a newer human request.
+        _resolve_on_answer(bus, ticket, row, kind, summary, att, row.get("body") or "")
+        return
     if kind == _a.KIND_ANSWER and (att or {}).get("recipient_kind") not in ("staff", "coach") \
             and _a.promises_human_follow_up(row.get("body") or ""):
         _a.route_follow_up_promise(bus, ticket, ident_name=identity.name,
@@ -3207,6 +3667,12 @@ def _resolve_on_answer(bus, ticket, row, kind, summary, att=None, body=""):
     tapped (MINOR 5, audit 7 -- resolve_and_notify used to stamp the ticket itself, before
     delivery, so a failed post left a ticket claiming to be resolved over a failed row)."""
     meta = att or {}
+    try:
+        current_message = bus.message(row["id"])
+    except Exception:  # a stale caller snapshot cannot bypass durable send uncertainty
+        return
+    if not current_message or not _support_send_completed(current_message):
+        return
     fixer = bool(meta.get("fixer"))
     current_notice_enabled = config.slack_convo_echo_current_notice_enabled()
     if meta.get("fixer_current_attempt_token") and not current_notice_enabled:
@@ -3217,6 +3683,15 @@ def _resolve_on_answer(bus, ticket, row, kind, summary, att=None, body=""):
         kind == _a.KIND_ANSWER and ticket.get("status") == "verification"
         or kind == _a.KIND_STATUS and meta.get("resolve_notice") is True
         and ticket.get("status") != "resolved")
+    if "slack_replay_id" in (row.get("attachments") or {}):
+        if should_resolve:
+            from . import replay
+            try:
+                if replay.resolve_delivery(bus, row).get("resolved") is True:
+                    summary["resolved"] += 1
+            except Exception:  # failed or unreadable CAS leaves the ticket open
+                pass
+        return
     if fixer and should_resolve:
         # Slack (or the portal thread) may accept a delivery while the requester
         # corrects it or an operator changes its eligibility. Keep the receipt for
@@ -3290,6 +3765,7 @@ def _resolve_on_answer(bus, ticket, row, kind, summary, att=None, body=""):
             summary["resolved"] += 1
 
 
+@_fence.guarded("operator_release", lambda: False)
 def release_held(bus, message_id, *, approved_by, identity=None, log=print):
     """A human tap on a hold notice: flip that held row to ready and stamp the ticket.
     Returns True when a held row was released. Refuses anything not currently held, any
@@ -3310,6 +3786,7 @@ def release_held(bus, message_id, *, approved_by, identity=None, log=print):
         return False
     if (att.get("fixer_slack_delivery_intent") is not None
             or att.get("fixer_slack_delivery_uncertain")
+            or att.get("slack_replay_delivery_uncertain")
             or att.get("fixer_slack_route_missing")):
         log(f"[slack-convo/outbox] release refused: FIXER delivery row {message_id} "
             "requires route or Slack readback reconciliation")
@@ -3325,6 +3802,7 @@ def release_held(bus, message_id, *, approved_by, identity=None, log=print):
     return True
 
 
+@_fence.guarded("operator_resolve", lambda: False)
 def resolve_and_notify(bus, ticket_id, *, approved_by, identity, log=print):
     """A human tap on an escalation card: tell the person it is handled, and close the
     ticket (D48).
@@ -3422,12 +3900,14 @@ def resolve_and_notify(bus, ticket_id, *, approved_by, identity, log=print):
         release_key = ((ticket.get("verification_after") or {}).get("fixer") or {}).get("request_key")
         if not current_key or release_key != current_key:
             return refuse_resolve("customer request changed or could not be verified")
-        request_version = ticket.get("request_version")
-        if (not isinstance(request_version, int) or isinstance(request_version, bool)
-                or request_version < 0):
-            return refuse_resolve("customer request version is unavailable")
         if not str(ticket.get("slack_channel_id") or "").startswith(("C", "G")):
             return refuse_resolve("customer fix has no group conversation for Blake to join")
+    # Every resolution notice must carry the same immutable requester cycle that
+    # the send boundary verifies. Bind it at INSERT so a new request cannot inherit
+    # this human tap, including notices outside the 0384 reservation path.
+    request_version = ticket.get("request_version")
+    if type(request_version) is not int or request_version < 0:
+        return refuse_resolve("customer request version is unavailable")
     # MINOR 4 (audit 7): `surface` was the ticket's SOURCE ("website_tab"), which is not one
     # of the surfaces gate 7 knows, so the notice was posted as a THREAD REPLY inside a DM --
     # a place people do not look. The real surface is on the ticket's own inbound rows.
@@ -3436,6 +3916,7 @@ def resolve_and_notify(bus, ticket_id, *, approved_by, identity, log=print):
         bus.record_outbound(
             ticket_id=ticket_id, author_type=getattr(identity, "name", "system"),
             body=RESOLVED_NOTICE, delivery_status="ready", kind=_a.KIND_STATUS,
+            expected_request_version=request_version,
             # Match the recipient checked by the trust ladder above.
             meta={"identity": getattr(identity, "name", ""), "recipient_kind": recipient_kind,
                   "surface": surface, "resolved_by": approved_by, "resolve_notice": True,
