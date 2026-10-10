@@ -22,7 +22,7 @@ preserved. None of the phases below is safe to activate on its own.
 | `migrations/DRAFT_visual_group_claim_trigger_20261002.sql` now routes guarded calendar writes through `visual_group_global_claim` to `visual_global_claim_scene`, which verifies selected row bytes and claims the full attested scene set. | The DRAFT trigger integration exists, but cannot safely arm until every row's source/delivered bytes and lineage are evidenced and the integrated PG/concurrency matrix passes. |
 | `visual_global_import_history`, `visual_global_coverage` and `visual_global_history_coverage` now enumerate scene fingerprint sets, import retained local ledger history, and report calendar plus orphan/member/global-owner gaps. | Reports/import cannot reconstruct missing historical bytes or lineage, nor recover rows absent from retained ledger/evidence; those gaps remain activation blockers. |
 | `agent/visual_writer_prepare.py` and `agent/visual_owner_receipts.py` now read both exact objects, create owner-only read/render receipts, and call `visual_global_prepare_source_rendition`; `agent/story_reburn.py` returns byte observations and `agent/portal_social.py` passes them through preparation. | This is dirty DRAFT code, not accepted or production evidence. Audit receipt trust, all transformation paths, and the real-PostgreSQL cases before relying on it. |
-| `agent/portal_calendar_store.py` now prepares the replacement with render evidence and returns the scoped persisted PATCH row; the portal reburn checks that result. The calendar autopublish reburn also checks its persisted row. | Other transformations remain unreconciled: the feed-aspect rehost path still patches without checking persistence or supplying source/output receipt evidence, and direct `content_calendar.image_url` writers must be inventoried. |
+| `agent/portal_calendar_store.py` now prepares the replacement with render evidence and returns the scoped persisted PATCH row; portal and calendar reburns check that result. The feed-aspect rehost also submits source/output render evidence when writer preparation is enabled and checks the persisted PATCH row. | This code has no production acceptance. Direct operator PATCH fallbacks and the forward-reservation staging/finalization path still need release reconciliation; complete historical byte and lineage coverage remains required. |
 
 ## Target invariants and schema
 
@@ -106,21 +106,26 @@ and both coverage functions enumerate every attested scene fingerprint for
 retained local ledger groups, including released staged groups and orphaned
 global members/owners. They still cannot fill missing historical byte or render
 evidence, and deleted calendar rows are covered only when their local ledger
-and relevant evidence remain. Story reburn receipt production and persisted
-PATCH verification exist in the dirty implementation, but other transformations
-and direct writers remain to be reviewed and wired. All-tenant enforcement stays OFF; this
+and relevant evidence remain. Story reburn and feed-aspect rehost now produce
+render evidence and verify persisted PATCH results in the draft implementation.
+The remaining direct writers and forward-reservation finalization still need
+release reconciliation. All-tenant enforcement stays OFF; this
 subset is not an accepted or activatable source/rendition release.
 
 ### 2. Writer and actual render evidence
 
-The dirty implementation now reads both exact objects, verifies source asset
+The draft implementation now reads both exact objects, verifies source asset
 MD5 where present, writes owner receipts, and passes Story reburn evidence
 through `agent/calendar_autopublish.py` and `agent/portal_social.py`; both
-reburn callers check the persisted PATCH result. Independently review and
-accept this wiring. The feed rehost at
-`agent/calendar_autopublish.py:334-405` still needs persisted-PATCH checking
-and source/output receipt evidence. Inventory all direct calendar writers and
-give each transformation equivalent evidence. Preserve the raw source field;
+reburn callers check the persisted PATCH result. The feed-aspect rehost in
+`agent/calendar_autopublish.py` also submits source/output render evidence
+when writer preparation is enabled and refuses an unverified persisted PATCH.
+The operator scripts `scripts/refresh_lasso_calendar.py` and
+`scripts/swap_crossfitchateau_blocked_media.py` retain flag-off direct PATCH
+fallbacks. `SupabaseCalendarStore.insert_rows` skips visual preparation for
+forward-reservation staging; prove the isolated finalization path binds exact
+bytes and lineage before activating either flag combination. Independently
+review and accept all writer paths. Preserve the raw source field;
 a failed preparation or unverified external object must leave the calendar
 unchanged or visibly held.
 
