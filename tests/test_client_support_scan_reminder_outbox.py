@@ -2,6 +2,7 @@
 from copy import deepcopy
 from datetime import datetime, timezone
 from types import SimpleNamespace
+import json
 
 import pytest
 
@@ -25,7 +26,21 @@ class Bus:
         self.gym = {"id": "gym-1", "slug": "real-gym"}
         self.messages = []
         self.on_claim = None
+        self.before_patch = None
         self.broken = False
+
+    def _patch(self, table, match, fields):
+        assert table == "support_messages"
+        if self.before_patch:
+            self.before_patch(self)
+        assert match["id"] == "eq." + self.row["id"]
+        if (match["delivery_status"] != "eq." + self.row["delivery_status"]
+                or (match["slack_ts"] == "is.null" and self.row.get("slack_ts"))
+                or match["attachments"] != "eq." + json.dumps(
+                    self.row["attachments"], sort_keys=True, separators=(",", ":"))):
+            return None
+        self.row.update(deepcopy(fields))
+        return deepcopy(self.row)
 
     def _get(self, table, params):
         if self.broken:
@@ -367,6 +382,64 @@ def test_dual_marker_dispatch_skips_before_reminder(monkeypatch):
                          summary=summary, now=NOW, readback=None)
     assert summary["skipped"] == 1 and summary["posted"] == 0
     assert bus.row["delivery_status"] == "ready"
+
+
+def test_ready_replay_reminder_collision_is_held_without_send_or_suppression(monkeypatch):
+    bus = Bus()
+    bus.row["attachments"]["slack_replay_id"] = "replay-1"
+    monkeypatch.setenv("AGENT_CLIENT_SUPPORT_SCAN_REMINDER_ENABLED", "true")
+    monkeypatch.setattr(outbox, "_dispatch_scan_reminder",
+                        lambda *a, **kw: pytest.fail("replay collision reached reminder"))
+    summary = {"posted": 0, "skipped": 0, "suppressed": 0}
+    outbox._dispatch_one(bus,
+                         lambda *a, **kw: pytest.fail("replay collision must not POST"),
+                         deepcopy(bus.row), identity=IDENTITY, log=lambda *a: None,
+                         summary=summary, now=NOW, readback=None)
+    assert bus.row["delivery_status"] == "held"
+    assert bus.row["attachments"]["slack_replay_id"] == "replay-1"
+    assert "replay authority" in bus.row["attachments"]["held_why"]
+    assert summary["held"] == 1
+    assert summary["posted"] == summary["suppressed"] == 0
+
+
+@pytest.mark.parametrize("change", ["posting", "posted", "attachments"])
+def test_ready_replay_reminder_collision_preserves_newer_owner(monkeypatch, change):
+    bus = Bus()
+    bus.row["attachments"]["slack_replay_id"] = "replay-1"
+    def win_race(current):
+        current.before_patch = None
+        if change == "attachments":
+            current.row["attachments"]["slack_replay_delivery_token"] = "new-owner"
+        else:
+            current.row["delivery_status"] = change
+            if change == "posted":
+                current.row["slack_ts"] = "123.456"
+    bus.before_patch = win_race
+    monkeypatch.setenv("AGENT_CLIENT_SUPPORT_SCAN_REMINDER_ENABLED", "true")
+    monkeypatch.setattr(outbox, "_dispatch_scan_reminder",
+                        lambda *a, **kw: pytest.fail("replay collision reached reminder"))
+    summary = {"posted": 0, "skipped": 0, "suppressed": 0}
+    outbox._dispatch_one(bus,
+                         lambda *a, **kw: pytest.fail("replay collision must not POST"),
+                         deepcopy(bus.row), identity=IDENTITY, log=lambda *a: None,
+                         summary=summary, now=NOW, readback=None)
+    assert bus.row["delivery_status"] == ("ready" if change == "attachments" else change)
+    assert bus.row["attachments"].get("held_why") is None
+    assert bus.row["attachments"]["slack_replay_id"] == "replay-1"
+    assert summary["skipped"] == 1
+    assert summary["posted"] == summary["suppressed"] == summary.get("held", 0) == 0
+
+
+def test_held_replay_reminder_collision_skips_reminder_recovery(monkeypatch):
+    bus = Bus()
+    bus.row["delivery_status"] = "held"
+    bus.row["attachments"]["slack_replay_id"] = "replay-1"
+    bus._get = lambda table, params: [deepcopy(bus.row)]
+    monkeypatch.setenv("AGENT_CLIENT_SUPPORT_SCAN_REMINDER_ENABLED", "true")
+    monkeypatch.setattr(outbox, "_recover_scan_reminder",
+                        lambda *a, **kw: pytest.fail("replay collision reached recovery"))
+    outbox._reconcile_held_scan_reminders(bus, IDENTITY, None, lambda *a: None, {})
+    assert bus.row["delivery_status"] == "held"
 
 
 def test_dual_marker_stale_claim_admission_hold_first(monkeypatch):

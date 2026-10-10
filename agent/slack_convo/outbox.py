@@ -2621,6 +2621,8 @@ def _reconcile_held_scan_reminders(bus, identity, readback, log, summary):
     except Exception:
         return
     for row in rows:
+        if (row.get("attachments") or {}).get("slack_replay_id"):
+            continue  # replay-owned collision stays held for operator reconciliation
         if _scan_reminder_candidate(row):
             _recover_scan_reminder(bus, row, identity, readback, log, summary)
 
@@ -2682,6 +2684,32 @@ def _dispatch_one(bus, post, row, *, identity, log, summary, now=None,
         # Even an operator release/status edit cannot mint another acquisition
         # after a lost ACK. The frozen invocation and Slack receipt need review.
         summary["skipped"] += 1
+        return
+    if att.get("slack_replay_id") and _scan_reminder_candidate(row):
+        # A replay row is owned by the replay delivery protocol. A stray
+        # reminder marker must not route it through reminder validation, which
+        # would permanently suppress the replay without consulting that owner.
+        try:
+            snapshot = row.get("attachments")
+            next_att = {**att, "held_why":
+                        "Replay row also carries scan reminder markers; "
+                        "replay authority requires reconciliation"}
+            changed = bus._patch("support_messages", {
+                "id": "eq." + row["id"], "delivery_status": "eq.ready",
+                "slack_ts": "is.null",
+                "attachments": ("is.null" if snapshot is None else "eq." +
+                                json.dumps(snapshot, sort_keys=True, separators=(",", ":"))),
+            }, {"delivery_status": "held", "attachments": next_att})
+            if (isinstance(changed, dict) and changed.get("delivery_status") == "held"
+                    and changed.get("attachments") == next_att
+                    and changed.get("id") == row["id"]):
+                summary["held"] = int(summary.get("held") or 0) + 1
+            else:
+                summary["skipped"] += 1  # a newer owner changed the row
+        except Exception as exc:  # noqa: BLE001 - preserve ready for guarded retry
+            log(f"[slack-convo/outbox] replay/reminder collision quarantine failed "
+                f"row={row['id']}: {type(exc).__name__}")
+            summary["skipped"] += 1
         return
     if _scan_reminder_candidate(row):
         _dispatch_scan_reminder(bus, post, row, identity, log, summary, now=now, readback=readback)
