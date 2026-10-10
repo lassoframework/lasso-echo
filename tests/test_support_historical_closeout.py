@@ -12,6 +12,7 @@ class Fake:
             client_id='gym', bot_identity='echo', slack_user_id='U',
             slack_channel_id='C', slack_thread_ts='1.2', resolved_at='2026-10-09T12:00:00Z',
             escalated=False, hold_tier=None, client_delivery_guard_required=True)
+        self.reserve_args=None; self.returned_evidence='review:123'
         self.rows=[]; self.calls=[]; self.refuse=False; self.uncertain=False; self.drift=None
     def ticket(self, tid): return copy.deepcopy(self.t)
     def messages(self, tid, limit): return copy.deepcopy(self.rows)
@@ -19,10 +20,11 @@ class Fake:
     def message(self, mid): return None
     def reserve_historical_receipt(self,t,**kw):
         self.calls.append('reserve')
+        self.reserve_args=kw
         if self.uncertain: raise TimeoutError()
         if self.refuse: return None
         result={**t, 'ticket_id':t['id'], 'status':'pending', 'request_key':kw['request_key'],
-                'notice_message_id':kw['notice_id'], 'notice_body_sha256':kw['body_sha256'], 'evidence_ref':kw['evidence_ref']}
+                'notice_message_id':kw['notice_id'], 'notice_body_sha256':kw['body_sha256'], 'evidence_ref':self.returned_evidence}
         if self.drift=='tenant': self.t['client_id']='other'
         if self.drift=='route': self.t['slack_channel_id']='other'
         if self.drift=='transcript': self.rows.append(dict(direction='inbound',author_type='client',id='correction',created_at='now',body='changed'))
@@ -30,12 +32,12 @@ class Fake:
     def record_outbound(self,**kw): self.calls.append('insert'); return kw
 
 
-def prep(f):
+def prep(f, *, attestation_id="a3bdc0a4-5a9e-4d69-a23f-c056674b8d46", evidence_ref="review:123"):
     body=PRECLOSE_BODY.format(recipient=f.t['slack_user_id'],scope='the scheduling change')
     review=dict(ticket_id=f.t['id'],request_version=f.t['request_version'],
         body_sha256=hashlib.sha256(body.encode()).hexdigest(),
         independently_verified_by='independent_verifier',
-        evidence_ref='review:123',production_evidence_refs=['production:123'],
+        attestation_id=attestation_id, evidence_ref=evidence_ref,production_evidence_refs=['production:123'],
         verified_scope='the scheduling change')
     return prepare_historical_receipt(f, expected_ticket=copy.deepcopy(f.t),
         body=body, review=review, selected_notice_id=str(uuid.uuid4()))
@@ -45,7 +47,7 @@ def prep(f):
 def test_prepare_requires_exact_independent_review_and_no_premature_closure(changed):
     f=Fake(); body=PRECLOSE_BODY.format(recipient=f.t['slack_user_id'],scope='the scheduling change')
     review=dict(ticket_id=f.t['id'],request_version=2,body_sha256=hashlib.sha256(body.encode()).hexdigest(),
-        independently_verified_by='independent_verifier',evidence_ref='review:123',
+        independently_verified_by='independent_verifier',attestation_id=str(uuid.uuid4()),evidence_ref='review:123',
         production_evidence_refs=['production:123'],verified_scope='the scheduling change')
     if changed=='missing': review=None
     elif changed=='wrong_digest': review['body_sha256']='0'*64
@@ -185,3 +187,53 @@ def test_close_missing_fence_blocks_before_admission(field,monkeypatch):
     f=CloseFake();del f.rows[0]['attachments'][field]
     with pytest.raises(HistoricalCloseoutError): close(f,monkeypatch)
     assert f.calls==[]
+
+
+@pytest.mark.parametrize('value', [None, '', 'review:123', 7,
+    'A3BDC0A4-5A9E-4D69-A23F-C056674B8D46',
+    'a3bdc0a45a9e4d69a23fc056674b8d46',
+    '{a3bdc0a4-5a9e-4d69-a23f-c056674b8d46}'])
+def test_prepare_rejects_missing_or_noncanonical_attestation_before_reserve(value):
+    f = Fake()
+    with pytest.raises(HistoricalCloseoutError, match='attestation UUID'):
+        prep(f, attestation_id=value)
+    assert f.calls == []
+
+
+def test_attestation_uuid_is_reserve_input_and_reviewed_uri_is_preserved():
+    f = Fake()
+    attestation = str(uuid.uuid4())
+    row = prep(f, attestation_id=attestation)
+    assert f.reserve_args['evidence_ref'] == attestation
+    assert row['meta']['historical_receipt_evidence_ref'] == 'review:123'
+    assert row['meta']['historical_receipt_evidence_ref'] != attestation
+
+
+def test_attestation_cannot_replace_reviewed_evidence_uri():
+    f = Fake()
+    attestation = str(uuid.uuid4())
+    with pytest.raises(HistoricalCloseoutError, match='attestation UUID'):
+        prep(f, attestation_id=attestation, evidence_ref=attestation)
+    assert f.calls == []
+
+
+@pytest.mark.parametrize('returned', ['wrong:uri', None,
+    'a3bdc0a4-5a9e-4d69-a23f-c056674b8d46'])
+def test_wrong_returned_evidence_never_inserts_or_retries(returned):
+    f = Fake()
+    f.returned_evidence = returned
+    with pytest.raises(HistoricalCloseoutError, match='reservation refused'):
+        prep(f)
+    assert f.calls == ['reserve']
+
+
+def test_shared_review_contract_does_not_require_historical_reserve_attestation():
+    from agent.support_historical_closeout import _reviewed_resolution
+    f = Fake()
+    body = 'A reviewed postclose acknowledgement'
+    digest = hashlib.sha256(body.encode()).hexdigest()
+    review = dict(ticket_id=f.t['id'], request_version=f.t['request_version'],
+                  body_sha256=digest, independently_verified_by='independent_verifier',
+                  evidence_ref='review:123', production_evidence_refs=['production:123'],
+                  verified_scope='the scheduling change')
+    assert _reviewed_resolution(f.t, body, review) == ('review:123', digest)

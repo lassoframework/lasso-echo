@@ -1,6 +1,6 @@
 """Explicit single-ticket historical receipt preparation. Never dispatches Slack.
 
-0640 is a draft dependency. A ready row is preparation, not delivery or closeout.
+0640 and trusted independent attestation 0641 are draft dependencies. A ready row is preparation, not delivery or closeout.
 A lost reserve/insert response requires reconciliation of the original notice ID.
 """
 import hashlib
@@ -70,7 +70,8 @@ def prepare_historical_receipt(bus, *, expected_ticket, body, review,
                                selected_notice_id):
     """Reserve and create one caller-selected exact ID; no retries or send sweep.
 
-    Caller supplies an independent production review bound to the exact body.
+    Caller supplies an independent production review bound to the exact body
+    and its trusted 0641 attestation UUID, distinct from the reviewed evidence URI.
     Completion wording must stay within verified scope; finalization is still pending.
     Existing posted receipts block even when their readback is ambiguous.
     """
@@ -97,6 +98,16 @@ def prepare_historical_receipt(bus, *, expected_ticket, body, review,
                                            scope=review['verified_scope'])):
         raise HistoricalCloseoutError('preclose body/requester/review mismatch')
     evidence_ref, digest = _reviewed_resolution(ticket, body, review)
+    attestation_id = review.get('attestation_id')
+    try:
+        if (not isinstance(attestation_id, str)
+                or str(uuid.UUID(attestation_id)) != attestation_id
+                or attestation_id == review['evidence_ref']):
+            raise ValueError('noncanonical or conflated attestation ID')
+    except (ValueError, TypeError, AttributeError) as exc:
+        raise HistoricalCloseoutError('trusted attestation UUID missing or invalid') from exc
+    # UUID syntax is not authority. The 0641 reserve wrapper verifies the trusted
+    # binding and actual database preparer, and returns its reviewed evidence URI.
     rows = bus.messages(ticket_id, limit=1000)
     if not isinstance(rows, list) or len(rows) >= 1000:
         raise HistoricalCloseoutError('receipt scan incomplete')
@@ -109,7 +120,7 @@ def prepare_historical_receipt(bus, *, expected_ticket, body, review,
     if not key:
         raise HistoricalCloseoutError('request transcript unavailable')
     reservation = bus.reserve_historical_receipt(ticket, request_key=key,
-        evidence_ref=evidence_ref, body_sha256=digest, notice_id=selected_notice_id)
+        evidence_ref=attestation_id, body_sha256=digest, notice_id=selected_notice_id)
     if (not isinstance(reservation, dict) or reservation.get('status') != 'pending'
             or reservation.get('ticket_id') != ticket_id
             or reservation.get('notice_message_id') != selected_notice_id

@@ -8,13 +8,8 @@ notices, a changed same-version requester transcript, and a missing or
 dissenting validator all fail closed with no Slack POST.
 """
 import hashlib
-import os
 import uuid
 import pytest
-
-os.environ.setdefault("RAILWAY_DEPLOYMENT_ID", "test-deployment")
-os.environ.setdefault("RAILWAY_GIT_COMMIT_SHA", "test-build-sha")
-os.environ.setdefault("AGENT_SLACK_BOT_USER_ID", "U_ECHO_BOT")
 
 from agent.slack_convo import adapter as A  # noqa: E402
 from agent.slack_convo import identities as IDS  # noqa: E402
@@ -23,6 +18,13 @@ from tests.test_slack_convo import FakeBus, _posted  # noqa: E402
 
 MENTION = "<@U_CLIENT>"
 RESERVATION = "0640-reservation-chateau-20261009"
+
+
+@pytest.fixture(autouse=True)
+def deployment_identity(monkeypatch):
+    monkeypatch.setenv("RAILWAY_DEPLOYMENT_ID", "test-deployment")
+    monkeypatch.setenv("RAILWAY_GIT_COMMIT_SHA", "test-build-sha")
+    monkeypatch.setenv("AGENT_SLACK_BOT_USER_ID", "U_ECHO_BOT")
 
 
 def _case(bus, *, stamped=True):
