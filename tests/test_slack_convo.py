@@ -73,18 +73,28 @@ class FakeBus:
                       "paused": False, "unresolved": sum(
                           value != "completed" for value in self._support_lane_invocations.values()),
                       "drained": False, "operation_id": "test-open"}
-        elif name == "support_admission_acquire_lane":
+        elif name == "support_admission_acquire_bound":
             ident = args["p_invocation_id"]
+            ticket = self.ticket(args["p_ticket_id"])
+            message = self.message(args["p_message_id"])
             admitted = (args["p_expected_generation"] == self._support_lane_generation
-                        and ident not in self._support_lane_invocations)
+                        and ident not in self._support_lane_invocations
+                        and ticket is not None and message is not None
+                        and ticket.get("request_version") == args["p_expected_request_version"]
+                        and message.get("ticket_id") == args["p_ticket_id"]
+                        and message.get("direction") == "outbound"
+                        and message.get("delivery_request_version") == args["p_expected_request_version"])
             if admitted:
                 self._support_lane_invocations[ident] = "running"
             result = {"admitted": admitted, "lane": args["p_lane"],
-                      "invocation_id": ident, "generation": self._support_lane_generation}
+                      "invocation_id": ident, "generation": self._support_lane_generation,
+                      "ticket_id": args["p_ticket_id"],
+                      "request_version": args["p_expected_request_version"],
+                      "message_id": args["p_message_id"]}
         elif name == "support_admission_finish_lane":
             ident = args["p_invocation_id"]
             outcome = self._support_lane_invocations.get(ident)
-            # The frozen 0624 finish is idempotent for the same terminal outcome,
+            # The frozen 0633 finish is idempotent for the same terminal outcome,
             # and rejects attempts to turn unknown into completed (or vice versa).
             recorded = (outcome is not None
                         and args["p_generation"] == self._support_lane_generation
@@ -2874,7 +2884,7 @@ def test_fixer_readback_mismatch_never_posts_or_resolves_and_never_resends(monke
                                      ).isoformat()})
     third = OB.run_once(bus, post, identity=IDS.get("echo"),
                         member_check=lambda *_: True, log=lambda *_: None)
-    # Later exact Slack evidence cannot promote a frozen 0624 unknown outcome
+    # Later exact Slack evidence cannot promote a frozen 0633 unknown outcome
     # to completed. Message reconciliation preserves delivery proof and no resend,
     # while current-request closure awaits explicit reviewed reconciliation.
     assert third["resolved"] == 0

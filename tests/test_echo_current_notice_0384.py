@@ -43,7 +43,7 @@ class NoticeBus:
                           "acquire_denied": False, "finish_fails": False,
                           "finishes": [], "calls": []}
 
-    # -- portal 0624 support-resolution-send admission transport ----------------
+    # -- portal 0633 support-resolution-send admission transport ----------------
     def _client(self):
         bus = self
 
@@ -65,7 +65,7 @@ class NoticeBus:
                                     "drained": bus.admission["paused"]
                                     and bus.admission["unresolved"] == 0,
                                     "operation_id": "op-test"}
-                        if name == "support_admission_acquire_lane":
+                        if name == "support_admission_acquire_bound":
                             if bus.admission["acquire_denied"]:
                                 return {"admitted": False,
                                         "lane": "support-resolution-send",
@@ -74,7 +74,10 @@ class NoticeBus:
                             return {"admitted": True,
                                     "lane": "support-resolution-send",
                                     "invocation_id": body["p_invocation_id"],
-                                    "generation": body["p_expected_generation"]}
+                                    "generation": body["p_expected_generation"],
+                                    "ticket_id": body["p_ticket_id"],
+                                    "request_version": body["p_expected_request_version"],
+                                    "message_id": body["p_message_id"]}
                         if name == "support_admission_finish_lane":
                             bus.admission["finishes"].append(body["p_outcome"])
                             if bus.admission["finish_fails"]:
@@ -274,14 +277,14 @@ def test_single_post_binds_after_exact_readback_then_resolves():
 
 
 def test_admitted_send_records_lease_before_post_and_completion_after():
-    """The successful path: durable 0624 admission wraps the exact one POST."""
+    """The successful path: durable 0633 admission wraps the exact one POST."""
     bus = NoticeBus()
     _snapshot, result, posts = _send(bus)
     assert result.delivered and len(posts) == 1
     calls = bus.admission["calls"]
     assert calls[0] == "support_admission_status_lane"
-    assert calls.index("support_admission_acquire_lane") < bus.events.index("slack_post")
-    assert calls.index("support_admission_acquire_lane") < calls.index(
+    assert calls.index("support_admission_acquire_bound") < bus.events.index("slack_post")
+    assert calls.index("support_admission_acquire_bound") < calls.index(
         "support_admission_finish_lane")
     assert bus.admission["finishes"] == ["completed"]
     att = bus.row["attachments"]
@@ -298,7 +301,7 @@ def test_admitted_send_records_lease_before_post_and_completion_after():
 
 
 def test_paused_admission_lane_zero_posts_and_no_reservation():
-    """A paused 0624 lane refuses before reservation: no row, no notice, no POST."""
+    """A paused 0633 lane refuses before reservation: no row, no notice, no POST."""
     bus = NoticeBus()
     bus.admission["paused"] = True
     _snapshot, result, posts = _send(bus)
@@ -366,7 +369,7 @@ def test_missing_deployment_env_refuses_before_reservation(monkeypatch):
 
 
 def test_denied_acquisition_holds_uncertain_finishes_unknown_and_never_posts():
-    """A denied 0624 acquisition: zero POSTs, lease finished unknown, row held."""
+    """A denied 0633 acquisition: zero POSTs, lease finished unknown, row held."""
     bus = NoticeBus()
     bus.admission["acquire_denied"] = True
     _snapshot, result, posts = _send(bus)
@@ -435,14 +438,14 @@ def test_sender_change_after_acquisition_never_posts():
 
 @pytest.mark.parametrize("mode", ["revoked", "unreadable"])
 def test_membership_change_after_acquisition_never_posts(mode):
-    """P1 reproduction: after the 0624 acquire and the second auth.test, Blake's
+    """P1 reproduction: after the 0633 acquire and the second auth.test, Blake's
     exact channel membership is rechecked immediately before the one POST. A
     revoked or unreadable membership finishes the lease 'unknown', holds the row
     and never posts, binds or replays."""
     bus = NoticeBus()
 
     def member_check(_channel, _user):
-        if "support_admission_acquire_lane" in bus.admission["calls"]:
+        if "support_admission_acquire_bound" in bus.admission["calls"]:
             if mode == "unreadable":
                 raise RuntimeError("conversations.members unavailable")
             return False
@@ -462,7 +465,7 @@ def test_request_change_during_membership_recheck_never_posts():
     bus = NoticeBus()
 
     def member_check(_channel, _user):
-        if "support_admission_acquire_lane" in bus.admission["calls"]:
+        if "support_admission_acquire_bound" in bus.admission["calls"]:
             bus.current["request_version"] = 4
         return True
 
@@ -490,7 +493,7 @@ def _pending_route_recovery(receipt):
                            "fixer_route_pending": True, "fixer_route_uncertain": True,
                            "fixer_slack_delivery_intent": intent,
                            "delivery_expected_status": "verification"}}
-    if receipt is not None:  # admitted rows carry the durable 0624 lease
+    if receipt is not None:  # admitted rows carry the durable 0633 lease
         row["attachments"][outbox.SUPPORT_SEND_ADMISSION_KEY] = {
             "lane": outbox.SUPPORT_SEND_LANE, "invocation_id": "inv-1",
             "generation": 7, "deployment": "dep-test", "build": "build-test",
@@ -567,7 +570,7 @@ def test_pending_route_recovery_requires_confirmed_completion_receipt():
 
 @pytest.mark.parametrize("receipt", ["missing", "bad"])
 def test_pending_route_recovery_no_bind_on_unknown_or_bad_receipt(receipt):
-    """P1 reproduction: absent or unrecorded 0624 completion receipts stay held;
+    """P1 reproduction: absent or unrecorded 0633 completion receipts stay held;
     recovery never binds, promotes, resolves or resends on uncertainty."""
     finished, bus, row, summary = _pending_route_recovery(receipt)
     assert not finished and summary["resolved"] == 0
@@ -1552,7 +1555,7 @@ def test_failed_suppression_alert_insert_reconciles_from_terminal_source(monkeyp
             return True
 
         monkeypatch.setattr(bus, "claim_message", claim)
-        # These two refusal paths never reach the in-flight 0624 admission; the
+        # These two refusal paths never reach the in-flight 0633 admission; the
         # durable lane status preflight is stubbed so the real Bus needs no HTTP.
         monkeypatch.setattr(outreach, "_current_notice_admission_status",
                             lambda _bus: {"generation": 7})

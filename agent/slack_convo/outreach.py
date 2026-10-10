@@ -239,7 +239,7 @@ def _current_notice_sender_proof(ident, verifier):
 
 
 def _current_notice_admission_status(bus):
-    """Portal 0624 support-resolution-send lane status, fail closed.
+    """Portal 0633 support-resolution-send lane status, fail closed.
 
     Returns the validated status dict only when the exact Railway deployment/build
     env is present and the durable lane answers unpaused and well formed. A paused,
@@ -270,12 +270,13 @@ def _current_notice_admission_status(bus):
 
 def _admit_current_notice_send(bus, *, ticket, row, ident, sender, channel_id, text,
                                generation, verifier, readback, member_check):
-    """Portal 0624 durable admission for one initially unrouted current-notice send.
+    """Portal 0633 durable admission for one initially unrouted current-notice send.
 
     Same contract as outbox._post_support_resolution, adapted to the unrouted
-    first-contact row (0624 takes no ticket parameters; the immutable invocation id
-    is derived only from the binding persisted onto this exact claimed posting row
-    by message CAS BEFORE acquisition). The captured poster is re-authenticated
+    first-contact row. The 0633 bound acquisition revalidates the exact ticket
+    id, request version and message id inside the lane transaction; the
+    immutable invocation id is derived only from the binding persisted onto
+    this exact claimed posting row by message CAS BEFORE acquisition. The captured poster is re-authenticated
     after acquisition, before any Slack POST, and Blake's exact channel membership
     is rechecked in that same post-acquisition window: a revocation during the
     network round trips cancels the send before the one POST, never after. An
@@ -318,15 +319,20 @@ def _admit_current_notice_send(bus, *, ticket, row, ident, sender, channel_id, t
     current = _ob._support_send_cas(bus, row,
                                     meta={_ob.SUPPORT_SEND_ADMISSION_KEY: lease})
     try:
-        receipt = _ob._support_send_rpc(bus, "support_admission_acquire_lane", {
+        receipt = _ob._support_send_rpc(bus, "support_admission_acquire_bound", {
             "p_lane": _ob.SUPPORT_SEND_LANE, "p_expected_generation": generation,
             "p_invocation_id": invocation, "p_deployment": deployment,
-            "p_build": build})
+            "p_build": build, "p_ticket_id": ticket["id"],
+            "p_expected_request_version": version, "p_message_id": row["id"]})
         if (receipt.get("admitted") is not True
                 or receipt.get("lane") != _ob.SUPPORT_SEND_LANE
                 or receipt.get("invocation_id") != invocation
                 or type(receipt.get("generation")) is not int
-                or receipt["generation"] != generation):
+                or receipt["generation"] != generation
+                or receipt.get("ticket_id") != ticket["id"]
+                or type(receipt.get("request_version")) is not int
+                or receipt["request_version"] != version
+                or receipt.get("message_id") != row["id"]):
             raise _ob.SupportResolutionAdmissionError(
                 "Current notice send durable admission denied or receipt mismatch")
         if _current_notice_sender_proof(ident, verifier) != sender:
@@ -358,7 +364,7 @@ def _admit_current_notice_send(bus, *, ticket, row, ident, sender, channel_id, t
         return lease
     except Exception as exc:
         # An acquired-but-unconfirmed receipt cannot be completed by assumption.
-        # 0624 unknown remains unresolved; never retry acquisition or POST.
+        # 0633 unknown remains unresolved; never retry acquisition or POST.
         try:
             _ob._support_send_rpc(bus, "support_admission_finish_lane", {
                 "p_lane": _ob.SUPPORT_SEND_LANE, "p_invocation_id": invocation,
@@ -373,7 +379,7 @@ def _admit_current_notice_send(bus, *, ticket, row, ident, sender, channel_id, t
 
 
 def _finish_current_notice_admission(bus, lease, *, outcome):
-    """Close one acquired 0624 lease; the caller treats any failure as uncertain."""
+    """Close one acquired 0633 lease; the caller treats any failure as uncertain."""
     receipt = _ob._support_send_rpc(bus, "support_admission_finish_lane", {
         "p_lane": _ob.SUPPORT_SEND_LANE, "p_invocation_id": lease["invocation_id"],
         "p_generation": lease["generation"], "p_outcome": outcome})
@@ -514,7 +520,7 @@ def _send(ticket, who, ident, *, open_group_dm, post_first_message, record_outbo
         if not blake_is_member:
             return OutreachResult(opened=True, channel_id=channel_id,
                                   reason="blake_membership_unverified")
-        # Authenticate the exact captured poster and the durable 0624 send lane
+        # Authenticate the exact captured poster and the durable 0633 send lane
         # BEFORE anything is reserved: a wrong sender or a paused/unreachable lane
         # fails closed here with zero Slack posts and nothing to reconcile.
         notice_sender = _current_notice_sender_proof(ident, verifier)
@@ -648,7 +654,7 @@ def _send(ticket, who, ident, *, open_group_dm, post_first_message, record_outbo
         # The same designated row carries the first and only customer message.
         # Persist intent before Slack, read back the returned exact timestamp,
         # then let 0384 bind the route while the row is still posting.
-        # An acquired 0624 lease whose durable send effect was never proven
+        # An acquired 0633 lease whose durable send effect was never proven
         # completed is finished 'unknown' exactly once (mirroring
         # outbox._post_support_resolution): it never returns to the automatic
         # send queue and is never retried, whatever the failure below was.
@@ -744,7 +750,7 @@ def _send(ticket, who, ident, *, open_group_dm, post_first_message, record_outbo
                     "delivery_readback_verified") is not True:
                 return uncertain("exact Slack readback could not be persisted")
             # The durable send effect (timestamp persisted + exact readback) is
-            # complete. Close the 0624 lease and persist the confirmed completion
+            # complete. Close the 0633 lease and persist the confirmed completion
             # receipt BEFORE the route bind: a bind/promote failure then leaves a
             # held row whose receipt already proves the send, so exact recovery
             # (_finish_pending_route_notice) may finish it, while any attempt

@@ -44,7 +44,7 @@ never a truncated prefix of it). When an answer posts, its ticket is marked reso
 ticket closes when the person has the answer, not before (V-M4).
 
 A post failure marks the row 'failed' and moves on; one bad row never stalls the queue.
-Client resolution sends additionally require portal 0624 durable admission for the
+Client resolution sends additionally require portal 0633 durable admission for the
 exact Railway deployment/build. Missing, paused or uncertain admission holds the
 row. The message stores its ticket/source/version/destination/sender binding before
 acquisition; uncertain attempts never return to the automatic send queue.
@@ -150,7 +150,7 @@ def _support_resolution_row(ticket, att, kind, body):
 
 
 def _support_send_rpc(bus, name, body):
-    """Frozen portal 0624 contract. Never retry an uncertain acquisition."""
+    """Frozen portal 0633 contract. Never retry an uncertain acquisition."""
     response = bus._client().post(
         bus._rest("rpc/" + name), data=json.dumps(body),
         headers=bus._headers(), timeout=30)
@@ -324,9 +324,11 @@ def _post_support_resolution(bus, post, row, ticket, identity, body, channel,
                              member_check=None, require_member=False):
     """Admit each client resolution against the DB pause, then prove its exact send.
 
-    0624 has no ticket parameters. Its immutable invocation id is derived from
-    the binding stored by message CAS BEFORE acquisition. No local/preview
-    identity fallback and no feature flag can bypass this send boundary.
+    0633 bound acquisition revalidates the exact ticket id, request version and
+    message id inside the lane-serializing transaction. The immutable invocation
+    id is derived from the binding stored by message CAS BEFORE acquisition.
+    No local/preview identity fallback and no feature flag can bypass this
+    send boundary.
     """
     if not _support_resolution_row(ticket, att, kind, body):
         recipient = att.get("recipient_kind") or ticket.get("identity_kind") or "client"
@@ -388,12 +390,18 @@ def _post_support_resolution(bus, post, row, ticket, identity, body, channel,
                  "generation": generation, "deployment": deployment, "build": build,
                  "binding": binding, "not_before": datetime.now(timezone.utc).isoformat()}
         current = _support_send_cas(bus, current, meta={SUPPORT_SEND_ADMISSION_KEY: lease})
-        receipt = _support_send_rpc(bus, "support_admission_acquire_lane", {
+        receipt = _support_send_rpc(bus, "support_admission_acquire_bound", {
             "p_lane": SUPPORT_SEND_LANE, "p_expected_generation": generation,
-            "p_invocation_id": invocation, "p_deployment": deployment, "p_build": build})
+            "p_invocation_id": invocation, "p_deployment": deployment, "p_build": build,
+            "p_ticket_id": ticket["id"], "p_expected_request_version": version,
+            "p_message_id": row["id"]})
         if (receipt.get("admitted") is not True or receipt.get("lane") != SUPPORT_SEND_LANE
                 or receipt.get("invocation_id") != invocation
-                or type(receipt.get("generation")) is not int or receipt["generation"] != generation):
+                or type(receipt.get("generation")) is not int or receipt["generation"] != generation
+                or receipt.get("ticket_id") != ticket["id"]
+                or type(receipt.get("request_version")) is not int
+                or receipt["request_version"] != version
+                or receipt.get("message_id") != row["id"]):
             raise SupportResolutionAdmissionError("Support send durable admission denied or receipt mismatch")
         if _verify_support_post_sender(post, identity) != sender:
             raise SupportResolutionAdmissionError("Support sender changed during send admission")
@@ -440,7 +448,7 @@ def _post_support_resolution(bus, post, row, ticket, identity, body, channel,
         return ts
     except Exception as exc:
         # An acquired-but-unconfirmed receipt or POST cannot be completed by
-        # assumption. 0624 unknown remains unresolved; failed finish ACK leaves
+        # assumption. 0633 unknown remains unresolved; failed finish ACK leaves
         # a running invocation unresolved too. Never retry acquisition or POST.
         if lease:
             try:
@@ -1416,7 +1424,7 @@ def _finish_pending_route_notice(bus, row, proof, identity, log, summary):
         if not verified or (verified.get("attachments") or {}).get(
                 "delivery_readback_verified") is not True:
             return False
-        # An admitted 0624 send is closed only when its confirmed durable
+        # An admitted 0633 send is closed only when its confirmed durable
         # completion receipt was persisted before this bind (the primary path
         # records it ahead of bind_current_notice_route). Absent, unknown or
         # mismatched receipts stay held -- never bind, promote or resolve on

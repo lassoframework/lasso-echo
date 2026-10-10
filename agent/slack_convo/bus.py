@@ -878,6 +878,28 @@ class Bus:
             raise BusError(400, "support admission status malformed")
         return result
 
+    def support_admission_inventory(self, lane, *, limit=200, after_started=None,
+                                    after_invocation=None):
+        """Read-only portal 0633 paginated invocation inventory, fail closed.
+
+        Keyset cursor: (after_started, after_invocation) move together or not at
+        all. Never retries; callers validate every page field before trusting it.
+        """
+        if (after_started is None) != (after_invocation is None):
+            raise BusError(400, "support admission inventory cursor malformed")
+        body = {"p_lane": lane, "p_limit": int(limit),
+                "p_after_started": after_started,
+                "p_after_invocation": after_invocation}
+        r = self._client().post(self._rest("rpc/support_admission_inventory"),
+                                data=json.dumps(body),
+                                headers=self._headers(), timeout=30)
+        if r.status_code >= 400:
+            raise BusError(r.status_code, "support admission inventory unavailable")
+        result = r.json()
+        if not isinstance(result, dict):
+            raise BusError(400, "support admission inventory malformed")
+        return result
+
     def outbox(self, status="ready", limit=50, identity=None):
         """Outbound rows in one delivery state, oldest first. `identity` narrows to rows this
         bot wrote (attachments.identity), so two identities' loops never read each other's

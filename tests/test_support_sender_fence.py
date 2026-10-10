@@ -12,6 +12,8 @@ from agent import echo_ticket_worker
 
 LANE_STATUS = {"lane": "support-resolution-send", "generation": 1, "unresolved": 0,
                "paused": True, "drained": True, "operation_id": "op-test"}
+CLOSE_STATUS = {"lane": "support-ticket-close", "generation": 1, "unresolved": 0,
+                "paused": True, "drained": True, "operation_id": "op-test-close"}
 
 BODY = "Update from the LASSO team: this one is handled."
 BODY_SHA = hashlib.sha256(BODY.encode()).hexdigest()
@@ -32,6 +34,19 @@ READBACK = {"delivery_readback_verified": True, "delivery_readback_channel": "C-
             "delivery_readback_request_version": 3}
 
 
+def _status_for(lane):
+    return dict(LANE_STATUS if lane == "support-resolution-send" else CLOSE_STATUS)
+
+
+def empty_page(lane):
+    status = _status_for(lane)
+    return {"lane": lane, "generation": status["generation"],
+            "operation_id": status["operation_id"], "paused": True,
+            "limit": fence._INVENTORY_PAGE, "returned": 0, "has_more": False,
+            "next_after_started": None, "next_after_invocation": None,
+            "invocations": []}
+
+
 class Bus:
     def support_uncertain_outbound(self, limit=1000):
         return []
@@ -39,8 +54,12 @@ class Bus:
     def outbox(self, status, limit):
         return []
 
-    def support_admission_status_lane(self):
-        return dict(LANE_STATUS)
+    def support_admission_status_lane(self, lane="support-resolution-send"):
+        return _status_for(lane)
+
+    def support_admission_inventory(self, lane, *, limit, after_started=None,
+                                    after_invocation=None):
+        return empty_page(lane)
 
 
 def pause(monkeypatch, tmp_path):
@@ -100,8 +119,7 @@ def test_waits_for_admitted_send(monkeypatch, tmp_path):
     release.set()
     thread.join(2)
     receipt = fence.receipt(Bus())
-    assert not receipt['local_drained']
-    assert 'admission_inventory_unverified' in receipt['blockers']
+    assert receipt['local_drained'] and receipt['blockers'] == []
     assert not receipt['fleet_drained']
     assert receipt['generation'] == '0619-test'
 
@@ -142,15 +160,17 @@ def test_malformed_held_scan_never_acknowledges_drain(monkeypatch, tmp_path, row
     assert 'held_row_malformed' in receipt['blockers']
 
 
-def test_valid_ordinary_held_row_still_lacks_invocation_inventory(monkeypatch, tmp_path):
+def test_valid_ordinary_held_row_drains_with_verified_empty_inventory(
+        monkeypatch, tmp_path):
     pause(monkeypatch, tmp_path)
     class Held(Bus):
         def outbox(self, status, limit):
             return [{'id': 'held-row', 'direction': 'outbound', 'delivery_status': 'held',
                      'attachments': {}}] if status == 'held' else []
     receipt = fence.receipt(Held())
-    assert not receipt['local_drained']
-    assert 'admission_inventory_unverified' in receipt['blockers']
+    assert receipt['blockers'] == []
+    assert receipt['local_drained']
+    assert receipt['fleet_drained'] is False
 
 
 @pytest.mark.parametrize('identity', ['echo', 'scout'])
@@ -165,6 +185,13 @@ def test_portal_only_paused_polls_emit_live_process_receipt(monkeypatch, tmp_pat
         def outbox(self, status, limit):
             self.reads.append((status, limit))
             return []
+        def support_uncertain_outbound(self, limit=1000):
+            return []
+        def support_admission_status_lane(self, lane="support-resolution-send"):
+            return _status_for(lane)
+        def support_admission_inventory(self, lane, *, limit, after_started=None,
+                                        after_invocation=None):
+            return empty_page(lane)
         def __getattr__(self, name):
             raise AssertionError(f'paused poll attempted {name}')
     bus = ReadOnlyBus()
@@ -186,8 +213,8 @@ def test_portal_only_paused_polls_emit_live_process_receipt(monkeypatch, tmp_pat
     assert observed['deployed_sha'] == 'test-sha'
     assert observed['observed_at']
     assert observed['active'] == {}
-    assert not observed['local_drained']
-    assert 'admission_inventory_unverified' in observed['blockers']
+    assert observed['local_drained']
+    assert observed['blockers'] == []
     assert observed['fleet_drained'] is False
 
 
@@ -202,9 +229,10 @@ def test_receipt_emits_after_admitted_pass_finishes(monkeypatch, tmp_path):
         return {'processed': 1}
     assert running_pass(Bus(), log=lines.append) == {'processed': 1}
     observed = json.loads(lines[0].removeprefix('[support-sender-fence] '))
-    assert not observed['local_drained']
-    assert 'admission_inventory_unverified' in observed['blockers']
+    assert observed['local_drained']
+    assert observed['blockers'] == []
     assert observed['active'] == {}
+    assert observed['fleet_drained'] is False
 
 
 def _fence_pass_decorator():
@@ -396,43 +424,46 @@ def test_invalid_admission_lane_status_blocks_drain(monkeypatch, tmp_path,
                                                     status_override):
     pause(monkeypatch, tmp_path)
     class LaneBus(Bus):
-        def support_admission_status_lane(self):
-            return {**LANE_STATUS, **status_override}
+        def support_admission_status_lane(self, lane="support-resolution-send"):
+            return {**_status_for(lane), **status_override}
     receipt = fence.receipt(LaneBus())
     assert not receipt['local_drained']
-    assert 'admission_lane_invalid' in receipt['blockers']
+    assert any(blocker.startswith('admission_lane_invalid:')
+               for blocker in receipt['blockers'])
 
 
 @pytest.mark.parametrize('bad_status', [None, [], 'ok', {'paused': True}])
 def test_malformed_admission_lane_status_blocks_drain(monkeypatch, tmp_path, bad_status):
     pause(monkeypatch, tmp_path)
     class LaneBus(Bus):
-        def support_admission_status_lane(self):
+        def support_admission_status_lane(self, lane="support-resolution-send"):
             return bad_status
     receipt = fence.receipt(LaneBus())
     assert not receipt['local_drained']
-    assert 'admission_lane_invalid' in receipt['blockers']
+    assert any(blocker.startswith('admission_lane_invalid:')
+               for blocker in receipt['blockers'])
 
 
 def test_admission_lane_change_during_scans_blocks_drain(monkeypatch, tmp_path):
     pause(monkeypatch, tmp_path)
     class LaneBus(Bus):
         calls = 0
-        def support_admission_status_lane(self):
+        def support_admission_status_lane(self, lane="support-resolution-send"):
             type(self).calls += 1
-            status = dict(LANE_STATUS)
+            status = _status_for(lane)
             if type(self).calls > 1:
                 status['operation_id'] = 'op-next'
             return status
     receipt = fence.receipt(LaneBus())
     assert not receipt['local_drained']
-    assert 'admission_lane_changed' in receipt['blockers']
+    assert any(blocker.startswith('admission_lane_changed:')
+               for blocker in receipt['blockers'])
 
 
 def test_unavailable_admission_lane_blocks_drain(monkeypatch, tmp_path):
     pause(monkeypatch, tmp_path)
     class LaneBus(Bus):
-        def support_admission_status_lane(self):
+        def support_admission_status_lane(self, lane="support-resolution-send"):
             raise RuntimeError('rpc unavailable')
     assert not fence.receipt(LaneBus())['local_drained']
     class NoLane(Bus):
@@ -454,14 +485,15 @@ def test_completed_admission_row_fails_closed_pending_external_verification(
             in receipt['blockers'])
 
 
-def test_no_admission_zero_unresolved_still_lacks_inventory(monkeypatch, tmp_path):
+def test_no_admission_zero_invocation_inventory_drains(monkeypatch, tmp_path):
     pause(monkeypatch, tmp_path)
     class PlainBus(Bus):
         def support_uncertain_outbound(self, limit=1000):
             return [_admission_row()]
     receipt = fence.receipt(PlainBus())
-    assert 'admission_inventory_unverified' in receipt['blockers']
-    assert not receipt['local_drained']
+    assert receipt['blockers'] == []
+    assert receipt['local_drained']
+    assert receipt['fleet_drained'] is False
 
 
 def test_current_notice_flat_verified_readback_still_fails_closed(
@@ -590,3 +622,287 @@ def test_untrusted_completion_receipt_blocks_drain(monkeypatch, tmp_path, comple
                                    completion=completion, readback=dict(READBACK))]
     receipt = fence.receipt(AdmissionBus())
     assert not receipt['local_drained'], completion
+
+
+# ---- portal 0633 paginated invocation inventory verification -------------------
+
+INV_A = '11111111-1111-4111-8111-111111111111'
+INV_B = '11111111-1111-4111-8111-111111111112'
+MSG_A = '22222222-2222-4222-8222-222222222222'
+TICKET_A = '33333333-3333-4333-8333-333333333333'
+
+
+def _invocation(inv_id=INV_A, *, lane='support-resolution-send', outcome='completed',
+                unresolved=False, started='2026-10-10 00:00:00+00',
+                ended='2026-10-10 00:00:01+00', generation=1,
+                ticket_id=TICKET_A, request_version=3, message_id=MSG_A):
+    return {'invocation_id': inv_id, 'lane': lane, 'generation': generation,
+            'deployment': 'dep-1', 'build': 'sha-1', 'started_at': started,
+            'ended_at': ended, 'outcome': outcome, 'unresolved': unresolved,
+            'ticket_id': ticket_id, 'request_version': request_version,
+            'message_id': message_id}
+
+
+def _page(lane, rows, *, has_more=False, **overrides):
+    status = _status_for(lane)
+    page = {'lane': lane, 'generation': status['generation'],
+            'operation_id': status['operation_id'], 'paused': True,
+            'limit': fence._INVENTORY_PAGE, 'returned': len(rows),
+            'has_more': has_more,
+            'next_after_started': rows[-1]['started_at'] if rows else None,
+            'next_after_invocation': rows[-1]['invocation_id'] if rows else None,
+            'invocations': rows}
+    page.update(overrides)
+    return page
+
+
+class InventoryBus(Bus):
+    """Serves fixed send-lane inventory pages; the close lane stays empty."""
+    pages = ()
+
+    def __init__(self):
+        self.calls = []
+
+    def support_admission_inventory(self, lane, *, limit, after_started=None,
+                                    after_invocation=None):
+        self.calls.append((lane, after_started, after_invocation))
+        if lane != 'support-resolution-send':
+            return empty_page(lane)
+        index = 0
+        if after_started is not None:
+            index = 1 + next(i for i, page in enumerate(self.pages)
+                             if page['invocations']
+                             and (page['invocations'][-1]['started_at'],
+                                  page['invocations'][-1]['invocation_id'])
+                             == (after_started, after_invocation))
+        return self.pages[index]
+
+
+def _verified_message(**overrides):
+    row = {'id': MSG_A, 'ticket_id': TICKET_A, 'direction': 'outbound',
+           'body': BODY, 'delivery_status': 'posted', 'delivery_request_version': 3,
+           'slack_ts': '1700.000002',
+           'attachments': {'support_resolution_send_readback': dict(READBACK)}}
+    row.update(overrides)
+    return row
+
+
+def test_paginated_completed_send_inventory_requires_external_proof(
+        monkeypatch, tmp_path):
+    pause(monkeypatch, tmp_path)
+    monkeypatch.setattr(fence, '_INVENTORY_PAGE', 1)
+    first = _invocation(INV_A, started='2026-10-10 00:00:00+00')
+    second = _invocation(INV_B, started='2026-10-10 00:00:02+00',
+                         message_id=MSG_A)
+    class Paged(InventoryBus):
+        pages = (_page('support-resolution-send', [first], has_more=True),
+                 _page('support-resolution-send', [second]))
+        def message(self, message_id):
+            assert message_id == MSG_A
+            return _verified_message()
+    bus = Paged()
+    receipt = fence.receipt(bus)
+    assert not receipt['local_drained']
+    assert f'admission_external_verification_required:{MSG_A}' in receipt['blockers']
+    assert receipt['fleet_drained'] is False
+    assert bus.calls == [('support-resolution-send', None, None),
+                         ('support-resolution-send', '2026-10-10 00:00:00+00', INV_A),
+                         ('support-ticket-close', None, None)]
+
+
+def test_stripped_marker_and_forged_stored_readback_cannot_clear_drain(
+        monkeypatch, tmp_path):
+    pause(monkeypatch, tmp_path)
+    class Forged(InventoryBus):
+        pages = (_page('support-resolution-send', [_invocation()]),)
+        def message(self, message_id):
+            row = _verified_message()
+            # No admission marker remains. The mutable proof appears valid.
+            assert 'support_resolution_send_admission' not in row['attachments']
+            return row
+    receipt = fence.receipt(Forged())
+    assert not receipt['local_drained']
+    assert f'admission_external_verification_required:{MSG_A}' in receipt['blockers']
+
+
+def test_first_lane_resume_during_second_lane_scan_blocks_drain(
+        monkeypatch, tmp_path):
+    pause(monkeypatch, tmp_path)
+    class Changed(Bus):
+        changed = False
+        def support_admission_status_lane(self, lane='support-resolution-send'):
+            status = _status_for(lane)
+            if lane == 'support-resolution-send' and self.changed:
+                status['paused'] = False
+                status['drained'] = False
+            return status
+        def support_admission_inventory(self, lane, *, limit,
+                                        after_started=None, after_invocation=None):
+            if lane == 'support-ticket-close':
+                self.changed = True
+            return empty_page(lane)
+    receipt = fence.receipt(Changed())
+    assert not receipt['local_drained']
+    assert 'admission_lane_changed:support-resolution-send' in receipt['blockers']
+
+
+@pytest.mark.parametrize('override', [
+    {'limit': 50},                                     # page size mismatch
+    {'returned': 0},                                   # returned count mismatch
+    {'returned': 2},
+    {'has_more': 'yes'},                               # non-boolean has_more
+    {'has_more': True, 'next_after_started': None},    # cursor dropped
+    {'next_after_invocation': INV_B},                  # cursor past last item
+    {'lane': 'support-ticket-close'},                  # wrong lane echoed
+    {'generation': True},                              # bool is not generation 1
+    {'generation': 2},                                 # generation changed mid-scan
+    {'operation_id': 'op-other'},                      # operation changed mid-scan
+    {'paused': False},                                 # lane resumed mid-scan
+])
+def test_tampered_inventory_page_blocks_drain(monkeypatch, tmp_path, override):
+    pause(monkeypatch, tmp_path)
+    malformed_page = _page('support-resolution-send', [_invocation()])
+    malformed_page.update(override)
+    class Tampered(InventoryBus):
+        pages = (malformed_page,)
+        def message(self, message_id):
+            return _verified_message()
+    receipt = fence.receipt(Tampered())
+    assert not receipt['local_drained'], override
+    assert 'admission_inventory_malformed:support-resolution-send' in receipt['blockers']
+
+
+@pytest.mark.parametrize('rows', [
+    [_invocation(INV_B, started='2026-10-10 00:00:00+00'),
+     _invocation(INV_A, started='2026-10-10 00:00:00+00')],   # order not unique-increasing
+    [_invocation(INV_A, started='2026-10-10 00:00:00+00'),
+     _invocation(INV_A, started='2026-10-10 00:00:00+00')],   # duplicate key
+    [_invocation(INV_A, started='2026-10-10 00:00:00+00'),
+     _invocation(INV_A, started='2026-10-10 00:00:02+00')],   # duplicate id
+    [_invocation('not-a-uuid')],                              # malformed invocation id
+    [{**_invocation(), 'lane': 'support-ticket-close'}],      # wrong lane item
+])
+def test_inventory_ordering_and_identity_defects_block_drain(
+        monkeypatch, tmp_path, rows):
+    pause(monkeypatch, tmp_path)
+    class BadRows(InventoryBus):
+        pages = (_page('support-resolution-send', rows),)
+        def message(self, message_id):
+            return _verified_message()
+    receipt = fence.receipt(BadRows())
+    assert not receipt['local_drained']
+    assert 'admission_inventory_malformed:support-resolution-send' in receipt['blockers']
+
+
+def test_completed_send_with_missing_message_blocks_drain(monkeypatch, tmp_path):
+    pause(monkeypatch, tmp_path)
+    class Missing(InventoryBus):
+        pages = (_page('support-resolution-send', [_invocation()]),)
+        def message(self, message_id):
+            return None
+    receipt = fence.receipt(Missing())
+    assert not receipt['local_drained']
+    assert f'admission_completed_unverified:{INV_A}' in receipt['blockers']
+
+
+@pytest.mark.parametrize('override', [
+    {'ticket_id': '33333333-3333-4333-8333-333333333334'},
+    {'delivery_request_version': 4},
+    {'body': 'tampered body'},
+    {'slack_ts': None},
+    {'slack_ts': '1700.999999'},                          # readback ts mismatch
+    {'attachments': {'support_resolution_send_readback':
+                     {**READBACK, 'delivery_readback_verified': False}}},
+    {'attachments': {}},                                  # readback proof missing
+])
+def test_completed_send_message_or_readback_mismatch_blocks_drain(
+        monkeypatch, tmp_path, override):
+    pause(monkeypatch, tmp_path)
+    class Mismatch(InventoryBus):
+        pages = (_page('support-resolution-send', [_invocation()]),)
+        def message(self, message_id):
+            return _verified_message(**override)
+    receipt = fence.receipt(Mismatch())
+    assert not receipt['local_drained'], override
+    assert f'admission_completed_unverified:{INV_A}' in receipt['blockers']
+
+
+@pytest.mark.parametrize('outcome,unresolved,ended,prefix', [
+    ('running', True, None, 'admission_running:'),
+    ('unknown', True, '2026-10-10 00:00:01+00', 'admission_unknown:'),
+])
+def test_unresolved_inventory_invocation_blocks_drain(
+        monkeypatch, tmp_path, outcome, unresolved, ended, prefix):
+    pause(monkeypatch, tmp_path)
+    row = _invocation(outcome=outcome, unresolved=unresolved, ended=ended)
+    class Unresolved(InventoryBus):
+        pages = (_page('support-resolution-send', [row]),)
+    receipt = fence.receipt(Unresolved())
+    assert not receipt['local_drained']
+    assert any(blocker.startswith(prefix) for blocker in receipt['blockers'])
+
+
+def test_legacy_unbound_completed_invocation_blocks_drain(monkeypatch, tmp_path):
+    pause(monkeypatch, tmp_path)
+    row = _invocation(ticket_id=None, request_version=None, message_id=None)
+    class Legacy(InventoryBus):
+        pages = (_page('support-resolution-send', [row]),)
+    receipt = fence.receipt(Legacy())
+    assert not receipt['local_drained']
+    assert f'admission_legacy_unbound:support-resolution-send:{INV_A}' in receipt['blockers']
+
+
+def test_close_lane_completed_invocation_fails_closed(monkeypatch, tmp_path):
+    pause(monkeypatch, tmp_path)
+    row = _invocation(lane='support-ticket-close')
+    class CloseHistory(Bus):
+        def support_admission_inventory(self, lane, *, limit, after_started=None,
+                                        after_invocation=None):
+            if lane == 'support-ticket-close':
+                return _page(lane, [row])
+            return empty_page(lane)
+    receipt = fence.receipt(CloseHistory())
+    assert not receipt['local_drained']
+    assert f'admission_close_unverified:support-ticket-close:{INV_A}' in receipt['blockers']
+
+
+def test_close_lane_unresolved_invocation_blocks_drain(monkeypatch, tmp_path):
+    pause(monkeypatch, tmp_path)
+    row = _invocation(lane='support-ticket-close', outcome='unknown',
+                      unresolved=True, ticket_id=TICKET_A, request_version=3,
+                      message_id=MSG_A)
+    class CloseUnknown(Bus):
+        def support_admission_inventory(self, lane, *, limit, after_started=None,
+                                        after_invocation=None):
+            if lane == 'support-ticket-close':
+                return _page(lane, [row])
+            return empty_page(lane)
+    receipt = fence.receipt(CloseUnknown())
+    assert not receipt['local_drained']
+    assert any(blocker.startswith('admission_unknown:support-ticket-close:')
+               for blocker in receipt['blockers'])
+
+
+def test_unavailable_inventory_rpc_blocks_drain(monkeypatch, tmp_path):
+    pause(monkeypatch, tmp_path)
+    class NoInventory(Bus):
+        support_admission_inventory = None
+    receipt = fence.receipt(NoInventory())
+    assert not receipt['local_drained']
+    assert 'admission_inventory_unavailable:support-resolution-send' in receipt['blockers']
+    class Failing(Bus):
+        def support_admission_inventory(self, lane, *, limit, after_started=None,
+                                        after_invocation=None):
+            raise RuntimeError('rpc unavailable')
+    receipt = fence.receipt(Failing())
+    assert not receipt['local_drained']
+    assert any(blocker.startswith('admission_inventory_read:')
+               for blocker in receipt['blockers'])
+
+
+def test_verified_inventory_never_sets_fleet_drain(monkeypatch, tmp_path):
+    # No process-local evidence, however complete, may assert a fleet-wide drain.
+    pause(monkeypatch, tmp_path)
+    receipt = fence.receipt(Bus())
+    assert receipt['local_drained'] and receipt['blockers'] == []
+    assert receipt['fleet_drained'] is False
