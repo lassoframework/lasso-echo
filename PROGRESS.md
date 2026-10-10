@@ -4945,3 +4945,9 @@ SQLite source approval labels and palette JSON notes do not establish that
 provenance. Exact inspected paths and required receipt bindings are recorded in
 `docs/GENERATED_INFOGRAPHIC_RUNTIME_20261007.md`. No owner rewrite or activation
 was attempted; the previously verified missing-pin publisher hold remains.
+
+## Gym website palette authority install (2026-10-10, release held)
+
+- [~] Added a container-side, stdin-only installer for an operator-reviewed gym website mapping. It stages private bytes, validates with the production loader, atomically replaces the authority file, and prepares the private capture journal directory. Capture and publishing gates remain OFF.
+- [x] Focused local verification: 53 tests passed across installer, startup, and gym palette bundle; independent reviewer found and rechecked fixes for CLI argument and pre-replacement safety defects. This is offline evidence only.
+- [ ] Production collector service deployment is still held by the rejected Railway approval action. After exact approval, install the reviewed mapping on its private volume, perform one allowlisted Swift River capture, verify the active website palette bundle and infographic consumer, then expand only to gyms with verified website identity and approval receipts. No live palette capture is claimed here.
