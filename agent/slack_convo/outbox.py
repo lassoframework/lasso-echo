@@ -321,7 +321,8 @@ def _hold_support_send(bus, row, reason, log):
 
 def _post_support_resolution(bus, post, row, ticket, identity, body, channel,
                              thread_ts, readback, *, kind, att,
-                             member_check=None, require_member=False):
+                             member_check=None, require_member=False,
+                             pre_post_check=None):
     """Admit each client resolution against the DB pause, then prove its exact send.
 
     0624 has no ticket parameters. Its immutable invocation id is derived from
@@ -417,6 +418,20 @@ def _post_support_resolution(bus, post, row, ticket, identity, body, channel,
                     not _recipient_armed(identity, att.get("recipient_kind") or ticket.get("identity_kind") or "client")
                     or kind == _a.KIND_ANSWER and not config.slack_convo_auto_answer_armed(identity.name)))):
             raise SupportResolutionAdmissionError("Support send ticket, sender or release changed after admission")
+        if pre_post_check is not None:
+            # Portal 0640 historical receipt boundary: runs AFTER admission and
+            # its latest ticket/message snapshot, immediately before POST. A
+            # missing, faulting or dissenting check fails closed.
+            try:
+                allowed = callable(pre_post_check) and pre_post_check(
+                    latest_ticket, latest, sender)
+            except SupportResolutionAdmissionError:
+                raise
+            except Exception:  # noqa: BLE001 - a validator fault is never admission
+                allowed = False
+            if not allowed:
+                raise SupportResolutionAdmissionError(
+                    "Support send pre-POST historical receipt validation failed")
         ts = post(channel, body, thread_ts=thread_ts, blocks=None)
         if not isinstance(ts, str) or not ts:
             raise SupportResolutionAdmissionError("Support Slack timestamp unconfirmed")
@@ -1031,6 +1046,127 @@ def _fresh_fixer_request(bus, ticket, att, *, body="", require_direct_answer=Fal
     if require_direct_answer and not _direct_answerable_question(fresh, body):
         return None
     return fresh
+
+
+_HISTORICAL_RECEIPT_CLASSIFICATIONS = frozenset(
+    {"answerable_question", "code_fix", "ops_fix", "action_request"})
+HISTORICAL_PRECLOSE_BODY = (
+    '<@{recipient}> We independently verified {scope} in production. '
+    'We are confirming delivery of this update before closing the ticket.')
+
+
+def _historical_receipt_candidate(att, kind):
+    """Only a row explicitly stamped for portal 0640 historical receipt recovery.
+
+    This marker never applies to ordinary FIXER notices: those still require
+    _verified_fix_notice and its current merged/verified evidence."""
+    return (kind == _a.KIND_STATUS
+            and (att or {}).get("fixer") is True
+            and (att or {}).get("resolve_notice") is True
+            and (att or {}).get("historical_receipt_recovery") is True)
+
+
+def _historical_receipt_state(ticket):
+    """Resolved, eligible, unheld ticket state for a 0640 historical receipt."""
+    return (isinstance(ticket, dict)
+            and ticket.get("status") == "resolved"
+            and str(ticket.get("classification") or "").lower()
+                in _HISTORICAL_RECEIPT_CLASSIFICATIONS
+            and ticket.get("escalated") is False
+            and ticket.get("hold_tier") is None
+            and ticket.get("identity_kind") in (None, "client")
+            and not (ticket.get("verification_after") or {}).get("hold"))
+
+
+def _historical_receipt_fresh_request(bus, ticket, att, row):
+    """Bind a historical receipt to its reserved notice, body and CURRENT request.
+
+    The stamped request key is recomputed from the full inbound transcript via
+    _fresh_fixer_request, so a requester change at the same request version
+    fails closed. Its exact reviewed scope and requester mention cannot drift
+    from the stamped SHA256 or be replaced with an early closure claim."""
+    body = (row or {}).get("body") or ""
+    stamped_sha = (att or {}).get("historical_receipt_body_sha256")
+    scope = (att or {}).get("historical_receipt_verified_scope")
+    recipient = (ticket or {}).get("slack_user_id") if isinstance(ticket, dict) else None
+    if (not isinstance(stamped_sha, str)
+            or not re.fullmatch(r"[0-9a-f]{64}", stamped_sha)
+            or hashlib.sha256(body.encode("utf-8")).hexdigest() != stamped_sha
+            or not isinstance(scope, str)
+            or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9 ,/&()\-]{4,149}', scope)
+            or re.search(r'\b(?:clos(?:e|ed|ing)|ticket|published|delivered)\b', scope, re.I)
+            or not isinstance(recipient, str) or not recipient
+            or body != HISTORICAL_PRECLOSE_BODY.format(recipient=recipient, scope=scope)):
+        return None
+    notice_id = (att or {}).get("historical_receipt_notice_id")
+    reservation = (att or {}).get("historical_receipt_reservation")
+    if (not isinstance(notice_id, str) or not notice_id
+            or notice_id != str((row or {}).get("id") or "")
+            or not isinstance(reservation, str) or not reservation.strip()):
+        return None
+    if not _historical_receipt_state(ticket):
+        return None
+    if (att.get("delivery_identity_fence") is not True
+            or att.get("recipient_kind") != "client"
+            or row.get("author_type") != ticket.get("bot_identity")
+            or type(row.get("delivery_request_version")) is not int
+            or row["delivery_request_version"] != ticket.get("request_version")
+            or att.get("request_version") != ticket.get("request_version")
+            or not isinstance(att.get("request_key"), str)
+            or not att["request_key"]):
+        return None
+    expected_fields = {
+        "delivery_expected_source": ticket.get("source"),
+        "delivery_expected_product": ticket.get("product"),
+        "delivery_expected_client_id": ticket.get("client_id"),
+        "delivery_expected_status": "resolved",
+        "delivery_expected_classification": ticket.get("classification"),
+        "delivery_expected_bot_identity": ticket.get("bot_identity"),
+        "delivery_expected_slack_user_id": ticket.get("slack_user_id"),
+        "delivery_expected_slack_channel_id": ticket.get("slack_channel_id"),
+        "delivery_expected_slack_thread_ts": ticket.get("slack_thread_ts"),
+    }
+    if any(field not in att or att[field] != value
+           for field, value in expected_fields.items()):
+        return None
+    fresh = _fresh_fixer_request(bus, ticket, att)
+    if not _historical_receipt_state(fresh):
+        return None
+    return fresh
+
+
+def _historical_receipt_dispatch_validated(bus, row, ticket, att, intent):
+    """Service-role 0640 validation immediately before the Slack POST.
+
+    The portal RPC may not be wired yet; a missing, faulting or disagreeing
+    validator fails closed and the row is held, never posted."""
+    validator = getattr(bus, "fixer_validate_historical_receipt_dispatch", None)
+    if not callable(validator):
+        return False
+    body = (intent or {}).get("body") or ""
+    payload = {
+        "notice_id": (row or {}).get("id"),
+        "reservation": (att or {}).get("historical_receipt_reservation"),
+        "ticket_id": (ticket or {}).get("id"),
+        "request_key": (att or {}).get("request_key"),
+        "request_version": (att or {}).get("request_version"),
+        "body_sha256": hashlib.sha256(body.encode("utf-8")).hexdigest(),
+        "source": (ticket or {}).get("source"),
+        "product": (ticket or {}).get("product"),
+        "client_id": (ticket or {}).get("client_id"),
+        "bot_identity": (ticket or {}).get("bot_identity"),
+        "slack_user_id": (ticket or {}).get("slack_user_id"),
+        "channel": (intent or {}).get("channel"),
+        "thread_ts": (intent or {}).get("thread_ts"),
+        "sender": (intent or {}).get("sender"),
+    }
+    try:
+        result = validator(payload)
+    except Exception:  # noqa: BLE001 - a validator fault is never admission
+        return False
+    return (isinstance(result, dict) and result.get("ok") is True
+            and result.get("notice_id") == payload["notice_id"]
+            and result.get("reservation") == payload["reservation"])
 
 
 def _fresh_portal_progress(bus, ticket, row, identity):
@@ -2263,8 +2399,10 @@ def _blake_is_member(identity, channel, user):
 
 @_fence.guarded("outbox", lambda: {"paused": 1})
 def run_once(bus, post, *, identity, log=print, limit=50, now=None,
-             member_check=None, readback=None):
+             member_check=None, readback=None, exact_message_id=None):
     """Process up to `limit` ready rows for THIS identity.
+    With exact_message_id, read only that ready historical receipt row;
+    skip all queue scans, recovery and reporting. Normal dispatch gates apply.
     post(channel, text, thread_ts=None, blocks=None) -> slack ts.
     Returns a summary dict. Never raises out of the loop."""
     summary = {"posted": 0, "held": 0, "suppressed": 0, "failed": 0, "skipped": 0,
@@ -2273,29 +2411,49 @@ def run_once(bus, post, *, identity, log=print, limit=50, now=None,
     readback = readback or getattr(post, "readback", None)
     member_check = member_check or (lambda channel, user: _blake_is_member(
         identity, channel, user))
-    summary["reclaimed"] = _recover_stale_claims(
-        bus, identity, log, now=now, readback=readback, summary=summary)
-    _report_suppressed_current_notices(bus, identity, log)
-    _report_uncertain_outreach(bus, identity, log)
-    _reconcile_held_fixer(bus, identity, readback, log, summary)
-    route_requeued = _recover_route_missing_fixer(
-        bus, identity, member_check, log, now=now)
-    summary["reclaimed"] += route_requeued
-    summary["requeued_ready"] += route_requeued
-    config_requeued = _recover_config_missing_fixer(
-        bus, identity, readback, log, now=now)
-    summary["reclaimed"] += config_requeued
-    summary["requeued_ready"] += config_requeued
-    _report_uncertain_fixer(bus, identity, log, now=now)
-    _reconcile_posted_fixer(bus, identity, log, summary)
-    _reconcile_held_scan_reminders(bus, identity, readback, log, summary)
-    try:
-        rows = bus.outbox("ready", limit=limit, identity=identity.name)
-    except TypeError:  # a bus without the identity filter (older fakes)
-        rows = bus.outbox("ready", limit=limit)
-    except Exception as e:  # noqa: BLE001
-        log(f"[slack-convo/outbox] read failed: {type(e).__name__}")
-        return summary
+    if exact_message_id is not None:
+        try:
+            row = bus.message(exact_message_id)
+        except Exception as exc:  # noqa: BLE001 - exact read must fail closed
+            log(f"[slack-convo/outbox] exact read failed: {type(exc).__name__}")
+            summary["skipped"] += 1
+            return summary
+        if (not isinstance(row, dict)
+                or row.get("id") != exact_message_id
+                or row.get("delivery_status") != "ready"
+                or row.get("direction") != "outbound"
+                or not isinstance(row.get("attachments"), dict)
+                or row["attachments"].get("identity") != identity.name
+                or row["attachments"].get("historical_receipt_recovery") is not True
+                or row.get("author_type") != identity.name):
+            log("[slack-convo/outbox] exact dispatch refused: row missing or ineligible")
+            summary["skipped"] += 1
+            return summary
+        rows = [row]
+    else:
+        summary["reclaimed"] = _recover_stale_claims(
+            bus, identity, log, now=now, readback=readback, summary=summary)
+        _report_suppressed_current_notices(bus, identity, log)
+        _report_uncertain_outreach(bus, identity, log)
+        _reconcile_held_fixer(bus, identity, readback, log, summary)
+        route_requeued = _recover_route_missing_fixer(
+            bus, identity, member_check, log, now=now)
+        summary["reclaimed"] += route_requeued
+        summary["requeued_ready"] += route_requeued
+        config_requeued = _recover_config_missing_fixer(
+            bus, identity, readback, log, now=now)
+        summary["reclaimed"] += config_requeued
+        summary["requeued_ready"] += config_requeued
+        _report_uncertain_fixer(bus, identity, log, now=now)
+        _reconcile_posted_fixer(bus, identity, log, summary)
+        _reconcile_held_scan_reminders(bus, identity, readback, log, summary)
+        try:
+            rows = bus.outbox("ready", limit=limit, identity=identity.name)
+        except TypeError:  # a bus without the identity filter (older fakes)
+            rows = bus.outbox("ready", limit=limit)
+        except Exception as e:  # noqa: BLE001
+            log(f"[slack-convo/outbox] read failed: {type(e).__name__}")
+            return summary
     for row in rows:
         try:
             _dispatch_one(bus, post, row, identity=identity, log=log, summary=summary,
@@ -3031,7 +3189,31 @@ def _dispatch_one(bus, post, row, *, identity, log, summary, now=None,
                     and _customer_fix_reply(ticket, att, row.get("body") or ""))
     fixer_grounded_answer = _fixer_grounded_question_answer(
         ticket, att, kind, row.get("body") or "")
-    if customer_fix:
+    historical_receipt = (not portal_progress
+                          and _historical_receipt_candidate(att, kind))
+    if historical_receipt:
+        # An already-resolved ticket can never satisfy _verified_fix_notice;
+        # its only admission is the portal 0640 reservation stamped on this
+        # exact row, rebound here against the current requester transcript.
+        fresh_request = _historical_receipt_fresh_request(bus, ticket, att, row)
+        if not fresh_request:
+            _suppress(bus, row, ticket, identity,
+                      "historical receipt recovery no longer matches its reserved "
+                      "resolved request", log, summary)
+            return
+        ticket = fresh_request
+    elif (not portal_progress and kind == _a.KIND_STATUS
+            and att.get("resolve_notice") is True
+            and (ticket or {}).get("status") == "resolved"):
+        # An already-resolved ticket's resolution notice is admissible ONLY as a
+        # portal 0640 historical receipt with its exact reservation. An ordinary
+        # resolved status notice has no live resolution to announce; it is
+        # rejected rather than re-notifying the client.
+        _suppress(bus, row, ticket, identity,
+                  "resolved ticket status notice has no historical receipt "
+                  "reservation", log, summary)
+        return
+    elif customer_fix:
         if not _verified_fix_notice(ticket, att, kind, bus=bus, now=now):
             _suppress(bus, row, ticket, identity,
                       "customer fix reply requires current PR merged, deployed and verified",
@@ -3198,16 +3380,19 @@ def _dispatch_one(bus, post, row, *, identity, log, summary, now=None,
     # Membership reads and the claim itself are externally visible boundaries. A
     # correction arriving during either one invalidates a grounded FIXER answer
     # even though that answer legitimately has no deployment record.
-    if fixer_grounded_answer or customer_fix:
+    if fixer_grounded_answer or customer_fix or historical_receipt:
         fresh = _fresh_fixer_request(
             bus, ticket, att, body=row.get("body") or "",
             require_direct_answer=fixer_grounded_answer)
         release_key = (((fresh or {}).get("verification_after") or {}).get("fixer") or {}).get(
             "request_key")
         if (not fresh
-                or (customer_fix and (not _verified_fix_notice(
-                    fresh, att, kind, bus=bus, now=now)
-                    or release_key != att.get("request_key")))):
+                or (historical_receipt
+                    and not _historical_receipt_fresh_request(bus, fresh, att, row))
+                or (customer_fix and not historical_receipt
+                    and (not _verified_fix_notice(
+                        fresh, att, kind, bus=bus, now=now)
+                        or release_key != att.get("request_key")))):
             _suppress(bus, row, ticket, identity,
                       "FIXER requester identity changed before delivery", log, summary)
             return
@@ -3317,7 +3502,7 @@ def _dispatch_one(bus, post, row, *, identity, log, summary, now=None,
         summary["held"] += 1
         return
     sent_body = row["body"]
-    if fixer_customer_slack:
+    if fixer_customer_slack and not historical_receipt:
         mention = f"<@{config.APPROVER_SLACK_ID}>"
         if mention not in sent_body:
             sent_body = f"{mention} {sent_body}"
@@ -3340,7 +3525,7 @@ def _dispatch_one(bus, post, row, *, identity, log, summary, now=None,
             row = {**row, "body": sent_body}
     # Persisting Blake's exact mention/body is another mutation window. Re-read
     # the durable requester identity at the last possible point before Slack.
-    if fixer_grounded_answer or customer_fix:
+    if fixer_grounded_answer or customer_fix or historical_receipt:
         fresh = _fresh_fixer_request(
             bus, ticket, att, body=row.get("body") or "",
             require_direct_answer=fixer_grounded_answer)
@@ -3349,9 +3534,12 @@ def _dispatch_one(bus, post, row, *, identity, log, summary, now=None,
         if (not fresh
                 or fresh.get("slack_channel_id") != channel
                 or fresh.get("slack_thread_ts") != ticket.get("slack_thread_ts")
-                or (customer_fix and (not _verified_fix_notice(
-                    fresh, att, kind, bus=bus, now=now)
-                    or release_key != att.get("request_key")))):
+                or (historical_receipt
+                    and not _historical_receipt_fresh_request(bus, fresh, att, row))
+                or (customer_fix and not historical_receipt
+                    and (not _verified_fix_notice(
+                        fresh, att, kind, bus=bus, now=now)
+                        or release_key != att.get("request_key")))):
             _suppress(bus, row, fresh or ticket, identity,
                       "FIXER requester identity changed before Slack delivery", log, summary)
             return
@@ -3451,9 +3639,12 @@ def _dispatch_one(bus, post, row, *, identity, log, summary, now=None,
             "request_key")
         if (not fresh or fresh.get("slack_channel_id") != channel
                 or fresh.get("slack_thread_ts") != ticket.get("slack_thread_ts")
-                or (customer_fix and (not _verified_fix_notice(
-                    fresh, saved_att, kind, bus=bus, now=now)
-                    or release_key != saved_att.get("request_key")))):
+                or (historical_receipt
+                    and not _historical_receipt_fresh_request(bus, fresh, saved_att, row))
+                or (customer_fix and not historical_receipt
+                    and (not _verified_fix_notice(
+                        fresh, saved_att, kind, bus=bus, now=now)
+                        or release_key != saved_att.get("request_key")))):
             refuse_after_intent(
                 "FIXER requester, route, or release changed during intent persistence",
                 fresh or ticket)
@@ -3470,11 +3661,39 @@ def _dispatch_one(bus, post, row, *, identity, log, summary, now=None,
                 latest or fresh)
             return
         ticket = latest
+        pre_post_check = None
+        if historical_receipt:
+            def pre_post_check(latest_ticket, latest_row, sender):
+                # The portal 0640 service-role validator is the last admission
+                # boundary, re-run inside _post_support_resolution AFTER send
+                # admission and its latest snapshot, immediately before POST.
+                # Recomputing the full inbound request hash here closes the
+                # same-version correction window opened during admission. An
+                # absent or dissenting validator fails closed; the durable
+                # intent is preserved for exact reconciliation, never a resend.
+                fresh = _historical_receipt_fresh_request(
+                    bus, latest_ticket, saved_att, row)
+                if not fresh or not _historical_receipt_dispatch_validated(
+                        bus, row, fresh, saved_att, intent):
+                    return False
+                # The RPC itself is a network window. An inbound correction
+                # during validation invalidates the receipt before POST.
+                latest_ticket = bus.ticket(ticket["id"])
+                if (not latest_ticket
+                        or any(latest_ticket.get(field) != fresh.get(field)
+                               for field in _SUPPORT_BIND_FIELDS)
+                        or latest_ticket.get("slack_channel_id") != channel
+                        or latest_ticket.get("slack_thread_ts") != thread_ts
+                        or bus.message(row["id"]) != latest_row
+                        or identity.bot_user_id() != sender):
+                    return False
+                return bool(_historical_receipt_fresh_request(
+                    bus, latest_ticket, saved_att, row))
         try:
             ts = _post_support_resolution(
                 bus, post, row, ticket, identity, sent_body, channel, thread_ts,
                 readback, kind=kind, att=att, member_check=member_check,
-                require_member=True)
+                require_member=True, pre_post_check=pre_post_check)
         except SupportResolutionAdmissionError:
             raise
         except Exception as exc:  # noqa: BLE001 - a timeout can follow a successful post

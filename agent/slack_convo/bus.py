@@ -362,6 +362,84 @@ class Bus:
             raise BusError(r.status_code, (r.text or "")[:200])
         return r.json()
 
+    def reserve_historical_receipt(self, ticket, *, request_key, evidence_ref,
+                                   body_sha256, notice_id):
+        """One exact 14-argument 0640 attempt; never retry an ambiguous response."""
+        body = {"p_ticket_id": ticket["id"], "p_request_version": ticket["request_version"]}
+        for field in ("source", "product", "client_id", "bot_identity", "slack_user_id",
+                      "slack_channel_id", "slack_thread_ts", "resolved_at"):
+            body["p_" + field] = ticket.get(field)
+        body.update(p_request_key=request_key, p_evidence_ref=evidence_ref,
+                    p_notice_body_sha256=body_sha256, p_notice_message_id=notice_id)
+        r = self._client().post(self._rest("rpc/fixer_reserve_historical_receipt_recovery"),
+                               data=json.dumps(body), headers=self._headers(), timeout=30)
+        if r.status_code >= 400:
+            raise BusError(r.status_code, "historical reserve unavailable")
+        return r.json()
+
+    def finalize_historical_receipt(self, *, ticket_id, notice_id, note,
+                                    invocation_id, generation, deployment, build):
+        """One exact 7-argument RPC; caller owns 0636 admission and readback."""
+        body = {"p_ticket_id": ticket_id, "p_notice_message_id": notice_id,
+                "p_note": note, "p_admission_invocation_id": invocation_id,
+                "p_admission_generation": generation,
+                "p_admission_deployment": deployment, "p_admission_build": build}
+        r = self._client().post(self._rest("rpc/fixer_finalize_historical_receipt"),
+                               data=json.dumps(body), headers=self._headers(), timeout=30)
+        if r.status_code >= 400:
+            raise BusError(r.status_code, "historical finalize unavailable")
+        return r.json()
+
+    def fixer_validate_historical_receipt_dispatch(self, expected):
+        """Check the exact pending 0640 reservation with the service-role RPC.
+
+        This read-only result is reservation consistency, not send authority.
+        The caller must independently recheck the full requester transcript,
+        sender, member, admission lease and exact notice immediately before POST.
+        """
+        if not isinstance(expected, dict) or not all(key in expected for key in (
+                "ticket_id", "request_version", "notice_id", "request_key",
+                "body_sha256", "source", "product", "client_id", "bot_identity",
+                "slack_user_id", "channel", "thread_ts", "reservation")):
+            return None
+        version = expected["request_version"]
+        if (not _UUID.fullmatch(str(expected["ticket_id"] or ""))
+                or not _UUID.fullmatch(str(expected["notice_id"] or ""))
+                or type(version) is not int or version < 0
+                or not _HASH.fullmatch(str(expected["request_key"] or ""))
+                or not _HASH.fullmatch(str(expected["body_sha256"] or ""))
+                or not isinstance(expected["source"], str) or not expected["source"]
+                or not isinstance(expected["product"], str) or not expected["product"]
+                or not isinstance(expected["bot_identity"], str)
+                or not expected["bot_identity"]
+                or not isinstance(expected["channel"], str)
+                or not expected["channel"].strip()
+                or not isinstance(expected["reservation"], str)
+                or not expected["reservation"].strip()):
+            return None
+        body = {
+            "p_ticket_id": expected["ticket_id"],
+            "p_request_version": version,
+            "p_notice_message_id": expected["notice_id"],
+            "p_request_key": expected["request_key"],
+            "p_intended_body_sha256": expected["body_sha256"],
+            "p_source": expected["source"],
+            "p_product": expected["product"],
+            "p_client_id": expected["client_id"],
+            "p_bot_identity": expected["bot_identity"],
+            "p_slack_user_id": expected["slack_user_id"],
+            "p_slack_channel_id": expected["channel"],
+            "p_slack_thread_ts": expected["thread_ts"],
+        }
+        r = self._client().post(self._rest("rpc/fixer_validate_historical_receipt_reservation"),
+                                data=json.dumps(body), headers=self._headers(), timeout=30)
+        if r.status_code >= 400:
+            raise BusError(r.status_code, "historical receipt validator unavailable")
+        if r.json() is not True:
+            return None
+        return {"ok": True, "notice_id": expected["notice_id"],
+                "reservation": expected["reservation"]}
+
     def begin_current_notice(self, ticket, notice_id, *, unrouted=False):
         """Reserve one exact notice before its outbound INSERT (portal 0384)."""
         if not config.slack_convo_echo_current_notice_enabled():
