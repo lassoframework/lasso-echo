@@ -7,13 +7,13 @@ No ticket, support message, client route, or client text is read or modified.
 """
 from __future__ import annotations
 
-import os
 import threading
 from datetime import datetime, timezone
 from uuid import UUID
 
 from agent import config
 from agent.jobs.client_support_scan_reminder import _enabled
+from agent.slack_convo.identities import get as get_identity
 from agent.slack_surface import SlackPoster
 
 _LOCK = threading.Lock()
@@ -49,7 +49,7 @@ def run(report, *, poster=None, now=None):
     """Return confirmed/unconfirmed visibility; never report an uncertain send as success.
 
     ``poster`` is an offline test seam. Production uses the reviewed private
-    support channel and its member bot token, never a per-ticket channel.
+    support channel and its Scout member bot token, never a per-ticket channel.
     """
     if not _enabled():
         return {"ok": True, "state": "disabled", "confirmed": False}
@@ -61,7 +61,10 @@ def run(report, *, poster=None, now=None):
         return {"ok": False, "state": "unconfirmed", "reason": "invalid_clock",
                 "confirmed": False}
     channel = config.support_channel_id()
-    token = config.support_slack_bot_token()
+    # The dedicated support token is currently empty in production. Scout is
+    # the member bot for private #echosupport; do not fall back to Echo's token.
+    scout = get_identity("scout")
+    token = scout.env(scout.bot_token_env)
     # A typo or client-channel override must not turn a health alert into a
     # customer message. Changing the internal destination requires code review.
     if channel != _INTERNAL_SUPPORT_CHANNEL or not token:

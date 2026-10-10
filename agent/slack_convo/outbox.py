@@ -2004,6 +2004,29 @@ def _scan_reminder_candidate(row):
             or str(row.get("body") or "").startswith("CLIENT SUPPORT SCAN REMINDER:"))
 
 
+def _scan_reminder_sender(identity):
+    """Resolve a bot sender before POST when its optional user-ID env is absent.
+
+    Scout and Wrangler have live bot tokens but no configured bot user ID in
+    the current production environment. Slack's authenticated identity is the
+    readback sender; a failed lookup refuses delivery before any Slack POST.
+    """
+    configured = identity.bot_user_id()
+    if configured:
+        return configured
+    token = identity.env(identity.bot_token_env)
+    if not token:
+        return None
+    from ..slack_surface import SlackPoster
+    auth = SlackPoster(token=token)._send("https://slack.com/api/auth.test", {})
+    sender = auth.get("user_id") if isinstance(auth, dict) else None
+    if (not isinstance(auth, dict) or auth.get("ok") is not True
+            or not auth.get("bot_id") or not isinstance(sender, str)
+            or not sender.startswith(("U", "W"))):
+        return None
+    return sender
+
+
 def _scan_reminder_eligible(bus, row, identity, *, now=None):
     """Exact persisted contract plus fresh, metadata-only current classification.
 
@@ -2083,8 +2106,10 @@ def _dispatch_scan_reminder(bus, post, row, identity, log, summary, *, now=None,
     if (row.get("attachments") or {}).get("scan_reminder_slack_intent"):
         _recover_scan_reminder(bus, row, identity, readback, log, summary)
         return
-    sender_fn = getattr(identity, "bot_user_id", None)
-    sender = sender_fn() if callable(sender_fn) else None
+    try:
+        sender = _scan_reminder_sender(identity)
+    except Exception:
+        sender = None
     if not sender or not callable(readback):
         summary["skipped"] += 1
         return
@@ -2217,8 +2242,10 @@ def _recover_scan_reminder(bus, row, identity, readback, log, summary):
         # claims as well: provenance alone cannot prove the old code did not send.
         _hold_scan_reminder(bus, row, "claim has no durable attempt proof", log, summary)
         return
-    sender_fn = getattr(identity, "bot_user_id", None)
-    sender = sender_fn() if callable(sender_fn) else None
+    try:
+        sender = _scan_reminder_sender(identity)
+    except Exception:
+        sender = None
     if (intent.get("body") != row.get("body") or intent.get("thread_ts") is not None
             or intent.get("channel") != _channel_for(_a.KIND_ESCALATION, identity)
             or not sender or intent.get("sender") != sender

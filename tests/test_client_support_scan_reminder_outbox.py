@@ -84,6 +84,37 @@ def test_current_reminder_posts_informational_only(monkeypatch):
     assert bus.ticket_row["status"] == "working"
 
 
+def test_missing_configured_sender_uses_authenticated_bot_identity(monkeypatch):
+    from agent import slack_surface
+
+    calls = []
+    class AuthPoster:
+        def __init__(self, *, token):
+            assert token == "scout-token"
+        def _send(self, url, payload):
+            calls.append((url, payload))
+            return {"ok": True, "user_id": "WSCOUT", "bot_id": "BSCOUT"}
+    monkeypatch.setattr(slack_surface, "SlackPoster", AuthPoster)
+    identity = SimpleNamespace(bot_user_id=lambda: "", bot_token_env="SCOUT_TOKEN",
+                               env=lambda name: "scout-token")
+    assert outbox._scan_reminder_sender(identity) == "WSCOUT"
+    assert calls == [("https://slack.com/api/auth.test", {})]
+
+
+def test_missing_sender_auth_failure_refuses_post(monkeypatch):
+    from agent import slack_surface
+
+    class BadAuthPoster:
+        def __init__(self, *, token):
+            pass
+        def _send(self, url, payload):
+            return {"ok": False, "error": "invalid_auth"}
+    monkeypatch.setattr(slack_surface, "SlackPoster", BadAuthPoster)
+    identity = SimpleNamespace(bot_user_id=lambda: "", bot_token_env="SCOUT_TOKEN",
+                               env=lambda name: "scout-token")
+    assert outbox._scan_reminder_sender(identity) is None
+
+
 @pytest.mark.parametrize("field,value", [
     ("request_version", 3), ("request_version", True), ("client_id", "other"),
     ("bot_identity", "scout"), ("source", "ops_fix"), ("product", "portal"),

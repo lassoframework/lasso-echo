@@ -35,7 +35,7 @@ class Poster:
 def setup(monkeypatch):
     health._LAST_ATTEMPT.clear()
     monkeypatch.setenv('AGENT_CLIENT_SUPPORT_SCAN_REMINDER_ENABLED', 'true')
-    monkeypatch.setenv('AGENT_SLACK_BOT_TOKEN', 'test-token')
+    monkeypatch.setenv('SCOUT_SLACK_BOT_TOKEN', 'test-token')
     monkeypatch.setenv('AGENT_SUPPORT_CHANNEL_ID', health._INTERNAL_SUPPORT_CHANNEL)
 
 
@@ -76,6 +76,15 @@ def test_no_route_fails_closed(monkeypatch):
     poster = Poster()
     monkeypatch.setenv('AGENT_SUPPORT_CHANNEL_ID', '')
     assert health.run({'ok': False}, poster=poster, now=NOW)['reason'] == 'ops_route_unavailable'
+    assert not poster.posts
+
+
+def test_missing_scout_token_does_not_fall_back_to_echo(monkeypatch):
+    poster = Poster()
+    monkeypatch.delenv('SCOUT_SLACK_BOT_TOKEN')
+    monkeypatch.setenv('AGENT_SLACK_BOT_TOKEN', 'echo-token')
+    result = health.run({'ok': False}, poster=poster, now=NOW)
+    assert result['reason'] == 'ops_route_unavailable'
     assert not poster.posts
 
 
