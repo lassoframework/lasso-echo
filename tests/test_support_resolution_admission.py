@@ -132,6 +132,58 @@ def invocations(case):
     return case.engine.rows('support_admission_invocations')
 
 
+def test_marked_held_success_rechecks_private_binding_after_send_admission(case):
+    """0633 can admit a hold that the private #869 contract would reject.
+
+    The final service-role attestation is unavailable in this frozen 0633-only
+    fixture. A marked notice must fail after the durable send acquisition and
+    before the one external Slack effect, leaving an unknown invocation.
+    """
+    case.engine.sql(f"update support_tickets set status='hold', "
+                    f"hold_tier='framework' where id={q(case.ticket['id'])}")
+    case.ticket = case.bus.ticket(case.ticket['id'])
+    case.body = outbox.HELD_REQUESTER_SUCCESS_NOTICE_BODY
+    case.att = {**case.att, 'kind': adapter.KIND_STATUS,
+        'fixer': True, 'resolve_notice': True, 'fixer_requester_success': True,
+                'surface': 'portal_ticket_bridge'}
+    case.row = case.bus._patch('support_messages',
+        {'id': 'eq.' + case.row['id']},
+        {'body': case.body, 'attachments': case.att})
+    with pytest.raises(outbox.SupportResolutionAdmissionError):
+        send(case, kind=adapter.KIND_STATUS, thread_ts=None)
+    assert case.sent == []
+    assert any(name == 'support_admission_acquire_send'
+               for name, _ in case.transport.rpc_calls)
+    assert invocations(case)[0]['outcome'] == 'unknown'
+
+
+def test_marked_notice_rejects_true_to_numeric_one_after_final_attestation(
+        case, monkeypatch):
+    """A store mutation cannot exploit Python's True == 1 snapshot equality."""
+    case.body = outbox.HELD_REQUESTER_SUCCESS_NOTICE_BODY
+    case.att = {**case.att, 'kind': adapter.KIND_STATUS,
+        'fixer': True, 'resolve_notice': True, 'fixer_requester_success': True}
+    case.row = case.bus._patch('support_messages',
+        {'id': 'eq.' + case.row['id']},
+        {'body': case.body, 'attachments': case.att})
+
+    def attested_then_mutated(bus, _ticket, mid, _body):
+        row = bus.message(mid)
+        bus._patch('support_messages', {'id': 'eq.' + mid},
+                   {'attachments': {**row['attachments'],
+                                    'fixer_requester_success': 1}})
+        return True
+
+    monkeypatch.setattr(outbox, '_held_requester_success_attested',
+                        attested_then_mutated)
+    with pytest.raises(outbox.SupportResolutionAdmissionError):
+        send(case, kind=adapter.KIND_STATUS)
+    assert case.sent == []
+    assert invocations(case)[0]['outcome'] == 'unknown'
+    assert type(case.bus.message(case.row['id'])['attachments'][
+        'fixer_requester_success']) is int
+
+
 def test_real_0633_bound_lane_and_message_cas_bind_one_verified_send(case):
     ts = send(case)
     assert len(case.sent) == 1

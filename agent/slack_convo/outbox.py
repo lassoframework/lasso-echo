@@ -149,6 +149,21 @@ def _support_resolution_row(ticket, att, kind, body):
         or kind == _a.KIND_ANSWER and not _a.promises_human_follow_up(body)))
 
 
+def _same_typed_snapshot(left, right):
+    """Compare JSON-like store snapshots without Python's bool == int coercion."""
+    if type(left) is not type(right):
+        return False
+    if isinstance(left, dict):
+        return (left.keys() == right.keys()
+                and all(_same_typed_snapshot(value, right[key])
+                        for key, value in left.items()))
+    if isinstance(left, (list, tuple)):
+        return (len(left) == len(right)
+                and all(_same_typed_snapshot(a, b)
+                        for a, b in zip(left, right)))
+    return left == right
+
+
 def _support_send_rpc(bus, name, body):
     """Frozen portal 0633 contract. Never retry an uncertain acquisition."""
     response = bus._client().post(
@@ -368,6 +383,9 @@ def _post_support_resolution(bus, post, row, ticket, identity, body, channel,
     No local/preview identity fallback and no feature flag can bypass this
     send boundary.
     """
+    marked_success = "fixer_requester_success" in att
+    if marked_success and not _held_requester_success_candidate(att, kind, body):
+        raise SupportResolutionAdmissionError("Held requester-success notice shape changed")
     if not _support_resolution_row(ticket, att, kind, body):
         recipient = att.get("recipient_kind") or ticket.get("identity_kind") or "client"
         # A stale staff stamp cannot waive sender authentication in a client's
@@ -481,12 +499,30 @@ def _post_support_resolution(bus, post, row, ticket, identity, body, channel,
             raise SupportResolutionAdmissionError("Support send replay authority changed after admission")
         latest_ticket = bus.ticket(ticket["id"])
         latest = bus.message(row["id"])
-        if (not latest_ticket or any(latest_ticket.get(k) != ticket.get(k) for k in _SUPPORT_BIND_FIELDS)
-                or latest != current or identity.bot_user_id() != sender
+        if (not latest_ticket or any(not _same_typed_snapshot(
+                    latest_ticket.get(k), ticket.get(k)) for k in _SUPPORT_BIND_FIELDS)
+                or not _same_typed_snapshot(latest, current)
+                or identity.bot_user_id() != sender
                 or (not att.get("released_by") and (
                     not _recipient_armed(identity, att.get("recipient_kind") or ticket.get("identity_kind") or "client")
                     or kind == _a.KIND_ANSWER and not config.slack_convo_auto_answer_armed(identity.name)))):
             raise SupportResolutionAdmissionError("Support send ticket, sender or release changed after admission")
+        if marked_success:
+            # The 0633 send lane pins the ticket and notice, but does not know
+            # the private requester-success binding. Recheck it after every
+            # admission/CAS network window and before the one Slack effect.
+            if not _held_requester_success_attested(bus, latest_ticket, row["id"], body):
+                raise SupportResolutionAdmissionError(
+                    "Held requester-success binding changed before Slack delivery")
+            final_ticket = bus.ticket(ticket["id"])
+            final_message = bus.message(row["id"])
+            if (not _same_typed_snapshot(final_ticket, latest_ticket)
+                    or not _same_typed_snapshot(final_message, latest)
+                    or not _held_requester_success_candidate(
+                        (final_message or {}).get("attachments") or {}, kind,
+                        (final_message or {}).get("body") or "")):
+                raise SupportResolutionAdmissionError(
+                    "Held requester-success ticket or notice changed after attestation")
         ts = post(channel, body, thread_ts=thread_ts, blocks=None)
         if not isinstance(ts, str) or not ts:
             raise SupportResolutionAdmissionError("Support Slack timestamp unconfirmed")
@@ -647,6 +683,10 @@ def _customer_fix_reply(ticket, att, body=""):
     protect held portal incidents. A direct grounded QUESTION keeps its explicit
     classification and remains eligible for the normal answer gates.
     """
+    # Any row carrying this marker must reach the exact-shape and live DB
+    # attestation gate, including malformed marker values or recipient stamps.
+    if "fixer_requester_success" in att:
+        return True
     recipient = (att.get("recipient_kind") or ticket.get("identity_kind") or "client")
     if recipient in ("staff", "coach"):
         return False
@@ -1031,6 +1071,79 @@ def _verified_fix_notice(ticket, att, kind, *, bus=None, now=None):
             and bool(release.get("request_key"))):
         return False
     return _business_postcondition_observed(bus, ticket, business, merged_sha, now=now)
+
+
+# Portal draft #869: the exact, immutable body of the held requester-success
+# resolve notice. Any whitespace or wording change fails this marked path.
+HELD_REQUESTER_SUCCESS_NOTICE_BODY = (
+    "You confirmed this is resolved, so I am closing this ticket.")
+
+
+def _held_requester_success_candidate(att, kind, body):
+    """Exact shape of the Portal #869 held requester-success resolve notice.
+
+    The attachment flag alone is never trusted; it only selects which DB
+    attestation RPC must confirm the notice. A forged flag on any other kind,
+    without resolve_notice, or over a different body is not a candidate."""
+    return (kind == _a.KIND_STATUS
+            and isinstance(att, dict)
+            and att.get("fixer") is True
+            and att.get("fixer_requester_success") is True
+            and att.get("recipient_kind") == "client"
+            and att.get("resolve_notice") is True
+            and body == HELD_REQUESTER_SUCCESS_NOTICE_BODY)
+
+
+def _held_requester_success_attested(bus, ticket, notice_id, body):
+    """Service-role DB attestation for the held requester-success exception.
+
+    fixer_held_requester_success_dispatch_eligible re-checks the CURRENT
+    ticket/notice/private binding against the expected request version and the
+    exact body. It is called on every dispatch/recovery gate and again
+    immediately before the Slack POST with the freshest validated ticket.
+    Unavailable RPC, HTTP error, malformed or non-True result all fail closed."""
+    if not isinstance(ticket, dict) or not notice_id:
+        return False
+    version = ticket.get("request_version")
+    if type(version) is not int or version < 0:
+        return False
+    try:
+        response = bus._client().post(
+            bus._rest("rpc/fixer_held_requester_success_dispatch_eligible"),
+            data=json.dumps({
+                "p_ticket_id": ticket["id"],
+                "p_request_version": version,
+                "p_notice_message_id": notice_id,
+                "p_body": body,
+            }),
+            headers=bus._headers(), timeout=30)
+        if response.status_code >= 400:
+            return False
+        return response.json() is True
+    except Exception:  # noqa: BLE001 - attestation is mandatory, never assumed
+        return False
+
+
+def _customer_fix_release_ok(bus, ticket, att, kind, body, *, notice_id, now=None):
+    """Current code-fix release proof, or the narrow DB-attested exception.
+
+    The held requester-success exception (Portal draft #869) requires the exact
+    notice shape AND a live service-role attestation over the current ticket,
+    version and notice row. It waives ONLY the merged/deployed/verified PR
+    postcondition and its release-key binding; the fresh requester, route, hold,
+    membership, replay and immutable-admission gates are untouched. Every other
+    FIXER notice keeps the full _verified_fix_notice gate."""
+    if "fixer_requester_success" in (att or {}):
+        return (_held_requester_success_candidate(att, kind, body)
+                and _held_requester_success_attested(bus, ticket, notice_id, body))
+    if not _verified_fix_notice(ticket, att, kind, bus=bus, now=now):
+        return False
+    release_key = ((ticket.get("verification_after") or {}).get("fixer") or {}).get(
+        "request_key")
+    # _verified_fix_notice requires a truthy stamped request_key, so a missing
+    # release key here means the proof is malformed and must not bind.
+    return isinstance(release_key, str) and bool(release_key) \
+        and release_key == att.get("request_key")
 
 
 def _current_fixer_request_key(bus, ticket):
@@ -2023,10 +2136,8 @@ def _recover_route_missing_fixer(bus, identity, member_check, log, now=None):
             if not isinstance(channel, str) or not channel.startswith(("C", "G")):
                 continue
             if customer_fix:
-                release_key = (((fresh.get("verification_after") or {}).get("fixer")
-                                or {}).get("request_key"))
-                if (not _verified_fix_notice(fresh, att, kind, bus=bus, now=current)
-                        or release_key != att.get("request_key")):
+                if not _customer_fix_release_ok(bus, fresh, att, kind, body,
+                                                notice_id=row["id"], now=current):
                     continue
                 # Proof reads are mutation windows; bind the exact request and
                 # route once more after them.
@@ -2179,12 +2290,31 @@ def _finalize_fixer_post(bus, ticket, row, identity, log, summary):
 
 
 def _reconcile_posted_fixer(bus, identity, log, summary):
+    page_limit = 100
     try:
-        rows = bus.pending_fixer_finalization(identity.name, limit=100)
+        cursors = getattr(bus, "_fixer_posted_reconcile_cursors", None)
+        if not isinstance(cursors, dict):
+            cursors = {}
+            setattr(bus, "_fixer_posted_reconcile_cursors", cursors)
+        after = cursors.get(identity.name)
+        try:
+            rows = bus.pending_fixer_finalization(
+                identity.name, limit=page_limit, after=after)
+        except TypeError:  # compatibility for bounded legacy/test adapters
+            rows = bus.pending_fixer_finalization(identity.name, limit=page_limit)
+        if not rows and after:
+            cursors.pop(identity.name, None)
+            try:
+                rows = bus.pending_fixer_finalization(
+                    identity.name, limit=page_limit, after=None)
+            except TypeError:
+                rows = bus.pending_fixer_finalization(identity.name, limit=page_limit)
     except Exception as exc:  # noqa: BLE001
         log(f"[slack-convo/outbox] FIXER finalization scan failed: {type(exc).__name__}")
         return
     for row in rows:
+        cursors[identity.name] = {
+            "created_at": row.get("created_at"), "id": row.get("id")}
         try:
             ticket = bus.ticket(row["ticket_id"])
             if ticket:
@@ -3118,7 +3248,14 @@ def _dispatch_one(bus, post, row, *, identity, log, summary, now=None,
     fixer_grounded_answer = _fixer_grounded_question_answer(
         ticket, att, kind, row.get("body") or "")
     if customer_fix:
-        if not _verified_fix_notice(ticket, att, kind, bus=bus, now=now):
+        attested_success = _held_requester_success_candidate(
+            att, kind, row.get("body") or "")
+        if "fixer_requester_success" in att and not attested_success:
+            _suppress(bus, row, ticket, identity,
+                      "held requester-success notice shape changed", log, summary)
+            return
+        if not attested_success and not _verified_fix_notice(
+                ticket, att, kind, bus=bus, now=now):
             _suppress(bus, row, ticket, identity,
                       "customer fix reply requires current PR merged, deployed and verified",
                       log, summary)
@@ -3131,8 +3268,14 @@ def _dispatch_one(bus, post, row, *, identity, log, summary, now=None,
                 f"{type(e).__name__}")
             current_key = None
         fresh_request = _fresh_fixer_request(bus, ticket, att)
-        if (not fresh_request or not current_key or release_key != current_key
-                or att.get("request_key") != current_key):
+        # The attested held requester-success notice binds through the live
+        # service-role RPC against this freshest row, not a release key.
+        attested = (attested_success and fresh_request is not None
+                    and _held_requester_success_attested(
+                        bus, fresh_request, row["id"], row.get("body") or ""))
+        if (not fresh_request or not current_key
+                or att.get("request_key") != current_key
+                or not (attested or release_key == current_key)):
             _suppress(bus, row, ticket, identity,
                       "customer fix reply does not match the current requester messages",
                       log, summary)
@@ -3288,12 +3431,10 @@ def _dispatch_one(bus, post, row, *, identity, log, summary, now=None,
         fresh = _fresh_fixer_request(
             bus, ticket, att, body=row.get("body") or "",
             require_direct_answer=fixer_grounded_answer)
-        release_key = (((fresh or {}).get("verification_after") or {}).get("fixer") or {}).get(
-            "request_key")
         if (not fresh
-                or (customer_fix and (not _verified_fix_notice(
-                    fresh, att, kind, bus=bus, now=now)
-                    or release_key != att.get("request_key")))):
+                or (customer_fix and not _customer_fix_release_ok(
+                    bus, fresh, att, kind, row.get("body") or "",
+                    notice_id=row["id"], now=now))):
             _suppress(bus, row, ticket, identity,
                       "FIXER requester identity changed before delivery", log, summary)
             return
@@ -3403,7 +3544,11 @@ def _dispatch_one(bus, post, row, *, identity, log, summary, now=None,
         summary["held"] += 1
         return
     sent_body = row["body"]
-    if fixer_customer_slack:
+    # The DB-attested held requester-success notice is byte-exact: no Blake
+    # mention prepend and no other mutation, or its attestation body fails.
+    held_success_notice = (fixer_customer_slack
+                           and _held_requester_success_candidate(att, kind, sent_body))
+    if fixer_customer_slack and not held_success_notice:
         mention = f"<@{config.APPROVER_SLACK_ID}>"
         if mention not in sent_body:
             sent_body = f"{mention} {sent_body}"
@@ -3430,14 +3575,12 @@ def _dispatch_one(bus, post, row, *, identity, log, summary, now=None,
         fresh = _fresh_fixer_request(
             bus, ticket, att, body=row.get("body") or "",
             require_direct_answer=fixer_grounded_answer)
-        release_key = (((fresh or {}).get("verification_after") or {}).get("fixer") or {}).get(
-            "request_key")
         if (not fresh
                 or fresh.get("slack_channel_id") != channel
                 or fresh.get("slack_thread_ts") != ticket.get("slack_thread_ts")
-                or (customer_fix and (not _verified_fix_notice(
-                    fresh, att, kind, bus=bus, now=now)
-                    or release_key != att.get("request_key")))):
+                or (customer_fix and not _customer_fix_release_ok(
+                    bus, fresh, att, kind, row.get("body") or "",
+                    notice_id=row["id"], now=now))):
             _suppress(bus, row, fresh or ticket, identity,
                       "FIXER requester identity changed before Slack delivery", log, summary)
             return
@@ -3533,16 +3676,17 @@ def _dispatch_one(bus, post, row, *, identity, log, summary, now=None,
         fresh = _fresh_fixer_request(
             bus, ticket, saved_att, body=sent_body,
             require_direct_answer=fixer_grounded_answer)
-        release_key = (((fresh or {}).get("verification_after") or {}).get("fixer") or {}).get(
-            "request_key")
         if (not fresh or fresh.get("slack_channel_id") != channel
-                or fresh.get("slack_thread_ts") != ticket.get("slack_thread_ts")
-                or (customer_fix and (not _verified_fix_notice(
-                    fresh, saved_att, kind, bus=bus, now=now)
-                    or release_key != saved_att.get("request_key")))):
+                or fresh.get("slack_thread_ts") != ticket.get("slack_thread_ts")):
             refuse_after_intent(
                 "FIXER requester, route, or release changed during intent persistence",
                 fresh or ticket)
+            return
+        if customer_fix and not _customer_fix_release_ok(
+                bus, fresh, saved_att, kind, sent_body, notice_id=row["id"], now=now):
+            refuse_after_intent(
+                "FIXER requester, route, or release changed during intent persistence",
+                fresh)
             return
         # _verified_fix_notice may perform independent store reads. Bind the
         # requester once more after those reads and immediately before POST.
@@ -3741,6 +3885,11 @@ def _resolve_on_answer(bus, ticket, row, kind, summary, att=None, body=""):
     tapped (MINOR 5, audit 7 -- resolve_and_notify used to stamp the ticket itself, before
     delivery, so a failed post left a ticket claiming to be resolved over a failed row)."""
     meta = att or {}
+    if "fixer_requester_success" in meta:
+        # The requester confirmed success; this notice only tells them that
+        # closure is underway. Scout alone consumes the exact posted/readback
+        # notice through fixer_close_held_requester_success after admission.
+        return
     try:
         current_message = bus.message(row["id"])
     except Exception:  # a stale caller snapshot cannot bypass durable send uncertainty
