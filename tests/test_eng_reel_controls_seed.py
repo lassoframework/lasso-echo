@@ -128,6 +128,16 @@ def test_worker_state_refusal(status):
         seed.run(**run_kwargs(FakeBus(), gym_status=lambda gym: status))
 
 
+def test_exhausted_worker_allows_only_elapsed_legacy_retry_timestamp():
+    elapsed = datetime.now(timezone.utc).timestamp() - 60
+    status = {"ok": True, "gym": "eng", "jobs": [{**JOB, "next_attempt_at": elapsed}]}
+    assert seed._validate_worker_state(status)["request_id"] == seed.REQUEST_ID
+    for value in (datetime.now(timezone.utc).timestamp() + 60, float("nan"), -1, True):
+        status["jobs"][0]["next_attempt_at"] = value
+        with pytest.raises(seed.ReelSeedError, match="original_job_not_terminal_hold"):
+            seed._validate_worker_state(status)
+
+
 def test_default_worker_reader_refuses_nondurable_store(monkeypatch):
     from agent import auto_reels
     monkeypatch.setattr(auto_reels.db, "kv_is_durable", lambda: False)
