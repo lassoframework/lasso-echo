@@ -1,9 +1,11 @@
 """Adversarial tests for the durable support cutover reservation receipt.
 
-The Portal SQL contract is PROPOSED (pending finalization); Echo must fail
-closed on every deviation: missing RPC, released/resumed reservation, stale
-pointer, page echo mismatch, mid-scan lane change, ABA local control flip and
-active operations appearing during reads.
+Aligned to the frozen Portal DRAFT_0639 SQL (head
+f7ca4a04175be10bf6d401e22e91660c4e63b120): Echo must fail closed on every
+deviation — missing RPC, released/resumed reservation, stale epoch, wrong
+pointer, pinned/duplicate tuple mismatch, live-lane defect, page echo
+mismatch, mid-scan release/change/error, ABA local control flip and active
+operations appearing during reads.
 """
 import json
 import os
@@ -16,27 +18,52 @@ EPOCH = 7
 INV = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
 MSG = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
 TICKET = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
+SEND_OP = "dddddddd-dddd-4ddd-8ddd-dddddddddddd"
+CLOSE_OP = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee"
+SEND_GEN = 3
+CLOSE_GEN = 5
+LANES = ("support-resolution-send", "support-ticket-close")
+_TUPLES = {"support-resolution-send": (SEND_GEN, SEND_OP),
+           "support-ticket-close": (CLOSE_GEN, CLOSE_OP)}
 
 
-def _pin(generation=1, operation_id="op-res-1"):
-    return {"generation": generation, "operation_id": operation_id,
-            "paused": True, "unresolved": 0}
+def _pin(generation, operation_id):
+    return {"generation": generation, "operation_id": operation_id}
+
+
+def _pinned(send=None, close=None):
+    return {"support-resolution-send": send or _pin(SEND_GEN, SEND_OP),
+            "support-ticket-close": close or _pin(CLOSE_GEN, CLOSE_OP)}
+
+
+def _live_lane(lane_name, **overrides):
+    generation, operation_id = _TUPLES[lane_name]
+    live = {"lane": lane_name, "paused": True, "generation": generation,
+            "operation_id": operation_id, "reservation_id": RESERVATION_ID,
+            "unresolved": 0, "pinned_generation": generation,
+            "pinned_operation_id": operation_id, "drained": True}
+    live.update(overrides)
+    return live
 
 
 def _status(**overrides):
-    status = {"reservation_id": RESERVATION_ID, "owner_epoch": EPOCH,
-              "state": "held", "is_current": True,
-              "lanes": {lane: _pin() for lane in fence._LANES}}
+    status = {"reservation_id": RESERVATION_ID, "epoch": EPOCH,
+              "owner_epoch": EPOCH, "owner": "cutover-owner",
+              "pinned": _pinned(),
+              "send_generation": SEND_GEN, "send_operation_id": SEND_OP,
+              "close_generation": CLOSE_GEN, "close_operation_id": CLOSE_OP,
+              "support-resolution-send": _live_lane("support-resolution-send"),
+              "support-ticket-close": _live_lane("support-ticket-close")}
     status.update(overrides)
     return status
 
 
 def _page(lane, rows=(), **overrides):
-    pins = {l: _pin() for l in fence._LANES}
-    page = {"reservation_id": RESERVATION_ID, "owner_epoch": EPOCH, "lane": lane,
-            "generation": pins[lane]["generation"],
-            "operation_id": pins[lane]["operation_id"], "paused": True,
-            "lanes": pins, "limit": fence._INVENTORY_PAGE, "returned": len(rows),
+    page = {"reservation_id": RESERVATION_ID, "epoch": EPOCH,
+            "owner_epoch": EPOCH, "pinned": _pinned(),
+            "send_generation": SEND_GEN, "send_operation_id": SEND_OP,
+            "close_generation": CLOSE_GEN, "close_operation_id": CLOSE_OP,
+            "lane": lane, "limit": fence._INVENTORY_PAGE, "returned": len(rows),
             "has_more": False,
             "next_after_started": rows[-1]["started_at"] if rows else None,
             "next_after_invocation": rows[-1]["invocation_id"] if rows else None,
@@ -59,6 +86,7 @@ class GuardedBus:
         self._statuses = list(statuses) if statuses is not None else None
         self._pages = pages or {}
         self._hook = hook
+        self.inventory_calls = []
 
     def support_uncertain_outbound(self, limit=1000):
         return []
@@ -66,18 +94,28 @@ class GuardedBus:
     def outbox(self, status, limit):
         return []
 
-    def support_cutover_status(self, reservation_id, owner_epoch):
+    def support_cutover_reservation_status(self, reservation_id, epoch):
         if self._hook:
             self._hook()
         if self._statuses:
-            return self._statuses.pop(0)
-        return _status(reservation_id=reservation_id, owner_epoch=owner_epoch)
+            item = self._statuses.pop(0)
+            if isinstance(item, Exception):
+                raise item
+            return item
+        return _status(reservation_id=reservation_id, epoch=epoch,
+                       owner_epoch=epoch)
 
-    def support_admission_inventory_guarded(self, reservation_id, owner_epoch,
-                                            lane, *, limit, after_started=None,
-                                            after_invocation=None):
-        page = self._pages.get(lane)
-        return page if page is not None else _page(lane)
+    def support_cutover_reservation_inventory(self, reservation_id, epoch,
+                                              lane, *, limit,
+                                              after_started=None,
+                                              after_invocation=None):
+        self.inventory_calls.append((lane, after_started, after_invocation))
+        pages = self._pages.get(lane)
+        if pages is None:
+            return _page(lane, limit=limit)
+        if isinstance(pages, list):
+            return pages.pop(0) if pages else _page(lane, limit=limit)
+        return pages
 
 
 @pytest.fixture
@@ -120,16 +158,31 @@ def test_missing_cutover_rpc_blocks(pause):
 
 
 @pytest.mark.parametrize("override", [
-    {"state": "released"},
-    {"state": "resumed"},
-    {"is_current": False},
     {"reservation_id": "dddddddd-dddd-4ddd-8ddd-dddddddddddd"},
+    {"epoch": EPOCH + 1},
     {"owner_epoch": EPOCH + 1},
-    {"lanes": {"support-resolution-send": _pin()}},  # close lane pin missing
-    {"lanes": {lane: _pin() for lane in fence._LANES} |
-              {"support-ticket-close": _pin() | {"unresolved": 1}}},
-    {"lanes": {lane: _pin() for lane in fence._LANES} |
-              {"support-resolution-send": _pin() | {"paused": False}}},
+    {"epoch": str(EPOCH)},
+    {"epoch": 0},
+    {"owner_epoch": None},
+    {"owner": ""},
+    {"owner": 7},
+    {"pinned": {"support-resolution-send": _pin(SEND_GEN, SEND_OP)}},  # close pin missing
+    {"pinned": _pinned(close=_pin(CLOSE_GEN, "ffffffff-ffff-4fff-8fff-ffffffffffff"))},
+    {"pinned": _pinned(send=_pin(SEND_GEN, "not-a-uuid"))},
+    {"pinned": _pinned(send={"operation_id": SEND_OP})},  # generation omitted
+    {"send_generation": SEND_GEN + 1},
+    {"close_operation_id": SEND_OP},
+    {"support-ticket-close": _live_lane("support-ticket-close", paused=False)},
+    {"support-ticket-close": _live_lane("support-ticket-close", drained=False)},
+    {"support-resolution-send": _live_lane("support-resolution-send", unresolved=1)},
+    {"support-resolution-send": _live_lane("support-resolution-send", unresolved=True)},
+    {"support-resolution-send": _live_lane("support-resolution-send",
+                                           reservation_id=SEND_OP)},
+    {"support-resolution-send": _live_lane("support-resolution-send", lane="support-ticket-close")},
+    {"support-resolution-send": _live_lane("support-resolution-send",
+                                           generation=SEND_GEN + 1)},
+    {"support-ticket-close": _live_lane("support-ticket-close",
+                                        pinned_operation_id=SEND_OP)},
 ])
 def test_invalid_or_released_reservation_blocks(pause, override):
     bus = GuardedBus(statuses=[_status(**override)])
@@ -139,9 +192,40 @@ def test_invalid_or_released_reservation_blocks(pause, override):
     assert result["local_drained"] is False
 
 
+@pytest.mark.parametrize("missing", [
+    "reservation_id", "epoch", "owner_epoch", "owner", "pinned",
+    "send_generation", "send_operation_id", "close_generation",
+    "close_operation_id", "support-resolution-send", "support-ticket-close",
+])
+def test_status_missing_field_blocks(pause, missing):
+    status = _status()
+    del status[missing]
+    bus = GuardedBus(statuses=[status])
+    result = fence.receipt(bus, reservation_id=RESERVATION_ID, owner_epoch=EPOCH)
+    assert "reservation_cutover_invalid" in result["blockers"]
+    assert result["reservation_held"] is False
+    assert result["local_drained"] is False
+
+
+@pytest.mark.parametrize("missing", [
+    "lane", "paused", "drained", "generation", "operation_id",
+    "reservation_id", "unresolved", "pinned_generation", "pinned_operation_id",
+])
+def test_status_live_lane_missing_field_blocks(pause, missing):
+    status = _status()
+    del status["support-resolution-send"][missing]
+    bus = GuardedBus(statuses=[status])
+    result = fence.receipt(bus, reservation_id=RESERVATION_ID, owner_epoch=EPOCH)
+    assert "reservation_cutover_invalid" in result["blockers"]
+    assert result["reservation_held"] is False
+
+
 def test_reservation_change_during_scans_blocks(pause):
     changed = _status()
-    changed["lanes"]["support-resolution-send"] = _pin(generation=2)
+    changed["pinned"]["support-resolution-send"]["generation"] = SEND_GEN + 1
+    changed["send_generation"] = SEND_GEN + 1
+    changed["support-resolution-send"]["generation"] = SEND_GEN + 1
+    changed["support-resolution-send"]["pinned_generation"] = SEND_GEN + 1
     bus = GuardedBus(statuses=[_status(), changed])
     result = fence.receipt(bus, reservation_id=RESERVATION_ID, owner_epoch=EPOCH)
     assert "reservation_cutover_changed" in result["blockers"]
@@ -149,15 +233,26 @@ def test_reservation_change_during_scans_blocks(pause):
     assert result["local_drained"] is False
 
 
+def test_reservation_release_during_scans_blocks(pause):
+    bus = GuardedBus(statuses=[_status(), RuntimeError("released")])
+    result = fence.receipt(bus, reservation_id=RESERVATION_ID, owner_epoch=EPOCH)
+    assert any(b.startswith("database_read:") for b in result["blockers"])
+    assert result["reservation_held"] is False
+    assert result["local_drained"] is False
+    assert result["fleet_drained"] is False
+
+
 @pytest.mark.parametrize("page_override", [
     {"reservation_id": "dddddddd-dddd-4ddd-8ddd-dddddddddddd"},
+    {"epoch": EPOCH + 1},
     {"owner_epoch": EPOCH + 1},
-    {"generation": 2},
-    {"operation_id": "op-other"},
-    {"paused": False},
-    {"lanes": {"support-resolution-send": _pin()}},
-    {"lanes": {lane: _pin() for lane in fence._LANES} |
-              {"support-ticket-close": _pin(operation_id="op-swapped")}},
+    {"owner_epoch": str(EPOCH)},
+    {"pinned": {"support-resolution-send": _pin(SEND_GEN, SEND_OP)}},
+    {"pinned": _pinned(close=_pin(CLOSE_GEN + 1, CLOSE_OP))},
+    {"send_generation": SEND_GEN + 1},
+    {"send_operation_id": CLOSE_OP},
+    {"close_generation": CLOSE_GEN - 1},
+    {"close_operation_id": SEND_OP},
 ])
 def test_page_echo_or_pin_mismatch_blocks(pause, page_override):
     lane = "support-resolution-send"
@@ -168,9 +263,90 @@ def test_page_echo_or_pin_mismatch_blocks(pause, page_override):
     assert result["local_drained"] is False
 
 
-def test_lane_status_change_inside_page_generation_blocks(pause):
+@pytest.mark.parametrize("missing", [
+    "reservation_id", "epoch", "owner_epoch", "pinned", "send_generation",
+    "send_operation_id", "close_generation", "close_operation_id", "lane",
+    "limit", "returned", "has_more", "invocations",
+])
+def test_page_missing_field_blocks(pause, missing):
     lane = "support-ticket-close"
-    bus = GuardedBus(pages={lane: _page(lane, generation=9)})
+    page = _page(lane)
+    del page[missing]
+    bus = GuardedBus(pages={lane: page})
+    result = fence.receipt(bus, reservation_id=RESERVATION_ID, owner_epoch=EPOCH)
+    assert f"admission_inventory_malformed:{lane}" in result["blockers"]
+    assert result["admission_drained"] is False
+
+
+def test_multi_page_inventory_cursor_preserved(pause, monkeypatch):
+    monkeypatch.setattr(fence, "_INVENTORY_PAGE", 2)
+    lane = "support-resolution-send"
+    rows = [_invocation(inv_id="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1",
+                        outcome="unknown", unresolved=True,
+                        started="2026-10-10T00:00:00+00:00"),
+            _invocation(inv_id="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa2",
+                        outcome="unknown", unresolved=True,
+                        started="2026-10-10T01:00:00+00:00")]
+    page1 = _page(lane, rows, limit=2, returned=2, has_more=True)
+    page2 = _page(lane, limit=2)
+    bus = GuardedBus(pages={lane: [page1, page2]})
+    result = fence.receipt(bus, reservation_id=RESERVATION_ID, owner_epoch=EPOCH)
+    assert f"admission_inventory_malformed:{lane}" not in result["blockers"]
+    assert any(b.startswith("admission_unknown") for b in result["blockers"])
+    assert bus.inventory_calls[0] == (lane, None, None)
+    assert bus.inventory_calls[1] == (lane, "2026-10-10T01:00:00+00:00",
+                                      "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa2")
+
+
+def test_second_page_must_advance_past_prior_cursor(pause, monkeypatch):
+    monkeypatch.setattr(fence, "_INVENTORY_PAGE", 2)
+    lane = "support-resolution-send"
+    first = [_invocation(inv_id="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1",
+                         outcome="unknown", unresolved=True,
+                         started="2026-10-10T00:00:00+00:00"),
+             _invocation(inv_id="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa2",
+                         outcome="unknown", unresolved=True,
+                         started="2026-10-10T01:00:00+00:00")]
+    # A unique invocation on the next page still violates the keyset cursor
+    # when its timestamp is earlier than the last row of the previous page.
+    rewind = _invocation(inv_id="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa3",
+                         outcome="unknown", unresolved=True,
+                         started="2026-10-10T00:30:00+00:00")
+    bus = GuardedBus(pages={lane: [
+        _page(lane, first, limit=2, returned=2, has_more=True),
+        _page(lane, [rewind], limit=2, returned=1)]})
+    result = fence.receipt(bus, reservation_id=RESERVATION_ID, owner_epoch=EPOCH)
+    assert f"admission_inventory_malformed:{lane}" in result["blockers"]
+    assert result["admission_drained"] is False
+
+
+def test_noncanonical_timestamp_ordering_uses_rfc3339(pause):
+    lane = "support-resolution-send"
+    # Chronologically increasing but lexically decreasing: a lexical compare
+    # would wrongly reject this page.
+    rows = [_invocation(inv_id="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1",
+                        outcome="unknown", unresolved=True,
+                        started="2026-10-10T10:00:00+00:00"),
+            _invocation(inv_id="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa2",
+                        outcome="unknown", unresolved=True,
+                        started="2026-10-10T09:30:00-01:00")]
+    bus = GuardedBus(pages={lane: _page(lane, rows)})
+    result = fence.receipt(bus, reservation_id=RESERVATION_ID, owner_epoch=EPOCH)
+    assert f"admission_inventory_malformed:{lane}" not in result["blockers"]
+    assert any(b.startswith("admission_unknown") for b in result["blockers"])
+
+
+def test_chronologically_reversed_noncanonical_page_blocks(pause):
+    lane = "support-resolution-send"
+    # Lexically increasing but chronologically reversed: only parsed ordering
+    # catches this.
+    rows = [_invocation(inv_id="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa2",
+                        outcome="unknown", unresolved=True,
+                        started="2026-10-10T09:30:00-01:00"),
+            _invocation(inv_id="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1",
+                        outcome="unknown", unresolved=True,
+                        started="2026-10-10T10:00:00+00:00")]
+    bus = GuardedBus(pages={lane: _page(lane, rows)})
     result = fence.receipt(bus, reservation_id=RESERVATION_ID, owner_epoch=EPOCH)
     assert f"admission_inventory_malformed:{lane}" in result["blockers"]
     assert result["admission_drained"] is False
@@ -302,7 +478,6 @@ def test_no_reservation_keeps_legacy_cross_lane_blocker(pause):
 
         def support_admission_inventory(self, lane, *, limit, after_started=None,
                                         after_invocation=None):
-            status = self.support_admission_status_lane(lane)
             return {"lane": lane, "generation": 1, "operation_id": "op-1",
                     "paused": True, "limit": fence._INVENTORY_PAGE, "returned": 0,
                     "has_more": False, "next_after_started": None,
