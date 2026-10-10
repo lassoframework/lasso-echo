@@ -9,12 +9,23 @@ from agent.slack_convo import outbox, outreach
 from agent import echo_ticket_worker
 
 
+LANE_STATUS = {"lane": "support-resolution-send", "generation": 1, "unresolved": 0,
+               "paused": True, "drained": True, "operation_id": "op-test"}
+
+LEASE = {"lane": "support-resolution-send", "invocation_id": "inv-1", "generation": 1}
+COMPLETION = {"recorded": True, "lane": "support-resolution-send",
+              "invocation_id": "inv-1", "outcome": "completed", "generation": 1}
+
+
 class Bus:
     def support_uncertain_outbound(self, limit=1000):
         return []
 
     def outbox(self, status, limit):
         return []
+
+    def support_admission_status_lane(self):
+        return dict(LANE_STATUS)
 
 
 def pause(monkeypatch, tmp_path):
@@ -323,3 +334,108 @@ def test_paused_standalone_producers_and_release_handler_do_not_write(monkeypatc
     result = outreach.request_approval(None, None, None)
     assert not result.requested and result.reason == 'support_sender_paused'
     assert stale_escalation_reminder.run(bus=bus, enabled=True)['paused'] == 1
+
+
+# ---- portal 0633 durable admission lane binding (fail closed) --------------------
+
+def _admission_row(status='posted', lease=None, completion=None):
+    att = {}
+    if lease is not None:
+        att['support_resolution_send_admission'] = lease
+    if completion is not None:
+        att['support_resolution_send_completion'] = completion
+    return {'id': 'admitted-row', 'direction': 'outbound', 'delivery_status': status,
+            'attachments': att}
+
+
+@pytest.mark.parametrize('status_override', [
+    {'paused': False, 'drained': False},
+    {'paused': True, 'drained': False},
+    {'paused': True, 'drained': True, 'unresolved': 1},
+    {'paused': True, 'drained': True, 'generation': True},
+    {'paused': True, 'drained': True, 'generation': '1'},
+    {'paused': True, 'drained': True, 'generation': -1},
+    {'paused': True, 'drained': True, 'operation_id': ''},
+    {'paused': True, 'drained': True, 'operation_id': None},
+    {'paused': True, 'drained': True, 'lane': 'other-lane'},
+    {'paused': 'true', 'drained': True},
+])
+def test_invalid_admission_lane_status_blocks_drain(monkeypatch, tmp_path,
+                                                    status_override):
+    pause(monkeypatch, tmp_path)
+    class LaneBus(Bus):
+        def support_admission_status_lane(self):
+            return {**LANE_STATUS, **status_override}
+    receipt = fence.receipt(LaneBus())
+    assert not receipt['local_drained']
+    assert 'admission_lane_invalid' in receipt['blockers']
+
+
+@pytest.mark.parametrize('bad_status', [None, [], 'ok', {'paused': True}])
+def test_malformed_admission_lane_status_blocks_drain(monkeypatch, tmp_path, bad_status):
+    pause(monkeypatch, tmp_path)
+    class LaneBus(Bus):
+        def support_admission_status_lane(self):
+            return bad_status
+    receipt = fence.receipt(LaneBus())
+    assert not receipt['local_drained']
+    assert 'admission_lane_invalid' in receipt['blockers']
+
+
+def test_admission_lane_change_during_scans_blocks_drain(monkeypatch, tmp_path):
+    pause(monkeypatch, tmp_path)
+    class LaneBus(Bus):
+        calls = 0
+        def support_admission_status_lane(self):
+            type(self).calls += 1
+            status = dict(LANE_STATUS)
+            if type(self).calls > 1:
+                status['operation_id'] = 'op-next'
+            return status
+    receipt = fence.receipt(LaneBus())
+    assert not receipt['local_drained']
+    assert 'admission_lane_changed' in receipt['blockers']
+
+
+def test_unavailable_admission_lane_blocks_drain(monkeypatch, tmp_path):
+    pause(monkeypatch, tmp_path)
+    class LaneBus(Bus):
+        def support_admission_status_lane(self):
+            raise RuntimeError('rpc unavailable')
+    assert not fence.receipt(LaneBus())['local_drained']
+    class NoLane(Bus):
+        support_admission_status_lane = None
+    assert not fence.receipt(NoLane())['local_drained']
+
+
+def test_unresolved_admission_marked_row_blocks_drain_at_any_status(monkeypatch, tmp_path):
+    pause(monkeypatch, tmp_path)
+    for status in ('posted', 'failed', 'ready', 'held'):
+        class AdmissionBus(Bus):
+            def support_uncertain_outbound(self, limit=1000):
+                return [_admission_row(status=status, lease=dict(LEASE))]
+        receipt = fence.receipt(AdmissionBus())
+        assert not receipt['local_drained'], status
+        assert 'admission_unresolved:admitted-row' in receipt['blockers']
+
+
+def test_admission_row_without_trusted_completion_blocks_drain(monkeypatch, tmp_path):
+    pause(monkeypatch, tmp_path)
+    for completion in (None, 'done', {'recorded': True, 'lane': 'other'},
+                       {**COMPLETION, 'invocation_id': 'other'},
+                       {**COMPLETION, 'recorded': False},
+                       {**COMPLETION, 'generation': 2},
+                       {**COMPLETION, 'outcome': 'unknown'}):
+        class AdmissionBus(Bus):
+            def support_uncertain_outbound(self, limit=1000):
+                return [_admission_row(lease=dict(LEASE), completion=completion)]
+        assert not fence.receipt(AdmissionBus())['local_drained'], completion
+
+
+def test_completed_admission_row_with_trusted_completion_allows_drain(monkeypatch,
+                                                                      tmp_path):
+    pause(monkeypatch, tmp_path)
+    class AdmissionBus(Bus):
+        def support_uncertain_outbound(self, limit=1000):
+            return [_admission_row(lease=dict(LEASE), completion=dict(COMPLETION))]
+    assert fence.receipt(AdmissionBus())['local_drained']

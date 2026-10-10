@@ -1210,3 +1210,27 @@ def test_compound_acknowledgement_is_benign(text):
 @pytest.mark.parametrize("text", ["got it, thanks please fix my posts", "got it thank you but stop", "thanks, my photos are broken"])
 def test_acknowledgement_prefix_does_not_suppress_request(text):
     assert not replay.benign_chatter(text)
+
+
+def test_uncertain_outbound_includes_admission_marked_row_at_any_status(pg_bus):
+    """A 0633 admission lease with no trusted completion survives a nonposting
+    delivery_status edit; the drain scan must still see the row (fail closed)."""
+    ticket = pg_bus.engine.sql(
+        "insert into support_tickets (product,source,client_id) values "
+        "('lasso','portal_form','g-1') returning id")
+    att = json.dumps({"identity": "echo", "kind": "answer",
+                      "support_resolution_send_admission": {
+                          "lane": "support-resolution-send",
+                          "invocation_id": "inv-offline", "generation": 1}})
+    for status in ('posted', 'failed', 'ready'):
+        pg_bus.engine.sql(
+            f"insert into support_messages (ticket_id,direction,body,attachments,"
+            f"delivery_status) values ({q(ticket)},'outbound','body',{q(att)}::jsonb,"
+            f"{q(status)})")
+    rows = pg_bus.support_uncertain_outbound()
+    assert len(rows) == 3
+    assert {row['delivery_status'] for row in rows} == {'posted', 'failed', 'ready'}
+    assert all(row['attachments']['support_resolution_send_admission']['invocation_id']
+               == 'inv-offline' for row in rows)
+    result = fence.receipt(pg_bus)
+    assert result['local_drained'] is False

@@ -843,16 +843,36 @@ class Bus:
             "created_at": f"gte.{since_iso}", "select": "id"})
         return len(rows)
 
+    # Portal 0633 durable send admission: a row stamped with this lease but without a
+    # trusted completion has an UNKNOWN durable effect no matter what delivery_status
+    # a later edit left behind. It must block any drain acknowledgment until the
+    # admission lane itself reports zero unresolved for the paused generation.
+    SUPPORT_SEND_LANE = "support-resolution-send"
+    SUPPORT_SEND_ADMISSION_KEY = "support_resolution_send_admission"
+
     def support_uncertain_outbound(self, limit=1000):
         """Status-independent read: uncertainty survives even a mistaken status edit."""
         markers = ("fixer_slack_delivery_uncertain", "fixer_route_uncertain",
                    "fixer_route_pending", "outreach_delivery_uncertain",
-                   "slack_replay_delivery_uncertain")
+                   "slack_replay_delivery_uncertain", self.SUPPORT_SEND_ADMISSION_KEY)
         return self._get(_MESSAGES, {
             "direction": "eq.outbound", "select": "*", "order": "created_at.asc,id.asc",
             "limit": str(int(limit)),
             "or": "(" + ",".join(f"attachments->>{key}.not.is.null" for key in markers) + ")",
         })
+
+    def support_admission_status_lane(self, lane=SUPPORT_SEND_LANE):
+        """Fresh portal 0633 durable admission lane status, fail closed on transport
+        or malformed receipts. Callers validate the payload; this never retries."""
+        r = self._client().post(self._rest("rpc/support_admission_status_lane"),
+                                data=json.dumps({"p_lane": lane}),
+                                headers=self._headers(), timeout=30)
+        if r.status_code >= 400:
+            raise BusError(r.status_code, "support admission status unavailable")
+        result = r.json()
+        if not isinstance(result, dict):
+            raise BusError(400, "support admission status malformed")
+        return result
 
     def outbox(self, status="ready", limit=50, identity=None):
         """Outbound rows in one delivery state, oldest first. `identity` narrows to rows this

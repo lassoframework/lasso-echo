@@ -18,6 +18,48 @@ _LOCAL = threading.local()
 _ACTIVE = {}
 _PROCESS = str(uuid.uuid4())
 
+# Portal 0633 durable support-resolution-send admission lane. The fence receipt is
+# not drained until this durable lane is paused with zero unresolved invocations;
+# a row stamped with an admission lease but no trusted completion has an unknown
+# durable effect and blocks drain no matter what delivery_status it now carries.
+_LANE = "support-resolution-send"
+_ADMISSION_KEY = "support_resolution_send_admission"
+_COMPLETION_KEY = "support_resolution_send_completion"
+_LANE_KEYS = ("lane", "generation", "unresolved", "paused", "drained", "operation_id")
+
+
+def _validated_lane_status(value):
+    """Fail-closed 0633 lane binding: exact lane, paused, drained, zero unresolved,
+    valid generation and operation id. Anything else is not a drain basis."""
+    if not isinstance(value, dict):
+        return None
+    generation, unresolved = value.get("generation"), value.get("unresolved")
+    if (value.get("lane") != _LANE
+            or type(generation) is not int or not 0 <= generation <= 2**53 - 1
+            or type(unresolved) is not int or unresolved != 0
+            or type(value.get("paused")) is not bool
+            or type(value.get("drained")) is not bool
+            or value["drained"] != (value["paused"] and unresolved == 0)
+            or not isinstance(value.get("operation_id"), str)
+            or not value["operation_id"]
+            or value["paused"] is not True):
+        return None
+    return value
+
+
+def _trusted_admission_completion(att):
+    """A completed 0633 row needs the finish receipt recorded against its exact lease."""
+    lease, done = att.get(_ADMISSION_KEY), att.get(_COMPLETION_KEY)
+    return (isinstance(lease, dict) and isinstance(done, dict)
+            and lease.get("lane") == _LANE and done.get("recorded") is True
+            and done.get("lane") == _LANE
+            and isinstance(lease.get("invocation_id"), str)
+            and bool(lease["invocation_id"])
+            and done.get("invocation_id") == lease["invocation_id"]
+            and type(lease.get("generation")) is int
+            and done.get("generation") == lease["generation"]
+            and done.get("outcome") in (None, "completed"))
+
 
 def control():
     if os.getenv("SUPPORT_MESSAGES_FENCE_ENABLED", "").lower() != "true":
@@ -109,6 +151,10 @@ def receipt(bus=None):
             blockers.append("database_not_checked")
         else:
             try:
+                lane_status = getattr(bus, "support_admission_status_lane", None)
+                if not callable(lane_status):
+                    raise RuntimeError("admission_lane_unavailable")
+                lane_before = lane_status()
                 uncertain = bus.support_uncertain_outbound(limit=1000)
                 if not isinstance(uncertain, list) or len(uncertain) >= 1000:
                     blockers.append("uncertain_scan_incomplete")
@@ -118,7 +164,11 @@ def receipt(bus=None):
                                 or not row["id"].strip() or row.get("direction") != "outbound"
                                 or not isinstance(row.get("attachments"), dict)):
                             blockers.append("uncertain_row_malformed")
-                        elif any(row["attachments"].get(key) for key in (
+                            continue
+                        if (row["attachments"].get(_ADMISSION_KEY) is not None
+                                and not _trusted_admission_completion(row["attachments"])):
+                            blockers.append(f"admission_unresolved:{row['id']}")
+                        if any(row["attachments"].get(key) for key in (
                                 "fixer_slack_delivery_uncertain", "fixer_route_uncertain",
                                 "fixer_route_pending", "outreach_delivery_uncertain",
                                 "slack_replay_delivery_uncertain")):
@@ -147,6 +197,15 @@ def receipt(bus=None):
                                     "fixer_route_pending", "outreach_delivery_uncertain",
                                     "slack_replay_delivery_uncertain"))):
                             blockers.append(f"{status}:{row.get('id', 'unknown')}")
+                lane_after = lane_status()
+                # A lane operation/generation change during the message scans
+                # invalidates every conclusion drawn from them.
+                if (_validated_lane_status(lane_before) is None
+                        or _validated_lane_status(lane_after) is None):
+                    blockers.append("admission_lane_invalid")
+                elif any(lane_before.get(key) != lane_after.get(key)
+                         for key in _LANE_KEYS):
+                    blockers.append("admission_lane_changed")
             except Exception as exc:
                 blockers.append(f"database_read:{type(exc).__name__}")
     # A control replacement during DB read invalidates this acknowledgment.
