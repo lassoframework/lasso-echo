@@ -172,6 +172,12 @@ def test_close_failure_never_reposts_or_retries(failure,monkeypatch):
     if failure=='transcript_after_acquire':
         assert not any(c[0]=='effect' for c in f.calls)
         assert f.calls[-1][1]['p_outcome']=='unknown'
+    if failure=='readback':
+        count=len(f.calls)
+        assert f._historical_close_uncertain is True
+        with pytest.raises(HistoricalCloseoutError,match='uncertain'):
+            close(f,monkeypatch)
+        assert len(f.calls)==count
 
 
 @pytest.mark.parametrize('field',['delivery_readback_verified','delivery_identity_fence'])

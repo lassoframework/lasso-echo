@@ -272,16 +272,21 @@ def finalize_historical_receipt(bus, *, expected_ticket, selected_notice_id,
     except Exception:
         bus._historical_close_uncertain=True
         raise
-    fresh=bus.ticket(ticket['id'])
-    if not isinstance(fresh,dict) or not _identity_matches(fresh,ticket) or fresh.get('status')!='resolved':
-        raise HistoricalCloseoutError('closed ticket readback unconfirmed')
-    posted=_posted_notice(bus,fresh,selected_notice_id)
-    recovery=((fresh.get('verification_after') or {}).get('fixer') or {}).get('historical_receipt_recovery')
-    if (not isinstance(recovery,dict) or recovery.get('notice_message_id')!=selected_notice_id
-            or recovery.get('request_version')!=ticket['request_version']
-            or recovery.get('request_key')!=row['attachments']['request_key']
-            or recovery.get('notice_body_sha256')!=hashlib.sha256(posted['body'].encode()).hexdigest()
-            or not recovery.get('evidence_ref') or not _identity_matches(
-                {**fresh,'resolved_at':recovery.get('resolved_at')},ticket)):
-        raise HistoricalCloseoutError('portal-visible historical receipt readback unconfirmed')
-    return fresh
+    try:
+        fresh=bus.ticket(ticket['id'])
+        if not isinstance(fresh,dict) or not _identity_matches(fresh,ticket) or fresh.get('status')!='resolved':
+            raise HistoricalCloseoutError('closed ticket readback unconfirmed')
+        posted=_posted_notice(bus,fresh,selected_notice_id)
+        recovery=((fresh.get('verification_after') or {}).get('fixer') or {}).get('historical_receipt_recovery')
+        if (not isinstance(recovery,dict) or recovery.get('notice_message_id')!=selected_notice_id
+                or recovery.get('request_version')!=ticket['request_version']
+                or recovery.get('request_key')!=row['attachments']['request_key']
+                or recovery.get('notice_body_sha256')!=hashlib.sha256(posted['body'].encode()).hexdigest()
+                or not recovery.get('evidence_ref') or not _identity_matches(
+                    {**fresh,'resolved_at':recovery.get('resolved_at')},ticket)):
+            raise HistoricalCloseoutError('portal-visible historical receipt readback unconfirmed')
+        return fresh
+    except Exception:
+        # The effect may have succeeded; a failed readback is never retry authority.
+        bus._historical_close_uncertain=True
+        raise
