@@ -194,6 +194,125 @@ def _to_utc_iso(iso_ts):
 _ERR_BODY_CHARS = 1200
 
 
+def _require_exact_post(payload):
+    """Single-account/single-image interim lane; unknown media shapes hold.
+
+    Targets come from the outgoing body, never from caller metadata. Page and
+    GBP location IDs are destination identifiers verified by existing builders.
+    Extra media fields lack an exact-byte schema and cannot enter this lane.
+    OFF mode still calls require (to preserve a previously acquired permit).
+    """
+    from . import delivered_byte_send_guard as exact
+    platforms = payload.get("platforms")
+    media = payload.get("mediaItems")
+    valid = (isinstance(platforms, list) and len(platforms) == 1
+             and isinstance(platforms[0], dict)
+             and isinstance(media, list) and len(media) == 1
+             and isinstance(media[0], dict)
+             and set(media[0]) == {"type", "url"}
+             and media[0].get("type") == "image"
+             and isinstance(media[0].get("url"), str)
+             and _media_type(media[0]["url"]) == "image"
+             and set(payload) <= {"content", "platforms", "mediaItems", "scheduledFor",
+                                  "timezone", "publishNow", "isDraft"})
+    target, urls = {}, []
+    if valid:
+        entry = platforms[0]
+        psd = entry.get("platformSpecificData", {})
+        valid = (set(entry) <= {"platform", "accountId", "platformSpecificData"}
+                 and isinstance(entry.get("platform"), str) and bool(entry["platform"])
+                 and isinstance(entry.get("accountId"), str) and bool(entry["accountId"])
+                 and isinstance(psd, dict)
+                 and set(psd) <= {"pageId", "contentType", "locationId", "topicType",
+                                  "callToAction", "event", "offer"})
+        if valid:
+            target = {"provider": "zernio", "platform": entry["platform"],
+                      "account_id": entry["accountId"]}
+            for field, key in (("pageId", "page_id"), ("locationId", "location_id")):
+                if field in psd:
+                    if not isinstance(psd[field], str) or not psd[field]:
+                        target = {}
+                        break
+                    target[key] = psd[field]
+            urls = [media[0]["url"]]
+    permit = exact.active_permit()
+    if permit is not None:
+        _check_exact_post_content(payload, platforms[0] if valid else {}, permit)
+    exact.require(target, urls)
+
+
+def _check_exact_post_content(payload, entry, permit):
+    """Bind the final body to the committed calendar content, before consumption.
+
+    Calendar authority is for immediate dispatch. It does not approve a vendor
+    schedule (scheduled_at is explicitly excluded from the snapshot), so any
+    scheduledFor/timezone representation holds. Stories deliberately send empty
+    vendor text because their approved copy is already burned into the image.
+    """
+    from . import delivered_byte_send_guard as exact
+
+    def hold():
+        raise exact.ExactByteSendHold('provider body differs from approved exact content',
+                                      definitive_no_post=False)
+
+    snapshot = permit.context.get('row_snapshot')
+    if not isinstance(snapshot, dict):
+        hold()
+    fmt = permit.context.get('format', snapshot.get('format'))
+    if snapshot.get('format', fmt) != fmt:
+        hold()
+    psd = entry.get('platformSpecificData', {})
+    platform = entry.get('platform')
+    if (payload.get('publishNow') is not True
+            or 'scheduledFor' in payload or 'timezone' in payload
+            or ('isDraft' in payload and payload['isDraft'] is not False)):
+        hold()
+    if platform in ('instagram', 'facebook'):
+        # No undocumented feed contentType or cross-platform semantic fields.
+        allowed = {'pageId'} | ({'contentType'} if fmt == 'story' else set())
+        if not isinstance(psd, dict) or not set(psd) <= allowed:
+            hold()
+        if fmt == 'story':
+            if psd.get('contentType') != 'story' or payload.get('content') != '':
+                hold()
+            exact.check_content(None, 'story')
+        else:
+            exact.check_content(payload.get('content'), 'feed')
+    elif platform == 'googlebusiness':
+        exact.check_content(payload.get('content'), 'feed')
+        # Missing keys cannot silently mean defaults: every semantic input must
+        # be present in the immutable snapshot, including explicit nulls.
+        fields = {'gbp_topic_type', 'gbp_cta_type', 'gbp_cta_url',
+                  'gbp_event', 'gbp_offer', 'pillar'}
+        if not fields <= set(snapshot):
+            hold()
+        if (any(snapshot[key] is not None and not isinstance(snapshot[key], str)
+                for key in ('gbp_topic_type', 'gbp_cta_type', 'gbp_cta_url', 'pillar'))
+                or any(snapshot[key] is not None and not isinstance(snapshot[key], dict)
+                       for key in ('gbp_event', 'gbp_offer'))):
+            hold()
+        from . import gbp
+        import json
+        try:
+            target = permit.context['provider_target']
+            approved = gbp.build_platform_data(
+                account_id=target['account_id'], location_id=target['location_id'],
+                topic_type=snapshot['gbp_topic_type'] or 'STANDARD',
+                cta_type=snapshot['gbp_cta_type'] or gbp.DEFAULT_CTA,
+                cta_url=snapshot['gbp_cta_url'] or '', pillar=snapshot['pillar'] or '',
+                event=snapshot['gbp_event'], offer=snapshot['gbp_offer'])
+            # Python dict equality treats True and 1 as identical. Compare JSON
+            # representations so nested event/offer value types are pinned too.
+            matches = (json.dumps(entry, sort_keys=True, allow_nan=False)
+                       == json.dumps(approved, sort_keys=True, allow_nan=False))
+        except (KeyError, TypeError, ValueError, AttributeError):
+            hold()
+        if not matches:
+            hold()
+    else:
+        hold()
+
+
 def _idempotency_headers(idempotency_key):
     """Preserve x-request-id and add a caller-owned, stable Idempotency-Key if given.
 
@@ -303,6 +422,21 @@ class ZernioClient:
         hdrs = {"Authorization": f"Bearer {self.api_key}"}
         if headers:
             hdrs.update(headers)
+        # Inspect the final HTTP body, including raw calls, at the last mutation
+        # boundary. Draft storage does not publish media to a platform.
+        if path == "/v1/posts" and payload.get("isDraft") is not True:
+            _require_exact_post(payload)
+        elif path.startswith("/v1/accounts/") and path.endswith("/gmb-media"):
+            from .delivered_byte_send_guard import require
+            account_id = path[len("/v1/accounts/"):-len("/gmb-media")]
+            valid = (bool(account_id) and '/' not in account_id
+                     and payload.get("mediaFormat") == "PHOTO"
+                     and isinstance(payload.get("sourceUrl"), str)
+                     and _media_type(payload["sourceUrl"]) == "image"
+                     and set(payload) <= {"mediaFormat", "sourceUrl", "category", "description"})
+            require({"provider": "zernio", "platform": "googlebusiness",
+                     "account_id": account_id} if valid else {},
+                    [payload["sourceUrl"]] if valid else [])
         r = self._client().post(
             self.base + path,
             json=payload,
