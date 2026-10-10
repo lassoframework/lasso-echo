@@ -130,6 +130,9 @@ def _guarded_receipt_qualifies(ticket, message):
     attachments = message.get("attachments")
     if not isinstance(attachments, dict):
         return False
+    if (attachments.get("purpose") == "support_postclose_ack"
+            or attachments.get("postclose_ack") is True):
+        return False
     request_version = ticket.get("request_version")
     if not _safe_nonnegative_int(request_version):
         return False
@@ -187,6 +190,11 @@ def qualifying_completion_receipt(ticket, messages):
     guarded = _guard_required(ticket)
     for message in messages or []:
         if not isinstance(message, dict) or message.get("ticket_id") != ticket_id:
+            continue
+        attachments = message.get("attachments")
+        if isinstance(attachments, dict) and (
+                attachments.get("purpose") == "support_postclose_ack"
+                or attachments.get("postclose_ack") is True):
             continue
         if guarded:
             if _guarded_receipt_qualifies(ticket, message):
