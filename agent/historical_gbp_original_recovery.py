@@ -282,6 +282,15 @@ def _validate_binding_shape(binding):
             raise RecoveryVerificationError("recovery binding hash malformed")
 
 
+def _require_validated_urls(binding, source_url, delivered_url):
+    """Fail closed on untrusted tenant URLs BEFORE any byte reader runs."""
+    for label, url in (("source", source_url), ("delivered", delivered_url)):
+        if validate_hosted_url(url, binding["source_origin"],
+                               binding["tenant_slug"]) is None:
+            raise RecoveryVerificationError(
+                f"recovery {label} URL is not a trusted tenant object")
+
+
 def _verify_bytes(binding, raw, delivered, source_url, delivered_url):
     segment = validate_hosted_url(source_url, binding["source_origin"],
                                   binding["tenant_slug"])
@@ -352,6 +361,7 @@ def observe(store, account_key, row, *, read_bytes=None):
             and historical.get("image_url") != binding["source_url"]):
         raise RecoveryVerificationError("historical row does not reference the pinned original")
     reader = read_bytes or _default_reader
+    _require_validated_urls(binding, binding["source_url"], row.get("image_url"))
     raw = vp._exact_bytes(binding["source_url"], reader, "recovery raw original")
     delivered = vp._exact_bytes(row.get("image_url"), reader, "recovery delivered")
     _verify_bytes(binding, raw, delivered, binding["source_url"], row.get("image_url"))
@@ -457,6 +467,7 @@ def receipt_identity(store, account_key, row, *, read_bytes=None):
     if row.get("source_media_url") != binding["source_url"]:
         raise RecoveryVerificationError("recovered source URL mismatch")
     reader = read_bytes or _default_reader
+    _require_validated_urls(binding, binding["source_url"], row.get("image_url"))
     raw = vp._exact_bytes(binding["source_url"], reader, "recovery raw original")
     delivered = vp._exact_bytes(row.get("image_url"), reader, "recovery delivered")
     _verify_bytes(binding, raw, delivered, binding["source_url"], row.get("image_url"))

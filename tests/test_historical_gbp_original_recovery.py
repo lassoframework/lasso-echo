@@ -195,6 +195,59 @@ def test_hosted_url_rejected(url):
 
 # --- observe verification ----------------------------------------------------
 
+UNSAFE_URL = "https://evil.example.test/echo/gym-test/0123456789abcdef/x.jpg"
+
+
+def _rebind_untrusted(case, source_url=None, delivered_url=None):
+    if source_url is not None:
+        case["binding"]["source_url"] = source_url
+        case["source_url"] = source_url
+        case["historical"].update(image_url=source_url,
+                                  source_media_url=source_url)
+    if delivered_url is not None:
+        case["target"]["image_url"] = delivered_url
+        case["delivered_url"] = delivered_url
+    case["binding"]["expected_before"] = hgr.row_snapshot(case["target"])
+    case["binding"]["historical_snapshot"] = hgr.row_snapshot(
+        case["historical"])
+
+
+def _counting_reader(calls):
+    def read(url):
+        calls.append(url)
+        return b""
+    return read
+
+
+@pytest.mark.parametrize("which", ["source", "delivered"])
+def test_observe_untrusted_url_fails_closed_before_reader(case, which):
+    _rebind_untrusted(
+        case,
+        source_url=UNSAFE_URL if which == "source" else None,
+        delivered_url=UNSAFE_URL if which == "delivered" else None)
+    calls = []
+    with pytest.raises(hgr.RecoveryVerificationError,
+                       match=f"recovery {which} URL is not a trusted tenant object"):
+        hgr.observe(_store(case), GYM, case["target"],
+                    read_bytes=_counting_reader(calls))
+    assert calls == []
+
+
+@pytest.mark.parametrize("which", ["source", "delivered"])
+def test_receipt_identity_untrusted_url_fails_closed_before_reader(case, which):
+    _rebind_untrusted(
+        case,
+        source_url=UNSAFE_URL if which == "source" else None,
+        delivered_url=UNSAFE_URL if which == "delivered" else None)
+    calls = []
+    store = _store(case, receipt=_receipt_for(case))
+    with pytest.raises(hgr.RecoveryVerificationError,
+                       match=f"recovery {which} URL is not a trusted tenant object"):
+        hgr.receipt_identity(store, GYM, _recovered_row(case),
+                             read_bytes=_counting_reader(calls))
+    assert calls == []
+
+
 def test_observe_success_builds_proof(case):
     obs = hgr.observe(_store(case), GYM, case["target"], read_bytes=_bytes(case))
     assert obs.proof == hgr.proof_for(case["binding"])
