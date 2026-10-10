@@ -1338,6 +1338,51 @@ def _result_proves_no_post(result):
     return getattr(result, "definitive_no_post", False) is True
 
 
+def _record_exact_byte_provider_outcome(store, permit, *, result=None, error=None):
+    """Persist factual acceptance before a later row can obtain sibling authority.
+
+    A provider post id is an acceptance receipt, never platform readback. Missing
+    receipts and unknown sends retain uncertain occupancy and the calendar claim.
+    OFF has no permit and performs no RPC. Do not retry an unknown RPC commit.
+    """
+    if permit is None:
+        return
+    from . import delivered_byte_send_guard as guard
+    accepted = (error is None and getattr(result, "ok", False) is True
+                and getattr(result, "mode", "") == "published")
+    if not permit.consumed:
+        if accepted:
+            raise guard.ExactByteSendHold(
+                "provider acceptance lacks consumed exact byte authority",
+                definitive_no_post=False)
+        return
+    receipt = getattr(result, "media_id", None)
+    receipt = receipt.strip() if isinstance(receipt, str) else ""
+    has_receipt = accepted and bool(receipt) and not getattr(result, "dedup", False)
+    no_send = not accepted and ((error is not None and getattr(error, "definitive_no_post", False) is True)
+               or (error is None and (getattr(result, "mode", "") == "would_publish"
+                                      or _result_proves_no_post(result))))
+    outcome = "provider_accepted" if has_receipt else "definite_no_send" if no_send else "uncertain"
+    import json
+    evidence = {"source": "calendar_provider_result",
+                "attempt_id": permit.attempt_id,
+                "provider_target": permit.context["provider_target"],
+                "outcome": outcome}
+    if has_receipt:
+        evidence["provider_post_id"] = receipt
+    elif error is not None:
+        evidence["exception_type"] = type(error).__name__
+    else:
+        evidence["result_mode"] = str(getattr(result, "mode", ""))
+        evidence["receipt_missing_or_dedup"] = accepted
+    guard.record_outcome(getattr(store, "_s", store), permit, outcome,
+                         json.dumps(evidence, sort_keys=True, separators=(",", ":")))
+    if accepted and not has_receipt:
+        raise guard.ExactByteSendHold(
+            "provider acceptance receipt unavailable for exact byte outcome",
+            definitive_no_post=False)
+
+
 def _clear_publish_blocked(gym_id):
     """Re-arm the deduped publish-blocked alerts for a gym (called when a row
     passes the guard: the state changed). Best effort; never raises."""
@@ -2184,6 +2229,7 @@ def publish_due(run_date, *, gym_id="lasso", store=None, publisher=None,
         # Default-OFF byte authority: a failed check is a proven pre-network
         # hold. Only release a lease whose persisted token this run owns.
         from . import forward_media_guard as _fmg
+        from . import delivered_byte_send_guard as _exact_guard
         from .forward_media_publish import authorize as _authorize_media
         if _fmg.enabled():
             try:
@@ -2250,13 +2296,23 @@ def publish_due(run_date, *, gym_id="lasso", store=None, publisher=None,
                 from contextlib import nullcontext
                 from .forward_media_publish import authorized_send as _authorized_send
                 with (_authorized_send(store, row, claim_token)
-                      if _fmg.enabled() else nullcontext()):
-                    if account.key.startswith("lasso") and \
-                            not config.lasso_via_zernio_enabled():
-                        result = publisher(draft, account)
-                    else:
-                        result = zernio_publish(draft, account, scheduled_for=None)
+                      if _fmg.enabled() or _exact_guard.enabled() else nullcontext()):
+                    _exact_permit = _exact_guard.active_permit()
+                    try:
+                        if account.key.startswith("lasso") and \
+                                not config.lasso_via_zernio_enabled():
+                            result = publisher(draft, account)
+                        else:
+                            result = zernio_publish(draft, account, scheduled_for=None)
+                    except Exception as exc:
+                        _record_exact_byte_provider_outcome(
+                            store, _exact_permit, error=exc)
+                        raise
+                    _record_exact_byte_provider_outcome(
+                        store, _exact_permit, result=result)
             except Exception as e:
+                if isinstance(e, _exact_guard.ExactByteSendHold):
+                    forward_media_holds[row_id] = 'exact_byte_verification'
                 if isinstance(e, _fmg.ForwardMediaVerificationHold):
                     forward_media_holds[row_id] = (
                         "forward_media_duplicate" if isinstance(

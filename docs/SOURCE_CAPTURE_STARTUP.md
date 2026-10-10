@@ -10,7 +10,22 @@ All three flags must explicitly equal `true` before construction:
 `ECHO_SOURCE_CAPTURE_INGEST_ENABLED`. They have no enabled defaults.
 
 The operator installs `ECHO_SOURCE_CAPTURE_APPROVED_MAPPINGS_FILE` as an absolute
-path to private server state: owner-only directory and file (0700 / 0600), current
+path to private server state. The supported method is the container-side CLI
+`python -m agent.source_brand_approval_install` (use `/opt/venv/bin/python -m ...`
+inside the Railway container per the shell interpreter note in AGENTS.md): the
+operator-reviewed mapping JSON is piped on stdin only (never CLI arguments,
+environment values, or log output) and the target path is read from
+`ECHO_SOURCE_CAPTURE_APPROVED_MAPPINGS_FILE`. The installer stages bytes to a
+fresh 0600 file in the authority directory, validates the staged file with the
+real `load_approved_mappings` loader, then atomically renames that verified file
+over the target. A failure before replacement leaves the previous authority
+untouched; it also creates `ECHO_SOURCE_CAPTURE_JOURNAL_DIR`
+0700 when absent. Railway remote stdin forwarding for `railway run`/`ssh` pipes
+could not be proven, so this is documented as a container-side method run with an
+attached stdin (for example via an interactive container shell), not a claimed
+working remote one-liner. Installation permission is still not proof that an
+approval is true; receipts require independent review as below. The installed state is an
+owner-only directory and file (0700 / 0600), current
 OS owner, regular file, no symlink components or hard links. The bounded JSON
 schema is `{"schema_version":1,"approved_mappings":[...]}`. Each mapping has exact
 `gym_id`, `echo_account_key`, `website_urls`, `domain_evidence`, `approval_receipt`

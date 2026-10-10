@@ -4186,6 +4186,11 @@ def stale_escalation_reminder_enabled() -> bool:
     return _truthy(os.environ.get("AGENT_STALE_ESCALATION_REMINDER", "true"))
 
 
+def client_support_scan_reminder_enabled() -> bool:
+    """Internal-only client support reconciliation, default OFF for rollout."""
+    return _truthy(os.environ.get("AGENT_CLIENT_SUPPORT_SCAN_REMINDER_ENABLED", "false"))
+
+
 def stale_hold_hours() -> float:
     """
     STALE_HOLD_HOURS (default 4.0): how long a ticket may sit in

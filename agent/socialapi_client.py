@@ -117,34 +117,58 @@ def list_accounts(brand_id="", http=None):
     return body.get("accounts") or body.get("data") or []
 
 
+
+
 # ---- media -----------------------------------------------------------------
 
-def upload_media(data_bytes, filename, content_type, http=None):
+def upload_media(data_bytes, filename, content_type, http=None, *,
+                 exact_target=None, image_url=None, post_content_type='feed', post_text=None):
     """Upload raw bytes and return the media_id. Multipart; the vendor ignores
     raw public URLs, so bytes are the only path. Files up to 50MB."""
+    from . import delivered_byte_send_guard as exact
+    if exact.enabled() or exact.active_permit() is not None:
+        if (not isinstance(exact_target, dict) or exact_target.get('provider') != 'socialapi'
+                or not isinstance(content_type, str) or not content_type.startswith('image/')
+                or post_content_type not in ('feed', 'stories')):
+            raise exact.ExactByteSendHold('exact SocialAPI upload target and image required',
+                                         definitive_no_post=exact.active_permit() is None)
+    exact.check_content(post_text, 'story' if post_content_type == 'stories' else 'feed')
+    permit = exact.require_bytes(exact_target, [image_url], image_bytes=data_bytes)
     client = http or _requests()
     files = {"file": (filename, data_bytes, content_type)}
     # NOTE: do not set Content-Type here; requests sets the multipart boundary.
     resp = client.post(f"{_base()}/media/upload",
                        headers=_auth_headers(), files=files, timeout=120)
     body = _check(resp, "upload_media")
-    return body.get("media_id") or body.get("id") or ""
+    media_id = body.get("media_id") or body.get("id") or ""
+    exact.bind_continuation(permit, exact_target, media_id,
+                            'socialapi:create_post:' + post_content_type)
+    return media_id
 
 
 # ---- posts -----------------------------------------------------------------
 
 def create_post(account_id, text, media_ids, content_type="feed", http=None,
-                idempotency_key=""):
+                idempotency_key="", *, exact_continuation=None):
     """Publish immediately to one connected account. content_type is 'feed' or
     'stories'. Text passes through verbatim (newlines preserved by JSON encoding).
     Returns the full post response (id, status, targets[])."""
+    from . import delivered_byte_send_guard as exact
+    media_ids = list(media_ids or [])
+    target_identity = (dict(exact_continuation.provider_target)
+                       if isinstance(exact_continuation, exact.SendContinuation) else {})
+    target_identity.update(provider='socialapi', account_id=str(account_id))
+    exact.require_continuation(exact_continuation, target_identity,
+                               media_ids[0] if len(media_ids) == 1 else None,
+                               'socialapi:create_post:' + str(content_type), caption=text,
+                               post_format='story' if content_type == 'stories' else 'feed')
     client = http or _requests()
     target = {"account_id": account_id}
     if content_type:
         target["platform_data"] = {"content_type": content_type}
     payload = {
         "text": text,
-        "media_ids": list(media_ids or []),
+        "media_ids": media_ids,
         "publish_now": True,
         "targets": [target],
     }
